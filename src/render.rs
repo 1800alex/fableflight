@@ -1,0 +1,1918 @@
+//! wgpu renderer: G-buffer pass, shadow map, deferred sky/water resolve,
+//! ambient occlusion (GTAO), volumetric clouds, GPU particles, temporal
+//! anti-aliasing, bloom and tonemap.
+use bytemuck::{Pod, Zeroable};
+use glam::Mat4;
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
+
+pub const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Distance (km) to the clouds a texel sees (reprojects the cloud history) and to the
+/// scene surface it marched to (depth-aware filtering and upsampling).
+const CLOUD_DIST: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
+/// Share of each pixel's light that is ambient (sky and bounce), and the
+/// ambient occlusion that darkens it.
+pub(crate) const AMB: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+const SHADOW_RES: u32 = 4096;
+pub const CASCADES: usize = 3;
+pub(crate) const MSAA: u32 = 4;
+const MAX_INST: usize = 16384;
+const MAX_FALL: usize = 4096;
+/// trees and undergrowth close enough to the camera for their leaf cards
+pub const MAX_NEAR: usize = 20000;
+const BLOOM_MIPS: u32 = 6;
+pub const MAX_PARTICLES: u32 = 1 << 16;
+/// Smoke volume around the effects anchor: cells along east, north, up; cell
+/// size in metres; height of the bottom of the grid above the anchor.
+pub const VOL_N: [u32; 3] = [40, 40, 48];
+pub const VOL_CELL: f32 = 8.0;
+pub const VOL_ZMIN: f32 = -24.0;
+const VOL_CELLS: u64 = (VOL_N[0] * VOL_N[1] * VOL_N[2]) as u64;
+const UB_ALIGN: u64 = 256;
+const MAX_TILES: u64 = 1024;
+const MAX_BUILDS: u64 = 512; // detail tiles; one extra slot is kept for loose trees
+const MAX_OBJS: u64 = 256;
+/// Shadow map layer that only the aircraft casts into, a few metres across.
+pub const PLANE_LAYER: usize = CASCADES;
+/// Resolution of the part of that layer it uses.
+pub const PLANE_SHADOW_RES: u32 = SHADOW_RES;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct Globals {
+    pub view_proj: [[f32; 4]; 4],
+    pub inv_view_proj: [[f32; 4]; 4],
+    pub shadow_vp: [[[f32; 4]; 4]; CASCADES],
+    pub planet: [f32; 4],
+    pub sun_dir: [f32; 4],
+    pub east: [f32; 4],
+    pub north: [f32; 4],
+    pub up: [f32; 4],
+    pub screen: [f32; 4],
+    pub time: [f32; 4],
+    pub cloud: [f32; 4],
+    pub light_pos: [f32; 4],
+    pub light_col: [f32; 4],
+    /// explosion volume: corner of the grid relative to camera, w = cell size
+    pub vol_o: [f32; 4],
+    /// explosion volume up axis, w = 1 while the volume holds live smoke
+    pub vol_u: [f32; 4],
+    pub misc: [f32; 4],
+    pub csm: [f32; 4],
+    pub scorch: [[f32; 4]; 8],
+    pub crater: [[f32; 4]; 8],
+    /// last frame's view-projection (without its sub-pixel offset), relative to last frame's camera
+    pub prev_vp: [[f32; 4]; 4],
+    /// camera movement since last frame; w = 1 when the cloud history is usable
+    pub cam_delta: [f32; 4],
+    /// xyz direction to the moon, w its illuminance
+    pub moon: [f32; 4],
+    /// explosion volume east and north axes
+    pub vol_e: [f32; 4],
+    pub vol_n: [f32; 4],
+    /// the aircraft's own shadow map
+    pub pshadow_vp: [[f32; 4]; 4],
+    /// texel size (m), depth bias, share of the layer used, w = 1 when in use
+    pub pshadow: [f32; 4],
+    /// temporal anti-aliasing: xy this frame's sub-pixel offset in uv, z = 1
+    /// when it is on, w = 1 when the aircraft is drawn
+    pub taa: [f32; 4],
+    /// camera-relative position to the aircraft's body frame
+    pub plane_inv: [[f32; 4]; 4],
+    /// body frame to last frame's clip space
+    pub plane_prev: [[f32; 4]; 4],
+    /// centre and half size of the aircraft in its body frame
+    pub plane_box: [[f32; 4]; 2],
+    /// xyz how far the wind has carried the clouds (planet frame, m), w haze (1 = clear day)
+    pub weather: [f32; 4],
+    /// xyz direction the wind aloft blows towards (planet frame), w number of storm cells
+    pub storm: [f32; 4],
+    /// storm cells, two each: centre (km, cloud space) and tower radius (km); maturity
+    pub storm_cells: [[f32; 4]; 2 * crate::weather::MAX_STORMS],
+    /// ground material layers: metres per repeat, metres of relief, scale of
+    /// the second sample, photo contrast (0 = procedural); set by the renderer
+    pub det: [[f32; 4]; 16],
+}
+
+/// Pipelines, bind groups and targets for drawing the atmosphere's
+/// transmittance and multiple-scattering tables.
+struct LutBake {
+    p_trans: wgpu::RenderPipeline,
+    p_ms: wgpu::RenderPipeline,
+    bg_trans: wgpu::BindGroup,
+    bg_ms: wgpu::BindGroup,
+    trans: wgpu::TextureView,
+    ms: wgpu::TextureView,
+}
+
+impl LutBake {
+    /// Uses whatever is in the globals buffer: only the planet radius and the haze matter.
+    fn draw(&self, enc: &mut wgpu::CommandEncoder) {
+        for (p, bg, target) in [(&self.p_trans, &self.bg_trans, &self.trans), (&self.p_ms, &self.bg_ms, &self.ms)] {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(target, true))], None));
+            rp.set_pipeline(p);
+            rp.set_bind_group(0, bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Default)]
+pub struct Particle {
+    pub pos: [f32; 3],
+    pub age: f32,
+    pub vel: [f32; 3],
+    pub life: f32,
+    pub size0: f32,
+    pub size1: f32,
+    pub temp: f32,
+    pub kind: f32,
+    pub drag: f32,
+    pub buoy: f32,
+    pub seed: f32,
+    pub alpha: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Default)]
+pub struct PSim {
+    pub anchor: [f32; 4],
+    pub upv: [f32; 4],
+    pub cam_r: [f32; 4],
+    pub cam_u: [f32; 4],
+    pub wind: [f32; 4],
+    /// volume grid: east axis (w cell size), north axis (w lowest altitude)
+    pub ve: [f32; 4],
+    pub vn: [f32; 4],
+    /// xyz: move every live particle by this much, once (the frame was re-anchored)
+    pub shift: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct MeshVertex {
+    pub pos: [f32; 3],
+    pub nrm: [f32; 3],
+    pub col: [f32; 4],
+}
+
+/// A vertex of the aircraft (or its wreckage).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Default, Debug)]
+pub struct PartVertex {
+    /// body-frame position at rest
+    pub pos: [f32; 3],
+    pub nrm: [f32; 3],
+    /// linear albedo, a = baked ambient occlusion
+    pub col: [f32; 4],
+    /// surface coordinates in metres (seams, rivets, decals) or a local [-1, 1] frame
+    pub uv: [f32; 2],
+    /// material, surface pattern, exposure to wear, material-specific extra
+    pub mat: [f32; 4],
+}
+
+/// A vertex of a tree or undergrowth model.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct TreeVertex {
+    pub pos: [f32; 3],
+    pub nrm: [f32; 3],
+    /// rgb; a = 0 bark, 1 foliage, or on a leaf card the number of leaves along it
+    pub col: [f32; 4],
+    /// leaf cards: along, across, seed, style. Solids: w = kind of bark
+    pub uv: [f32; 4],
+    /// leaf cards: aspect and two shape parameters. Solids: how far the vertex
+    /// draws in once the cards are out. w = openness to the sky
+    pub aux: [f32; 4],
+}
+
+/// One tree: where, how big, which way it faces, and how far it has fallen.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct TreeInst {
+    /// xyz position (relative to its tile centre), w height scale (0 = gone)
+    pub a: [f32; 4],
+    /// xy fall direction (east, north) times fall angle, z yaw, w width scale
+    pub b: [f32; 4],
+    /// colour multiplier, 127 = neutral; a = 255, or for undergrowth the distance (m) it is drawn to
+    pub tint: [u8; 4],
+}
+
+/// One instanced solid: rows of a 3x4 camera-relative model matrix and a tint
+/// (tint.a = 1 selects the matte rubble material).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct Inst {
+    pub m: [[f32; 4]; 3],
+    pub tint: [f32; 4],
+    /// rubble: a piece of facade's wall coordinates and style (inst.wgsl), else 0
+    pub ext: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct RoadVertex {
+    pub pos: [f32; 3],
+    /// across, along, half width, distance to the nearest end (all metres)
+    pub q: [f32; 4],
+    pub kind: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ObjU {
+    model: [[f32; 4]; 4],
+    tint: [f32; 4],
+    glow: [f32; 4],
+    params: [[f32; 4]; 6],
+    tear: [[f32; 4]; 2],
+    dmg: [f32; 4],
+    dmg2: [f32; 4],
+}
+
+pub struct TileGpu {
+    vbuf: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+}
+pub struct BuildGpu {
+    vbuf: wgpu::Buffer,
+    pub ibuf: wgpu::Buffer,
+    n_idx: u32,
+    n_tall: u32,
+    n_main: u32,
+    n_det: u32,
+    bind: wgpu::BindGroup,
+    road: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    pub trees: Option<wgpu::Buffer>,
+}
+impl BuildGpu {
+    /// The geometry buffers, in the order of `building_payload`.
+    pub fn targets(&self) -> [Option<&wgpu::Buffer>; 5] {
+        [Some(&self.vbuf), Some(&self.ibuf), self.road.as_ref().map(|r| &r.0), self.road.as_ref().map(|r| &r.1), self.trees.as_ref()]
+    }
+}
+/// The bytes each of `BuildGpu::targets` is filled with.
+pub fn building_payload(b: &crate::buildings::BuildingData) -> [&[u8]; 5] {
+    [bytemuck::cast_slice(&b.verts), bytemuck::cast_slice(&b.indices), bytemuck::cast_slice(&b.road_verts), bytemuck::cast_slice(&b.road_idx), bytemuck::cast_slice(&b.trees)]
+}
+/// Bytes of a terrain tile's upload, for the per-frame upload budget.
+pub fn tile_bytes(t: &crate::sources::TileData) -> usize {
+    std::mem::size_of_val(&t.verts[..]) + t.imagery.iter().chain(&t.mask).map(|m| m.len()).sum::<usize>()
+}
+/// One model drawn for a run of the frame's near instances.
+pub struct NearDraw {
+    pub mesh: u32,
+    pub first: u32,
+    pub count: u32,
+    /// leaf cards rather than a solid model
+    pub cards: bool,
+}
+pub struct TreeDraw {
+    pub mesh: u32,
+    pub first: u32,
+    pub count: u32,
+    pub view: bool,
+    /// bit per shadow cascade this batch casts into
+    pub casc: u8,
+    /// some of its trees may be close enough to have their crowns cut
+    pub close: bool,
+    /// drawn as impostors (`mesh` is then the model)
+    pub imp: bool,
+}
+/// Everything drawn for one detail tile this frame.
+pub struct DetailDraw<'a> {
+    pub gpu: &'a BuildGpu,
+    /// tile offset, roof atlas mapping, and how far each level of detail has
+    /// faded in: middle, finest, the whole tile
+    pub u: [f32; 16],
+    pub view: bool,
+    /// close enough for roads and the middle level of detail
+    pub near: bool,
+    pub casc: u8,
+    pub trees: Vec<TreeDraw>,
+    pub close: Vec<NearDraw>,
+}
+struct MeshLib {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    ranges: Vec<(u32, u32, i32)>,
+}
+pub struct MeshGpu {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    n_idx: u32,
+}
+pub struct DrawObj {
+    pub mesh: usize,
+    pub model: Mat4,
+    pub tint: [f32; 4],
+    pub glow: [f32; 4],
+    /// instrument readings and light states (see plane.wgsl)
+    pub params: [[f32; 4]; 6],
+    /// bit per shadow layer it casts into (bit `PLANE_LAYER` = the aircraft's own)
+    pub cast: u8,
+    /// drawn in the transparent pass
+    pub glass: bool,
+    /// has openings cut in it, or a break (needs the discarding pipelines)
+    pub cut: bool,
+    /// up to two breaks through the body frame: plane normal xyz, offset (see damage.rs)
+    pub tear: [[f32; 4]; 2],
+    /// mode of each break, scrapes 0..1, raggedness of the edge (m)
+    pub dmg: [f32; 4],
+    /// oil film on the windshield, crack centre z and y, crack size
+    pub dmg2: [f32; 4],
+}
+
+impl DrawObj {
+    pub const DEFAULT: DrawObj = DrawObj { mesh: 0, model: Mat4::IDENTITY, tint: [0.0; 4], glow: [0.0; 4], params: [[0.0; 4]; 6], cast: 0, glass: false, cut: false, tear: [[0.0; 4]; 2], dmg: [0.0; 4], dmg2: [0.0; 4] };
+}
+
+pub struct Frame<'a> {
+    pub g: Globals,
+    /// terrain tile and its uniform: offset, info, tessellated cell block (see terrain.wgsl)
+    pub tiles: Vec<(&'a TileGpu, [f32; 12])>,
+    pub details: Vec<DetailDraw<'a>>,
+    pub objs: Vec<DrawObj>,
+    /// (mesh, instance) for cars, rubble, rocks
+    pub insts: Vec<(u32, Inst)>,
+    /// (tree mesh, instance) for trees that have been knocked loose, camera-relative
+    pub fall: Vec<(u32, TreeInst)>,
+    /// trees (for their leaf cards) and undergrowth near the camera, relative to their tiles
+    pub near: Vec<TreeInst>,
+    pub casc_vp: [[[f32; 4]; 4]; CASCADES + 1],
+    pub psim: PSim,
+    pub sim_steps: bool,
+    /// the crash's fire simulation, while there is one
+    pub fluid: Option<crate::fluid::FluidFrame>,
+    pub egui: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
+    pub shot: Option<std::path::PathBuf>,
+}
+
+struct Targets {
+    color_ms: wgpu::TextureView,
+    aux_ms: wgpu::TextureView,
+    amb_ms: wgpu::TextureView,
+    depth_ms: wgpu::TextureView,
+    ao_raw: wgpu::TextureView,
+    ao: wgpu::TextureView,
+    bg_gtao: wgpu::BindGroup,
+    bg_ao_blur: wgpu::BindGroup,
+    bg_dres: wgpu::BindGroup,
+    color: wgpu::TextureView,
+    aux: wgpu::TextureView,
+    amb: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    hdr: wgpu::TextureView,
+    cloud: wgpu::TextureView,
+    cloud_dist: wgpu::TextureView,
+    cloud_hist: [wgpu::TextureView; 2],
+    /// anti-aliased frames: this one and the one before, taking turns
+    taa: [wgpu::TextureView; 2],
+    bg_taa: [wgpu::BindGroup; 2],
+    bloom: Vec<wgpu::TextureView>,
+    ldr_tex: wgpu::Texture,
+    ldr: wgpu::TextureView,
+    bg_composite: wgpu::BindGroup,
+    bg_cloud: wgpu::BindGroup,
+    bg_cloud_temporal: [wgpu::BindGroup; 2],
+    bg_cloud_apply: [wgpu::BindGroup; 2],
+    bg_particles: wgpu::BindGroup,
+    /// Bloom and the tonemap read the frame from `hdr` (index 0) or from either `taa` texture (1, 2).
+    bg_down0: [wgpu::BindGroup; 3],
+    bg_down: Vec<wgpu::BindGroup>,
+    bg_up: Vec<wgpu::BindGroup>,
+    bg_final: [wgpu::BindGroup; 3],
+    bg_blit: wgpu::BindGroup,
+}
+
+pub struct Renderer {
+    ground_mats: GroundMats,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+    pub config: wgpu::SurfaceConfiguration,
+    globals_ub: wgpu::Buffer,
+    bg0: wgpu::BindGroup,
+    bg0_pre: wgpu::BindGroup,
+    lut_sky: wgpu::TextureView,
+    shadow: Vec<wgpu::TextureView>,
+    casc_ub: wgpu::Buffer,
+    bg_casc: wgpu::BindGroup,
+    bg_tileu: wgpu::BindGroup,
+    l_dres: wgpu::BindGroupLayout,
+    l_ao: wgpu::BindGroupLayout,
+    p_gtao: wgpu::RenderPipeline,
+    p_ao_blur: wgpu::RenderPipeline,
+    p_dres: wgpu::RenderPipeline,
+    p_road: wgpu::RenderPipeline,
+    /// loose trees; `p_tree_near` draws the rest short of IMP_DIST (with the
+    /// outlines of their crowns cut into clumps), `imp` the ones beyond
+    p_tree: wgpu::RenderPipeline,
+    p_tree_near: wgpu::RenderPipeline,
+    imp: crate::impostor::Impostors,
+    p_tree_shadow: wgpu::RenderPipeline,
+    p_card: wgpu::RenderPipeline,
+    near_buf: wgpu::Buffer,
+    p_inst: wgpu::RenderPipeline,
+    p_inst_shadow: wgpu::RenderPipeline,
+    inst_buf: wgpu::Buffer,
+    fall_buf: wgpu::Buffer,
+    tree_lib: Option<MeshLib>,
+    inst_lib: Option<MeshLib>,
+    l_tile: wgpu::BindGroupLayout,
+    l_build: wgpu::BindGroupLayout,
+    l_composite: wgpu::BindGroupLayout,
+    l_cloud: wgpu::BindGroupLayout,
+    l_cloud_apply: wgpu::BindGroupLayout,
+    l_cloud_temporal: wgpu::BindGroupLayout,
+    l_post: wgpu::BindGroupLayout,
+    l_pdraw: wgpu::BindGroupLayout,
+    tile_ub: wgpu::Buffer,
+    build_ub: wgpu::Buffer,
+    obj_ub: wgpu::Buffer,
+    bg_obj: wgpu::BindGroup,
+    tile_ibuf: wgpu::Buffer,
+    tile_nidx: u32,
+    p_sky: wgpu::RenderPipeline,
+    p_terrain: wgpu::RenderPipeline,
+    p_terrain_tess: wgpu::RenderPipeline,
+    p_terrain_cells: wgpu::RenderPipeline,
+    /// index buffers of a tessellated cell patch and of a single cell quad
+    tess_ibuf: wgpu::Buffer,
+    tess_nidx: u32,
+    cell_ibuf: wgpu::Buffer,
+    p_build: wgpu::RenderPipeline,
+    p_build_shadow: wgpu::RenderPipeline,
+    p_obj: wgpu::RenderPipeline,
+    p_obj_shadow: wgpu::RenderPipeline,
+    p_obj_solid: wgpu::RenderPipeline,
+    p_obj_shadow_solid: wgpu::RenderPipeline,
+    p_glass: wgpu::RenderPipeline,
+    p_composite: wgpu::RenderPipeline,
+    p_cloud: wgpu::RenderPipeline,
+    p_cloud_apply: wgpu::RenderPipeline,
+    p_cloud_temporal: wgpu::RenderPipeline,
+    p_particles: wgpu::RenderPipeline,
+    p_taa: wgpu::RenderPipeline,
+    p_psim: wgpu::ComputePipeline,
+    p_vol: [wgpu::ComputePipeline; 5],
+    bg_vol_a: wgpu::BindGroup,
+    bg_vol_b: wgpu::BindGroup,
+    vol_acc: wgpu::Buffer,
+    pub fluid: crate::fluid::FluidGpu,
+    fluid_t: crate::fluid::FluidTargets,
+    /// game time (s) until which some smoke may still be alive, and the time now
+    smoke_until: f32,
+    now: f32,
+    p_down: wgpu::RenderPipeline,
+    p_up: wgpu::RenderPipeline,
+    p_final: wgpu::RenderPipeline,
+    p_final_taa: wgpu::RenderPipeline,
+    p_blit: wgpu::RenderPipeline,
+    psim_ub: wgpu::Buffer,
+    pbuf: wgpu::Buffer,
+    bg_psim: wgpu::BindGroup,
+    phead: u32,
+    black: wgpu::TextureView,
+    targets: Targets,
+    /// which cloud history texture this frame writes; false until it holds a valid frame
+    cloud_flip: usize,
+    cloud_hist_ok: bool,
+    /// what the transmittance and multi-scatter tables need to be redrawn
+    lut_bake: LutBake,
+    /// the haze the tables were last drawn with
+    lut_haze: f32,
+    /// the same for the anti-aliased frame history
+    taa_flip: usize,
+    taa_hist_ok: bool,
+    pub meshes: Vec<MeshGpu>,
+    pub egui: egui_wgpu::Renderer,
+}
+
+pub(crate) fn tex_entry(binding: u32, dim: wgpu::TextureViewDimension, depth: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::all(),
+        ty: wgpu::BindingType::Texture {
+            sample_type: if depth { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable: true } },
+            view_dimension: dim,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+pub(crate) fn ub_entry(binding: u32, dynamic: bool, size: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::all(),
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: dynamic, min_binding_size: wgpu::BufferSize::new(size) },
+        count: None,
+    }
+}
+pub(crate) fn samp_entry(binding: u32, ty: wgpu::SamplerBindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::all(), ty: wgpu::BindingType::Sampler(ty), count: None }
+}
+pub(crate) fn tex_res(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
+}
+pub(crate) fn buf_res(binding: u32, b: &wgpu::Buffer, size: u64) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: b, offset: 0, size: wgpu::BufferSize::new(size) }) }
+}
+
+pub(crate) fn make_tex(device: &wgpu::Device, label: &str, w: u32, h: u32, d: u32, mips: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> wgpu::Texture {
+    make_tex_ms(device, label, w, h, d, mips, format, usage, 1)
+}
+#[allow(clippy::too_many_arguments)]
+fn make_tex_ms(device: &wgpu::Device, label: &str, w: u32, h: u32, d: u32, mips: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages, samples: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: d },
+        mip_level_count: mips,
+        sample_count: samples,
+        dimension: if d > 1 { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
+        format,
+        usage,
+        view_formats: &[],
+    })
+}
+pub(crate) fn view(t: &wgpu::Texture) -> wgpu::TextureView {
+    t.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Upload a full mip chain for a square texture.
+fn upload_mips(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, size: u32, format: wgpu::TextureFormat, bpp: u32, mips: &[Vec<u8>]) -> wgpu::TextureView {
+    let t = make_tex(device, label, size, size, 1, mips.len() as u32, format, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+    for (i, m) in mips.iter().enumerate() {
+        let s = (size >> i).max(1);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &t, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            m,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(s * bpp), rows_per_image: Some(s) },
+            wgpu::Extent3d { width: s, height: s, depth_or_array_layers: 1 },
+        );
+    }
+    view(&t)
+}
+
+/// Small allocator blocks (host-visible ones are half these sizes). Every
+/// upload goes through staging memory that wgpu takes from the 246 MiB
+/// CPU-visible VRAM window (BAR1) on cards without resizable BAR. With the
+/// default 64-128 MiB blocks a burst of tile uploads grew the staging pool
+/// until BAR1 was nearly full; the NVIDIA driver then maps the new block
+/// through a slow path (~9 MB/s), and as the allocator keeps its last block
+/// for good, every later upload crawled: ~1 fps over cities. Small blocks
+/// keep BAR1 use close to what is in flight (see also world::UPLOAD_BUDGET).
+const MEMORY_HINTS: wgpu::MemoryHints = wgpu::MemoryHints::Manual { suballocated_device_memory_block_size: (32 << 20)..(64 << 20) };
+
+/// Sub-cells per side of a tessellated terrain cell (TN in terrain.wgsl).
+const TESS_N: u16 = 16;
+/// Size and layer count of the ground material arrays (see detail.wgsl).
+const DET_N: u32 = crate::materials::N;
+const DET_LAYERS: u32 = 13;
+/// Per-layer metres per repeat, metres of relief, scale of the second sample,
+/// photo contrast (0 = procedural layer): G.det, see common.wgsl. Must match
+/// SIZE / RANGE in detail.wgsl for the procedural layers. Layers 8 and up
+/// (mid-scale scans) are blank until their scan arrives.
+const DET_PROC: [[f32; 4]; 16] = [
+    [1.0, 0.05, 1.0, 0.0],
+    [2.0, 0.06, 4.0, 0.0],
+    [4.0, 0.45, 4.0, 0.0],
+    [2.0, 0.03, 3.0, 0.0],
+    [2.0, 0.006, 1.0, 0.0],
+    [2.0, 0.035, 1.0, 0.0],
+    [1.0, 0.08, 1.0, 0.0],
+    [2.0, 0.05, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+    [20.0, 0.0, 1.0, 0.0],
+];
+
+/// The ground material library: albedo + height and normal + cavity arrays
+/// with full mip chains. Generated on the GPU at start-up (detail.wgsl), then
+/// layers are replaced by photo scans as they finish loading (materials.rs).
+struct GroundMats {
+    alb: wgpu::Texture,
+    nrm: wgpu::Texture,
+    p_down: wgpu::ComputePipeline,
+    params: [[f32; 4]; 16],
+    photos: Option<crossbeam_channel::Receiver<crate::materials::Layer>>,
+}
+
+fn det_level(t: &wgpu::Texture, m: u32) -> wgpu::TextureView {
+    t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), base_mip_level: m, mip_level_count: Some(1), ..Default::default() })
+}
+
+fn det_run(d: &wgpu::Device, enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry], size: u32) {
+    let bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.get_bind_group_layout(0), entries });
+    let mut cp = enc.begin_compute_pass(&Default::default());
+    cp.set_pipeline(p);
+    cp.set_bind_group(0, &bg, &[]);
+    cp.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), DET_LAYERS);
+}
+
+impl GroundMats {
+    fn new(d: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let mips = DET_N.ilog2() + 1;
+        let mk = |label: &str| {
+            d.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: DET_N, height: DET_N, depth_or_array_layers: DET_LAYERS },
+                mip_level_count: mips,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let (alb, nrm) = (mk("ground albedo"), mk("ground normal"));
+        let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("detail"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/detail.wgsl").into()) });
+        let pipe = |entry: &str| d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: None, module: &m, entry_point: Some(entry), compilation_options: Default::default(), cache: None });
+        let (p_gen, p_nrm, p_down) = (pipe("gen"), pipe("nrm"), pipe("down"));
+        let mut enc = d.create_command_encoder(&Default::default());
+        let (a0, n0) = (det_level(&alb, 0), det_level(&nrm, 0));
+        det_run(d, &mut enc, &p_gen, &[tex_res(0, &a0)], DET_N);
+        det_run(d, &mut enc, &p_nrm, &[tex_res(1, &a0), tex_res(2, &n0)], DET_N);
+        let g = Self { alb, nrm, p_down, params: DET_PROC, photos: None };
+        g.mips(d, &mut enc);
+        queue.submit([enc.finish()]);
+        g
+    }
+
+    /// Rebuild every mip level from level 0 (both arrays, all layers).
+    fn mips(&self, d: &wgpu::Device, enc: &mut wgpu::CommandEncoder) {
+        for t in [&self.alb, &self.nrm] {
+            for i in 1..t.mip_level_count() {
+                let (src, dst) = (det_level(t, i - 1), det_level(t, i));
+                det_run(d, enc, &self.p_down, &[tex_res(3, &src), tex_res(4, &dst)], (DET_N >> i).max(1));
+            }
+        }
+    }
+
+    /// Swap in any photo layers that have finished loading.
+    fn poll(&mut self, d: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some(rx) = &self.photos else { return };
+        let mut any = false;
+        while let Ok(l) = rx.try_recv() {
+            for (t, data) in [(&self.alb, &l.alb), (&self.nrm, &l.nrm)] {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: l.layer }, aspect: wgpu::TextureAspect::All },
+                    data,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(DET_N * 4), rows_per_image: Some(DET_N) },
+                    wgpu::Extent3d { width: DET_N, height: DET_N, depth_or_array_layers: 1 },
+                );
+            }
+            self.params[l.layer as usize] = l.params;
+            any = true;
+        }
+        if any {
+            let mut enc = d.create_command_encoder(&Default::default());
+            self.mips(d, &mut enc);
+            queue.submit([enc.finish()]);
+        }
+    }
+
+    fn views(&self) -> (wgpu::TextureView, wgpu::TextureView) {
+        let all = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        (all(&self.alb), all(&self.nrm))
+    }
+}
+
+/// Tiling wave texture: RG slope, B height, A an independent noise channel.
+fn wave_texture() -> Vec<u8> {
+    const N: usize = 256;
+    let mut rng = 0x9e3779b97f4a7c15u64;
+    let mut rnd = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 11) as f32 / (1u64 << 53) as f32
+    };
+    let field = |waves: &[(f32, f32, f32, f32)]| -> Vec<[f32; 3]> {
+        let mut f = vec![[0f32; 3]; N * N];
+        for y in 0..N {
+            for x in 0..N {
+                let (u, v) = (x as f32 / N as f32 * std::f32::consts::TAU, y as f32 / N as f32 * std::f32::consts::TAU);
+                let mut o = [0f32; 3];
+                for (kx, ky, a, ph) in waves {
+                    let th = kx * u + ky * v + ph;
+                    o[0] += a * th.sin();
+                    o[1] += a * kx * th.cos();
+                    o[2] += a * ky * th.cos();
+                }
+                f[y * N + x] = o;
+            }
+        }
+        f
+    };
+    let mut wgen = |kmin: f32, kmax: f32, pow: f32, n: usize| -> Vec<(f32, f32, f32, f32)> {
+        (0..n)
+            .map(|_| {
+                let k = kmin + (kmax - kmin) * rnd().powf(1.6);
+                let a = rnd() * std::f32::consts::TAU;
+                let (kx, ky) = ((k * a.cos()).round(), (k * a.sin()).round());
+                let kk = (kx * kx + ky * ky).sqrt().max(1.0);
+                (kx, ky, kk.powf(-pow), rnd() * std::f32::consts::TAU)
+            })
+            .collect()
+    };
+    let w1 = wgen(3.0, 26.0, 1.55, 64);
+    let w2 = wgen(1.0, 18.0, 1.2, 48);
+    let (f1, f2) = (field(&w1), field(&w2));
+    let norm = |f: &[[f32; 3]], c: usize| f.iter().fold(0f32, |m, v| m.max(v[c].abs())).max(1e-6);
+    let (hs, sx, sy, ns) = (norm(&f1, 0), norm(&f1, 1), norm(&f1, 2), norm(&f2, 0));
+    let s = sx.max(sy);
+    let mut out = vec![0u8; N * N * 4];
+    for i in 0..N * N {
+        out[i * 4] = ((f1[i][1] / s * 0.5 + 0.5) * 255.0) as u8;
+        out[i * 4 + 1] = ((f1[i][2] / s * 0.5 + 0.5) * 255.0) as u8;
+        out[i * 4 + 2] = ((f1[i][0] / hs * 0.5 + 0.5) * 255.0) as u8;
+        out[i * 4 + 3] = ((f2[i][0] / ns * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+    }
+    out
+}
+
+impl Renderer {
+    pub async fn new(window: Arc<winit::window::Window>, vsync: bool) -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance.create_surface(window.clone())?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, force_fallback_adapter: false, compatible_surface: Some(&surface), ..Default::default() })
+            .await?;
+        log::info!("GPU: {}", adapter.get_info().name);
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor { label: None, required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, ..Default::default() }, memory_hints: MEMORY_HINTS, ..Default::default() })
+            .await?;
+        let size = window.inner_size();
+        let mut config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).ok_or_else(|| anyhow::anyhow!("surface unsupported"))?;
+        let caps = surface.get_capabilities(&adapter);
+        config.format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        config.present_mode = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+        surface.configure(&device, &config);
+
+        let d = &device;
+        let common = include_str!("shaders/common.wgsl");
+        let module = |name: &str, src: &str| d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(format!("{common}\n{src}").into()) });
+        let m_lut = module("lut", include_str!("shaders/lut.wgsl"));
+        let m_terrain = module("terrain", include_str!("shaders/terrain.wgsl"));
+        let facade = include_str!("shaders/facade.wgsl");
+        let m_build = module("buildings", &format!("{facade}\n{}", include_str!("shaders/buildings.wgsl")));
+        let m_obj = module("plane", include_str!("shaders/plane.wgsl"));
+        let sky = include_str!("shaders/sky.wgsl");
+        let m_comp = module("composite", &format!("{sky}\n{}", include_str!("shaders/composite.wgsl")));
+        let m_cloud = module("clouds", &format!("{sky}\n{}", include_str!("shaders/clouds.wgsl")));
+        let m_post = module("post", include_str!("shaders/post.wgsl"));
+        let m_psim = module("psim", include_str!("shaders/particles_sim.wgsl"));
+        let m_pdraw = module("pdraw", include_str!("shaders/particles_draw.wgsl"));
+        let m_road = module("roads", include_str!("shaders/roads.wgsl"));
+        let m_tree = module("trees", include_str!("shaders/trees.wgsl"));
+        let m_inst = module("inst", &format!("{facade}\n{}", include_str!("shaders/inst.wgsl")));
+        let m_vol = module("vol", include_str!("shaders/vol.wgsl"));
+        let m_ao = module("ao", include_str!("shaders/ao.wgsl"));
+        let m_taa = module("taa", include_str!("shaders/taa.wgsl"));
+        let m_dres = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("resolve"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/resolve.wgsl").into()) });
+
+        // ---- shared resources
+        let sampler = |addr, aniso: u16, cmp| {
+            d.create_sampler(&wgpu::SamplerDescriptor {
+                address_mode_u: addr,
+                address_mode_v: addr,
+                address_mode_w: addr,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: if cmp { wgpu::MipmapFilterMode::Nearest } else { wgpu::MipmapFilterMode::Linear },
+                anisotropy_clamp: aniso,
+                compare: if cmp { Some(wgpu::CompareFunction::LessEqual) } else { None },
+                ..Default::default()
+            })
+        };
+        let s_clamp = sampler(wgpu::AddressMode::ClampToEdge, 1, false);
+        let s_repeat = sampler(wgpu::AddressMode::Repeat, 1, false);
+        let s_aniso = sampler(wgpu::AddressMode::ClampToEdge, 16, false);
+        let s_shadow = sampler(wgpu::AddressMode::ClampToEdge, 1, true);
+        let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let lut_trans = view(&make_tex(d, "trans", 256, 64, 1, 1, HDR, rt));
+        let lut_ms = view(&make_tex(d, "ms", 32, 32, 1, 1, HDR, rt));
+        let lut_sky = view(&make_tex(d, "sky", 256, 128, 1, 1, HDR, rt));
+        let black = view(&make_tex(d, "black", 1, 1, 1, 1, HDR, rt));
+        let shadow_tex = d.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow"),
+            size: wgpu::Extent3d { width: SHADOW_RES, height: SHADOW_RES, depth_or_array_layers: CASCADES as u32 + 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH,
+            usage: rt,
+            view_formats: &[],
+        });
+        let arr = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let shadow_all = arr(&shadow_tex);
+        let shadow: Vec<_> = (0..CASCADES as u32 + 1)
+            .map(|i| shadow_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: i, array_layer_count: Some(1), ..Default::default() }))
+            .collect();
+        let dummy_depth = arr(&make_tex(d, "dummy depth", 1, 1, 1, 1, DEPTH, rt));
+        let vol3 = |label: &str, n: [u32; 3]| {
+            d.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: n[0], height: n[1], depth_or_array_layers: n[2] },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: HDR,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+        };
+        let vol_dens = vol3("smoke density", VOL_N);
+        let vol_light = vol3("smoke light", VOL_N);
+        let dummy_vol = vol3("dummy volume", [1, 1, 1]);
+        let noise_tex = make_tex(d, "noise3d", 128, 128, 128, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING);
+        let noise = view(&noise_tex);
+        {
+            let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("noise3d"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/noise3d.wgsl").into()) });
+            let p = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("noise3d"), layout: None, module: &m, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+            let bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.get_bind_group_layout(0), entries: &[tex_res(0, &noise)] });
+            let mut enc = d.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.dispatch_workgroups(32, 32, 32);
+            }
+            queue.submit([enc.finish()]);
+        }
+        let wave = upload_mips(d, &queue, "wave", 256, wgpu::TextureFormat::Rgba8Unorm, 4, &crate::sources::mip_chain(wave_texture(), 256, 4));
+        let ground_mats = GroundMats::new(d, &queue);
+        let (det_alb, det_nrm) = ground_mats.views();
+        let s_detail = sampler(wgpu::AddressMode::Repeat, 8, false);
+
+        let globals_ub = d.create_buffer(&wgpu::BufferDescriptor { label: Some("globals"), size: std::mem::size_of::<Globals>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let d2 = wgpu::TextureViewDimension::D2;
+        let l0 = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("globals"),
+            entries: &[
+                ub_entry(0, false, std::mem::size_of::<Globals>() as u64),
+                tex_entry(1, d2, false),
+                tex_entry(2, d2, false),
+                tex_entry(3, d2, false),
+                tex_entry(4, wgpu::TextureViewDimension::D3, false),
+                tex_entry(5, d2, false),
+                samp_entry(6, wgpu::SamplerBindingType::Filtering),
+                samp_entry(7, wgpu::SamplerBindingType::Filtering),
+                tex_entry(8, wgpu::TextureViewDimension::D2Array, true),
+                samp_entry(9, wgpu::SamplerBindingType::Comparison),
+                samp_entry(10, wgpu::SamplerBindingType::Filtering),
+                tex_entry(11, wgpu::TextureViewDimension::D3, false),
+                tex_entry(12, wgpu::TextureViewDimension::D2Array, false),
+                tex_entry(13, wgpu::TextureViewDimension::D2Array, false),
+                samp_entry(14, wgpu::SamplerBindingType::Filtering),
+            ],
+        });
+        let make_bg0 = |sky: &wgpu::TextureView, trans: &wgpu::TextureView, ms: &wgpu::TextureView, sh: &wgpu::TextureView, vl: &wgpu::TextureView| {
+            d.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("globals"),
+                layout: &l0,
+                entries: &[
+                    buf_res(0, &globals_ub, 0),
+                    tex_res(1, trans),
+                    tex_res(2, ms),
+                    tex_res(3, sky),
+                    tex_res(4, &noise),
+                    tex_res(5, &wave),
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&s_clamp) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&s_repeat) },
+                    tex_res(8, sh),
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&s_shadow) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(&s_aniso) },
+                    tex_res(11, vl),
+                    tex_res(12, &det_alb),
+                    tex_res(13, &det_nrm),
+                    wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(&s_detail) },
+                ],
+            })
+        };
+        let bg0 = make_bg0(&lut_sky, &lut_trans, &lut_ms, &shadow_all, &vol_light);
+        // Variant for passes that render into the LUTs / shadow map / smoke volume themselves.
+        let bg0_pre = make_bg0(&black, &lut_trans, &lut_ms, &dummy_depth, &dummy_vol);
+        let bg0_boot = make_bg0(&black, &black, &black, &dummy_depth, &dummy_vol);
+        let bg0_ms = make_bg0(&black, &lut_trans, &black, &dummy_depth, &dummy_vol);
+
+        // ---- layouts
+        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
+        let l_tile = layout(
+            "tile",
+            &[
+                ub_entry(0, true, 48),
+                tex_entry(1, d2, false),
+                tex_entry(2, d2, false),
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        );
+        let l_build = layout("build", &[ub_entry(0, true, 64), tex_entry(1, d2, false)]);
+        let l_tileu = layout("tile offset", &[ub_entry(0, true, 48)]);
+        let l_casc = layout("cascade", &[ub_entry(0, true, 64)]);
+        let l_dres = layout(
+            "depth resolve",
+            &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: true }, count: None }],
+        );
+        let l_obj = layout("obj", &[ub_entry(0, true, std::mem::size_of::<ObjU>() as u64)]);
+        let l_composite = layout("composite", &[tex_entry(0, d2, false), tex_entry(1, d2, false), tex_entry(2, d2, true), tex_entry(3, d2, false), tex_entry(4, d2, false)]);
+        let l_ao = layout("ao", &[tex_entry(0, d2, true), tex_entry(1, d2, false), tex_entry(2, d2, false)]);
+        let l_cloud = layout("cloud", &[tex_entry(0, d2, true)]);
+        let l_cloud_apply = layout("cloud apply", &[tex_entry(0, d2, true), tex_entry(1, d2, false), tex_entry(3, d2, false), tex_entry(5, d2, false)]);
+        let l_cloud_temporal = layout("cloud temporal", &[tex_entry(2, d2, false), tex_entry(3, d2, false), tex_entry(4, d2, false)]);
+        let l_post = layout("post", &[tex_entry(0, d2, false), tex_entry(1, d2, false), tex_entry(2, d2, true)]);
+        let storage = |ro: bool| wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: if ro { wgpu::ShaderStages::VERTEX } else { wgpu::ShaderStages::COMPUTE },
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: ro }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let psim_size = std::mem::size_of::<PSim>() as u64;
+        let l_psim = layout("psim", &[ub_entry(0, false, psim_size), storage(false)]);
+        let l_pdraw = layout("pdraw", &[ub_entry(0, false, psim_size), storage(true), tex_entry(2, d2, true)]);
+        let cbuf = |binding: u32, ro: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: ro }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let stex = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: HDR, view_dimension: wgpu::TextureViewDimension::D3 },
+            count: None,
+        };
+        let l_vol_a = layout("smoke splat", &[ub_entry(0, false, psim_size), cbuf(1, true), cbuf(2, false), cbuf(3, false), cbuf(4, false), stex(5)]);
+        let l_vol_b = layout("smoke light", &[ub_entry(0, false, psim_size), tex_entry(6, wgpu::TextureViewDimension::D3, false), stex(7)]);
+
+        let pl = |l1: &wgpu::BindGroupLayout| d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&l0), Some(l1)], immediate_size: 0 });
+        let pl0 = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&l0)], immediate_size: 0 });
+
+        // ---- pipelines
+        let full = |label: &str, layout: &wgpu::PipelineLayout, m: &wgpu::ShaderModule, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
+            d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState { module: m, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState { module: m, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })] }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let p_trans = full("trans", &pl0, &m_lut, "fs_trans", HDR, None);
+        let p_ms = full("ms", &pl0, &m_lut, "fs_ms", HDR, None);
+        let p_sky = full("sky", &pl0, &m_lut, "fs_sky", HDR, None);
+        let p_composite = full("composite", &pl(&l_composite), &m_comp, "fs", HDR, None);
+        let p_gtao = full("gtao", &pl(&l_ao), &m_ao, "fs_gtao", AMB, None);
+        let p_ao_blur = full("ao blur", &pl(&l_ao), &m_ao, "fs_blur", AMB, None);
+        let p_cloud = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cloud"),
+            layout: Some(&pl(&l_cloud)),
+            vertex: wgpu::VertexState { module: &m_cloud, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &m_cloud,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL }), Some(wgpu::ColorTargetState { format: CLOUD_DIST, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let p_cloud_temporal = full("cloud temporal", &pl(&l_cloud_temporal), &m_cloud, "fs_temporal", HDR, None);
+        let over = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::SrcAlpha, operation: wgpu::BlendOperation::Add };
+        let p_cloud_apply = full("cloud apply", &pl(&l_cloud_apply), &m_cloud, "fs_apply", HDR, Some(wgpu::BlendState { color: over, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }));
+        let p_taa = full("taa", &pl(&l_post), &m_taa, "fs_taa", HDR, None);
+        let p_down = full("down", &pl(&l_post), &m_post, "fs_down", HDR, None);
+        let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+        let p_up = full("up", &pl(&l_post), &m_post, "fs_up", HDR, Some(wgpu::BlendState { color: add, alpha: add }));
+        let p_final = full("final", &pl(&l_post), &m_post, "fs_final", wgpu::TextureFormat::Rgba8Unorm, None);
+        let p_final_taa = full("final taa", &pl(&l_post), &m_post, "fs_final_taa", wgpu::TextureFormat::Rgba8Unorm, None);
+        let p_blit = full("blit", &pl(&l_post), &m_post, if config.format.is_srgb() { "fs_blit_srgb" } else { "fs_blit" }, config.format, None);
+        let pm = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+        let p_particles = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("particles"),
+            layout: Some(&pl(&l_pdraw)),
+            vertex: wgpu::VertexState { module: &m_pdraw, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &m_pdraw, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: Some(wgpu::BlendState { color: pm, alpha: pm }), write_mask: wgpu::ColorWrites::ALL })] }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let p_psim = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("psim"), layout: Some(&pl(&l_psim)), module: &m_psim, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let (pl_va, pl_vb) = (pl(&l_vol_a), pl(&l_vol_b));
+        let p_vol = [("splat", &pl_va), ("blur_x", &pl_va), ("blur_y", &pl_va), ("blur_z", &pl_va), ("light", &pl_vb)]
+            .map(|(e, l)| d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(e), layout: Some(l), module: &m_vol, entry_point: Some(e), compilation_options: Default::default(), cache: None }));
+
+        // Geometry pipelines. Mode 0: lit colour + aux into the multisampled G-buffer.
+        // Mode 1: depth only into a shadow cascade. Mode 2: blended decal (roads).
+        // Mode 3: as 0, with the leaf card entry points. Mode 4: as 1, with a
+        // fragment stage that can cut holes (the aircraft's windows).
+        // Mode 7: as 0, with the entry points for trees near the camera.
+        let geom = |label: &str, l1: Option<&wgpu::BindGroupLayout>, m: &wgpu::ShaderModule, buffers: &[Option<wgpu::VertexBufferLayout>], mode: u8| {
+            let shadow = mode == 1 || mode == 4;
+            let groups = [Some(&l0), l1, Some(&l_casc)];
+            let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: if shadow { &groups[..] } else { &groups[..2] }, immediate_size: 0 });
+            let alpha = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+            let keep = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+            let targets = [
+                Some(wgpu::ColorTargetState { format: HDR, blend: if mode == 2 { Some(wgpu::BlendState { color: alpha, alpha: keep }) } else { None }, write_mask: wgpu::ColorWrites::ALL }),
+                Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: if mode == 2 { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL } }),
+                Some(wgpu::ColorTargetState { format: AMB, blend: None, write_mask: if mode == 2 { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL } }),
+            ];
+            d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: m, entry_point: Some(match mode {
+                    _ if shadow => "vs_shadow",
+                    3 => "vs_card",
+                    7 => "vs_near",
+                    8 => "vs_tess",
+                    9 => "vs_cells",
+                    _ => "vs",
+                }), compilation_options: Default::default(), buffers },
+                primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH,
+                    depth_write_enabled: Some(mode != 2),
+                    depth_compare: Some(match mode {
+                        1 | 4 => wgpu::CompareFunction::LessEqual,
+                        2 => wgpu::CompareFunction::GreaterEqual,
+                        _ => wgpu::CompareFunction::Greater,
+                    }),
+                    stencil: Default::default(),
+                    bias: if shadow { wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 } } else { Default::default() },
+                }),
+                multisample: wgpu::MultisampleState { count: if shadow { 1 } else { MSAA }, mask: !0, alpha_to_coverage_enabled: false },
+                fragment: if mode == 4 {
+                    Some(wgpu::FragmentState { module: m, entry_point: Some("fs_shadow"), compilation_options: Default::default(), targets: &[] })
+                } else if shadow {
+                    None
+                } else {
+                    Some(wgpu::FragmentState { module: m, entry_point: Some(match mode { 3 => "fs_card", 5 => "fs_solid", 7 => "fs_cut", _ => "fs" }), compilation_options: Default::default(), targets: &targets })
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        use wgpu::VertexFormat as VF;
+        let vb = |stride: u64, instance: bool, attributes: &'static [wgpu::VertexAttribute]| {
+            Some(wgpu::VertexBufferLayout { array_stride: stride, step_mode: if instance { wgpu::VertexStepMode::Instance } else { wgpu::VertexStepMode::Vertex }, attributes })
+        };
+        const A_TERRAIN: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x2];
+        const A_BUILD: [wgpu::VertexAttribute; 5] = [
+            wgpu::VertexAttribute { format: VF::Float32x3, offset: 0, shader_location: 0 },
+            wgpu::VertexAttribute { format: VF::Float32x3, offset: 12, shader_location: 1 },
+            wgpu::VertexAttribute { format: VF::Float32x2, offset: 24, shader_location: 2 },
+            wgpu::VertexAttribute { format: VF::Unorm8x4, offset: 32, shader_location: 3 },
+            wgpu::VertexAttribute { format: VF::Uint8x4, offset: 36, shader_location: 4 },
+        ];
+        const A_MESH: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
+        const A_ROAD: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32];
+        const A_TREEV: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 6 => Float32x4, 7 => Float32x4];
+        const A_TREE: [wgpu::VertexAttribute; 3] = [
+            wgpu::VertexAttribute { format: VF::Float32x4, offset: 0, shader_location: 3 },
+            wgpu::VertexAttribute { format: VF::Float32x4, offset: 16, shader_location: 4 },
+            wgpu::VertexAttribute { format: VF::Unorm8x4, offset: 32, shader_location: 5 },
+        ];
+        const A_INST: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
+        let p_terrain = geom("terrain", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 0);
+        // Mode 8: cells near the camera as tessellated patches; 9: the rest of such a tile.
+        let p_terrain_tess = geom("terrain tess", Some(&l_tile), &m_terrain, &[], 8);
+        let p_terrain_cells = geom("terrain cells", Some(&l_tile), &m_terrain, &[], 9);
+        let p_build = geom("build", Some(&l_build), &m_build, &[vb(40, false, &A_BUILD)], 0);
+        let p_build_shadow = geom("build shadow", Some(&l_build), &m_build, &[vb(40, false, &A_BUILD)], 1);
+        const A_PART: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x4];
+        let p_obj = geom("obj", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 0);
+        let p_obj_shadow = geom("obj shadow", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 4);
+        let p_obj_solid = geom("obj solid", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 5);
+        let p_obj_shadow_solid = geom("obj shadow solid", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 1);
+        // Glass and the propeller blur: blended over the finished, lit scene,
+        // tested against the resolved depth.
+        let p_glass = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("glass"),
+            layout: Some(&d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&l0), Some(&l_obj)], immediate_size: 0 })),
+            vertex: wgpu::VertexState { module: &m_obj, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[vb(64, false, &A_PART)] },
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Greater), stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &m_obj,
+                entry_point: Some("fs_glass"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let p_road = geom("road", Some(&l_tileu), &m_road, &[vb(32, false, &A_ROAD)], 2);
+        let p_tree = geom("tree", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 0);
+        let imp = crate::impostor::Impostors::new(d, &l0, &l_tileu, &m_tree);
+        let p_tree_near = geom("trees near", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 7);
+        let p_tree_shadow = geom("tree shadow", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 1);
+        let p_card = geom("leaf cards", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 3);
+        let p_inst = geom("inst", None, &m_inst, &[vb(40, false, &A_MESH), vb(80, true, &A_INST)], 0);
+        let p_inst_shadow = geom("inst shadow", None, &m_inst, &[vb(40, false, &A_MESH), vb(80, true, &A_INST)], 1);
+        let p_dres = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("depth resolve"),
+            layout: Some(&d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&l_dres)], immediate_size: 0 })),
+            vertex: wgpu::VertexState { module: &m_dres, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &m_dres, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[] }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // ---- per-draw uniform pools
+        let pool = |label: &str, n: u64| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: n * UB_ALIGN, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let (tile_ub, build_ub, obj_ub, casc_ub) = (pool("tiles", MAX_TILES), pool("builds", MAX_BUILDS + 1), pool("objs", MAX_OBJS), pool("cascades", CASCADES as u64 + 1));
+        let bg_tileu = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_tileu, entries: &[buf_res(0, &build_ub, 48)] });
+        let bg_casc = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_casc, entries: &[buf_res(0, &casc_ub, 64)] });
+        let dynbuf = |label: &str, size: u64| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let (inst_buf, fall_buf) = (dynbuf("instances", MAX_INST as u64 * 80), dynbuf("loose trees", MAX_FALL as u64 * 36));
+        let near_buf = dynbuf("near trees", MAX_NEAR as u64 * 36);
+        let bg_obj = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_obj, entries: &[buf_res(0, &obj_ub, std::mem::size_of::<ObjU>() as u64)] });
+        let ix = crate::sources::tile_indices();
+        let tile_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("tile idx"), contents: bytemuck::cast_slice(&ix), usage: wgpu::BufferUsages::INDEX });
+        let patch = |n: u16| {
+            let mut v = Vec::new();
+            for b in 0..n {
+                for a in 0..n {
+                    let (p00, p10, p01, p11) = (b * (n + 1) + a, b * (n + 1) + a + 1, (b + 1) * (n + 1) + a, (b + 1) * (n + 1) + a + 1);
+                    v.extend([p00, p01, p10, p10, p01, p11]);
+                }
+            }
+            v
+        };
+        let (tix, cix) = (patch(TESS_N), patch(1));
+        let tess_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("tess idx"), contents: bytemuck::cast_slice(&tix), usage: wgpu::BufferUsages::INDEX });
+        let cell_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cell idx"), contents: bytemuck::cast_slice(&cix), usage: wgpu::BufferUsages::INDEX });
+
+        // ---- particles
+        let psim_ub = d.create_buffer(&wgpu::BufferDescriptor { label: Some("psim"), size: psim_size, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let pbuf = d.create_buffer(&wgpu::BufferDescriptor { label: Some("particles"), size: MAX_PARTICLES as u64 * 64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bg_psim = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_psim, entries: &[buf_res(0, &psim_ub, 0), buf_res(1, &pbuf, 0)] });
+        let sbuf = |label: &str, size: u64| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let (vol_acc, vol_a, vol_b) = (sbuf("smoke splat", VOL_CELLS * 8), sbuf("smoke blur a", VOL_CELLS * 8), sbuf("smoke blur b", VOL_CELLS * 8));
+        let bg_vol_a = d.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &l_vol_a,
+            entries: &[buf_res(0, &psim_ub, 0), buf_res(1, &pbuf, 0), buf_res(2, &vol_acc, 0), buf_res(3, &vol_a, 0), buf_res(4, &vol_b, 0), tex_res(5, &vol_dens)],
+        });
+        let bg_vol_b = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_vol_b, entries: &[buf_res(0, &psim_ub, 0), tex_res(6, &vol_dens), tex_res(7, &vol_light)] });
+        let fluid = crate::fluid::FluidGpu::new(d, &l0, common, &vol_acc);
+
+        let egui = egui_wgpu::Renderer::new(d, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
+        let targets = Self::make_targets(d, &config, &l_dres, &l_ao, &l_composite, &l_cloud, &l_cloud_apply, &l_cloud_temporal, &l_post, &l_pdraw, &psim_ub, &pbuf, &black);
+        let fluid_t = fluid.draw_targets(d, &targets.depth, config.width, config.height);
+        // The transmittance and multi-scatter tables depend only on the planet
+        // and the haze: bake them now, and again whenever the haze changes.
+        let lut_bake = LutBake { p_trans, p_ms, bg_trans: bg0_boot, bg_ms: bg0_ms, trans: lut_trans, ms: lut_ms };
+        {
+            let mut g = Globals::zeroed();
+            g.planet = [0.0, 0.0, 0.0, crate::geo::R as f32];
+            g.weather[3] = 1.0;
+            queue.write_buffer(&globals_ub, 0, bytemuck::bytes_of(&g));
+            let mut enc = d.create_command_encoder(&Default::default());
+            lut_bake.draw(&mut enc);
+            queue.submit([enc.finish()]);
+        }
+        Ok(Self {
+            ground_mats,
+            casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_tree, p_tree_near, imp, p_tree_shadow, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
+            globals_ub, bg0, bg0_pre, lut_sky, shadow, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw,
+            tile_ub, build_ub, obj_ub, bg_obj, tile_ibuf, tile_nidx: ix.len() as u32,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit,
+            psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, smoke_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, surface, config, queue, device,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_targets(
+        d: &wgpu::Device, config: &wgpu::SurfaceConfiguration, l_dres: &wgpu::BindGroupLayout, l_ao: &wgpu::BindGroupLayout, l_composite: &wgpu::BindGroupLayout, l_cloud: &wgpu::BindGroupLayout, l_cloud_apply: &wgpu::BindGroupLayout, l_cloud_temporal: &wgpu::BindGroupLayout,
+        l_post: &wgpu::BindGroupLayout, l_pdraw: &wgpu::BindGroupLayout, psim_ub: &wgpu::Buffer, pbuf: &wgpu::Buffer, black: &wgpu::TextureView,
+    ) -> Targets {
+        let (w, h) = (config.width, config.height);
+        let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let ms = |label: &str, f| view(&make_tex_ms(d, label, w, h, 1, 1, f, rt, MSAA));
+        let (color_ms, aux_ms, amb_ms, depth_ms) = (ms("color ms", HDR), ms("aux ms", HDR), ms("amb ms", AMB), ms("depth ms", DEPTH));
+        let amb = view(&make_tex(d, "amb", w, h, 1, 1, AMB, rt));
+        let ao_raw = view(&make_tex(d, "ao raw", w, h, 1, 1, AMB, rt));
+        let ao = view(&make_tex(d, "ao", w, h, 1, 1, AMB, rt));
+        let color = view(&make_tex(d, "color", w, h, 1, 1, HDR, rt));
+        let aux = view(&make_tex(d, "aux", w, h, 1, 1, HDR, rt));
+        let depth = view(&make_tex(d, "depth", w, h, 1, 1, DEPTH, rt));
+        let hdr = view(&make_tex(d, "hdr", w, h, 1, 1, HDR, rt));
+        let (cw, ch) = ((w / 2).max(1), (h / 2).max(1));
+        let cloud = view(&make_tex(d, "cloud", cw, ch, 1, 1, HDR, rt));
+        let cloud_dist = view(&make_tex(d, "cloud dist", cw, ch, 1, 1, CLOUD_DIST, rt));
+        let cloud_hist = [view(&make_tex(d, "cloud hist 0", cw, ch, 1, 1, HDR, rt)), view(&make_tex(d, "cloud hist 1", cw, ch, 1, 1, HDR, rt))];
+        let bloom_tex = make_tex(d, "bloom", (w / 2).max(64), (h / 2).max(64), 1, BLOOM_MIPS, HDR, rt);
+        let bloom: Vec<_> = (0..BLOOM_MIPS).map(|i| bloom_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
+        let ldr_tex = make_tex(d, "ldr", w, h, 1, 1, wgpu::TextureFormat::Rgba8Unorm, rt | wgpu::TextureUsages::COPY_SRC);
+        let ldr = view(&ldr_tex);
+        let taa = [view(&make_tex(d, "taa 0", w, h, 1, 1, HDR, rt)), view(&make_tex(d, "taa 1", w, h, 1, 1, HDR, rt))];
+        let bg = |l: &wgpu::BindGroupLayout, e: &[wgpu::BindGroupEntry]| d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: l, entries: e });
+        let post = |src: &wgpu::TextureView, bl: &wgpu::TextureView| bg(l_post, &[tex_res(0, src), tex_res(1, bl), tex_res(2, &depth)]);
+        Targets {
+            bg_dres: bg(l_dres, &[tex_res(0, &depth_ms)]),
+            color_ms, aux_ms, amb_ms, depth_ms,
+            bg_composite: bg(l_composite, &[tex_res(0, &color), tex_res(1, &aux), tex_res(2, &depth), tex_res(3, &ao), tex_res(4, &amb)]),
+            // Each pass reads the other AO texture from the one it writes.
+            bg_gtao: bg(l_ao, &[tex_res(0, &depth), tex_res(1, &aux), tex_res(2, &ao)]),
+            bg_ao_blur: bg(l_ao, &[tex_res(0, &depth), tex_res(1, &aux), tex_res(2, &ao_raw)]),
+            ao_raw, ao,
+            bg_cloud: bg(l_cloud, &[tex_res(0, &depth)]),
+            bg_cloud_temporal: [0, 1].map(|i| bg(l_cloud_temporal, &[tex_res(2, &cloud), tex_res(3, &cloud_dist), tex_res(4, &cloud_hist[1 - i])])),
+            bg_cloud_apply: [0, 1].map(|i| bg(l_cloud_apply, &[tex_res(0, &depth), tex_res(1, &cloud_hist[i]), tex_res(3, &cloud_dist), tex_res(5, &color)])),
+            bg_particles: bg(l_pdraw, &[buf_res(0, psim_ub, 0), buf_res(1, pbuf, 0), tex_res(2, &depth)]),
+            bg_taa: [0, 1].map(|i| post(&hdr, &taa[1 - i])),
+            bg_down0: [&hdr, &taa[0], &taa[1]].map(|src| post(src, black)),
+            bg_down: (1..BLOOM_MIPS as usize).map(|i| post(&bloom[i - 1], black)).collect(),
+            bg_up: (0..BLOOM_MIPS as usize - 1).map(|i| post(&bloom[i + 1], black)).collect(),
+            bg_final: [&hdr, &taa[0], &taa[1]].map(|src| post(src, &bloom[0])),
+            taa,
+            bg_blit: post(&ldr, black),
+            color, aux, amb, depth, hdr, cloud, cloud_dist, cloud_hist, bloom, ldr_tex, ldr,
+        }
+    }
+
+    pub fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 || (w == self.config.width && h == self.config.height) {
+            return;
+        }
+        self.config.width = w;
+        self.config.height = h;
+        self.surface.configure(&self.device, &self.config);
+        self.cloud_hist_ok = false;
+        self.taa_hist_ok = false;
+        self.targets = Self::make_targets(&self.device, &self.config, &self.l_dres, &self.l_ao, &self.l_composite, &self.l_cloud, &self.l_cloud_apply, &self.l_cloud_temporal, &self.l_post, &self.l_pdraw, &self.psim_ub, &self.pbuf, &self.black);
+        self.fluid_t = self.fluid.draw_targets(&self.device, &self.targets.depth, w, h);
+    }
+
+    pub fn upload_tile(&self, t: &crate::sources::TileData) -> TileGpu {
+        let d = &self.device;
+        let vbuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.verts), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE });
+        let img = upload_mips(d, &self.queue, "imagery", t.img_size, wgpu::TextureFormat::Rgba8UnormSrgb, 4, &t.imagery);
+        let mask = upload_mips(d, &self.queue, "mask", crate::sources::MASK as u32, wgpu::TextureFormat::Rgba8Unorm, 4, &t.mask);
+        let bind = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_tile, entries: &[buf_res(0, &self.tile_ub, 48), tex_res(1, &img), tex_res(2, &mask), buf_res(3, &vbuf, 0)] });
+        TileGpu { vbuf, bind }
+    }
+
+    /// Create a building tile's GPU objects. The geometry buffers start out
+    /// empty: a dense downtown tile is ~100 MB, and every byte written goes
+    /// through wgpu staging memory, which (without resizable BAR) sits in a
+    /// 246 MiB heap. Filling them all at once overflows that heap and makes
+    /// every later upload crawl, so `World::update` fills them a slice per
+    /// frame with `fill_buffer`, matching `BuildGpu::targets` to
+    /// `building_payload`.
+    pub fn upload_buildings(&self, b: &crate::buildings::BuildingData) -> BuildGpu {
+        let d = &self.device;
+        let buf = |data: &[u8], usage| d.create_buffer(&wgpu::BufferDescriptor { label: None, size: (data.len().max(64) as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT), usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let vbuf = buf(bytemuck::cast_slice(&b.verts), wgpu::BufferUsages::VERTEX);
+        let ibuf = buf(bytemuck::cast_slice(&b.indices), wgpu::BufferUsages::INDEX);
+        let atlas = upload_mips(d, &self.queue, "atlas", b.atlas_size, wgpu::TextureFormat::Rgba8UnormSrgb, 4, &b.atlas);
+        let bind = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_build, entries: &[buf_res(0, &self.build_ub, 64), tex_res(1, &atlas)] });
+        let road = (!b.road_idx.is_empty()).then(|| (buf(bytemuck::cast_slice(&b.road_verts), wgpu::BufferUsages::VERTEX), buf(bytemuck::cast_slice(&b.road_idx), wgpu::BufferUsages::INDEX), b.road_idx.len() as u32));
+        let trees = (!b.trees.is_empty()).then(|| buf(bytemuck::cast_slice(&b.trees), wgpu::BufferUsages::VERTEX));
+        BuildGpu { vbuf, ibuf, n_idx: b.indices.len() as u32, n_tall: b.n_tall, n_main: b.n_main, n_det: b.n_det, bind, road, trees }
+    }
+
+    /// Write `data` into `buf` at byte offset `off` (both multiples of 4).
+    pub fn fill_buffer(&self, buf: &wgpu::Buffer, off: u64, data: &[u8]) {
+        self.queue.write_buffer(buf, off, data);
+    }
+
+    fn mesh_lib<V: Pod>(&self, meshes: &[(Vec<V>, Vec<u32>)]) -> MeshLib {
+        let (mut v, mut i, mut ranges) = (Vec::new(), Vec::new(), Vec::new());
+        for (mv, mi) in meshes {
+            ranges.push((i.len() as u32, mi.len() as u32, v.len() as i32));
+            v.extend_from_slice(mv);
+            i.extend_from_slice(mi);
+        }
+        let d = &self.device;
+        MeshLib {
+            vbuf: d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+            ibuf: d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&i), usage: wgpu::BufferUsages::INDEX }),
+            ranges,
+        }
+    }
+    /// Tree and undergrowth models, indexed by `variant * LODS + level of detail`
+    /// (the last "level" being the model's leaf cards).
+    /// Also takes the pictures for the impostors.
+    pub fn set_tree_meshes(&mut self, meshes: &[(Vec<TreeVertex>, Vec<u32>)]) {
+        let lib = self.mesh_lib(meshes);
+        let bounds = crate::impostor::Impostors::bounds(meshes);
+        self.imp.bake(&self.device, &self.queue, &self.bg0, &self.bg_tileu, &lib.vbuf, &lib.ibuf, &lib.ranges, &bounds);
+        self.tree_lib = Some(lib);
+    }
+    /// Models for instanced solids (cars, rubble, rocks).
+    pub fn set_inst_meshes(&mut self, meshes: &[(Vec<MeshVertex>, Vec<u32>)]) {
+        self.inst_lib = Some(self.mesh_lib(meshes));
+    }
+
+    pub fn add_mesh(&mut self, verts: &[PartVertex], idx: &[u32]) -> usize {
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(idx), usage: wgpu::BufferUsages::INDEX });
+        self.meshes.push(MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32 });
+        self.meshes.len() - 1
+    }
+    /// Swap the geometry behind an existing mesh id.
+    pub fn replace_mesh(&mut self, i: usize, verts: &[PartVertex], idx: &[u32]) {
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(idx), usage: wgpu::BufferUsages::INDEX });
+        self.meshes[i] = MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32 };
+    }
+
+    /// Append particles to the ring buffer (oldest are overwritten).
+    pub fn emit(&mut self, ps: &[Particle]) {
+        let mut ps = ps;
+        let smoky = ps.iter().filter(|p| matches!(p.kind as u32, 0 | 2 | 5 | 7 | 8)).map(|p| p.life).fold(0.0f32, f32::max);
+        if smoky > 0.0 {
+            self.smoke_until = self.smoke_until.max(self.now + smoky + 0.5);
+        }
+        if ps.len() > MAX_PARTICLES as usize {
+            ps = &ps[..MAX_PARTICLES as usize];
+        }
+        let first = (MAX_PARTICLES - self.phead).min(ps.len() as u32) as usize;
+        self.queue.write_buffer(&self.pbuf, self.phead as u64 * 64, bytemuck::cast_slice(&ps[..first]));
+        if first < ps.len() {
+            self.queue.write_buffer(&self.pbuf, 0, bytemuck::cast_slice(&ps[first..]));
+        }
+        self.phead = (self.phead + ps.len() as u32) % MAX_PARTICLES;
+    }
+    pub fn clear_particles(&mut self) {
+        self.queue.write_buffer(&self.pbuf, 0, &vec![0u8; MAX_PARTICLES as usize * 64]);
+        self.phead = 0;
+        self.smoke_until = 0.0;
+    }
+
+    /// Start loading the photo-scanned ground materials (see materials.rs).
+    pub fn load_ground_photos(&mut self, fetch: crate::fetch::Fetcher) {
+        self.ground_mats.photos = Some(crate::materials::spawn(fetch));
+    }
+
+    pub fn render(&mut self, mut f: Frame) {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            _ => return,
+        };
+        let sview = frame.texture.create_view(&Default::default());
+        let q = &self.queue;
+        self.cloud_flip ^= 1;
+        if !self.cloud_hist_ok {
+            f.g.cam_delta[3] = 0.0;
+        }
+        self.cloud_hist_ok = true;
+        // Anti-aliasing blends into last frame's result, if there is one and
+        // the camera has not jumped since.
+        let taa = f.g.taa[2] > 0.5;
+        if !self.taa_hist_ok || f.g.cam_delta[3] < 0.5 {
+            f.g.taa[2] = 0.0;
+        }
+        self.taa_hist_ok = taa;
+        self.taa_flip ^= 1;
+        // A clock jump (new flight) makes the bookkeeping meaningless.
+        if f.g.time[0] < self.now - 1.0 {
+            self.smoke_until = 0.0;
+        }
+        self.now = f.g.time[0];
+        let smoke = self.now < self.smoke_until || f.fluid.is_some();
+        f.g.vol_u[3] = if smoke { 1.0 } else { 0.0 };
+        self.ground_mats.poll(&self.device, q);
+        f.g.det = self.ground_mats.params;
+        q.write_buffer(&self.globals_ub, 0, bytemuck::bytes_of(&f.g));
+        q.write_buffer(&self.psim_ub, 0, bytemuck::bytes_of(&f.psim));
+        let n_tiles = f.tiles.len().min(MAX_TILES as usize);
+        let n_builds = f.details.len().min(MAX_BUILDS as usize);
+        let n_objs = f.objs.len().min(MAX_OBJS as usize);
+        let mut blob = vec![0u8; n_tiles * UB_ALIGN as usize];
+        for (i, (_, u)) in f.tiles.iter().take(n_tiles).enumerate() {
+            blob[i * 256..i * 256 + 48].copy_from_slice(bytemuck::bytes_of(u));
+        }
+        q.write_buffer(&self.tile_ub, 0, &blob);
+        // One extra slot after the tiles for loose trees: they are already
+        // camera-relative, and offset.w = 1 keeps them to the model they were given.
+        let mut blob = vec![0u8; (n_builds + 1) * UB_ALIGN as usize];
+        for (i, dd) in f.details.iter().take(n_builds).enumerate() {
+            blob[i * 256..i * 256 + 64].copy_from_slice(bytemuck::bytes_of(&dd.u));
+        }
+        blob[n_builds * 256 + 12..n_builds * 256 + 16].copy_from_slice(&1f32.to_ne_bytes());
+        q.write_buffer(&self.build_ub, 0, &blob);
+        let mut blob = vec![0u8; (CASCADES + 1) * UB_ALIGN as usize];
+        for (i, m) in f.casc_vp.iter().enumerate() {
+            blob[i * 256..i * 256 + 64].copy_from_slice(bytemuck::bytes_of(m));
+        }
+        q.write_buffer(&self.casc_ub, 0, &blob);
+        // Instances grouped by model so each model is one draw.
+        let group = |n_meshes: usize, items: &mut dyn Iterator<Item = u32>| -> (Vec<u32>, Vec<(u32, u32)>) {
+            let mut counts = vec![0u32; n_meshes + 1];
+            let ids: Vec<u32> = items.collect();
+            for m in &ids {
+                counts[(*m as usize).min(n_meshes.saturating_sub(1)) + 1] += 1;
+            }
+            for k in 0..n_meshes {
+                counts[k + 1] += counts[k];
+            }
+            let ranges = (0..n_meshes).map(|k| (counts[k], counts[k + 1])).collect();
+            let mut next = counts;
+            let order = ids.iter().map(|m| { let k = (*m as usize).min(n_meshes.saturating_sub(1)); next[k] += 1; next[k] - 1 }).collect();
+            (order, ranges)
+        };
+        let mut inst_ranges = Vec::new();
+        if let Some(lib) = &self.inst_lib {
+            let n = f.insts.len().min(MAX_INST);
+            let (order, ranges) = group(lib.ranges.len(), &mut f.insts.iter().take(n).map(|i| i.0));
+            let mut data = vec![Inst::zeroed(); n];
+            for (k, (_, inst)) in f.insts.iter().take(n).enumerate() {
+                data[order[k] as usize] = *inst;
+            }
+            q.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&data));
+            inst_ranges = ranges;
+        }
+        let mut fall_ranges = Vec::new();
+        if let Some(lib) = &self.tree_lib {
+            let n = f.fall.len().min(MAX_FALL);
+            let (order, ranges) = group(lib.ranges.len(), &mut f.fall.iter().take(n).map(|i| i.0));
+            let mut data = vec![TreeInst::zeroed(); n];
+            for (k, (_, inst)) in f.fall.iter().take(n).enumerate() {
+                data[order[k] as usize] = *inst;
+            }
+            q.write_buffer(&self.fall_buf, 0, bytemuck::cast_slice(&data));
+            fall_ranges = ranges;
+        }
+        let n_near = f.near.len().min(MAX_NEAR);
+        q.write_buffer(&self.near_buf, 0, bytemuck::cast_slice(&f.near[..n_near]));
+        let loose_slot = n_builds as u32 * 256;
+        let mut blob = vec![0u8; n_objs * UB_ALIGN as usize];
+        for (i, o) in f.objs.iter().take(n_objs).enumerate() {
+            let u = ObjU { model: o.model.to_cols_array_2d(), tint: o.tint, glow: o.glow, params: o.params, tear: o.tear, dmg: o.dmg, dmg2: o.dmg2 };
+            blob[i * 256..i * 256 + std::mem::size_of::<ObjU>()].copy_from_slice(bytemuck::bytes_of(&u));
+        }
+        q.write_buffer(&self.obj_ub, 0, &blob);
+
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.fluid.poll();
+        let t = &self.targets;
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        match &f.fluid {
+            Some(ff) => self.fluid.compute(q, &mut enc, ff),
+            None => self.fluid.live = false,
+        }
+        if f.g.weather[3] != self.lut_haze {
+            self.lut_haze = f.g.weather[3];
+            self.lut_bake.draw(&mut enc);
+        }
+        if f.sim_steps {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&self.p_psim);
+            cp.set_bind_group(0, &self.bg0, &[]);
+            cp.set_bind_group(1, &self.bg_psim, &[]);
+            cp.dispatch_workgroups(MAX_PARTICLES / 64, 1, 1);
+        }
+        if smoke {
+            // Smoke volume: splat, smooth, then light it (see vol.wgsl).
+            enc.clear_buffer(&self.vol_acc, 0, None);
+            if self.fluid.live {
+                self.fluid.splat_coarse(&mut enc);
+            }
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_bind_group(0, &self.bg0_pre, &[]);
+            let g = [VOL_N[0] / 4, VOL_N[1] / 4, VOL_N[2] / 4];
+            for (k, p) in self.p_vol.iter().enumerate() {
+                cp.set_pipeline(p);
+                cp.set_bind_group(1, if k == 4 { &self.bg_vol_b } else { &self.bg_vol_a }, &[]);
+                if k == 0 {
+                    cp.dispatch_workgroups(MAX_PARTICLES / 64, 1, 1);
+                } else {
+                    cp.dispatch_workgroups(g[0], g[1], g[2]);
+                }
+            }
+        }
+        {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&self.lut_sky, true))], None));
+            rp.set_pipeline(&self.p_sky);
+            rp.set_bind_group(0, &self.bg0_pre, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        // Draws shared by the shadow cascades (c = Some) and the main view (c = None).
+        let solids = |rp: &mut wgpu::RenderPass, c: Option<usize>| {
+            let shadow = c.is_some();
+            let bit = c.map(|c| 1u8 << c).unwrap_or(0);
+            rp.set_pipeline(if shadow { &self.p_build_shadow } else { &self.p_build });
+            for (i, dd) in f.details.iter().take(n_builds).enumerate() {
+                let g = dd.gpu;
+                let (mid, fine) = (dd.u[12] > 0.0, dd.u[13] > 0.0);
+                // Index runs per level of detail; the instance index tells the shader which.
+                let runs: [(u32, u32); 3] = match c {
+                    Some(_) if dd.casc & bit == 0 => [(0, 0); 3],
+                    Some(2) => [(0, g.n_tall), (0, 0), (0, 0)],
+                    Some(1) => [(0, g.n_main), (0, 0), (0, 0)],
+                    Some(_) => [(0, g.n_main), (g.n_main, if mid { g.n_det } else { g.n_main }), (g.n_det, if fine && dd.u[13] > 0.5 { g.n_idx } else { g.n_det })],
+                    None if !dd.view => [(0, 0); 3],
+                    None => [(0, g.n_main), (g.n_main, if mid { g.n_det } else { g.n_main }), (g.n_det, if fine { g.n_idx } else { g.n_det })],
+                };
+                if runs.iter().all(|r| r.1 <= r.0) {
+                    continue;
+                }
+                rp.set_bind_group(1, &g.bind, &[i as u32 * 256]);
+                rp.set_vertex_buffer(0, g.vbuf.slice(..));
+                rp.set_index_buffer(g.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                for (lvl, r) in runs.iter().enumerate() {
+                    if r.1 > r.0 {
+                        rp.draw_indexed(r.0..r.1, 0, lvl as u32..lvl as u32 + 1);
+                    }
+                }
+            }
+            if let Some(lib) = &self.tree_lib {
+                rp.set_vertex_buffer(0, lib.vbuf.slice(..));
+                rp.set_index_buffer(lib.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                // In view only the trees short of IMP_DIST are models (impostors follow below).
+                rp.set_pipeline(if shadow { &self.p_tree_shadow } else { &self.p_tree_near });
+                {
+                    for (i, dd) in f.details.iter().take(n_builds).enumerate() {
+                        let Some(tb) = &dd.gpu.trees else { continue };
+                        let mut bound = false;
+                        for t in &dd.trees {
+                            if t.imp || if shadow { t.casc & bit == 0 } else { !t.view || !t.close } {
+                                continue;
+                            }
+                            if !bound {
+                                rp.set_bind_group(1, &self.bg_tileu, &[i as u32 * 256]);
+                                rp.set_vertex_buffer(1, tb.slice(..));
+                                bound = true;
+                            }
+                            let (first, count, base) = lib.ranges[t.mesh as usize];
+                            rp.draw_indexed(first..first + count, base, t.first..t.first + t.count);
+                        }
+                    }
+                }
+                if !shadow {
+                    rp.set_pipeline(&self.p_tree);
+                }
+                let loose = c != Some(2) && fall_ranges.iter().any(|r| r.1 > r.0);
+                if loose {
+                    rp.set_bind_group(1, &self.bg_tileu, &[loose_slot]);
+                    rp.set_vertex_buffer(1, self.fall_buf.slice(..));
+                    for (k, r) in fall_ranges.iter().enumerate() {
+                        if r.1 > r.0 {
+                            let (first, count, base) = lib.ranges[k];
+                            rp.draw_indexed(first..first + count, base, r.0..r.1);
+                        }
+                    }
+                }
+                // What stands close to the camera: undergrowth (which only casts
+                // into the nearest cascade), then everyone's leaf cards.
+                let near = |rp: &mut wgpu::RenderPass, cards: bool| {
+                    for (i, dd) in f.details.iter().take(n_builds).enumerate() {
+                        let mut bound = false;
+                        for nd in dd.close.iter().filter(|nd| nd.cards == cards) {
+                            let (first, count, base) = lib.ranges[nd.mesh as usize];
+                            if count == 0 || nd.first + nd.count > n_near as u32 {
+                                continue;
+                            }
+                            if !bound {
+                                rp.set_bind_group(1, &self.bg_tileu, &[i as u32 * 256]);
+                                rp.set_vertex_buffer(1, self.near_buf.slice(..));
+                                bound = true;
+                            }
+                            rp.draw_indexed(first..first + count, base, nd.first..nd.first + nd.count);
+                        }
+                    }
+                };
+                if c.is_none() || c == Some(0) {
+                    if !shadow {
+                        rp.set_pipeline(&self.p_tree_near);
+                    }
+                    near(rp, false);
+                }
+                if c.is_none() {
+                    rp.set_pipeline(&self.p_card);
+                    near(rp, true);
+                    // Everything further off: one picture each.
+                    if self.imp.ready {
+                        rp.set_pipeline(&self.imp.p_draw);
+                        rp.set_bind_group(2, &self.imp.bg, &[]);
+                        rp.set_index_buffer(self.imp.quad.slice(..), wgpu::IndexFormat::Uint32);
+                        for (i, dd) in f.details.iter().take(n_builds).enumerate() {
+                            let Some(tb) = &dd.gpu.trees else { continue };
+                            let mut bound = false;
+                            for t in dd.trees.iter().filter(|t| t.imp) {
+                                if !bound {
+                                    rp.set_bind_group(1, &self.bg_tileu, &[i as u32 * 256]);
+                                    rp.set_vertex_buffer(0, tb.slice(..));
+                                    bound = true;
+                                }
+                                rp.draw_indexed(0..6, t.mesh as i32 * 4, t.first..t.first + t.count);
+                            }
+                        }
+                        rp.set_pipeline(&self.p_card);
+                        rp.set_vertex_buffer(0, lib.vbuf.slice(..));
+                        rp.set_index_buffer(lib.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    }
+                    if loose {
+                        rp.set_bind_group(1, &self.bg_tileu, &[loose_slot]);
+                        rp.set_vertex_buffer(1, self.fall_buf.slice(..));
+                        for (k, r) in fall_ranges.iter().enumerate() {
+                            if r.1 > r.0 && k % crate::trees::LODS == 0 {
+                                let (first, count, base) = lib.ranges[k + crate::trees::CARDS as usize];
+                                rp.draw_indexed(first..first + count, base, r.0..r.1);
+                            }
+                        }
+                    }
+                }
+            }
+            if c == Some(2) {
+                return;
+            }
+            if let Some(lib) = &self.inst_lib {
+                rp.set_pipeline(if shadow { &self.p_inst_shadow } else { &self.p_inst });
+                rp.set_vertex_buffer(0, lib.vbuf.slice(..));
+                rp.set_vertex_buffer(1, self.inst_buf.slice(..));
+                rp.set_index_buffer(lib.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                for (k, r) in inst_ranges.iter().enumerate() {
+                    // (rebar is too thin to cast a shadow worth its cost)
+                    let thin = (crate::cars::M_REBAR..crate::cars::M_REBAR + crate::cars::N_REBAR).contains(&(k as u32));
+                    if r.1 > r.0 && !(shadow && thin) {
+                        let (first, count, base) = lib.ranges[k];
+                        rp.draw_indexed(first..first + count, base, r.0..r.1);
+                    }
+                }
+            }
+            let mut cur: Option<bool> = None;
+            for (i, o) in f.objs.iter().take(n_objs).enumerate() {
+                if o.glass || if shadow { o.cast & bit == 0 } else { false } {
+                    continue;
+                }
+                if cur != Some(o.cut) {
+                    rp.set_pipeline(match (shadow, o.cut) {
+                        (true, true) => &self.p_obj_shadow,
+                        (true, false) => &self.p_obj_shadow_solid,
+                        (false, true) => &self.p_obj,
+                        (false, false) => &self.p_obj_solid,
+                    });
+                    cur = Some(o.cut);
+                }
+                let m = &self.meshes[o.mesh];
+                rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                rp.set_vertex_buffer(0, m.vbuf.slice(..));
+                rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..m.n_idx, 0, 0..1);
+            }
+        };
+        for c in 0..CASCADES {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[], Some(depth_att(&self.shadow[c], 1.0))));
+            if f.g.csm[3] > 0.0 {
+                rp.set_bind_group(0, &self.bg0_pre, &[]);
+                rp.set_bind_group(2, &self.bg_casc, &[c as u32 * 256]);
+                solids(&mut rp, Some(c));
+            }
+        }
+        {
+            // The aircraft's own fine shadow map.
+            let mut rp = enc.begin_render_pass(&pass_desc(&[], Some(depth_att(&self.shadow[PLANE_LAYER], 1.0))));
+            if f.g.pshadow[3] > 0.0 {
+                rp.set_viewport(0.0, 0.0, PLANE_SHADOW_RES as f32, PLANE_SHADOW_RES as f32, 0.0, 1.0);
+                rp.set_bind_group(0, &self.bg0_pre, &[]);
+                rp.set_bind_group(2, &self.bg_casc, &[PLANE_LAYER as u32 * 256]);
+                for (i, o) in f.objs.iter().take(n_objs).enumerate() {
+                    if o.glass || o.cast & (1 << PLANE_LAYER) == 0 {
+                        continue;
+                    }
+                    rp.set_pipeline(if o.cut { &self.p_obj_shadow } else { &self.p_obj_shadow_solid });
+                    let m = &self.meshes[o.mesh];
+                    rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                    rp.set_vertex_buffer(0, m.vbuf.slice(..));
+                    rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..m.n_idx, 0, 0..1);
+                }
+            }
+        }
+        {
+            let att = |v, r| wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: Some(r), ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Discard } };
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(att(&t.color_ms, &t.color)), Some(att(&t.aux_ms, &t.aux)), Some(att(&t.amb_ms, &t.amb))], Some(depth_att(&t.depth_ms, 0.0))));
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_pipeline(&self.p_terrain);
+            rp.set_index_buffer(self.tile_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+            let tess = |u: &[f32; 12]| u[10] >= 1.0 && u[11] >= 1.0;
+            for (i, (tile, u)) in f.tiles.iter().take(n_tiles).enumerate() {
+                rp.set_bind_group(1, &tile.bind, &[i as u32 * 256]);
+                rp.set_vertex_buffer(0, tile.vbuf.slice(..));
+                // A tessellated tile only takes its skirts from here.
+                let first = if tess(u) { (crate::sources::GRID * crate::sources::GRID * 6) as u32 } else { 0 };
+                rp.draw_indexed(first..self.tile_nidx, 0, 0..1);
+            }
+            for (i, (tile, u)) in f.tiles.iter().take(n_tiles).enumerate() {
+                if !tess(u) {
+                    continue;
+                }
+                rp.set_bind_group(1, &tile.bind, &[i as u32 * 256]);
+                rp.set_pipeline(&self.p_terrain_cells);
+                rp.set_index_buffer(self.cell_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                rp.draw_indexed(0..6, 0, 0..(crate::sources::GRID * crate::sources::GRID) as u32);
+                rp.set_pipeline(&self.p_terrain_tess);
+                rp.set_index_buffer(self.tess_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                rp.draw_indexed(0..self.tess_nidx, 0, 0..(u[10] * u[11]) as u32);
+            }
+            // Roads go straight onto the terrain, before anything that stands on it.
+            rp.set_pipeline(&self.p_road);
+            for (i, dd) in f.details.iter().take(n_builds).enumerate() {
+                if let (true, Some((vb, ib, n))) = (dd.view && dd.near, &dd.gpu.road) {
+                    rp.set_bind_group(1, &self.bg_tileu, &[i as u32 * 256]);
+                    rp.set_vertex_buffer(0, vb.slice(..));
+                    rp.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..*n, 0, 0..1);
+                }
+            }
+            solids(&mut rp, None);
+        }
+        {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[], Some(depth_att(&t.depth, 0.0))));
+            rp.set_pipeline(&self.p_dres);
+            rp.set_bind_group(0, &t.bg_dres, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        let full = |enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, clear: bool, p: &wgpu::RenderPipeline, bg1: &wgpu::BindGroup| {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(target, clear))], None));
+            rp.set_pipeline(p);
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_bind_group(1, bg1, &[]);
+            rp.draw(0..3, 0..1);
+        };
+        full(&mut enc, &t.ao_raw, true, &self.p_gtao, &t.bg_gtao);
+        full(&mut enc, &t.ao, true, &self.p_ao_blur, &t.bg_ao_blur);
+        full(&mut enc, &t.hdr, true, &self.p_composite, &t.bg_composite);
+        {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.cloud, true)), Some(color_att(&t.cloud_dist, true))], None));
+            rp.set_pipeline(&self.p_cloud);
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_bind_group(1, &t.bg_cloud, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        let cf = self.cloud_flip;
+        full(&mut enc, &t.cloud_hist[cf], true, &self.p_cloud_temporal, &t.bg_cloud_temporal[cf]);
+        {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], None));
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_pipeline(&self.p_cloud_apply);
+            rp.set_bind_group(1, &t.bg_cloud_apply[cf], &[]);
+            rp.draw(0..3, 0..1);
+        }
+        {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], None));
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_pipeline(&self.p_particles);
+            rp.set_bind_group(1, &t.bg_particles, &[]);
+            // Ring order = age order, so blending stays stable without sorting.
+            rp.draw(0..6, self.phead..MAX_PARTICLES);
+            if self.phead > 0 {
+                rp.draw(0..6, 0..self.phead);
+            }
+        }
+        // The fire is drawn over the particles: sparks and leaves behind or
+        // inside it are hidden by it (those in front are dimmed with them).
+        if self.fluid.live {
+            let ft = &self.fluid_t;
+            {
+                let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&ft.half, true)), Some(color_att(&ft.half_z, true))], None));
+                rp.set_bind_group(0, &self.bg0, &[]);
+                rp.set_pipeline(&self.fluid.p_draw);
+                rp.set_bind_group(1, &ft.bg_march, &[]);
+                rp.draw(0..3, 0..1);
+            }
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], None));
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_pipeline(&self.fluid.p_up);
+            rp.set_bind_group(1, &ft.bg_up, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        if f.objs.iter().take(n_objs).any(|o| o.glass) {
+            let ds = wgpu::RenderPassDepthStencilAttachment { view: &t.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None };
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], Some(ds)));
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_pipeline(&self.p_glass);
+            for (i, o) in f.objs.iter().take(n_objs).enumerate() {
+                if !o.glass {
+                    continue;
+                }
+                let m = &self.meshes[o.mesh];
+                rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                rp.set_vertex_buffer(0, m.vbuf.slice(..));
+                rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..m.n_idx, 0, 0..1);
+            }
+        }
+        // The finished frame: `hdr` itself, or blended into the frames before it.
+        let src = if taa {
+            full(&mut enc, &t.taa[self.taa_flip], true, &self.p_taa, &t.bg_taa[self.taa_flip]);
+            1 + self.taa_flip
+        } else {
+            0
+        };
+        for i in 0..BLOOM_MIPS as usize {
+            full(&mut enc, &t.bloom[i], true, &self.p_down, if i == 0 { &t.bg_down0[src] } else { &t.bg_down[i - 1] });
+        }
+        for i in (0..BLOOM_MIPS as usize - 1).rev() {
+            full(&mut enc, &t.bloom[i], false, &self.p_up, &t.bg_up[i]);
+        }
+        full(&mut enc, &t.ldr, true, if taa { &self.p_final_taa } else { &self.p_final }, &t.bg_final[src]);
+
+        let egui_jobs = f.egui.map(|(jobs, delta, ppp)| {
+            for (id, ds) in &delta.set {
+                for d in ds {
+                    self.egui.update_texture(&self.device, &self.queue, *id, d);
+                }
+            }
+            let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point: ppp };
+            self.egui.update_buffers(&self.device, &self.queue, &mut enc, &jobs, &sd);
+            (jobs, delta, sd)
+        });
+        if let Some((jobs, _, sd)) = &egui_jobs {
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.ldr, false))], None)).forget_lifetime();
+            self.egui.render(&mut rp, jobs, sd);
+        }
+        full(&mut enc, &sview, true, &self.p_blit, &t.bg_blit);
+        let shot = f.shot.map(|path| {
+            let (w, h) = (self.config.width, self.config.height);
+            let row = (w * 4).div_ceil(256) * 256;
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &t.ldr_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            (path, buf, w, h, row)
+        });
+        self.queue.submit([enc.finish()]);
+        self.fluid.after_submit();
+        self.queue.present(frame);
+        if let Some((_, delta, _)) = egui_jobs {
+            for id in &delta.free {
+                self.egui.free_texture(id);
+            }
+        }
+        if let Some((path, buf, w, h, row)) = shot {
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            let data = buf.slice(..).get_mapped_range().expect("mapped");
+            let mut img = image::RgbaImage::new(w, h);
+            for y in 0..h as usize {
+                img.as_flat_samples_mut().samples[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(&data[y * row as usize..y * row as usize + w as usize * 4]);
+            }
+            match image::DynamicImage::ImageRgba8(img).to_rgb8().save(&path) {
+                Ok(_) => log::info!("saved screenshot {}", path.display()),
+                Err(e) => log::error!("screenshot failed: {e}"),
+            }
+        }
+    }
+}
+
+fn color_att(view: &wgpu::TextureView, clear: bool) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: wgpu::Operations { load: if clear { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store },
+    }
+}
+fn depth_att(view: &wgpu::TextureView, clear: f32) -> wgpu::RenderPassDepthStencilAttachment<'_> {
+    wgpu::RenderPassDepthStencilAttachment { view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store }), stencil_ops: None }
+}
+fn pass_desc<'a>(colors: &'a [Option<wgpu::RenderPassColorAttachment<'a>>], depth: Option<wgpu::RenderPassDepthStencilAttachment<'a>>) -> wgpu::RenderPassDescriptor<'a> {
+    wgpu::RenderPassDescriptor { label: None, color_attachments: colors, depth_stencil_attachment: depth, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        self.fluid.shutdown(&self.device);
+    }
+}

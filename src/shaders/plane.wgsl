@@ -1,0 +1,1270 @@
+// The aircraft (and its wreckage): paint scheme, panel seams and rivets,
+// weathering, the cockpit's instruments and radios, and the transparent pass
+// (windows and the propeller blur). Every vertex carries its body-frame
+// position at rest (L), so whatever is painted here stays put on moving parts.
+// Material, pattern, light and instrument ids follow airframe.rs / cabin.rs.
+
+// tear: up to two breaks through the body frame (plane normal, offset); dmg:
+// the mode of each (see damage.rs), scrapes 0..1, raggedness of the edge (m);
+// dmg2: oil film on the windshield, crack centre z and y, crack size.
+struct Obj { model: mat4x4f, tint: vec4f, glow: vec4f, params: array<vec4f, 6>, tear: array<vec4f, 2>, dmg: vec4f, dmg2: vec4f };
+@group(1) @binding(0) var<uniform> O: Obj;
+@group(2) @binding(0) var<uniform> CS: Cascade;
+
+// params[0] airspeed kt, altitude ft, vertical speed fpm, heading deg
+// params[1] pitch deg, bank deg, turn rate deg/s, slip
+// params[2] rpm, manifold pressure, fuel left, fuel right (gal)
+// params[3] oil temp F, oil pressure psi, EGT 0..1, amps
+// params[4] suction, clock (s), gear position, flaps deg
+// params[5] nav lights, strobe flash, beacon flash, landing light
+
+const M_PAINT = 0u; const M_LIVERY = 1u; const M_ALU = 2u; const M_STEEL = 3u; const M_RUBBER = 4u;
+const M_PLASTIC = 5u; const M_FABRIC = 6u; const M_GLASS = 7u; const M_LAMP = 8u; const M_GAUGE = 9u;
+const M_BLACK = 10u; const M_EXHAUST = 11u; const M_SCREW = 12u; const M_PROP = 13u; const M_DISPLAY = 14u;
+const M_SATIN = 15u; const M_PROPDISC = 16u;
+const P_FUSE = 1u; const P_WING = 2u; const P_CTRL = 3u; const P_COWL = 4u; const P_TAIL = 5u; const P_TREAD = 6u;
+const P_LINING = 7u; const P_SEAT = 8u; const P_CARPET = 9u; const P_PANEL = 10u; const P_PLACARD = 11u; const P_KNURL = 12u;
+
+const WHITE_PAINT = vec3f(0.80, 0.80, 0.78);
+const NAVY = vec3f(0.010, 0.024, 0.075);
+const ACCENT = vec3f(0.34, 0.018, 0.012);
+
+struct VOut {
+  @builtin(position) clip: vec4f,
+  @location(0) P: vec3f,
+  @location(1) N: vec3f,
+  @location(2) col: vec4f,
+  @location(3) uv: vec2f,
+  @location(4) @interpolate(flat) mat: vec4f,
+  @location(5) wear: f32,
+  @location(6) L: vec3f,
+  @location(7) Nl: vec3f,
+};
+struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f32 };
+struct SOut { @builtin(position) clip: vec4f, @location(0) L: vec3f, @location(1) @interpolate(flat) mat: vec4f };
+
+@vertex fn vs(@location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) col: vec4f, @location(3) uv: vec2f, @location(4) mat: vec4f) -> VOut {
+  let P = (O.model * vec4f(pos, 1.0)).xyz;
+  let N = (O.model * vec4f(nrm, 0.0)).xyz;
+  return VOut(G.view_proj * vec4f(P, 1.0), P, N, col, uv, mat, mat.z, pos, nrm);
+}
+@vertex fn vs_shadow(@location(0) pos: vec3f, @location(4) mat: vec4f) -> SOut {
+  return SOut(CS.vp * vec4f((O.model * vec4f(pos, 1.0)).xyz, 1.0), pos, mat);
+}
+@fragment fn fs_shadow(in: SOut) {
+  // Sunlight comes in through the windows, the gear wells stay open, and
+  // nothing is cast by what has been torn off.
+  if (cut_here(in.L, u32(in.mat.y + 0.5)) || u32(in.mat.x + 0.5) == M_GLASS || u32(in.mat.x + 0.5) == M_PROPDISC || tear_d(in.L) > 0.0) { discard; }
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn sat(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
+fn nz(p: vec3f) -> vec4f { return textureSampleLevel(t_noise, s_repeat, p, 0.0); }
+fn seg_d(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+  let pa = p - a;
+  let ba = b - a;
+  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-9), 0.0, 1.0);
+  return length(pa - ba * h);
+}
+fn line(d: f32, w: f32) -> f32 { return exp(-d * d / (w * w)); }
+fn rot2(p: vec2f, a: f32) -> vec2f { let c = cos(a); let s = sin(a); return vec2f(c * p.x - s * p.y, s * p.x + c * p.y); }
+// A row of round-headed rivets along `along`, `across` from the row: 0..1 dome.
+fn rivets(along: f32, across: f32, pitch: f32, r: f32) -> f32 {
+  let a = (fract(along / pitch + 0.5) - 0.5) * pitch;
+  return max(0.0, 1.0 - (a * a + across * across) / (r * r));
+}
+
+// Exact signed distance to a polygon of n <= 5 points (negative inside).
+fn sd_poly(p: vec2f, vin: array<vec2f, 5>, n: i32) -> f32 {
+  var v = vin;
+  var d = dot(p - v[0], p - v[0]);
+  var s = 1.0;
+  var j = n - 1;
+  for (var i = 0; i < n; i++) {
+    let e = v[j] - v[i];
+    let w = p - v[i];
+    let b = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
+    d = min(d, dot(b, b));
+    let c1 = p.y >= v[i].y;
+    let c2 = p.y < v[j].y;
+    let c3 = e.x * w.y > e.y * w.x;
+    if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) { s = -s; }
+    j = i;
+  }
+  return s * sqrt(d);
+}
+fn quad(a: vec2f, b: vec2f, c: vec2f, d: vec2f) -> array<vec2f, 5> { return array<vec2f, 5>(a, b, c, d, a); }
+
+// Window openings (negative inside); matches airframe::window.
+fn window(p: vec3f) -> f32 {
+  let zy = vec2f(p.z, p.y);
+  var d = sd_poly(zy, array<vec2f, 5>(vec2f(-1.72, 0.31), vec2f(-1.52, 0.07), vec2f(-1.03, 0.64), vec2f(-1.0, 0.80), vec2f(-1.75, 0.80)), 5) + 0.01;
+  if (abs(p.x) > 0.3 && p.y < 0.6) {
+    d = min(d, sd_poly(zy, quad(vec2f(-1.36, 0.12), vec2f(-0.60, 0.12), vec2f(-0.60, 0.48), vec2f(-0.98, 0.48)), 4) - 0.04);
+    d = min(d, sd_poly(zy, quad(vec2f(-0.42, 0.12), vec2f(0.62, 0.12), vec2f(0.42, 0.48), vec2f(-0.42, 0.48)), 4) - 0.04);
+  }
+  if (p.y > 0.35) {
+    d = min(d, sd_poly(vec2f(p.z, p.x), quad(vec2f(0.84, -0.30), vec2f(1.48, -0.17), vec2f(1.48, 0.17), vec2f(0.84, 0.30)), 4) - 0.04);
+  }
+  return d;
+}
+// Landing gear wells (only the skin has them); matches airframe::well.
+fn well(p: vec3f) -> f32 {
+  var d = 1.0;
+  if (p.y < -0.40) {
+    d = min(d, sd_poly(vec2f(p.z, p.x), quad(vec2f(-3.0, -0.135), vec2f(-1.915, -0.135), vec2f(-1.915, 0.135), vec2f(-3.0, 0.135)), 4) + 0.005);
+    let q = vec2f(p.z, abs(p.x));
+    let trough = sd_poly(q, quad(vec2f(0.215, 0.37), vec2f(1.15, 0.183), vec2f(1.15, 0.427), vec2f(0.215, 0.55)), 4);
+    let bay = sd_poly(q, array<vec2f, 5>(vec2f(1.14, 0.03), vec2f(1.545, 0.03), vec2f(1.545, 0.43), vec2f(1.27, 0.505), vec2f(1.14, 0.44)), 5);
+    d = min(d, min(trough, bay) + 0.005);
+  }
+  return d;
+}
+fn cut_here(L: vec3f, pt: u32) -> bool {
+  return (pt == P_FUSE || pt == P_COWL || pt == P_LINING) && (window(L) < 0.0 || (pt != P_LINING && well(L) < 0.0));
+}
+fn torn() -> bool { return O.dmg.x != 0.0 || O.dmg.y != 0.0; }
+// Signed distance past the piece's break(s): positive where it has been torn
+// away. The edge wanders by dmg.w, the same way on both sides of the break,
+// so the stump and the part that left share one ragged line.
+fn tear_d(L: vec3f) -> f32 {
+  if (!torn()) { return -1e3; }
+  let jag = O.dmg.w;
+  // A few big jags, torn skin between them, and fine shredding along the edge.
+  let n1 = (nz(L * 1.4).r - 0.5) * 1.6 + (nz(L * 4.5).b - 0.5) * 0.7;
+  let n2 = nz(L * 16.0).g - 0.5;
+  var s = -1e3;
+  for (var i = 0; i < 2; i++) {
+    let m = select(O.dmg.x, O.dmg.y, i == 1);
+    if (m == 0.0) { continue; }
+    let t = O.tear[i];
+    var q = L;
+    if (abs(m) > 1.5) { q.x = abs(q.x); }
+    var v = dot(q, t.xyz) - t.w + n1 * jag + n2 * jag * 0.35;
+    if (m < 0.0) { v = -v; }
+    s = max(s, v);
+  }
+  return s;
+}
+// Cabin door outline in (z, y).
+fn door(L: vec3f) -> f32 {
+  return sd_poly(vec2f(L.z, L.y), array<vec2f, 5>(vec2f(-1.47, -0.42), vec2f(-0.47, -0.42), vec2f(-0.47, 0.59), vec2f(-0.99, 0.59), vec2f(-1.47, 0.03)), 5);
+}
+fn baggage_door(L: vec3f) -> f32 {
+  let q = vec2f(L.z - 1.25, L.y + 0.14);
+  let b = abs(q) - vec2f(0.20, 0.17) + 0.03;
+  return length(max(b, vec2f(0.0))) + min(max(b.x, b.y), 0.0) - 0.03;
+}
+
+// ---------------------------------------------------------------- lettering
+
+// Stroke font: digits, N E S W and a point (glyphs 0-14; 15 is a space).
+var<private> GSEG: array<vec4f, 99> = array<vec4f, 99>(
+  vec4f(0.25, 0.0, 0.75, 0.0),
+  vec4f(0.75, 0.0, 1.0, 0.4),
+  vec4f(1.0, 0.4, 1.0, 1.6),
+  vec4f(1.0, 1.6, 0.75, 2.0),
+  vec4f(0.75, 2.0, 0.25, 2.0),
+  vec4f(0.25, 2.0, 0.0, 1.6),
+  vec4f(0.0, 1.6, 0.0, 0.4),
+  vec4f(0.0, 0.4, 0.25, 0.0),
+  vec4f(0.5, 0.0, 0.5, 2.0),
+  vec4f(0.5, 2.0, 0.2, 1.65),
+  vec4f(0.0, 1.6, 0.25, 2.0),
+  vec4f(0.25, 2.0, 0.75, 2.0),
+  vec4f(0.75, 2.0, 1.0, 1.6),
+  vec4f(1.0, 1.6, 1.0, 1.25),
+  vec4f(1.0, 1.25, 0.0, 0.0),
+  vec4f(0.0, 0.0, 1.0, 0.0),
+  vec4f(0.0, 1.7, 0.25, 2.0),
+  vec4f(0.25, 2.0, 0.75, 2.0),
+  vec4f(0.75, 2.0, 1.0, 1.65),
+  vec4f(1.0, 1.65, 1.0, 1.35),
+  vec4f(1.0, 1.35, 0.7, 1.05),
+  vec4f(0.7, 1.05, 0.35, 1.05),
+  vec4f(0.7, 1.05, 1.0, 0.75),
+  vec4f(1.0, 0.75, 1.0, 0.35),
+  vec4f(1.0, 0.35, 0.75, 0.0),
+  vec4f(0.75, 0.0, 0.25, 0.0),
+  vec4f(0.25, 0.0, 0.0, 0.3),
+  vec4f(0.75, 0.0, 0.75, 2.0),
+  vec4f(0.75, 2.0, 0.0, 0.6),
+  vec4f(0.0, 0.6, 1.0, 0.6),
+  vec4f(1.0, 2.0, 0.05, 2.0),
+  vec4f(0.05, 2.0, 0.0, 1.1),
+  vec4f(0.0, 1.1, 0.65, 1.2),
+  vec4f(0.65, 1.2, 1.0, 0.85),
+  vec4f(1.0, 0.85, 1.0, 0.35),
+  vec4f(1.0, 0.35, 0.7, 0.0),
+  vec4f(0.7, 0.0, 0.25, 0.0),
+  vec4f(0.25, 0.0, 0.0, 0.3),
+  vec4f(0.9, 1.9, 0.6, 2.0),
+  vec4f(0.6, 2.0, 0.3, 2.0),
+  vec4f(0.3, 2.0, 0.0, 1.5),
+  vec4f(0.0, 1.5, 0.0, 0.4),
+  vec4f(0.0, 0.4, 0.3, 0.0),
+  vec4f(0.3, 0.0, 0.7, 0.0),
+  vec4f(0.7, 0.0, 1.0, 0.35),
+  vec4f(1.0, 0.35, 1.0, 0.8),
+  vec4f(1.0, 0.8, 0.7, 1.15),
+  vec4f(0.7, 1.15, 0.3, 1.15),
+  vec4f(0.3, 1.15, 0.0, 0.85),
+  vec4f(0.0, 2.0, 1.0, 2.0),
+  vec4f(1.0, 2.0, 0.35, 0.0),
+  vec4f(0.5, 1.1, 0.15, 1.3),
+  vec4f(0.15, 1.3, 0.1, 1.75),
+  vec4f(0.1, 1.75, 0.35, 2.0),
+  vec4f(0.35, 2.0, 0.65, 2.0),
+  vec4f(0.65, 2.0, 0.9, 1.75),
+  vec4f(0.9, 1.75, 0.85, 1.3),
+  vec4f(0.85, 1.3, 0.5, 1.1),
+  vec4f(0.5, 1.1, 0.05, 0.85),
+  vec4f(0.05, 0.85, 0.0, 0.35),
+  vec4f(0.0, 0.35, 0.3, 0.0),
+  vec4f(0.3, 0.0, 0.7, 0.0),
+  vec4f(0.7, 0.0, 1.0, 0.35),
+  vec4f(1.0, 0.35, 0.95, 0.85),
+  vec4f(0.95, 0.85, 0.5, 1.1),
+  vec4f(0.1, 0.1, 0.4, 0.0),
+  vec4f(0.4, 0.0, 0.7, 0.0),
+  vec4f(0.7, 0.0, 1.0, 0.5),
+  vec4f(1.0, 0.5, 1.0, 1.6),
+  vec4f(1.0, 1.6, 0.7, 2.0),
+  vec4f(0.7, 2.0, 0.3, 2.0),
+  vec4f(0.3, 2.0, 0.0, 1.65),
+  vec4f(0.0, 1.65, 0.0, 1.2),
+  vec4f(0.0, 1.2, 0.3, 0.85),
+  vec4f(0.3, 0.85, 0.7, 0.85),
+  vec4f(0.7, 0.85, 1.0, 1.15),
+  vec4f(0.0, 0.0, 0.0, 2.0),
+  vec4f(0.0, 2.0, 1.0, 0.0),
+  vec4f(1.0, 0.0, 1.0, 2.0),
+  vec4f(1.0, 0.0, 0.0, 0.0),
+  vec4f(0.0, 0.0, 0.0, 2.0),
+  vec4f(0.0, 2.0, 1.0, 2.0),
+  vec4f(0.0, 1.0, 0.75, 1.0),
+  vec4f(1.0, 1.7, 0.75, 2.0),
+  vec4f(0.75, 2.0, 0.25, 2.0),
+  vec4f(0.25, 2.0, 0.0, 1.7),
+  vec4f(0.0, 1.7, 0.0, 1.35),
+  vec4f(0.0, 1.35, 0.25, 1.05),
+  vec4f(0.25, 1.05, 0.75, 0.95),
+  vec4f(0.75, 0.95, 1.0, 0.65),
+  vec4f(1.0, 0.65, 1.0, 0.3),
+  vec4f(1.0, 0.3, 0.75, 0.0),
+  vec4f(0.75, 0.0, 0.25, 0.0),
+  vec4f(0.25, 0.0, 0.0, 0.3),
+  vec4f(0.0, 2.0, 0.25, 0.0),
+  vec4f(0.25, 0.0, 0.5, 1.2),
+  vec4f(0.5, 1.2, 0.75, 0.0),
+  vec4f(0.75, 0.0, 1.0, 2.0),
+  vec4f(0.45, 0.08, 0.55, 0.08)
+);
+var<private> GSTART: array<u32, 17> = array<u32, 17>(0u, 8u, 10u, 16u, 27u, 30u, 38u, 49u, 51u, 65u, 76u, 79u, 83u, 94u, 98u, 99u, 99u);
+
+fn glyph_d(g: u32, p: vec2f) -> f32 {
+  var d = 1e3;
+  let s = GSTART[g];
+  let e = GSTART[g + 1u];
+  for (var i = s; i < e; i++) {
+    let q = GSEG[i];
+    d = min(d, seg_d(p, q.xy, q.zw));
+  }
+  return d;
+}
+// A packed string (4 bits a glyph, first lowest) at p in glyph units: glyphs
+// are 1 wide, 2 tall, 1.45 apart. Returns ink coverage.
+fn text(p: vec2f, code: u32, n: u32, stroke: f32, aa: f32) -> f32 {
+  if (p.y < -0.6 || p.y > 2.6 || p.x < -0.6) { return 0.0; }
+  let k = i32(floor((p.x + 0.225) / 1.45));
+  if (k < 0 || k >= i32(n)) { return 0.0; }
+  let g = (code >> (4u * u32(k))) & 15u;
+  let d = glyph_d(g, vec2f(p.x - f32(k) * 1.45, p.y));
+  return 1.0 - smoothstep(stroke - aa, stroke + aa, d);
+}
+fn num_code(v: u32) -> vec2u {
+  var digs = array<u32, 6>(0u, 0u, 0u, 0u, 0u, 0u);
+  var x = v;
+  var n = 0u;
+  loop {
+    digs[n] = x % 10u;
+    x = x / 10u;
+    n = n + 1u;
+    if (x == 0u || n >= 6u) { break; }
+  }
+  var code = 0u;
+  for (var i = 0u; i < n; i++) { code = code | (digs[n - 1u - i] << (4u * i)); }
+  return vec2u(code, n);
+}
+// A string centred on c, glyph height h (same units as p).
+fn label_code(p: vec2f, c: vec2f, code: u32, n: u32, h: f32, aa: f32) -> f32 {
+  let s = h * 0.5;
+  let w = (f32(n) * 1.45 - 0.45) * s;
+  return text((p - c + vec2f(w * 0.5, h * 0.5)) / s, code, n, 0.17, aa / s + 0.02);
+}
+fn pack(a: u32, b: u32, c: u32, d: u32, e: u32, f: u32) -> u32 {
+  return a | (b << 4u) | (c << 8u) | (d << 12u) | (e << 16u) | (f << 20u);
+}
+
+// ---------------------------------------------------------------- paint scheme
+
+fn livery(L: vec3f, aa: f32) -> vec3f {
+  var c = WHITE_PAINT;
+  let ax = abs(L.x);
+  let fin = ax < 0.15 && L.y > 0.33 && L.z > 2.8;
+  // Cheat line along the fuselage, sweeping up the tail cone.
+  if (!fin && ax < 0.62 && L.y < 0.62 && L.z > -3.16 && L.z < 4.7) {
+    let zz = max(L.z - 1.0, 0.0);
+    let yc = -0.18 + zz * zz * 0.045;
+    let dy = L.y - yc;
+    let taper = smoothstep(-3.16, -2.85, L.z);
+    let hw = 0.065 * taper;
+    let navy = smoothstep(hw + aa, hw - aa, abs(dy));
+    let red = smoothstep(0.009 * taper + aa, 0.009 * taper - aa, abs(dy - 0.095 * taper));
+    c = mix(c, NAVY, navy);
+    c = mix(c, ACCENT, red);
+  }
+  if (fin) {
+    let band = smoothstep(aa, -aa, abs(L.y - 1.09) - 0.07);
+    let pin = smoothstep(aa, -aa, abs(L.y - 1.205) - 0.014);
+    c = mix(c, NAVY, max(band, smoothstep(1.69 - aa, 1.69 + aa, L.y)));
+    c = mix(c, ACCENT, pin);
+  }
+  // Wing and stabiliser tips, spinner.
+  if (ax > 5.26 && L.y > 0.5) { c = NAVY; }
+  if (ax > 1.53 && L.z > 3.3 && L.y > -0.1 && L.y < 0.3) { c = NAVY; }
+  if (L.z < -3.178) { c = NAVY; }
+  // Registration on both sides of the tail cone, reading nose-to-tail on the
+  // left and tail-to-nose on the right as painted.
+  if (ax > 0.1 && L.z > 1.6 && L.z < 3.0 && L.y > 0.0 && L.y < 0.3) {
+    let tx = (2.25 - L.z) * sign(L.x) + 0.44;
+    let reg = pack(10u, 4u, 1u, 9u, 6u, 12u);
+    let ink = text(vec2f(tx, L.y - 0.045) / 0.09, reg, 6u, 0.13, aa / 0.09 + 0.01);
+    c = mix(c, NAVY, ink);
+  }
+  return c;
+}
+
+// Grime, exhaust soot, oil and fuel stains, fading: everything a few hundred
+// hours of flying leaves on the paint. Returns (colour, extra roughness).
+fn weather(L: vec3f, N: vec3f, base: vec3f) -> vec4f {
+  var c = base;
+  let n = nz(L * 0.35);
+  let belly = sat(-N.y * 1.5 + 0.2);
+  c *= 1.0 - (0.03 + 0.07 * belly) * n.g;
+  // Soot from the exhaust stack streaking back along the belly.
+  let d = L.z + 2.1;
+  if (d > 0.0 && L.y < -0.2) {
+    let cx = 0.335 - min(d, 1.8) * 0.12;
+    let spread = 0.05 + d * 0.07;
+    let streak = nz(vec3f(L.x * 7.0, L.y * 7.0, L.z * 0.35)).r;
+    let soot = exp(-pow((L.x - cx) / spread, 2.0)) * exp(-d / 1.6) * sat(belly * 1.5) * (0.55 + 0.6 * streak);
+    c = mix(c, vec3f(0.035, 0.03, 0.026), sat(soot * 1.2));
+  }
+  // Oil mist from the breather along the belly centreline.
+  if (L.y < -0.45 && L.z > -2.2 && L.z < 1.5) {
+    let oil = exp(-L.x * L.x / 0.03) * exp(-(L.z + 2.1) / 1.4) * (0.4 + 0.6 * nz(vec3f(L.x * 5.0, 0.0, L.z * 0.5)).b);
+    c = mix(c, c * vec3f(0.62, 0.52, 0.36), sat(oil * 0.6));
+  }
+  // Blue streaks of spilt avgas behind the fuel caps.
+  if (L.y > 0.6 && abs(abs(L.x) - 1.55) < 0.12 && L.z > -0.5 && L.z < 0.3) {
+    let f = exp(-pow((abs(L.x) - 1.55) / 0.035, 2.0)) * smoothstep(-0.47, -0.42, L.z) * exp(-(L.z + 0.42) / 0.25) * nz(vec3f(L.x * 18.0, 0.0, L.z * 2.0)).r;
+    c = mix(c, c * vec3f(0.72, 0.84, 1.0), sat(f * 1.6));
+  }
+  return vec4f(c, 0.08 * belly * n.b);
+}
+
+// ---------------------------------------------------------------- surface relief
+
+fn chord_at(s: f32) -> f32 { return select(1.65 - 0.5 * (s - 2.55) / 2.95, 1.65, s <= 2.55); }
+
+// Height (m), seam dirt, rivet coverage, for the surface pattern.
+fn relief(pt: u32, uv: vec2f, L: vec3f, Nl: vec3f, px: f32) -> vec3f {
+  var h = 0.0;
+  var dirt = 0.0;
+  var rv = 0.0;
+  let gw = max(0.0007, px * 0.9);
+  let ga = 0.00045 * min(1.0, 0.0012 / gw);
+  let rr = 0.0024;
+  let rf = 1.0 - smoothstep(rr * 0.5, rr * 1.6, px);
+  switch pt {
+    case 1u: { // fuselage
+      let z = uv.x;
+      let s = abs(uv.y);
+      var st = array<f32, 8>(-1.98, 0.92, 1.52, 2.12, 2.72, 3.32, 3.92, 4.40);
+      for (var i = 0; i < 8; i++) {
+        let dz = z - st[i];
+        if (abs(dz) < 0.04) {
+          h -= ga * line(dz, gw);
+          dirt += line(dz, gw * 2.5);
+          rv = max(rv, rivets(s, abs(abs(dz) - 0.012), 0.027, rr) * rf);
+        }
+      }
+      if (L.y < -0.4 && z > -1.9 && z < 0.9) {
+        for (var i = 0; i < 3; i++) {
+          let dz = z - (-1.25 + f32(i) * 0.75);
+          h -= ga * line(dz, gw);
+          dirt += line(dz, gw * 2.5);
+          rv = max(rv, rivets(s, abs(abs(dz) - 0.012), 0.027, rr) * rf);
+        }
+      }
+      if (z > 0.92) {
+        for (var i = 0; i < 2; i++) {
+          let ds = s - select(1.25, 0.6, i == 0);
+          h -= ga * line(ds, gw);
+          dirt += line(ds, gw * 2.0);
+          rv = max(rv, rivets(z, abs(ds - 0.011), 0.027, rr) * rf);
+        }
+        // Single rows of rivets on the stringers between the laps.
+        let k = (fract(s / 0.21) - 0.5) * 0.21;
+        rv = max(rv, rivets(z, k, 0.04, rr * 0.9) * rf * 0.8);
+      }
+      if (abs(L.x) > 0.35) {
+        let dd = door(L);
+        h -= ga * 1.8 * line(dd, gw * 1.3);
+        dirt += line(dd, gw * 3.0);
+        if (L.x < 0.0) {
+          let bd = baggage_door(L);
+          h -= ga * 1.6 * line(bd, gw * 1.2);
+          dirt += line(bd, gw * 2.5);
+        }
+      }
+      h += rv * 0.0006;
+    }
+    case 2u, 5u: { // wing, tail surfaces
+      let s = abs(uv.x);
+      let av = abs(uv.y);
+      let tail = pt == 5u;
+      let c = select(chord_at(s), 1.0, tail);
+      let xc = av / c;
+      let rib_p = select(0.305, 0.21, tail);
+      let rib0 = select(0.62, 0.15, tail);
+      if (s > rib0 && s < select(5.24, 1.6, tail)) {
+        let d = (fract((s - rib0) / rib_p + 0.5) - 0.5) * rib_p;
+        rv = max(rv, rivets(av, d, 0.03, rr) * rf);
+      }
+      let spar = select(0.25 * c, 0.20, tail);
+      rv = max(rv, rivets(s, av - spar, 0.03, rr) * rf);
+      if (!tail) {
+        rv = max(rv, rivets(s, av - 0.66 * c, 0.03, rr) * rf);
+        let le = av - 0.13 * c;
+        h -= ga * line(le, gw);
+        dirt += line(le, gw * 2.0);
+        rv = max(rv, rivets(s, abs(le + 0.012), 0.025, rr) * rf);
+        for (var i = 0; i < 3; i++) {
+          let ds = s - select(select(5.28, 3.9, i == 1), 2.55, i == 0);
+          h -= ga * line(ds, gw);
+          dirt += line(ds, gw * 2.0);
+          if (i < 2) { rv = max(rv, rivets(av, abs(ds) - 0.012, 0.027, rr) * rf); }
+        }
+      }
+      h += rv * 0.0006;
+    }
+    case 3u: { // control surfaces: stiffening beads across the span
+      let d = (fract(abs(uv.x) / 0.075) - 0.5) * 0.075;
+      h += 0.0009 * line(d, max(0.0045, px));
+      dirt += 0.3 * line(abs(d) - 0.007, gw * 2.0);
+    }
+    case 4u: { // cowling
+      let lines = array<f32, 2>(L.z + 2.975, L.y + 0.085);
+      for (var i = 0; i < 2; i++) {
+        let d = lines[i];
+        h -= ga * 1.4 * line(d, gw);
+        dirt += line(d, gw * 2.5);
+      }
+      if (L.y > 0.15) {
+        let q = vec2f(L.z + 2.36, L.x);
+        let b = abs(q) - vec2f(0.12, 0.10);
+        let od = length(max(b, vec2f(0.0))) + min(max(b.x, b.y), 0.0);
+        h -= ga * 1.5 * line(od, gw);
+        dirt += line(od, gw * 2.0);
+      }
+    }
+    case 7u: { // cabin lining: door gaps, headliner seams, grain
+      if (abs(L.x) > 0.35) {
+        let dd = door(L);
+        h -= 0.0015 * line(dd, max(0.0015, px));
+        dirt += line(dd, max(0.003, px * 2.0));
+      }
+      if (L.y > 0.46) {
+        let d = (fract((L.z + 0.6) / 0.42) - 0.5) * 0.42;
+        h -= 0.001 * line(d, max(0.004, px));
+        dirt += 0.5 * line(d, 0.006);
+      }
+      h += 0.00015 * nz(L * 40.0).r * (1.0 - smoothstep(0.0005, 0.002, px));
+    }
+    case 8u: { // pleated upholstery
+      if (abs(Nl.x) < 0.7) {
+        let t = fract(L.x / 0.065 + 0.5) * 2.0 - 1.0;
+        h += 0.004 * sqrt(max(1.0 - t * t, 0.0));
+        dirt += smoothstep(0.85, 1.0, abs(t));
+      }
+      h += 0.0004 * nz(L * 60.0).g * (1.0 - smoothstep(0.0005, 0.002, px));
+    }
+    case 9u: { h += 0.0015 * nz(L * 45.0).r * (1.0 - smoothstep(0.001, 0.004, px)); }
+    case 10u: { h += 0.0002 * nz(L * 160.0).r * (1.0 - smoothstep(0.0003, 0.0012, px)); }
+    case 12u: { h += 0.00025 * sin((L.x + L.y * 1.3 + L.z * 0.7) * 2600.0) * (1.0 - smoothstep(0.0002, 0.0008, px)); }
+    case 6u: { // tyre tread: circumferential grooves
+      var c = vec3f(sign(L.x) * 1.25, -1.31, 0.30);
+      var r = 0.19;
+      var g = vec2f(0.022, 0.048);
+      if (L.z < -1.0) { c = vec3f(0.0, -1.335, -2.87); r = 0.165; g = vec2f(0.018, 0.038); }
+      let ax = abs(L.x - c.x);
+      let rad = length(L.yz - c.yz);
+      if (rad > r * 0.9) {
+        let gd = min(abs(ax - g.x), abs(ax - g.y));
+        h -= 0.002 * line(gd, max(0.003, px));
+        dirt += line(gd, max(0.004, px));
+      }
+    }
+    default: {}
+  }
+  // Fine seams fade with distance rather than widen into dark bands.
+  return vec3f(h, sat(dirt) * min(1.0, 0.0022 / gw), rv);
+}
+
+// ---------------------------------------------------------------- instruments
+// Each instrument only sets up what is on its face below; the graduations,
+// arcs, needles and lettering are then drawn once, so the shader stays small.
+
+fn ang_of(uv: vec2f) -> f32 { return atan2(uv.x, uv.y); }
+fn unwrap(th: f32, a0: f32) -> f32 { return a0 + fract((th - a0) / 6.2831853) * 6.2831853; }
+fn wrapa(a: f32) -> f32 { return a - round(a / 6.2831853) * 6.2831853; }
+// Graduations: n intervals between angles a0 and a1, every `per`th long.
+fn ticks(uv: vec2f, a0: f32, a1: f32, n: f32, per: f32, px: f32) -> f32 {
+  let r = length(uv);
+  let th = unwrap(ang_of(uv), min(a0, a1) - 0.05);
+  let k = clamp(round((th - a0) / (a1 - a0) * n), 0.0, n);
+  let ak = a0 + (a1 - a0) * k / n;
+  let major = abs(k - round(k / per) * per) < 0.5;
+  let len = select(0.085, 0.17, major);
+  let w = select(0.011, 0.022, major);
+  let d = abs(wrapa(th - ak)) * r;
+  let inr = smoothstep(0.95 - len - px, 0.95 - len + px, r) * smoothstep(0.95 + px, 0.95 - px, r);
+  return inr * (1.0 - smoothstep(w - px, w + px, d));
+}
+fn arc(uv: vec2f, a0: f32, a1: f32, r0: f32, r1: f32, px: f32) -> f32 {
+  let r = length(uv);
+  let th = unwrap(ang_of(uv), a0 - 0.3);
+  let inside = step(a0, th) * step(th, a1);
+  return inside * smoothstep(r0 - px, r0 + px, r) * smoothstep(r1 + px, r1 - px, r);
+}
+fn needle(uv: vec2f, a: f32, len: f32, w: f32, tail: f32, px: f32) -> f32 {
+  let d = vec2f(sin(a), cos(a));
+  let t = clamp(dot(uv, d), -tail, len);
+  let r = w * mix(1.0, 0.3, sat(t / len));
+  return 1.0 - smoothstep(-px, px, length(uv - d * t) - r);
+}
+fn dial(v: f32, vmin: f32, vmax: f32, a0: f32, a1: f32) -> f32 { return a0 + sat((v - vmin) / (vmax - vmin)) * (a1 - a0); }
+fn rad(d: f32) -> f32 { return d * 0.017453293; }
+// Compass card lettering: N, 3, 6, E, 12 ... for card index 0..11.
+fn card_code(k: i32) -> vec2u {
+  let ki = u32((k % 12 + 12) % 12);
+  if (ki == 0u) { return vec2u(10u, 1u); }
+  if (ki == 3u) { return vec2u(11u, 1u); }
+  if (ki == 6u) { return vec2u(12u, 1u); }
+  if (ki == 9u) { return vec2u(13u, 1u); }
+  return num_code(ki * 3u);
+}
+
+// The face of an instrument: rgb albedo, a = how much of it is luminous paint.
+fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
+  let P0 = O.params[0];
+  let P1 = O.params[1];
+  let P2 = O.params[2];
+  let P3 = O.params[3];
+  let P4 = O.params[4];
+  let r = length(uv);
+  var bg = vec3f(0.012, 0.012, 0.013);
+  var ink = 0.0;
+  var col = vec3f(0.0);
+  var cov = 0.0;
+  var ndl = 0.0;
+  // Dial: angles, value range, graduations.
+  var a0 = 0.0; var a1 = 0.0; var vmin = 0.0; var vmax = 1.0; var tn = 0.0; var tper = 1.0;
+  var q = uv;                       // where the dial is drawn (small gauges sit low)
+  // Numbers round the dial: count, first value, step, divisor, radius, height.
+  var ln = 0.0; var lfirst = 0.0; var lstep = 1.0; var ldiv = 1.0; var lr = 0.6; var lh = 0.15;
+  // Coloured arcs (value from, to; colour) and a red line.
+  var arcs = array<vec4f, 3>(vec4f(0.0), vec4f(0.0), vec4f(0.0));
+  var arc_col = array<vec3f, 3>(vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  var redline = -1e9;
+  // Needles: angle, length, width, tail.
+  var nd = array<vec4f, 3>(vec4f(0.0), vec4f(0.0), vec4f(0.0));
+  var nn = 0;
+  // One more piece of lettering: point in its frame, centre, code, glyphs, height.
+  var tp = uv; var tc = vec2f(9.0); var tcode = 0u; var tlen = 0u; var th = 0.1;
+  var hub = true;
+  let green = vec3f(0.05, 0.4, 0.08);
+  switch id {
+    case 0u: { // airspeed
+      a0 = 0.0; a1 = rad(330.0); vmax = 200.0; tn = 40.0; tper = 4.0;
+      ln = 7.0; lfirst = 40.0; lstep = 20.0; lr = 0.62;
+      arcs[0] = vec4f(50.0, 140.0, 0.86, 0.95); arc_col[0] = green;
+      arcs[1] = vec4f(140.0, 175.0, 0.86, 0.95); arc_col[1] = vec3f(0.6, 0.45, 0.02);
+      arcs[2] = vec4f(41.0, 85.0, 0.79, 0.85); arc_col[2] = vec3f(0.6);
+      redline = 175.0;
+      nd[0] = vec4f(dial(P0.x, 0.0, 200.0, a0, a1), 0.86, 0.035, 0.18); nn = 1;
+    }
+    case 2u: { // altimeter: hundreds, thousands, ten thousands, pressure window
+      a0 = 0.0; a1 = rad(360.0); vmax = 10.0; tn = 50.0; tper = 5.0;
+      ln = 10.0; lfirst = 0.0; lstep = 1.0; lr = 0.64; lh = 0.17;
+      let alt = P0.y;
+      nd[0] = vec4f(fract(alt / 1000.0) * 6.2831853, 0.8, 0.03, 0.15);
+      nd[1] = vec4f(fract(alt / 10000.0) * 6.2831853, 0.5, 0.06, 0.1);
+      nd[2] = vec4f(fract(alt / 100000.0) * 6.2831853, 0.93, 0.012, 0.0);
+      nn = 3;
+      let kb = abs(uv - vec2f(0.52, 0.0)) - vec2f(0.2, 0.07);
+      if (max(kb.x, kb.y) < 0.0) { bg = vec3f(0.0); ln = 0.0; tn = 0.0; }
+      tc = vec2f(0.52, 0.0); tcode = pack(2u, 9u, 9u, 2u, 0u, 0u); tlen = 4u; th = 0.09;
+    }
+    case 5u: { // vertical speed
+      a0 = rad(-260.0); a1 = rad(80.0); vmin = -2000.0; vmax = 2000.0; tn = 40.0; tper = 5.0;
+      ln = 9.0; lfirst = -2000.0; lstep = 500.0; ldiv = 100.0;
+      nd[0] = vec4f(dial(P0.z, vmin, vmax, a0, a1), 0.86, 0.035, 0.18); nn = 1;
+    }
+    case 6u: { // tachometer with its hour meter
+      a0 = rad(-135.0); a1 = rad(135.0); vmax = 3500.0; tn = 35.0; tper = 5.0;
+      ln = 8.0; lfirst = 0.0; lstep = 500.0; ldiv = 100.0;
+      arcs[0] = vec4f(2100.0, 2700.0, 0.86, 0.95); arc_col[0] = green;
+      redline = 2700.0;
+      nd[0] = vec4f(dial(P2.x, 0.0, vmax, a0, a1), 0.86, 0.035, 0.18); nn = 1;
+      let hb = abs(uv - vec2f(0.0, -0.45)) - vec2f(0.2, 0.065);
+      if (max(hb.x, hb.y) < 0.0) { bg = vec3f(0.0); tn = 0.0; ln = 0.0; }
+      tc = vec2f(0.0, -0.45); tcode = pack(1u, 8u, 3u, 4u, 0u, 0u); tlen = 4u; th = 0.085;
+    }
+    case 7u: { // manifold pressure
+      a0 = rad(-135.0); a1 = rad(135.0); vmin = 10.0; vmax = 35.0; tn = 25.0; tper = 5.0;
+      ln = 6.0; lfirst = 10.0; lstep = 5.0; lh = 0.16;
+      arcs[0] = vec4f(15.0, 25.0, 0.86, 0.95); arc_col[0] = green;
+      nd[0] = vec4f(dial(P2.y, vmin, vmax, a0, a1), 0.86, 0.04, 0.18); nn = 1;
+    }
+    case 8u, 9u, 10u, 11u, 12u, 13u, 16u, 18u: { // small engine gauges, dial low on the face
+      a0 = rad(-60.0); a1 = rad(60.0); tn = 10.0; tper = 5.0;
+      q = (uv + vec2f(0.0, 0.35)) * 0.78;
+      var v = 0.0; var g0 = 0.0; var g1 = 0.0;
+      if (id == 8u) { v = P2.z; vmax = 26.0; g0 = 2.0; g1 = 26.0; }
+      if (id == 9u) { v = P2.w; vmax = 26.0; g0 = 2.0; g1 = 26.0; }
+      if (id == 10u) { v = P3.x; vmin = 100.0; vmax = 250.0; g0 = 100.0; g1 = 240.0; }
+      if (id == 11u) { v = P3.y; vmax = 115.0; g0 = 60.0; g1 = 90.0; redline = 114.0; }
+      if (id == 12u) { v = P3.w; vmin = -60.0; vmax = 60.0; g0 = -5.0; g1 = 60.0; }
+      if (id == 13u) { v = P4.x; vmin = 3.0; vmax = 7.0; g0 = 4.5; g1 = 5.5; }
+      if (id == 16u) { v = P3.z; g0 = 0.5; g1 = 0.8; }
+      if (id == 18u) { v = P3.x * 1.6 + 30.0; vmin = 200.0; vmax = 500.0; g0 = 200.0; g1 = 460.0; }
+      arcs[0] = vec4f(g0, g1, 0.86, 0.95); arc_col[0] = green;
+      if (id == 8u || id == 9u) {
+        arcs[1] = vec4f(vmin, 2.0, 0.86, 0.95); arc_col[1] = vec3f(0.6, 0.02, 0.01);
+        tc = vec2f(-0.55, 0.35); tcode = 0u; tlen = 1u; th = 0.16;
+      }
+      nd[0] = vec4f(dial(v, vmin, vmax, a0, a1), 0.9, 0.05, 0.0); nn = 1;
+      ndl = 1.0 - smoothstep(0.06 - px, 0.06 + px, length(q));
+      hub = false;
+    }
+    case 14u: { // clock, with a red sweep second hand
+      a0 = 0.0; a1 = rad(360.0); vmax = 12.0; tn = 60.0; tper = 5.0;
+      ln = 4.0; lfirst = 3.0; lstep = 3.0; lh = 0.2;
+      let t = P4.y;
+      nd[0] = vec4f(fract(t / 43200.0) * 6.2831853, 0.5, 0.05, 0.1);
+      nd[1] = vec4f(fract(t / 3600.0) * 6.2831853, 0.8, 0.035, 0.1);
+      nn = 2;
+      let sec = needle(uv, floor(t) * 0.10471976, 0.9, 0.012, 0.2, px);
+      col = vec3f(0.6, 0.05, 0.02) * sec;
+      cov = sec;
+    }
+    case 1u: { // attitude indicator
+      let roll = rad(P1.y);
+      let pitch = P1.x;
+      let qq = rot2(uv, roll);
+      let hz = -pitch * 0.028;
+      bg = mix(vec3f(0.2, 0.09, 0.03), vec3f(0.06, 0.2, 0.5), smoothstep(hz - px, hz + px, qq.y));
+      if (r < 0.74) {
+        ink = 1.0 - smoothstep(0.0, px * 1.5, abs(qq.y - hz) - 0.01);
+        let k = clamp(round((qq.y - hz) / 0.14), -4.0, 4.0);
+        let w = select(0.1, 0.2, abs(k - round(k / 2.0) * 2.0) < 0.5);
+        let m = (1.0 - smoothstep(0.0, px, abs(qq.y - hz - k * 0.14) - 0.008)) * step(abs(qq.x), w) * step(0.5, abs(k));
+        ink = max(ink, m);
+      } else {
+        // Bank scale on the rotating ring: 10, 20, 30, 45, 60, 90 degrees.
+        let a = abs(ang_of(qq)) * 57.29578;
+        let mk = select(select(select(round(a / 10.0) * 10.0, 45.0, a > 37.5 && a < 52.5), 60.0, a >= 52.5 && a < 75.0), 90.0, a >= 75.0);
+        let d = abs(a - mk) * 0.017453 * r;
+        let len = select(0.1, 0.18, mk == 30.0 || mk == 60.0 || mk == 90.0);
+        ink = (1.0 - smoothstep(0.012, 0.012 + px, d)) * step(0.97 - len, r) * step(mk, 90.5) * select(0.0, 1.0, mk != 40.0 && mk != 50.0 && mk != 70.0 && mk != 80.0);
+      }
+      let tri = step(abs(uv.x), (0.74 - uv.y) * 0.5) * step(0.62, uv.y) * step(uv.y, 0.74);
+      let wing = (1.0 - smoothstep(0.0, px, abs(uv.y) - 0.022)) * step(0.16, abs(uv.x)) * step(abs(uv.x), 0.5);
+      let fixed_ = max(max(tri, wing), 1.0 - smoothstep(0.04, 0.04 + px, r));
+      col = vec3f(0.75, 0.35, 0.02) * fixed_;
+      cov = fixed_;
+      hub = false;
+    }
+    case 4u: { // heading indicator: the card turns under a fixed lubber line
+      let hdg = rad(P0.w);
+      a0 = 0.0; a1 = rad(360.0); tn = 72.0; tper = 2.0;
+      q = rot2(uv, -hdg);
+      let k = round((ang_of(uv) + hdg) / rad(30.0));
+      let a = k * rad(30.0) - hdg;
+      tp = rot2(uv - vec2f(sin(a), cos(a)) * 0.6, a);
+      tc = vec2f(0.0);
+      let cc = card_code(i32(k));
+      tcode = cc.x; tlen = cc.y; th = 0.17;
+      let lub = step(abs(uv.x), (0.98 - uv.y) * 0.4) * step(0.8, uv.y);
+      let plane = max((1.0 - smoothstep(0.0, px, abs(uv.x) - 0.02)) * step(abs(uv.y + 0.05), 0.3), (1.0 - smoothstep(0.0, px, abs(uv.y - 0.05) - 0.02)) * step(abs(uv.x), 0.25));
+      col = vec3f(0.75, 0.35, 0.02) * lub + vec3f(0.6) * plane;
+      cov = max(lub, plane);
+      hub = false;
+    }
+    case 3u: { // turn coordinator
+      let qq = rot2(uv, clamp(P1.z / 3.0, -1.6, 1.6) * rad(20.0));
+      let wing = (1.0 - smoothstep(0.0, px, abs(qq.y) - 0.025)) * step(abs(qq.x), 0.62);
+      let body = 1.0 - smoothstep(0.07, 0.07 + px, length(qq));
+      let fin = (1.0 - smoothstep(0.0, px, abs(qq.x) - 0.018)) * step(0.0, qq.y) * step(qq.y, 0.2);
+      ink = max(max(wing, body), fin);
+      // Level and standard-rate marks either side.
+      let a = abs(ang_of(uv));
+      let mk = select(rad(110.0), rad(90.0), a < rad(100.0));
+      ink = max(ink, (1.0 - smoothstep(0.02, 0.02 + px, abs(a - mk) * r)) * step(0.66, r) * step(r, 0.85));
+      // Inclinometer: a ball in a curved glass tube.
+      let tube = vec2f(uv.x, uv.y + 0.52 - uv.x * uv.x * 0.25);
+      if (abs(tube.y) < 0.09 && abs(tube.x) < 0.45) {
+        let lines = 1.0 - smoothstep(0.0, px, abs(abs(tube.x) - 0.1) - 0.008);
+        let ball = 1.0 - smoothstep(0.075 - px, 0.075 + px, length(tube - vec2f(clamp(P1.w, -1.0, 1.0) * 0.32, 0.0)));
+        bg = mix(vec3f(0.45, 0.45, 0.42), vec3f(0.01), max(ball, lines));
+      }
+      hub = false;
+    }
+    case 15u: { // VOR / CDI with the OBS card and a NAV flag
+      a0 = 0.0; a1 = rad(360.0); tn = 72.0; tper = 2.0;
+      if (r < 0.8) { tn = 0.0; }
+      let dev = sin(G.time.x * 0.07) * 0.25;
+      ndl = (1.0 - smoothstep(0.0, px, abs(uv.x - dev) - 0.018)) * step(abs(uv.y), 0.6);
+      let k = clamp(round(uv.x / 0.13), -4.0, 4.0);
+      ink = (1.0 - smoothstep(0.022, 0.022 + px, length(uv - vec2f(k * 0.13, 0.0)))) * step(0.5, abs(k));
+      let flag = step(abs(uv.x - 0.35), 0.1) * step(abs(uv.y - 0.35), 0.06);
+      col = vec3f(0.6, 0.02, 0.01) * flag;
+      cov = flag;
+      tc = vec2f(0.0, 0.66); tcode = pack(0u, 9u, 0u, 0u, 0u, 0u); tlen = 3u; th = 0.15;
+    }
+    case 17u: { // magnetic compass: a card seen edge-on through a window
+      let hdg = P0.w;
+      let x = uv.x * 32.0 + hdg;
+      let k = round(x / 5.0);
+      let major = abs(k - round(k / 2.0) * 2.0) < 0.5;
+      ink = (1.0 - smoothstep(0.008, 0.008 + px, abs(x - k * 5.0) / 32.0)) * step(select(0.3, 0.05, major), uv.y) * step(uv.y, 0.7);
+      let kl = round(x / 30.0);
+      tc = vec2f((kl * 30.0 - hdg) / 32.0, -0.35);
+      let cc = card_code(i32(kl));
+      tcode = cc.x; tlen = cc.y; th = 0.5;
+      let lub = 1.0 - smoothstep(0.0, px, abs(uv.x) - 0.02);
+      col = vec3f(0.6, 0.05, 0.02) * lub;
+      cov = lub;
+      bg = vec3f(0.02, 0.02, 0.022) * (1.0 - 0.4 * uv.y * uv.y);
+      hub = false;
+    }
+    case 19u: { // fuel selector plate
+      let arrow = step(abs(uv.x), (0.8 - uv.y) * 0.35) * step(-0.2, uv.y);
+      ink = max(arrow, 1.0 - smoothstep(0.0, px, abs(r - 0.85) - 0.02));
+      tp = vec2f(abs(uv.x), uv.y); tc = vec2f(0.6, -0.1); tcode = select(2u, 1u, uv.x < 0.0); tlen = 1u; th = 0.22;
+      hub = false;
+    }
+    default: {}
+  }
+  // The dial, drawn once whatever the instrument.
+  if (tn > 0.0) {
+    ink = max(ink, ticks(q, a0, a1, tn, tper, px));
+    for (var i = 0; i < 3; i++) {
+      if (arcs[i].x != arcs[i].y) {
+        let m = arc(q, dial(arcs[i].x, vmin, vmax, a0, a1), dial(arcs[i].y, vmin, vmax, a0, a1), arcs[i].z, arcs[i].w, px);
+        col += arc_col[i] * m;
+        cov = max(cov, m);
+      }
+    }
+    if (redline > -1e8) {
+      let m = arc(q, dial(redline, vmin, vmax, a0, a1) - 0.012, dial(redline, vmin, vmax, a0, a1) + 0.012, 0.78, 0.97, px);
+      col += vec3f(0.6, 0.02, 0.01) * m;
+      cov = max(cov, m);
+    }
+  }
+  for (var i = 0; i < nn; i++) {
+    ndl = max(ndl, needle(q, nd[i].x, nd[i].y, nd[i].z, nd[i].w, px));
+  }
+  // Lettering: the nearest number round the dial, or the instrument's own.
+  if (ln > 0.0) {
+    let ang = unwrap(ang_of(q), min(a0, a1) - 0.3);
+    let x = vmin + (ang - a0) / (a1 - a0) * (vmax - vmin);
+    let k = clamp(round((x - lfirst) / lstep), 0.0, ln - 1.0);
+    let v = lfirst + k * lstep;
+    let a = a0 + (v - vmin) / (vmax - vmin) * (a1 - a0);
+    let c = vec2f(sin(a), cos(a)) * lr;
+    if (length(q - c) < length(tp - tc)) {
+      let nc = num_code(u32(round(abs(v) / ldiv)));
+      tp = q; tc = c; tcode = nc.x; tlen = nc.y; th = lh;
+    }
+  }
+  if (tlen > 0u) { ink = max(ink, label_code(tp, tc, tcode, tlen, th, px)); }
+  if (hub) {
+    let hb = 1.0 - smoothstep(0.075 - px, 0.075 + px, r);
+    ndl = ndl * (1.0 - hb);
+    col = mix(col, vec3f(0.02), hb);
+    cov = max(cov, hb);
+  }
+  var c = mix(bg, col / max(cov, 1e-3), sat(cov));
+  c = mix(c, vec3f(0.78, 0.78, 0.74), ink * (1.0 - cov * 0.5));
+  c = mix(c, vec3f(0.82, 0.82, 0.78), ndl);
+  c *= 1.0 - 0.6 * smoothstep(0.8, 1.0, r) * step(r, 1.01) * select(1.0, 0.0, id == 17u);
+  return vec4f(c, max(ink, ndl) * 0.8 + cov * 0.2);
+}
+
+// Radio readouts (emissive): up to two strings per display.
+fn display(id: u32, uv: vec2f, px: f32) -> vec3f {
+  var size = vec2f(0.048, 0.0085);
+  var c0 = vec2f(9.0); var k0 = 0u; var n0 = 0u; var h0 = 0.0105; var col0 = vec3f(0.0);
+  var c1 = vec2f(9.0); var k1 = 0u; var n1 = 0u; var h1 = 0.0105; var col1 = vec3f(0.0);
+  var bg = vec3f(0.0);
+  switch id {
+    case 0u: { // nav-com: active and standby
+      c0 = vec2f(-0.023, 0.0); k0 = pack(1u, 2u, 2u, 14u, 8u, 0u); n0 = 6u; col0 = vec3f(0.35, 1.0, 0.45);
+      c1 = vec2f(0.024, 0.0); k1 = pack(1u, 2u, 1u, 14u, 5u, 0u); n1 = 6u; col1 = vec3f(0.2, 0.55, 0.25);
+    }
+    case 1u: { // autopilot altitude
+      c0 = vec2f(0.015, 0.0); k0 = pack(4u, 5u, 0u, 0u, 0u, 0u); n0 = 4u; col0 = vec3f(1.0, 0.55, 0.1);
+    }
+    case 2u: { // transponder: code and pressure altitude
+      c0 = vec2f(0.012, 0.0); k0 = pack(1u, 2u, 0u, 0u, 0u, 0u); n0 = 4u; col0 = vec3f(1.0, 0.55, 0.1);
+      let a = num_code(u32(max(O.params[0].y, 0.0) / 100.0));
+      c1 = vec2f(-0.025, 0.0); k1 = a.x; n1 = a.y; h1 = 0.007; col1 = vec3f(0.6, 0.33, 0.06);
+    }
+    case 3u: { // GPS: a heading-up moving map, ground speed in the corner
+      size = vec2f(0.052, 0.027);
+      let m = rot2(uv * vec2f(1.0, 0.52), -rad(O.params[0].w));
+      let land = nz(vec3f(m * 0.3, 0.37)).g;
+      bg = mix(vec3f(0.02, 0.05, 0.14), vec3f(0.12, 0.2, 0.08), smoothstep(0.45, 0.5, land));
+      bg = mix(bg, vec3f(0.9, 0.1, 0.8), (1.0 - smoothstep(0.0, px * 60.0, abs(uv.x) - 0.012)) * step(0.0, uv.y));
+      bg = mix(bg, vec3f(1.0), step(abs(uv.x), (0.12 - uv.y) * 0.6) * step(-0.12, uv.y));
+      bg = mix(bg, vec3f(0.0), step(0.78, uv.y));
+      let gs = num_code(u32(O.params[0].x));
+      c0 = vec2f(-0.04, 0.021); k0 = gs.x; n0 = gs.y; h0 = 0.006; col0 = vec3f(1.0);
+    }
+    case 5u: { // hour meter
+      size = vec2f(0.021, 0.0065);
+      c0 = vec2f(0.0); k0 = pack(1u, 8u, 3u, 4u, 14u, 6u); n0 = 6u; h0 = 0.008; col0 = vec3f(0.9);
+    }
+    default: {}
+  }
+  let q = uv * size;
+  var c = bg;
+  if (n0 > 0u) { c = mix(c, col0, label_code(q, c0, k0, n0, h0, px)); }
+  if (n1 > 0u) { c = mix(c, col1, label_code(q, c1, k1, n1, h1, px)); }
+  return c;
+}
+
+// ---------------------------------------------------------------- lighting
+
+fn ggx(ndh: f32, a: f32) -> f32 {
+  let a2 = a * a;
+  let d = ndh * ndh * (a2 - 1.0) + 1.0;
+  return a2 / (PI * d * d);
+}
+fn vis(ndv: f32, ndl: f32, a: f32) -> f32 {
+  let k = a * 0.5;
+  return 0.25 / ((ndv * (1.0 - k) + k) * (ndl * (1.0 - k) + k));
+}
+
+// Lit colour, normal and SSR weight, and whether the fragment lies in an opening.
+struct Shaded { c: vec4f, n: vec4f, kill: f32, amb: f32 };
+
+// Pieces with openings cut in them (skin, lining) discard; everything else
+// goes through fs_solid, which never does, so early depth testing stays on.
+@fragment fn fs(in: VOut) -> GOut {
+  let s = surface(in);
+  if (s.kill > 0.5) { discard; }
+  return GOut(s.c, s.n, s.amb);
+}
+@fragment fn fs_solid(in: VOut) -> GOut {
+  let s = surface(in);
+  return GOut(s.c, s.n, s.amb);
+}
+
+fn surface(in: VOut) -> Shaded {
+  let id = u32(in.mat.x + 0.5);
+  let pt = u32(in.mat.y + 0.5);
+  // Everything that needs screen derivatives first, while control flow is uniform.
+  let dPx = dpdx(in.P);
+  let dPy = dpdy(in.P);
+  let px = max(length(dPx), length(dPy));
+  let duv = max(length(dpdx(in.uv)), length(dpdy(in.uv)));
+  let rel = relief(pt, in.uv, in.L, in.Nl, px);
+  let hx = dpdx(rel.x);
+  let hy = dpdy(rel.x);
+  let cuts = pt == P_FUSE || pt == P_COWL || pt == P_LINING;
+  var wd = 1.0;
+  var wl = 1.0;
+  if (cuts) { wd = window(in.L); }
+  if (pt == P_FUSE || pt == P_COWL) { wl = well(in.L); }
+  // The well outlines are drawn in plan (z, x); on the steep sides of the
+  // belly that stretches distances along the skin, so measure the edge there.
+  let wl_s = wl * px / max(length(vec2f(dpdx(wl), dpdy(wl))), 1e-7);
+  let td = tear_d(in.L);
+  let kill = (cuts && (wd < 0.0 || wl < 0.0)) || id == M_GLASS || id == M_PROPDISC || td > 0.0;
+
+  var n0 = in.N;
+  if (dot(n0, n0) < 1e-10) { n0 = -in.P; }
+  n0 = normalize(n0);
+  let r1 = cross(dPy, n0);
+  let r2 = cross(n0, dPx);
+  let det = dot(dPx, r1);
+  var N = n0;
+  if (abs(det) > 1e-14) { N = normalize(abs(det) * n0 - sign(det) * (hx * r1 + hy * r2)); }
+  let V = normalize(in.P);
+  var Ng = n0;
+  let back = dot(n0, V) > 0.0;
+  if (back) { N = -N; Ng = -n0; }
+  let l = light_at(in.P);
+  let night = 1.0 - smoothstep(-0.08, 0.1, dot(l.upn, G.sun_dir.xyz));
+  let L = in.L;
+  let ns = nz(L * 2.1);
+  let fine = nz(L * 13.0);
+
+  var albedo = in.col.rgb;
+  var rough = 0.5;
+  var metal = 0.0;
+  var emit = vec3f(0.0);
+  var spec_k = 1.0;
+  var ssr = 0.0;
+  var ao = in.col.a;
+  let cav = 1.0 - rel.y * 0.4;
+
+  switch id {
+    case 0u, 1u, 15u: {
+      if (id == 1u) { albedo = livery(L, px * 1.2); }
+      rough = select(0.13 + 0.08 * ns.g, 0.5 + 0.15 * ns.g, id == 15u);
+      // Each skin panel's paint aged a little differently.
+      albedo *= 0.985 + 0.03 * fine.a * select(0.4, 1.0, id == 1u);
+      if (id == 1u || pt == P_FUSE) {
+        let w = weather(L, in.Nl, albedo);
+        albedo = w.rgb;
+        rough += w.a;
+        // Chipped paint where things get knocked: leading edges, around fasteners.
+        let chip = smoothstep(0.80, 0.83, nz(L * 7.0).b + in.wear * 0.07) * sat(in.wear * 1.5);
+        albedo = mix(albedo, vec3f(0.55, 0.56, 0.58), chip);
+        metal = chip;
+        rough = mix(rough, 0.35, chip);
+        // Bugs on the leading edges.
+        let bugs = smoothstep(0.86, 0.9, nz(L * 9.0).a) * smoothstep(0.75, 0.97, in.wear) * sat(-in.Nl.z * 2.0) * (1.0 - smoothstep(0.002, 0.008, px));
+        albedo = mix(albedo, vec3f(0.12, 0.09, 0.03), bugs * 0.7);
+        ssr = 1.0;
+      }
+      // Window sealant and the edges of the gear wells.
+      if (pt == P_FUSE || pt == P_COWL) {
+        let gk = smoothstep(0.016 + px, 0.016 - px, wd) * step(-0.001, wd);
+        let we = smoothstep(0.004 + px, 0.004 - px, wl_s) * step(-0.001, wl);
+        albedo = mix(albedo, vec3f(0.012), max(gk, we * 0.6));
+        rough = mix(rough, 0.6, gk);
+        ssr *= 1.0 - gk;
+        if (pt == P_COWL && L.z < -2.97) {
+          // Cooling air inlets in the nose bowl.
+          let e1 = length((vec2f(abs(L.x), L.y) - vec2f(0.235, 0.05)) / vec2f(0.105, 0.068));
+          let e2 = length((L.xy - vec2f(0.0, -0.33)) / vec2f(0.11, 0.045));
+          let inlet = smoothstep(1.0 + px * 10.0, 1.0 - px * 10.0, min(e1, e2));
+          albedo = mix(albedo, vec3f(0.006) * (0.4 + 0.6 * smoothstep(0.0, 1.0, min(e1, e2))), inlet);
+          rough = mix(rough, 0.9, inlet);
+          ao *= 1.0 - 0.6 * inlet;
+          ssr *= 1.0 - inlet;
+        }
+      }
+      albedo *= cav;
+      // Rivet heads catch a little grime round their edges.
+      albedo *= 1.0 - rel.z * (1.0 - rel.z) * 0.35 - rel.z * 0.03;
+    }
+    case 2u: { // bare aluminium
+      metal = 1.0;
+      rough = 0.22 + 0.18 * fine.g;
+      albedo *= 0.9 + 0.12 * ns.r;
+      ssr = 0.6;
+    }
+    case 3u: { // steel: 0 machined, 1 chrome, 2 cast iron / heat-tinted
+      metal = 1.0;
+      rough = select(select(0.25, 0.05, in.mat.w > 0.5 && in.mat.w < 1.5), 0.45, in.mat.w > 1.5);
+      if (in.mat.w > 1.5) {
+        albedo = mix(albedo, vec3f(0.30, 0.16, 0.07), smoothstep(0.4, 0.7, fine.r) * 0.6);
+        metal = 0.8;
+      }
+      ssr = 0.5;
+    }
+    case 4u: { // rubber: dusty, the tread worn lighter
+      rough = 0.85;
+      albedo = mix(albedo, vec3f(0.07, 0.065, 0.058), sat(rel.y * 0.0 + smoothstep(0.3, 0.8, ns.g) * 0.4 + select(0.0, 0.45, pt == P_TREAD && rel.y < 0.3)));
+      spec_k = 0.4;
+    }
+    case 5u: {
+      rough = 0.5 + 0.2 * fine.b;
+      spec_k = 0.6;
+      albedo *= cav;
+      if (pt == P_PLACARD) {
+        let t = fract(in.uv * vec2f(220.0, 340.0));
+        let txt = step(0.3, t.y) * step(t.y, 0.72) * step(0.45, nz(vec3f(in.uv * 300.0, 0.5)).r);
+        albedo = mix(albedo, vec3f(0.02), txt * 0.8 * (1.0 - smoothstep(0.0003, 0.001, px)));
+      }
+    }
+    case 6u: { // fabric: rough with a soft sheen at grazing angles
+      rough = 0.95;
+      spec_k = 0.15;
+      albedo *= cav * (0.9 + 0.2 * fine.r);
+      let ndv = max(dot(N, -V), 0.0);
+      albedo *= 1.0 + 0.35 * pow(1.0 - ndv, 3.0);
+    }
+    case 8u: { // light lens
+      rough = 0.08;
+      let ch = u32(in.mat.w + 0.5);
+      let P4 = O.params[4];
+      let P5 = O.params[5];
+      var on = 0.0;
+      var k = 0.0;
+      switch ch {
+        case 0u, 1u, 2u: { on = P5.x; k = mix(0.08, 0.6, night); }
+        case 3u: { on = P5.y; k = 3.0; }
+        case 4u: { on = P5.z; k = mix(0.5, 0.6, night); }
+        case 5u: { on = P5.w; k = mix(0.3, 0.8, night); }
+        case 6u: { on = step(0.999, P4.z); k = mix(0.05, 0.01, night); }
+        case 7u: { on = step(P4.z, 0.001); k = mix(0.05, 0.01, night); }
+        default: { on = 1.0; k = 0.004; }
+      }
+      emit = in.col.rgb * on * k * G.sun_dir.w;
+      if (ch == 5u) { emit *= 0.6 + 0.4 * smoothstep(1.0, 0.0, length(in.uv)); }
+      albedo = in.col.rgb * 0.15;
+      ssr = 0.5;
+    }
+    case 9u: { // instrument face under glass
+      let g = gauge(u32(in.mat.w + 0.5), in.uv, max(duv * 1.2, 0.004));
+      albedo = g.rgb;
+      rough = 0.04;
+      spec_k = 0.5;
+      emit = g.rgb * g.a * G.sun_dir.w * 0.0035 * night;
+    }
+    case 10u: { // matte black: scuffed
+      rough = 0.65 + 0.2 * fine.g;
+      albedo *= 0.8 + 0.5 * smoothstep(0.6, 0.9, fine.a);
+      spec_k = 0.5;
+    }
+    case 11u: { // exhaust: heat-tinted, sooted at the outlet
+      metal = 0.75;
+      rough = 0.45;
+      let t = sat((L.y + 0.45) / -0.3);
+      albedo = mix(vec3f(0.42, 0.33, 0.20), vec3f(0.18, 0.16, 0.20), t) * (0.6 + 0.6 * fine.r);
+      albedo = mix(albedo, vec3f(0.35, 0.18, 0.08), smoothstep(0.55, 0.8, ns.b) * 0.6);
+      albedo = mix(albedo, vec3f(0.02), smoothstep(-2.2, -2.11, L.z));
+    }
+    case 12u: { // screw head: a cross recess, paint worn off the rim
+      let q = in.uv;
+      let cr = min(max(abs(q.x) - 0.15, abs(q.y) - 0.62), max(abs(q.y) - 0.15, abs(q.x) - 0.62));
+      let slot = 1.0 - smoothstep(-0.05, 0.05, cr);
+      let kind = in.mat.w;
+      metal = select(1.0, select(0.0, 0.4, kind > 1.5), kind > 0.5);
+      rough = select(0.3, select(0.18, 0.5, kind > 1.5), kind > 0.5);
+      if (kind > 0.5 && kind < 1.5) {
+        let worn = smoothstep(0.6, 0.85, length(q)) * smoothstep(0.4, 0.7, fine.g) + slot * 0.6;
+        albedo = mix(albedo, vec3f(0.5, 0.5, 0.52), sat(worn));
+        metal = sat(worn);
+      }
+      albedo *= 1.0 - slot * 0.9;
+      ao *= 1.0 - slot * 0.7;
+    }
+    case 13u: { // propeller: grey face, black back, painted tips, eroded edge
+      let r = in.uv.x;
+      let front = in.uv.y > 0.0;
+      albedo = select(vec3f(0.018), vec3f(0.30, 0.30, 0.31), front);
+      rough = select(0.75, 0.4, front);
+      let tip = smoothstep(0.864, 0.866, r);
+      let band = smoothstep(0.865, 0.867, r) * smoothstep(0.885, 0.883, r);
+      albedo = mix(albedo, vec3f(0.78, 0.78, 0.74), tip);
+      albedo = mix(albedo, vec3f(0.5, 0.03, 0.02), band);
+      let ero = smoothstep(0.5, 0.95, in.wear) * smoothstep(0.35, 0.9, r) * smoothstep(0.4, 0.7, fine.r);
+      albedo = mix(albedo, vec3f(0.6, 0.6, 0.62), ero);
+      metal = ero;
+    }
+    case 14u: { // backlit display under glass
+      albedo = vec3f(0.01);
+      rough = 0.05;
+      emit = display(u32(in.mat.w + 0.5), in.uv, max(duv * 0.012, 0.00015)) * G.sun_dir.w * mix(0.09, 0.012, night);
+    }
+    default: {}
+  }
+
+  // Damage. The inside of a torn skin: primer, stringers and ribs, no paint.
+  let exterior = pt == P_WING || pt == P_TAIL || pt == P_CTRL || pt == P_FUSE || pt == P_COWL;
+  if (torn() && back && exterior) {
+    var inner = vec3f(0.30, 0.36, 0.24) * (0.7 + 0.5 * fine.g);
+    let rib = line((fract((abs(L.x) - 0.62) / 0.305 + 0.5) - 0.5) * 0.305, 0.012);
+    let str_ = line((fract(L.y / 0.09 + 0.5) - 0.5) * 0.09, 0.006) * select(0.0, 1.0, pt == P_FUSE);
+    inner *= 1.0 - 0.5 * max(rib, str_);
+    albedo = inner;
+    metal = 0.0;
+    rough = 0.6;
+    spec_k = 0.5;
+    ssr = 0.0;
+    emit = vec3f(0.0);
+    // Open to the sky through the break: more light gets in than the bake knew.
+    ao = max(ao, 0.55);
+  }
+  // The torn edge: bare, crumpled metal curling back from the break.
+  if (torn()) {
+    let rip = smoothstep(-0.05, -0.004, td);
+    let shred = nz(L * 40.0).r;
+    albedo = mix(albedo, vec3f(0.36, 0.37, 0.39) * (0.5 + 0.8 * shred), rip);
+    metal = mix(metal, 0.85, rip);
+    rough = mix(rough, 0.5, rip);
+    N = normalize(N + (nz(L * 23.0).gba - 0.5) * rip * 1.2);
+    ao *= 1.0 - 0.35 * rip;
+  }
+  // Scrapes and dents from trees, roofs and the ground, streaked back along
+  // the airflow; green smears where foliage went over the leading edges.
+  if (O.dmg.z > 0.0 && exterior && (id == M_LIVERY || id == M_PAINT || id == M_SATIN)) {
+    let scuff = O.dmg.z;
+    // Where it gets knocked: leading edges, the belly, and patches at random.
+    let where_ = sat(in.wear * 1.5 + sat(-in.Nl.y) * 0.5) * 0.6 + 0.6 * smoothstep(0.55, 0.8, nz(L * 1.7).a);
+    let sc = nz(vec3f(L.x * 9.0, L.y * 9.0, L.z * 1.3));
+    let scratch = smoothstep(0.84 - 0.2 * scuff * where_, 0.9 - 0.2 * scuff * where_, sc.r) * scuff * where_;
+    albedo = mix(albedo, vec3f(0.5, 0.5, 0.52), scratch * 0.8);
+    metal = max(metal, scratch * 0.7);
+    rough = mix(rough, 0.4, scratch);
+    let sap = smoothstep(0.4, 0.95, in.wear) * scuff * smoothstep(0.45, 0.7, sc.b);
+    albedo = mix(albedo, vec3f(0.12, 0.16, 0.05), sap * 0.5);
+    // Dents.
+    N = normalize(N + (nz(L * 4.0).gba - 0.5) * 0.3 * scuff * where_ * smoothstep(0.5, 0.75, nz(L * 2.3).r));
+  }
+
+  // Wreckage: soot and burn-through.
+  let cn = nz(L * 0.35 + O.glow.w);
+  let char = clamp(O.tint.a * 1.6 - cn.g * 0.7, 0.0, 1.0);
+  albedo = mix(albedo, vec3f(0.015, 0.013, 0.012), char);
+  rough = mix(rough, 0.9, char);
+  metal *= 1.0 - char;
+  ssr *= 1.0 - char;
+
+  // Light: sun (with the aircraft's own fine shadow), sky, ground bounce, moon.
+  let sh = shadow_at(in.P, Ng);
+  let Ls = G.sun_dir.xyz;
+  let ndl = max(dot(N, Ls), 0.0);
+  let ndv = max(dot(N, -V), 1e-3);
+  let H = normalize(Ls - V);
+  let a = max(rough * rough, 0.002);
+  let F0 = mix(vec3f(0.04), albedo, metal);
+  let Fs = F0 + (1.0 - F0) * pow(1.0 - max(dot(-V, H), 0.0), 5.0);
+  let spec = l.sun * ggx(max(dot(N, H), 0.0), a) * vis(ndv, ndl, a) * Fs * ndl * sh * spec_k;
+  // Inside the cabin, light bounces around off every surface: a fill that the
+  // occlusion term alone would miss.
+  let inside = step(abs(L.x), 0.58) * step(-1.42, L.z) * step(L.z, 1.5) * step(L.y, 0.62) * select(0.0, 1.0, id != M_LIVERY && pt != P_FUSE && pt != P_COWL);
+  let amb_ao = mix(ao * ao * (3.0 - 2.0 * ao), 0.25 + 0.75 * ao, inside);
+  let fill = (l.amb * 0.45 + l.sun * max(dot(l.upn, Ls), 0.0) * 0.045) * (0.35 + 0.65 * ao) * inside;
+  let bounce = l.sun * max(dot(l.upn, Ls), 0.0) * 0.05 * sat(0.5 - 0.5 * dot(N, l.upn)) + l.sun * max(dot(l.upn, Ls), 0.0) * 0.025;
+  let moon = moon_light(l.upn, l.h) * max(dot(N, G.moon.xyz), 0.0);
+  let diffuse = albedo * (1.0 - metal) * ((l.sun * ndl * sh + moon) / PI + (l.amb * (0.55 + 0.45 * dot(N, l.upn)) + bounce) * amb_ao + fill + point_light(in.P, N));
+  let R = reflect(V, N);
+  let env_sharp = env_reflect(in.P, R, l.upn, false);
+  let env_soft = sky_lut(normalize(mix(R, l.upn, 0.5))) * 0.9;
+  let Fe = F0 + (max(vec3f(1.0 - rough), F0) - F0) * pow(1.0 - ndv, 5.0);
+  let spec_occ = sat(pow(ndv + ao, 2.0) - 1.0 + ao) * ao;
+  let envw = Fe * spec_occ * spec_k;
+  var c = diffuse + spec + mix(env_sharp, env_soft, sat(rough * 1.6)) * envw;
+  // The cabin has its own occlusion baked in; only the outside takes the screen-space kind.
+  g_amb = albedo * (1.0 - metal) * (l.amb * (0.55 + 0.45 * dot(N, l.upn)) + bounce) * amb_ao * (1.0 - inside);
+  // Instrument flood lighting at night, warm and dim, inside the cabin.
+  c += albedo * vec3f(1.0, 0.62, 0.38) * G.sun_dir.w * 0.0025 * night * inside * ao;
+  c += emit;
+  // Embers along the charred edges while it burns.
+  let ember = smoothstep(0.45, 0.7, cn.b) * smoothstep(0.2, 0.6, char) * O.glow.x;
+  c += vec3f(1.0, 0.28, 0.04) * ember * G.sun_dir.w * 1.5;
+  // Screen-space reflections (in the composite) only where they would show.
+  let rw = dot(envw, vec3f(0.333));
+  let reflect_w = select(0.0, rw, ssr > 0.0 && rough < 0.3 && rw > 0.09) * ssr;
+  return Shaded(vec4f(c, 1.0), vec4f(N, -reflect_w), select(0.0, 1.0, kill), amb_share(c));
+}
+
+// ---------------------------------------------------------------- transparent pass
+
+@fragment fn fs_glass(in: VOut) -> @location(0) vec4f {
+  let px = max(length(dpdx(in.P)), length(dpdy(in.P)));
+  let id = u32(in.mat.x + 0.5);
+  let V = normalize(in.P);
+  var N = normalize(in.N);
+  let from_inside = dot(N, V) > 0.0;
+  if (from_inside) { N = -N; }
+  let l = light_at(in.P);
+  let sh = shadow_at(in.P, N);
+  let Ls = G.sun_dir.xyz;
+  if (id == M_PROPDISC) {
+    // The blur of the spinning blades: their share of each ring, a slow
+    // shutter beat, painted tips showing as a ring.
+    let r = length(in.uv) * 0.975;
+    if (r < 0.2 || r > 0.975) { discard; }
+    let c = max(0.155 - 0.11 * pow((r - 0.55) / 0.42, 2.0), 0.05);
+    var cover = 2.0 * c / (6.2831853 * r);
+    let ang = atan2(in.L.y + 0.03, in.L.x);
+    let beat = 0.65 + 0.35 * cos(2.0 * (ang - G.time.x * 1.9));
+    let tip = smoothstep(0.86, 0.87, r);
+    // One blade snapped: only the inner part of the disc is swept twice.
+    if (torn()) { cover *= select(0.5, 1.0, r < 0.45); }
+    let lit = l.sun * max(dot(N, Ls), 0.0) * sh / PI + l.amb * 0.8;
+    let back = from_inside == false && dot(in.N, -V) > 0.0;
+    var col = select(vec3f(0.30), vec3f(0.02), dot(in.N, V) < 0.0);
+    col = mix(col, vec3f(0.78, 0.78, 0.74), tip);
+    let alpha = sat(cover * beat * O.tint.x * (1.0 - smoothstep(0.955, 0.975, r)) * 1.3);
+    let _b = back;
+    return vec4f(col * lit * alpha, alpha);
+  }
+  let d = window(in.L);
+  let cov = 1.0 - smoothstep(-px, px, d);
+  if (cov <= 0.0) { discard; }
+  let ndv = max(dot(N, -V), 0.0);
+  let F = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+  let R = reflect(V, N);
+  // Looking out, the glass mostly mirrors the dim cabin.
+  var env = l.amb * 0.035;
+  if (!from_inside) { env = env_reflect(in.P, R, l.upn, true); }
+  let H = normalize(Ls - V);
+  let ndl = max(dot(N, Ls), 0.0);
+  let glint = l.sun * ggx(max(dot(N, H), 0.0), 0.02) * vis(max(ndv, 1e-3), ndl, 0.02) * ndl * sh * (0.04 + 0.96 * pow(1.0 - max(dot(-V, H), 0.0), 5.0));
+  // Dust, smudges, grime along the edges and bugs low on the windshield; they
+  // light up when you look toward the sun.
+  let L = in.L;
+  let n1 = nz(L * 2.3);
+  let n2 = nz(L * 17.0);
+  var haze = 0.012 + 0.03 * smoothstep(0.45, 0.85, n1.r) + 0.02 * smoothstep(0.6, 0.9, n2.g);
+  haze += 0.06 * smoothstep(-0.05, 0.0, d);
+  let bugs = smoothstep(0.86, 0.9, nz(L * 12.0).a) * step(L.z, -1.25) * smoothstep(0.55, 0.2, L.y) * (1.0 - smoothstep(0.002, 0.008, px));
+  let toward = pow(max(dot(V, Ls), 0.0), 6.0);
+  let lit = l.sun * sh * (0.15 + 2.5 * toward) + l.amb * 0.6;
+  var rgb = env * F + glint + haze * lit * 0.35 + vec3f(0.05, 0.04, 0.02) * bugs * (l.amb + l.sun * sh * 0.2);
+  var trans = (1.0 - F) * (1.0 - haze) * (1.0 - bugs * 0.9) * 0.93;
+  if (L.z < -0.95) {
+    // Engine oil blown back over the windshield: a brown film, thickest low
+    // down, drawn up and back by the airflow into streaks.
+    let oil = O.dmg2.x;
+    if (oil > 0.0) {
+      let st = nz(vec3f(L.x * 14.0, L.y * 2.2 - L.z * 1.6, 0.3));
+      let low = 1.0 - clamp((L.y - 0.05) / 0.8, 0.0, 1.0);
+      let film = clamp((st.r * 0.7 + st.g * 0.45 + low * 0.7 - 1.05 + oil * 1.1) * 2.5, 0.0, 1.0) * smoothstep(0.0, 0.15, oil);
+      rgb += vec3f(0.22, 0.13, 0.05) * film * (l.amb * 0.8 + l.sun * sh * 0.25 + l.sun * toward * 0.6);
+      trans *= 1.0 - film * 0.92;
+    }
+    // A crack: radial spokes with rings between, scattering the light.
+    let size = O.dmg2.w;
+    if (size > 0.0) {
+      let q = vec2f(L.z, L.y) - O.dmg2.yz;
+      let r = length(q);
+      if (r < size * 1.05) {
+        let th = atan2(q.y, q.x);
+        let k = round(th / 0.8976);
+        let ak = k * 0.8976 + 0.25 * sin(k * 4.7) + 0.35 * (nz(vec3f(r * 5.0, k * 0.3, 0.7)).r - 0.5);
+        let spoke = (1.0 - smoothstep(0.0, px * 1.5 + 0.0012, abs(sin(th - ak)) * r)) * step(r, size * (0.75 + 0.25 * nz(vec3f(k, 0.2, 0.4)).g));
+        let ring = (1.0 - smoothstep(0.0, px * 1.5 + 0.001, abs(fract(r / (size * 0.28) + 0.3 * nz(vec3f(th, 0.5, 0.1)).r) - 0.5) * size * 0.28)) * step(r, size * 0.7) * step(size * 0.08, r);
+        let web = max(spoke, ring * 0.7) * (1.0 - smoothstep(size * 0.6, size, r)) + (1.0 - smoothstep(0.0, size * 0.1, r)) * 0.6;
+        rgb += web * (l.amb * 0.9 + l.sun * sh * (0.08 + 0.5 * toward));
+        trans *= 1.0 - web * 0.7;
+      }
+    }
+  }
+  let alpha = 1.0 - trans;
+  return vec4f(rgb * cov, alpha * cov);
+}
