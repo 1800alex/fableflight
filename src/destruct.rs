@@ -13,6 +13,8 @@ use crate::cars::{M_CUBE, M_REBAR, M_ROCK, M_SLAB, N_REBAR};
 use crate::crash::{Rng, DUST, GLASS, GRIT, LEAF};
 use crate::geo::{self, TileId};
 use crate::render::{Inst, MeshVertex, Particle, TreeInst};
+use crate::skin::{Group, PieceRef, NO_SKIN};
+use crate::tiles3d::SkinSrc;
 use crate::world::{TreeRef, World, Wreck};
 use glam::{DQuat, DVec3, Mat3, Vec2, Vec3};
 use std::collections::HashMap;
@@ -281,6 +283,10 @@ struct Chunk {
     gone: bool,
     /// the dark inside of the aircraft's hole: gone once the floors give
     void: bool,
+    /// its slot in its structure's mesh from the 3D tiles (skin.rs), if it has one
+    skin: u32,
+    /// a piece of outer wall or roof
+    outer: bool,
 }
 
 impl Chunk {
@@ -314,6 +320,8 @@ impl Chunk {
             face: [0.0; 4],
             gone: false,
             void: false,
+            skin: NO_SKIN,
+            outer: false,
         }
     }
 }
@@ -405,6 +413,8 @@ struct Structure {
     left: usize,
     /// seconds since the last piece let go (negative while some stand)
     done_t: f32,
+    /// its own mesh from the 3D tiles, on its pieces (skin.rs)
+    skin: Option<Group>,
 }
 
 pub struct Destruction {
@@ -599,7 +609,9 @@ impl Destruction {
     /// Bring a building down. `parts`: the building that was hit first, then
     /// any parts standing on it. `impact`/`vel`: where it was hit, how hard.
     /// `hit`: the aircraft itself went in here, so the wall shows its outline.
-    pub fn collapse(&mut self, parts: &[Wreck], impact: DVec3, vel: DVec3, hit: Option<Hitter>, emit: &mut Vec<(DVec3, Particle)>) {
+    /// `photo`: the building as the 3D tiles had it (cut out of them), which
+    /// its pieces then carry.
+    pub fn collapse(&mut self, parts: &[Wreck], impact: DVec3, vel: DVec3, hit: Option<Hitter>, photo: Option<&SkinSrc>, emit: &mut Vec<(DVec3, Particle)>) {
         let Some(w0) = parts.first() else { return };
         if w0.ring.len() < 3 {
             return;
@@ -764,6 +776,7 @@ impl Destruction {
             grounded: false,
             left: 0,
             done_t: -1.0,
+            skin: None,
         };
 
         // Every piece of the standing building, before the hole is taken out:
@@ -780,6 +793,9 @@ impl Destruction {
             face: [f32; 4],
             vh: f32,
             mass: f32,
+            /// outer wall or roof, and its colour before any soot
+            outer: bool,
+            col0: [f32; 3],
             /// inside the aircraft's outline: blown out
             cut: bool,
             /// a small piece of wall from around the hole
@@ -863,6 +879,8 @@ impl Destruction {
                                 face: [face[0] + xs * dx, face[1] - dz, face[2], face[3]],
                                 vh: ch * 0.5,
                                 mass: w * ch * t_wall * 3.0,
+                                outer: true,
+                                col0: p.wall,
                                 cut: false,
                                 fine: false,
                             }
@@ -1016,6 +1034,8 @@ impl Destruction {
                             face: [0.0; 4],
                             vh: t_slab * 0.5,
                             mass: wa * wb * lh,
+                            outer: roof,
+                            col0: col,
                             cut: false,
                             fine: false,
                         });
@@ -1036,11 +1056,37 @@ impl Destruction {
                 })
                 .fold(1e3, f32::min)
         };
+        // In the zone of the 3D tiles the building's own mesh goes onto its
+        // pieces: each piece of wall or roof moved onto the mesh it carries,
+        // and coloured like it.
+        let skin = photo.map(|src| {
+            let refs: Vec<PieceRef> = pieces.iter().map(|p| PieceRef { pos: p.pos, rot: p.rot, half: p.half, outer: p.outer }).collect();
+            let a = crate::skin::assign(src, &refs, hit.map(|_| (impact, 11.0)), (cs * 0.25).clamp(0.8, 2.5));
+            for (i, pc) in pieces.iter_mut().enumerate() {
+                if !pc.outer {
+                    continue;
+                }
+                pc.pos += pc.rot * DVec3::Y * a.shift[i] as f64;
+                let c = a.col[i].unwrap_or(a.mean);
+                // (soot from the impact stays on: the colour as a share of what it was)
+                let k = [0, 1, 2].map(|j| (pc.col[j] / pc.col0[j].max(1e-3)).min(1.0));
+                pc.col0 = c;
+                pc.col = [c[0] * k[0], c[1] * k[1], c[2] * k[2]];
+            }
+            log::info!("3D tiles: {} triangles on {} of {} pieces", a.n_tris(), a.area.iter().filter(|&&w| w > 0.0).count(), refs.len());
+            (Group::new(src), a)
+        });
+        let frames: Vec<(DVec3, DQuat)> = pieces.iter().map(|p| (p.pos, p.rot)).collect();
+        let mut slot_of = vec![NO_SKIN; pieces.len()];
+        let (mut sgroup, sassign) = match skin {
+            Some((g, a)) => (Some(g), Some(a)),
+            None => (None, None),
+        };
         // How deep the wall the aircraft went through lies along its way.
         let (mut t_in, mut n_in) = (0.0f32, 0);
         let mut blown: Vec<(DVec3, Vec3, f32, Vec3, bool, bool)> = Vec::new();
         let mut n_bits = 0;
-        for pc in pieces {
+        for (pi, pc) in pieces.into_iter().enumerate() {
             let d = (pc.pos - impact).length() as f32;
             let facade = pc.mat > 1.5;
             let near_t = if facade { 1e3 } else { through(&pc) };
@@ -1080,6 +1126,11 @@ impl Destruction {
             }
             let upper = tall && (pc.z1 - pc.vh) > cut;
             st.left += 1;
+            let sk = match (&mut sgroup, &sassign) {
+                (Some(g), Some(a)) if pc.outer || a.area[pi] > 0.0 => g.alloc(pc.col0),
+                _ => NO_SKIN,
+            };
+            slot_of[pi] = sk;
             self.chunks.push(Chunk {
                 pos: pc.pos,
                 half: pc.half,
@@ -1108,7 +1159,13 @@ impl Destruction {
                 face: pc.face,
                 gone: false,
                 void: false,
+                skin: sk,
+                outer: pc.outer,
             });
+        }
+        if let (Some(mut g), Some(a)) = (sgroup, sassign) {
+            g.build(&a, &slot_of, &frames);
+            st.skin = Some(g);
         }
         // Inside the hole: soot-black and dark, not the far side of the
         // building in daylight. A burnt wall a few metres in, across the
@@ -1285,6 +1342,9 @@ impl Destruction {
         let mut bits: Vec<Chunk> = Vec::new();
         let mut shatter: Vec<(DVec3, Vec3, Vec3, Vec3)> = Vec::new();
         let mut mounds: Vec<(DVec3, DVec3, f32, [f32; 3])> = Vec::new();
+        // pieces that broke in two: (the new half in `bits`, structure, slot,
+        // axis, where it broke, how far each half moved)
+        let mut splits: Vec<(usize, u32, u32, usize, f32, f32, f32)> = Vec::new();
         for c in chunks.iter_mut() {
             if c.state == 2 {
                 continue;
@@ -1438,6 +1498,9 @@ impl Destruction {
                             o.omega = (rng.dir() * rng.range(0.5, 3.0)).as_dvec3();
                             o.var = (rng.f() * N_SLAB as f32) as u32 % N_SLAB;
                             o.mesh = M_SLAB + o.var;
+                            if c.skin != NO_SKIN {
+                                splits.push((bits.len(), c.group, c.skin, i, -hl + 2.0 * h1, hl - h1, hl - h2));
+                            }
                             let k = h2 / hl;
                             o.mass = c.mass * k;
                             c.mass *= 1.0 - k;
@@ -1523,6 +1586,11 @@ impl Destruction {
                 let mut m = Chunk::loose(p + (rng.dir() * half).as_dvec3(), Vec3::new(len, 0.035, 0.07), DQuat::from_axis_angle(rng.dir().as_dvec3(), rng.range(0.0, 6.0) as f64), (v + out * rng.range(1.0, 4.0) + rng.dir() * 2.0).as_dvec3(), (rng.dir() * rng.range(1.0, 5.0)).as_dvec3(), [0.2, 0.21, 0.22], M_CUBE);
                 m.bit = true;
                 bits.push(m);
+            }
+        }
+        for (b, g, slot, axis, cut, sc, so) in splits {
+            if let Some(gr) = structs.get_mut(g as usize).and_then(|s| s.skin.as_mut()) {
+                bits[b].skin = gr.split(slot, axis, cut, sc, so);
             }
         }
         chunks.extend(bits);
@@ -1673,12 +1741,19 @@ impl Destruction {
             if o.length_squared() > far * far {
                 continue;
             }
+            // Standing walls and roof of a building from the 3D tiles: its mesh is all there is to see.
+            let photo = c.skin != NO_SKIN;
+            if photo && c.state == 0 && c.outer {
+                continue;
+            }
             let r3 = Mat3::from_quat(c.rot.as_quat());
             let m = r3 * Mat3::from_diagonal(c.half);
             // Far off, a broken piece is a few pixels: the plain box will do.
             let d2 = o.length_squared();
             let mesh = if is_slab(c.mesh) && d2 > (160.0 * c.half.max_element()).powi(2) { M_CUBE } else { c.mesh };
-            insts.push((mesh, Inst { m: [[m.x_axis.x, m.y_axis.x, m.z_axis.x, o.x], [m.x_axis.y, m.y_axis.y, m.z_axis.y, o.y], [m.x_axis.z, m.y_axis.z, m.z_axis.z, o.z]], tint: [c.col[0], c.col[1], c.col[2], c.mat], ext: c.face }));
+            // (its pieces are bare: the mesh on them shows the wall)
+            let (mat, face) = if photo { (1.0, [0.0; 4]) } else { (c.mat, c.face) };
+            insts.push((mesh, Inst { m: [[m.x_axis.x, m.y_axis.x, m.z_axis.x, o.x], [m.x_axis.y, m.y_axis.y, m.z_axis.y, o.y], [m.x_axis.z, m.y_axis.z, m.z_axis.z, o.z]], tint: [c.col[0], c.col[1], c.col[2], mat], ext: face }));
             // Bars sticking out of its broken edges, close enough to be seen.
             if c.rebar && mesh != M_CUBE && is_slab(mesh) && d2 < 320.0 * 320.0 && n_bars < 3000 {
                 let up = r3 * Vec3::Y;
@@ -1718,6 +1793,59 @@ impl Destruction {
             i.b = [t.dir.x * a, t.dir.y * a, t.inst.b[2], t.inst.b[3]];
             trees.push((t.mesh, i));
         }
+    }
+
+    /// Where every piece carrying a destroyed building's mesh is this frame
+    /// (skin.rs); meshes none of whose pieces are left are let go.
+    pub fn skin_frame(&mut self, cam: DVec3) {
+        for s in &mut self.structs {
+            if let Some(g) = &mut s.skin {
+                g.xf.clear();
+                g.xf.resize(g.len(), [[0.0; 4]; 4]);
+            }
+        }
+        let mut live = vec![false; self.structs.len()];
+        for c in &self.chunks {
+            if c.skin == NO_SKIN {
+                continue;
+            }
+            let Some(g) = self.structs.get_mut(c.group as usize).and_then(|s| s.skin.as_mut()) else { continue };
+            if (c.skin as usize) < g.xf.len() {
+                let o = (c.pos - cam).as_vec3();
+                g.xf[c.skin as usize] = g.slot_xf(c.skin, o, c.rot, c.col);
+                live[c.group as usize] = true;
+            }
+        }
+        for (s, l) in self.structs.iter_mut().zip(live) {
+            if !l {
+                s.skin = None;
+            }
+        }
+    }
+
+    /// Copies new meshes, and triangles that changed pieces, to the GPU.
+    pub fn upload_skins(&mut self, r: &crate::render::Renderer) {
+        for g in self.structs.iter_mut().filter_map(|s| s.skin.as_mut()) {
+            g.upload(r);
+        }
+    }
+
+    /// This frame's slots, all meshes' one after the other, and each mesh with
+    /// where its slots start.
+    pub fn skin_draws(&self) -> (Vec<[[f32; 4]; 4]>, Vec<(&crate::render::SkinGpu, u32)>) {
+        let (mut slots, mut draws) = (Vec::new(), Vec::new());
+        for g in self.structs.iter().filter_map(|s| s.skin.as_ref()) {
+            // (each mesh's slots start on a 256-byte boundary)
+            while slots.len() % 4 != 0 {
+                slots.push([[0.0; 4]; 4]);
+            }
+            let first = slots.len() as u32;
+            slots.extend_from_slice(&g.xf);
+            for gpu in g.gpus() {
+                draws.push((gpu, first));
+            }
+        }
+        (slots, draws)
     }
 
     pub fn clear(&mut self) {

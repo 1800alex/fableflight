@@ -14,7 +14,9 @@ struct VOut {
   @location(3) col: vec4f,
   @location(4) @interpolate(flat) sty: vec4u,
   @location(5) auv: vec2f,
-  // level of detail this geometry belongs to: 0 always drawn, 1 middle, 2 finest
+  // level of detail this geometry belongs to (low 3 bits: 0 always drawn,
+  // 1 middle, 2 finest, 3 full geometry going, 4 far stand-in coming) and 4x
+  // the distance scale of its height class above them (see `lod_dist`)
   @location(6) @interpolate(flat) lod: u32,
 };
 struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f32 };
@@ -25,14 +27,29 @@ struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f3
   // coordinate is (very nearly) a linear function of position.
   let auv = vec2f(dot(pos, T.ax.xyz) + T.ax.w, dot(pos, T.ay.xyz) + T.ay.w);
   var clip = G.view_proj * vec4f(P, 1.0);
-  // Detail beyond the distance its level is drawn to is dropped here, before it costs fill.
-  let d = length(P);
-  if ((lod == 1u && d > LOD1_FAR) || (lod == 2u && d > LOD2_FAR)) { clip = vec4f(2.0, 2.0, 2.0, 1.0); }
+  // Detail beyond the distance its level is drawn to is dropped here, before
+  // it costs fill (and far stand-ins short of theirs). The margin keeps every
+  // corner of a triangle that is cut this way past the end of its dissolve.
+  let d = lod_dist(P, lod);
+  let l = lod & 7u;
+  if ((l == 1u || l == 3u) && d > FAR1 + 250.0) || (l == 2u && d > LOD2_FAR) || (l == 4u && d < FAR0 - 250.0) { clip = vec4f(2.0, 2.0, 2.0, 1.0); }
   return VOut(clip, P, nrm, uv, col, sty, auv, lod);
 }
-const LOD1_FAR = 2600.0;
+// Distance the levels of detail go by: towers keep theirs out to a multiple of
+// the usual distances (buildings::HCLASS; the draw's instance index carries 4x
+// the multiple above the level).
+fn lod_dist(P: vec3f, lod: u32) -> f32 {
+  return length(P) / max(f32(lod >> 3u) * 0.25, 1.0);
+}
 const LOD2_FAR = 680.0;
+// Distances over which buildings dissolve from their full geometry (and its
+// middle level of dressing) into their far stand-ins. Must match BFAR in buildings.rs.
+const FAR0 = 1000.0;
+const FAR1 = 1300.0;
 @vertex fn vs_shadow(@location(0) pos: vec3f) -> @builtin(position) vec4f {
+  // Under the 3D tiles' mesh, which casts instead (decided for the whole
+  // batch, so no triangle is cut in two).
+  if (G.photo.z > 0.0 && photo_fade(T.offset.xyz) < 0.5) { return vec4f(2.0, 2.0, 2.0, 1.0); }
   return CS.vp * vec4f(pos + T.offset.xyz, 1.0);
 }
 
@@ -244,13 +261,21 @@ fn roof_glint(N: vec3f, V: vec3f, f0: vec3f, rough: f32) -> vec3f {
 }
 
 @fragment fn fs(in: VOut) -> GOut {
+  // Inside the 3D tiles zone the mesh stands in for this (tiles3d.rs).
+  if (photo_hides(in.P, in.clip.xy)) { discard; }
   // Each level of detail dissolves in: over a second or so when it arrives,
   // and building by building with distance as the camera approaches.
-  let dcam = length(in.P);
+  let dcam = lod_dist(in.P, in.lod);
+  let lod = in.lod & 7u;
   var fade = T.lod.z;
-  if (in.lod == 1u) { fade = min(fade, T.lod.x) * (1.0 - smoothstep(LOD1_FAR * 0.7, LOD1_FAR * 0.95, dcam)); }
-  else if (in.lod == 2u) { fade = min(fade, T.lod.y) * (1.0 - smoothstep(LOD2_FAR * 0.6, LOD2_FAR * 0.95, dcam)); }
-  if (fade < 1.0 && ign(in.clip.xy) >= fade) { discard; }
+  // Full geometry and far stand-in take complementary pixels of the same noise.
+  let near = 1.0 - smoothstep(FAR0, FAR1, dcam);
+  let n = ign(in.clip.xy);
+  if (lod == 1u) { fade = min(min(fade, T.lod.x), near); }
+  else if (lod == 2u) { fade = min(fade, T.lod.y) * (1.0 - smoothstep(LOD2_FAR * 0.6, LOD2_FAR * 0.95, dcam)); }
+  else if (lod == 3u) { fade = min(fade, near); }
+  else if (lod == 4u && n < near) { discard; }
+  if (fade < 1.0 && n >= fade) { discard; }
   let V = normalize(in.P);
   var N = normalize(in.N);
   let kind = u32(in.col.a * 255.0 / 50.0 + 0.5);

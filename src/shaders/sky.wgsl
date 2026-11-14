@@ -71,7 +71,9 @@ fn night_cam() -> f32 { return 1.0 - smoothstep(-0.2, 0.05, dot(G.up.xyz, G.sun_
 fn sky_color(rd: vec3f, jit: f32) -> vec3f {
   let oc = -G.planet.xyz;
   let sun = G.sun_dir.xyz;
-  let sc = sky_march(rd, 24, jit);
+  // Fresh jitter every frame: cloud shadows cross the march (light shafts), and the
+  // temporal AA smooths what the steps miss.
+  let sc = sky_march(rd, 24, fract(jit + G.time.w * 0.618034));
   var col = sc.L;
   let gnd = ray_sphere(oc, rd, G.planet.w);
   if (gnd.x > 0.0) {

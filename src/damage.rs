@@ -17,20 +17,33 @@ pub const JAG: f32 = 0.14;
 
 /// A break through a piece. `mode` 1 keeps the side where n·L < d, -1 the
 /// other side; ±2 the same with |L.x| in place of L.x (both halves at once).
+/// `jag` is how ragged its edge is (m): a clean shear is a few centimetres, torn skin far more.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct Tear {
     pub n: Vec3,
     pub d: f32,
     pub mode: f32,
+    pub jag: f32,
 }
 
 impl Tear {
-    pub const NONE: Tear = Tear { n: Vec3::ZERO, d: 0.0, mode: 0.0 };
+    pub const NONE: Tear = Tear { n: Vec3::ZERO, d: 0.0, mode: 0.0, jag: 0.0 };
     pub fn new(n: Vec3, d: f32, mode: f32) -> Self {
-        Self { n, d, mode }
+        Self { n, d, mode, jag: JAG }
     }
     pub fn is_some(&self) -> bool {
         self.mode != 0.0
+    }
+    /// The same break seen from the other side.
+    pub fn flip(&self) -> Self {
+        Self { mode: -self.mode, ..*self }
+    }
+    /// Moved so the kept side grows by `by` metres (spars poking out past torn skin).
+    pub fn grow(&self, by: f32) -> Self {
+        if self.mode == 0.0 {
+            return *self;
+        }
+        Self { d: self.d + by * self.mode.signum(), ..*self }
     }
     /// Does the break (without its ragged edge) keep this body-frame point?
     pub fn keeps(&self, p: Vec3) -> bool {
@@ -46,11 +59,48 @@ impl Tear {
     }
 }
 
+/// A wing that has buckled but not let go: the part outboard of the break
+/// hangs from the torn skin on one side and swings about it (body frame).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Fold {
+    pub on: bool,
+    /// a point on the hinge line, and its direction (positive angles lift the tip)
+    pub pivot: Vec3,
+    pub axis: Vec3,
+    pub ang: f32,
+    pub rate: f32,
+    /// the break, as the stump sees it (mode 1); and the hanging part's outer
+    /// end if the tip had already gone (NONE: it runs out to the tip)
+    pub tear: Tear,
+    pub outer: Tear,
+    /// span stations of the break and of the hanging part's outer end
+    pub root: f32,
+    pub tip: f32,
+    /// how close the torn skin is to letting go (1 = gone), and how much load it takes (N m)
+    pub stress: f32,
+    pub hold: f32,
+}
+
+impl Fold {
+    /// Where the hanging part is drawn: its rest pose swung about the hinge.
+    pub fn mat(&self) -> Mat4 {
+        Mat4::from_translation(self.pivot) * Mat4::from_axis_angle(self.axis, self.ang) * Mat4::from_translation(-self.pivot)
+    }
+}
+
 /// Everything that can be wrong with the airframe.
 #[derive(Clone, Copy, Debug)]
 pub struct Damage {
     /// span station each wing now ends at (SPAN = whole), left then right
     pub wing: [f32; 2],
+    /// the break each wing stump ends in (NONE with a shorter `wing`: a straight cut there)
+    pub wing_tear: [Tear; 2],
+    /// a wing that has snapped but still hangs on
+    pub fold: [Fold; 2],
+    /// the tail broken off through the tail cone: the break the stump keeps (NONE: attached)
+    pub tail: Tear,
+    /// how battered the fuselage is, 0..1
+    pub hull: f32,
     /// control surfaces: 1 sound, 0.5 hanging from one hinge, 0 gone
     pub aileron: [f32; 2],
     pub flap: [f32; 2],
@@ -87,6 +137,10 @@ impl Default for Damage {
     fn default() -> Self {
         Self {
             wing: [SPAN; 2],
+            wing_tear: [Tear::NONE; 2],
+            fold: [Fold::default(); 2],
+            tail: Tear::NONE,
+            hull: 0.0,
             aileron: [1.0; 2],
             flap: [1.0; 2],
             elevator: [1.0; 2],
@@ -128,6 +182,9 @@ fn halves(h: [f32; 2], d: f32) -> Tear {
 impl Damage {
     /// Pieces that are no longer there at all.
     pub fn hidden(&self, p: &Piece) -> bool {
+        if self.tail.is_some() && p.group == G_TAIL && p.name != "tail cone" {
+            return true;
+        }
         match p.name {
             "left aileron" | "right aileron" => self.aileron[side_of(p.name)] <= 0.0,
             "left flap" | "right flap" => self.flap[side_of(p.name)] <= 0.0,
@@ -153,8 +210,11 @@ impl Damage {
         match p.group {
             G_LWING | G_RWING => {
                 let s = if p.group == G_RWING { 1 } else { 0 };
-                if self.wing[s] < SPAN {
-                    t[0] = Tear::new(Vec3::new(sgn(s), 0.0, 0.0), self.wing[s] + stick, 1.0);
+                t[0] = self.stump(s).grow(stick);
+            }
+            G_TAIL if self.tail.is_some() => {
+                if p.name == "tail cone" {
+                    t[0] = self.tail;
                 }
             }
             G_TAIL => match p.name {
@@ -182,6 +242,28 @@ impl Damage {
         t
     }
 
+    /// The break a wing stump ends in (NONE: the whole wing).
+    pub fn stump(&self, s: usize) -> Tear {
+        if self.wing_tear[s].is_some() {
+            self.wing_tear[s]
+        } else if self.wing[s] < SPAN {
+            Tear::new(Vec3::new(sgn(s), 0.0, 0.0), self.wing[s], 1.0)
+        } else {
+            Tear::NONE
+        }
+    }
+    /// How ragged the edges drawn on a piece are.
+    pub fn jag_for(&self, p: &Piece) -> f32 {
+        match p.group {
+            G_LWING | G_RWING => {
+                let t = self.stump(if p.group == G_RWING { 1 } else { 0 });
+                if t.jag > 0.0 { t.jag } else { JAG }
+            }
+            G_TAIL if self.tail.is_some() => self.tail.jag,
+            _ => JAG,
+        }
+    }
+
     /// Wing area outboard of span station `b` on one side (m²).
     pub fn wing_lost(b: f32) -> f32 {
         let chord = |s: f32| 1.65 - 0.5 * ((s - 2.55) / (SPAN - 2.55)).clamp(0.0, 1.0);
@@ -199,8 +281,13 @@ impl Damage {
         let mut r = Vec::new();
         for s in 0..2 {
             let lr = if s == 0 { "L" } else { "R" };
-            if self.wing[s] < SPAN {
+            if self.fold[s].on {
+                r.push(format!("{lr} WING BUCKLED, HANGING"));
+            } else if self.wing[s] < SPAN {
                 r.push(format!("{lr} WING  -{:.1} m", SPAN - self.wing[s]));
+            }
+            if self.wing[s] < airframe::TANK[1] {
+                r.push(format!("{lr} TANK RUPTURED"));
             }
             if self.aileron[s] <= 0.0 {
                 r.push(format!("{lr} AILERON GONE"));
@@ -216,10 +303,13 @@ impl Damage {
                 r.push(format!("{lr} ELEVATOR GONE"));
             }
         }
-        if self.fin < 1.0 {
+        if self.tail.is_some() {
+            r.push("TAIL BROKEN OFF".into());
+        } else if self.fin < 1.0 {
             r.push(format!("FIN {:.0}%", self.fin * 100.0));
         }
-        if self.rudder <= 0.0 {
+        if self.tail.is_some() {
+        } else if self.rudder <= 0.0 {
             r.push("RUDDER GONE".into());
         } else if self.rudder < 1.0 {
             r.push(format!("RUDDER {:.0}%", self.rudder * 100.0));
@@ -244,6 +334,11 @@ impl Damage {
         }
         if self.crack[2] > 0.0 {
             r.push("WINDSHIELD CRACKED".into());
+        }
+        if self.hull > 0.5 {
+            r.push("FUSELAGE CRUMPLED".into());
+        } else if self.hull > 0.15 {
+            r.push("FUSELAGE DENTED".into());
         }
         r
     }
@@ -275,16 +370,87 @@ impl Damage {
                 "oil" => self.oil = v,
                 "crack" => self.crack = [-1.45, 0.45, 0.22 * v],
                 "scuff" => self.scuff = [v; GROUPS.len()],
+                // An angled break at that station, or a buckled wing hanging there
+                // (random shape, seeded by the station), or the tail broken off at z.
+                "lsnap" | "rsnap" | "lfold" | "rfold" => {
+                    let s = if k.trim().starts_with('l') { 0 } else { 1 };
+                    let mut rng = Rng(v.to_bits() as u64 * 7919 + 1 + s as u64);
+                    let tear = wing_break(s, v, rng.range(-0.5, 0.5), rng.range(-0.2, 0.2), rng.range(0.06, 0.3), &Tear::NONE);
+                    self.wing[s] = v;
+                    self.wing_tear[s] = tear;
+                    if k.trim().ends_with("fold") {
+                        self.fold[s] = fold_at(s, v, tear, Tear::NONE, SPAN, rng.f() < 0.5, 2500.0);
+                    }
+                }
+                "tail" => self.tail = tail_break(v, 0.1, -0.1, 0.2),
                 other => log::warn!("unknown damage item {other}"),
             }
         }
     }
 }
 
+/// A point on wing `s` (body frame): span station, fraction of the chord back
+/// from the leading edge, and which skin (+1 upper, -1 lower, 0 the mean line).
+pub fn wing_pt(s: usize, station: f32, xc: f32, skin: f32) -> Vec3 {
+    let k = airframe::wing_sect(station.clamp(0.0, SPAN));
+    let half = 0.06 * k.c * k.tf * (1.0 - (2.0 * xc - 0.6).powi(2)).max(0.15);
+    let p = k.le + k.cdir * (k.c * xc) + k.up * (half * skin + 0.02 * k.c);
+    Vec3::new(p.x * sgn(s), p.y, p.z)
+}
+
+/// An angled break across wing `s` near span `station`: `tz` slants it
+/// across the chord (a diagonal snap), `ty` through the thickness, `jag` is
+/// how ragged it is. It is kept wholly inboard of the break `prev` the wing
+/// already ends in (straightened if it has to be).
+pub fn wing_break(s: usize, station: f32, tz: f32, ty: f32, jag: f32, prev: &Tear) -> Tear {
+    let sg = sgn(s);
+    let k = airframe::wing_sect(station.clamp(0.0, SPAN));
+    let mid = wing_pt(1, station, 0.45, 0.0);
+    let make = |tz: f32| {
+        let n = Vec3::new(sg, ty, tz).normalize();
+        let p = Vec3::new(sg * station, mid.y, mid.z);
+        Tear { n, d: n.dot(p), mode: 1.0, jag }
+    };
+    let mut tz = tz;
+    for _ in 0..5 {
+        let t = make(tz);
+        // Where it crosses the leading and trailing edges must still be on the wing.
+        let fits = [k.le.z - 0.05, k.le.z + k.c + 0.05].iter().all(|&z| {
+            let x = (t.d - t.n.y * mid.y - t.n.z * z) / t.n.x;
+            prev.keeps(Vec3::new(x + sg * 0.2, mid.y, z))
+        });
+        if fits {
+            return t;
+        }
+        tz *= 0.5;
+    }
+    make(0.0)
+}
+
+/// A buckled wing hanging from the stump at `tear` (span `root`), out to `tip`
+/// where it ends in `outer`: hinged on its upper skin if it folds `up`, on
+/// its lower skin if it folds down.
+pub fn fold_at(s: usize, root: f32, tear: Tear, outer: Tear, tip: f32, up: bool, hold: f32) -> Fold {
+    let q = wing_pt(s, root, 0.4, if up { 1.0 } else { -1.0 });
+    let x = (tear.d - tear.n.y * q.y - tear.n.z * q.z) / tear.n.x;
+    let pivot = Vec3::new(x, q.y, q.z);
+    let axis = tear.n.cross(Vec3::Y).normalize();
+    Fold { on: true, pivot, axis, ang: 0.0, rate: if up { 0.6 } else { -0.6 }, tear, outer, root, tip, stress: 0.0, hold }
+}
+
+/// The tail broken off through the tail cone at `z`, slanted by `tx`, `ty`.
+pub fn tail_break(z: f32, tx: f32, ty: f32, jag: f32) -> Tear {
+    let n = Vec3::new(tx, ty, 1.0).normalize();
+    let p = Vec3::new(0.0, airframe::sec(z).mid, z);
+    Tear { n, d: n.dot(p), mode: 1.0, jag }
+}
+
 /// Which pieces a shed request refers to.
 #[derive(Clone, Copy, Debug)]
 pub enum Sel {
     Group(usize),
+    /// the group with its internal structure (a wing torn off shows its spars)
+    GroupAll(usize),
     Names(&'static [&'static str]),
 }
 
@@ -292,11 +458,25 @@ pub enum Sel {
 #[derive(Clone, Copy, Debug)]
 pub struct ShedReq {
     pub sel: Sel,
-    /// the break, seen from the side that leaves (NONE: the whole piece goes)
+    /// the break, seen from the side that leaves (NONE: the whole piece goes),
+    /// and the part's other end if it already had one
     pub tear: Tear,
+    pub tear2: Tear,
     /// extra velocity of the part, body frame
     pub kick: Vec3,
     pub spin: f32,
+    /// all its pieces go as one body (a wing with its flap and aileron)
+    pub rigid: bool,
+    /// where the pieces were relative to their usual pose (a wing that had folded)
+    pub pre: Mat4,
+    /// `tear2` is given; otherwise each piece keeps the first break it already had
+    pub own2: bool,
+}
+
+impl ShedReq {
+    pub fn new(sel: Sel, tear: Tear, kick: Vec3, spin: f32) -> Self {
+        Self { sel, tear, tear2: Tear::NONE, kick, spin, rigid: false, pre: Mat4::IDENTITY, own2: false }
+    }
 }
 
 /// A part that has left the aircraft and is on its way down.
@@ -310,7 +490,8 @@ pub struct Shed {
     vel: DVec3,
     rot: DQuat,
     omega: DVec3,
-    tear: Tear,
+    tear: [Tear; 2],
+    jag: f32,
     cut: bool,
     radius: f64,
     span: f32,
@@ -331,51 +512,78 @@ impl Sheds {
     /// Spawn whatever `req` tears off: every piece it names, cut along the tear.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(&mut self, req: &ShedReq, dmg: &Damage, pieces: &[Piece], piece_mesh: &[usize], piece_cut: &[bool], pose: &[Mat4], pos: DVec3, rot: DQuat, vel: DVec3, rng: &mut Rng, emit: &mut Vec<(DVec3, Particle)>) {
-        let mut first = true;
+        // The pieces that go, each with its pose and the breaks it is cut along.
+        let mut picked: Vec<(usize, Mat4, [Tear; 2], Vec3, Vec3, Vec3, usize)> = Vec::new();
         for (i, p) in pieces.iter().enumerate() {
-            if p.glass || dmg.hidden(p) {
+            let structure = p.name.ends_with("structure");
+            if p.glass {
                 continue;
             }
-            let picked = match req.sel {
-                Sel::Group(g) => p.group == g && !p.name.ends_with("structure"),
+            let take = match req.sel {
+                Sel::Group(g) => p.group == g && !structure,
+                Sel::GroupAll(g) => p.group == g,
                 Sel::Names(ns) => ns.contains(&p.name),
             };
-            if !picked {
+            // Structure counts as there whenever its skin is being torn.
+            if !take || (dmg.hidden(p) && !(structure && matches!(req.sel, Sel::GroupAll(_)))) {
                 continue;
             }
+            let stick = if structure { 0.12 } else { 0.0 };
+            let second = if req.own2 { req.tear2.grow(stick) } else { dmg.tears_for(p)[0] };
+            let tears = [req.tear.grow(stick), second];
             // Where the leaving part is: the mean of its vertices, body frame.
             let (mut c, mut n, mut lo, mut hi) = (Vec3::ZERO, 0usize, Vec3::splat(1e9), Vec3::splat(-1e9));
+            let local = req.pre * pose[i];
             for v in &p.mesh.v {
                 let q = Vec3::from(v.pos);
-                if req.tear.keeps(q) {
-                    c += q;
+                if tears.iter().all(|t| t.keeps(q)) {
+                    let w = local.transform_point3(q);
+                    c += w;
                     n += 1;
-                    lo = lo.min(q);
-                    hi = hi.max(q);
+                    lo = lo.min(w);
+                    hi = hi.max(w);
                 }
             }
             if n < 3 {
                 continue;
             }
-            c /= n as f32;
-            let ext = hi - lo;
-            let origin = pose[i].transform_point3(c);
+            picked.push((i, local, tears, c / n as f32, lo, hi, n));
+        }
+        if picked.is_empty() {
+            return;
+        }
+        // One body: shared centre, motion and size, so its pieces stay together.
+        let whole = if req.rigid {
+            let n: usize = picked.iter().map(|k| k.6).sum();
+            let c = picked.iter().map(|k| k.3 * k.6 as f32).sum::<Vec3>() / n as f32;
+            let lo = picked.iter().fold(Vec3::splat(1e9), |a, k| a.min(k.4));
+            let hi = picked.iter().fold(Vec3::splat(-1e9), |a, k| a.max(k.5));
+            Some((c, hi - lo, rng.dir() * 1.5, rng.dir().as_dvec3() * (req.spin * rng.range(0.6, 1.3)) as f64, rng.f()))
+        } else {
+            None
+        };
+        let mut first = true;
+        for (i, local, tears, c, lo, hi, _) in picked {
+            let p = &pieces[i];
+            let (origin, ext, jitter, omega, seed) = whole.unwrap_or_else(|| (c, hi - lo, rng.dir() * 1.5, rng.dir().as_dvec3() * (req.spin * rng.range(0.6, 1.3)) as f64, rng.f()));
             let wpos = pos + rot * origin.as_dvec3();
-            let kick = rot * (req.kick + rng.dir() * 1.5).as_dvec3();
+            let kick = rot * (req.kick + jitter).as_dvec3();
+            let jag = [tears[0].jag, tears[1].jag].into_iter().fold(0.0f32, f32::max);
             self.items.push(Shed {
                 mesh: piece_mesh[i],
-                local: pose[i],
+                local,
                 origin,
                 pos: wpos,
                 vel: vel * 0.97 + kick,
                 rot,
-                omega: rng.dir().as_dvec3() * (req.spin * rng.range(0.6, 1.3)) as f64,
-                tear: req.tear,
-                cut: piece_cut[i] || req.tear.is_some(),
+                omega,
+                tear: tears,
+                jag: if jag > 0.0 { jag } else { JAG },
+                cut: piece_cut[i] || tears.iter().any(|t| t.is_some()),
                 radius: (ext.max_element() * 0.5).clamp(0.1, 3.0) as f64,
                 span: ext.max_element(),
                 scuff: dmg.scuff[p.group].max(0.4),
-                seed: rng.f(),
+                seed,
                 age: 0.0,
                 bounces: 0,
                 resting: false,
@@ -471,8 +679,8 @@ impl Sheds {
                 params,
                 cast: 0b11,
                 cut: s.cut,
-                tear: [s.tear.gpu(), [0.0; 4]],
-                dmg: [s.tear.mode, 0.0, s.scuff, JAG],
+                tear: [s.tear[0].gpu(), s.tear[1].gpu()],
+                dmg: [s.tear[0].mode, s.tear[1].mode, s.scuff, s.jag],
                 ..DrawObj::DEFAULT
             });
         }

@@ -34,6 +34,20 @@ struct Globals {
   storm: vec4f,      // xyz direction the wind aloft blows towards (planet frame), w number of storm cells
   storm_cells: array<vec4f, 32>, // per cell: centre (km on the sphere, cloud space) + tower radius (km); maturity
   det: array<vec4f, 16>, // ground material layers: m per repeat, m of relief, scale of the second sample, photo contrast (0 = procedural)
+  photo_vp: mat4x4f, // photorealistic 3D tiles: camera-relative to coverage mask
+  photo: vec4f,      // zone radius (m, 0 = off), dissolve band (m), mask valid
+  photo_c: vec4f,    // zone centre on the ground, relative to the camera
+  photo_sun: vec4f,  // the sun the photographs were taken under, w how sure (-1 = light them flat)
+  // Destroyed buildings cut out of the 3D tiles (tiles3d.rs, Cut), G.photo.w of
+  // them: floor middle (camera-relative) + radius; east axis + vertex count;
+  // north axis + first vertex. Their outlines, two vertices (east, north) a row.
+  cut: array<vec4f, 48>,
+  cut_v: array<vec4f, 128>,
+  // Cloud shadow map (render.rs CloudShadow, see cloud_sun): the one to look up, then
+  // the one being drawn. Each: centre direction + inner half size; east axis + outer
+  // half size; north axis + first layer; base and top of its bands, valid.
+  cs: array<vec4f, 8>,
+  alto: vec4f,       // mid-level cloud: amount 0..1, height (m)
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -53,6 +67,10 @@ struct Globals {
 @group(0) @binding(12) var t_dalb: texture_2d_array<f32>;
 @group(0) @binding(13) var t_dnrm: texture_2d_array<f32>;
 @group(0) @binding(14) var s_detail: sampler;
+// Where the photorealistic 3D tiles are drawn, seen from above (tiles3d.rs).
+@group(0) @binding(15) var t_photo: texture_2d<f32>;
+// Cloud shadow map, two cascades double-buffered (see cloud_sun).
+@group(0) @binding(16) var t_cshadow: texture_2d_array<f32>;
 
 // GPU particles (explosions, smoke, dust, spray) and their simulation constants.
 struct Particle {
@@ -180,7 +198,12 @@ fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32) -
     let ext = atm_ext(d);
     let sr = RAYLEIGH * d.x;
     let sm = MIE_S * d.y;
-    var S = sun_trans(h, mu) * (sr * pr + vec3f(sm * pm)) + ms_lut(h, mu) * (sr + vec3f(sm));
+    // Air in the shadow of a cloud gets no sunlight (light shafts through the gaps);
+    // under a closed deck the light that remains is the deck's dull grey.
+    let cl = cloud_sun(p);
+    var msl = ms_lut(h, mu);
+    msl = mix(msl, vec3f(luma(msl)), cl.closed * 0.75) * (1.0 - 0.45 * cl.closed);
+    var S = sun_trans(h, mu) * cl.vis * (sr * pr + vec3f(sm * pm)) + msl * (sr + vec3f(sm));
     if (moon_on) {
       let mum = dot(p / r, moon);
       S += (sun_trans(h, mum) * (sr * prm + vec3f(sm * pmm)) + ms_lut(h, mum) * (sr + vec3f(sm))) * mk;
@@ -227,14 +250,15 @@ const CIRRUS_H = 8800.0;
 // cb: storm cell strength in this column, 0 outside, 1 at the core of the tower.
 // sc: the storm cell nearest this column, xyz centre (km on the sphere, planet frame),
 // w radius of its tower (km, 0 = none); sm its maturity (young towers have no anvil).
-struct Weather { cov: f32, typ: f32, top: f32, cb: f32, sc: vec4f, sm: f32 };
+// cell: stratocumulus cell pattern, 1 at the heart of a cell, low between cells.
+struct Weather { cov: f32, typ: f32, top: f32, cb: f32, sc: vec4f, sm: f32, cell: f32 };
 
 // Storm cells (cumulonimbus) are picked on the CPU (Weather::storm_cells): a short
 // list, nearest first. mask selects which of them to consider (bit i = cell i);
 // the cloud march passes only those its ray can meet.
 const ALL_STORMS = 0xffffffffu;
 fn storm_find(q: vec3f, mask: u32) -> Weather {
-  var w = Weather(0.0, 0.0, 0.0, 0.0, vec4f(0.0), 0.0);
+  var w = Weather(0.0, 0.0, 0.0, 0.0, vec4f(0.0), 0.0, 0.0);
   let n = u32(G.storm.w);
   var best = -1.5;
   for (var i = 0u; i < n; i++) {
@@ -287,11 +311,11 @@ fn cloud_weather_m(pp: vec3f, mask: u32) -> Weather {
   let q = normalize(pp) * 6371.0;  // km on the sphere
   let w = G.weather.xyz * 0.001;
   let hb = max(length(pp) - G.planet.w - G.cloud.y, 0.0);
-  var st = Weather(0.0, 0.0, 0.0, 0.0, vec4f(0.0), 0.0);
+  var st = Weather(0.0, 0.0, 0.0, 0.0, vec4f(0.0), 0.0, 0.0);
   if (mask != 0u && G.storm.w > 0.0) { st = storm_find(q + w, mask); }
   let cb = storm_cb(pp, hb, st.sc, st.sm);
   // Above the ordinary layer only storm towers reach (light probes from here only go up).
-  if (hb >= G.cloud.z) { return Weather(0.0, 0.0, 0.0, cb, st.sc, st.sm); }
+  if (hb >= G.cloud.z) { return Weather(0.0, 0.0, 0.0, cb, st.sc, st.sm, 0.0); }
   let big = textureSampleLevel(t_noise, s_repeat, q / 1700.0 + vec3f(0.13, 0.71, 0.37), 0.0);
   let mid = textureSampleLevel(t_noise, s_repeat, (q + w) / 173.0, 0.0);
   let cell = textureSampleLevel(t_noise, s_repeat, (q + w) / 29.0 + vec3f(0.53, 0.21, 0.87), 0.0);
@@ -299,12 +323,18 @@ fn cloud_weather_m(pp: vec3f, mask: u32) -> Weather {
   let c = G.cloud.x + (big.r - 0.5) * 0.4 + (mid.r - 0.5) * 0.45 + (cell.g - 0.62) * 0.2;
   let cov = clamp(c, 0.0, 1.0);
   // Broken skies grow cumulus; as it closes in the cloud flattens into stratocumulus, then stratus.
-  let typ = clamp(1.0 - smoothstep(0.78, 1.02, cov) + (big.g - 0.62) * 0.6, 0.0, 1.0);
+  let typ = clamp(1.0 - smoothstep(0.68, 0.98, cov) + (big.g - 0.62) * 0.6, 0.0, 1.0);
   // How tall the cumulus in this area grow: mostly fair-weather puffs, some towers.
-  let tower = smoothstep(0.25, 0.95, cov * 0.75 + cell.r * 0.55 - 0.1);
-  let cu_top = 0.22 + 0.78 * tower * tower;
+  // Towers need broken sky around them; a closed deck caps the convection (storm
+  // cells are separate and still punch through).
+  let tower = smoothstep(0.25, 0.95, cov * 0.75 + cell.r * 0.55 - 0.1) * (1.0 - 0.75 * smoothstep(0.7, 0.92, cov));
+  let cu_top = 0.28 + 0.72 * tower * tower;
   let top = mix(mix(0.1, 0.22, smoothstep(0.0, 0.5, typ)), cu_top, smoothstep(0.4, 1.0, typ));
-  return Weather(cov, typ, top, cb, st.sc, st.sm);
+  // Stratocumulus decks are a mosaic of cells 1-2 km across (Worley, columnar so each
+  // cell is one lump). Looked up per column, so light probes reuse it.
+  var cellv = 0.0;
+  if (typ < 0.9) { cellv = textureSampleLevel(t_noise, s_repeat, (pp + G.weather.xyz - normalize(pp) * (hb * 0.85)) / 16000.0 + vec3f(0.41, 0.77, 0.19), 0.0).g; }
+  return Weather(cov, typ, top, cb, st.sc, st.sm, cellv);
 }
 // How high a storm cell grows, as a share of base..ceiling: young towers stop short.
 fn storm_top(sm: f32) -> f32 { return mix(0.3, 1.0, smoothstep(0.0, 0.55, sm)); }
@@ -342,18 +372,29 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
   let far = smoothstep(40000.0, 400000.0, G.up.w);
   let smooth_d = wx.cov * wx.cov * 0.5 * smoothstep(0.0, 0.2, hn) * smoothstep(1.0, 0.6, hn);
   if (far >= 1.0) { return smooth_d; }
-  let n = textureSampleLevel(t_noise, s_repeat, (pp + wind) / CLOUD_SHAPE, 0.0);
+  // For cumulus the base shape is stretched upwards (half the vertical frequency), so a
+  // puff keeps its footprint as it climbs and grows into a tower instead of leaning
+  // off into a flat smear.
+  let n = textureSampleLevel(t_noise, s_repeat, (pp + wind - normalize(pp) * (hb * 0.5 * wx.typ)) / CLOUD_SHAPE, 0.0);
   let fbm = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
   let base = remap(n.r, fbm - 1.0, 1.0, 0.0, 1.0);
   var d = 0.0;
   if (cumulus) {
     // Flat, sharp bases (sharper for cumulus); tops that round off into domes as only
     // the strongest cores reach them. Stratus stays a slab with a soft top.
-    let bottom = smoothstep(0.0, mix(260.0, 70.0, wx.typ), hb);
-    let dome = 1.0 - pow(hn, mix(3.0, 1.35, wx.typ));
-    let prof = bottom * mix(smoothstep(1.0, 0.55, hn), dome, wx.typ);
+    // The profile scales the coverage, so the threshold rises with height: only the
+    // strongest cores reach the column top and every puff keeps a crisp, dense edge
+    // all the way up (scaling the density instead stopped them at half height).
+    // Stratocumulus: each cell of the deck is thickest (darkest from below) in the
+    // middle and thins towards its edges, where gaps open as the cover drops.
+    let stw = 1.0 - smoothstep(0.45, 0.9, wx.typ);
+    let tl = mix(1.0, mix(0.55, 1.0, smoothstep(0.25, 0.8, wx.cell)), stw);
+    let bv = mix(base, base * 0.5 + wx.cell * 0.55 + 0.05, stw);
+    let bottom = smoothstep(0.0, mix(150.0, 70.0, wx.typ), hb);
+    let dome = 1.0 - pow(hn, mix(3.0, 1.6, wx.typ));
+    let prof = bottom * mix(smoothstep(tl, tl * 0.7, hn), dome, wx.typ);
     let cv = mix(min(wx.cov * 1.15, 1.0), wx.cov, wx.typ);
-    d = remap(base * prof, 1.0 - cv, 1.0, 0.0, 1.0);
+    d = remap(bv, min(1.0 - cv * prof, 0.999), 1.0, 0.0, 1.0);
   }
   // Storm cell: a fat tower of stacked billows that narrows a little with height,
   // overshoots above the anvil at its core, and spreads into a flat-topped anvil
@@ -386,13 +427,13 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // Worley is brightest at cell centres. Eroding by its inverse keeps round
     // bulges (cauliflower billows); eroding by it directly leaves ragged, wispy
     // strands, which suits the undersides and the anvil's fibrous ice.
-    let low = select(1.0 - smoothstep(0.03, 0.25, hn), 1.0 - smoothstep(80.0, 600.0, hb), storm);
+    let low = select(1.0 - smoothstep(0.02, 0.13, hn), 1.0 - smoothstep(80.0, 600.0, hb), storm);
     let wisp = max(low, anvil);
     let ed = mix(1.0 - ef, ef, wisp);
     d = remap(d, ed * mix(0.5, 0.62, wx.typ) * mix(1.0, 0.35, anvil), 1.0, 0.0, 1.0);
   }
   // Real cloud edges are abrupt: a few tens of metres from clear air to dense.
-  d = smoothstep(0.0, 0.3, d) * mix(0.55, 1.0, max(wx.typ, min(cb * 4.0, 1.0)));
+  d = smoothstep(0.0, mix(0.22, 0.16, wx.typ), d) * mix(0.55, 1.0, max(wx.typ, min(cb * 4.0, 1.0)));
   return mix(d, smooth_d, far);
 }
 fn cloud_shape(pp: vec3f, h: f32, wx: Weather, detail: bool) -> f32 { return cloud_shape_f(pp, h, wx, detail, 0.0); }
@@ -400,18 +441,51 @@ fn cloud_density(pp: vec3f, h: f32, cheap: bool) -> f32 {
   if (h <= G.cloud.y || h >= G.cloud.w) { return 0.0; }
   return cloud_shape(pp, h, cloud_weather(pp), !cheap);
 }
-// Sun visibility through the cloud layer for a point below it.
-fn cloud_shadow(pp: vec3f, h: f32, mu: f32) -> f32 {
-  let h1 = G.cloud.y + 250.0;
-  if (h > h1 || mu < 0.02) { return 1.0; }
-  let s = 1.0 / max(mu, 0.12);
-  let q1 = pp + G.sun_dir.xyz * ((h1 - h) * s);
-  let wx = cloud_weather(q1);
-  let ct = column_top(wx);
-  let h2 = G.cloud.y + ct * 0.45;
-  let q2 = pp + G.sun_dir.xyz * ((h2 - h) * s);
-  let od = cloud_shape(q1, h1, wx, false) * 500.0 + cloud_shape(q2, h2, wx, false) * ct * 0.8;
-  return mix(1.0, exp(-od * 0.012 * s), 0.9);
+// Sunlight through the clouds at a point (planet-centred), from the cloud shadow map.
+// Its texels are rays along the sun from points on the cloud base, so any point
+// below or inside the layer finds its ray by sliding along the sun to the base.
+// Each holds the optical depth of cloud from the base up to 1/9, 4/9 and all of
+// the way (base..top, bands squeezed towards the base where the cumulus are), and
+// in w how closed the deck is there (1 = overcast).
+// vis: the share of direct sunlight left (with the forward-scattered glow that
+// thinner cloud lets through); closed: the deck overhead, for points under it.
+struct CloudSun { vis: f32, closed: f32 };
+fn cloud_sun(pc: vec3f) -> CloudSun {
+  var o = CloudSun(1.0, 0.0);
+  let base = G.cs[3].x;
+  let top = G.cs[3].y;
+  let r = length(pc);
+  let h = r - G.planet.w;
+  if (G.cs[3].z < 0.5 || h >= top) { return o; }
+  let sun = G.sun_dir.xyz;
+  let mu = dot(pc / r, sun);
+  let R = G.planet.w + base;
+  // Exactly along the sun (a low sun's rays cross the base tens of km away): forward
+  // to the base from below it, back down to it from inside the layer.
+  var ts = ray_sphere(pc, sun, R).y;
+  if (h >= base) {
+    let s = ray_sphere(pc, -sun, R);
+    ts = select((base - h) / max(mu, 0.04), -s.x, s.x > 0.0);
+  }
+  let qn = normalize(pc + sun * ts);
+  let loc = vec2f(dot(qn, G.cs[1].xyz), dot(qn, G.cs[2].xyz)) / max(dot(qn, G.cs[0].xyz), 0.5) * R;
+  let L = i32(G.cs[2].w);
+  let ui = loc / G.cs[0].w * 0.5 + 0.5;
+  let uo = loc / G.cs[1].w * 0.5 + 0.5;
+  let ei = max(abs(ui.x - 0.5), abs(ui.y - 0.5)) * 2.0;
+  let eo = max(abs(uo.x - 0.5), abs(uo.y - 0.5)) * 2.0;
+  if (eo >= 1.0) { return o; }
+  var v = textureSampleLevel(t_cshadow, s_clamp, uo, L + 1, 0.0);
+  if (ei < 1.0) { v = mix(textureSampleLevel(t_cshadow, s_clamp, ui, L, 0.0), v, smoothstep(0.8, 0.98, ei)); }
+  // Optical depth still above this point.
+  let f = sqrt(clamp((h - base) / (top - base), 0.0, 1.0)) * 3.0;
+  let below = select(select(mix(v.y, v.z, f - 2.0), mix(v.x, v.y, f - 1.0), f < 2.0), v.x * f, f < 1.0);
+  let od = max(v.z - below, 0.0);
+  let fade = smoothstep(0.85, 1.0, eo);
+  let t = exp(-od);
+  o.vis = mix(t + (1.0 - t) * 0.22 / (1.0 + 0.12 * od), 1.0, fade);
+  o.closed = v.w * (1.0 - fade) * (1.0 - smoothstep(base, base + 600.0, h));
+  return o;
 }
 // High cirrus: a thin streaky sheet at CIRRUS_H. Returns optical thickness.
 fn cirrus(pp: vec3f) -> f32 {
@@ -699,6 +773,80 @@ fn lamp_pool(across: f32, along: f32, half: f32, kind: u32) -> f32 {
 }
 const LAMP_COL = vec3f(1.0, 0.72, 0.40);
 // 1 once it is dark enough for the lights to be on.
+// ------------------------------------------------------------ 3D tiles zone
+// Inside the zone of photorealistic 3D tiles our own ground, buildings, trees
+// and cars give way to the mesh wherever it has been drawn into the coverage
+// mask. Across the band at the edge of the zone the two are dithered into
+// each other pixel by pixel, the same way on both sides (TAA smooths it).
+fn photo_fade(P: vec3f) -> f32 {
+  let q = P - G.photo_c.xyz;
+  let up = normalize(G.photo_c.xyz - G.planet.xyz);
+  let d = length(q - up * dot(q, up));
+  return smoothstep(G.photo.x - G.photo.y, G.photo.x, d);
+}
+// The mesh is drawn at this pixel (P on it).
+fn photo_keep(P: vec3f, px: vec2f) -> bool {
+  return ign(px + 5.588238 * (G.time.w % 64.0)) >= photo_fade(P);
+}
+// The mask at P: r = the mesh is there, g = height of our water surface
+// there (far below everything where there is none).
+fn photo_mask(P: vec3f) -> vec2f {
+  let q = G.photo_vp * vec4f(P, 1.0);
+  let uv = q.xy * vec2f(0.5, -0.5) + 0.5;
+  if (any(uv <= vec2f(0.0)) || any(uv >= vec2f(1.0))) { return vec2f(0.0, -1e4); }
+  return textureSampleLevel(t_photo, s_clamp, uv, 0.0).rg;
+}
+fn photo_covered(P: vec3f) -> bool {
+  if (G.photo.z <= 0.0) { return false; }
+  return photo_mask(P).r > 0.5;
+}
+// Height above the planet of a camera-relative point, good to a few cm
+// within tens of km (a straight length() loses half a metre in f32).
+fn height_of(P: vec3f) -> f32 {
+  let v = dot(P, G.up.xyz);
+  return G.up.w + v + (dot(P, P) - v * v) / (2.0 * G.planet.w);
+}
+// Whether P lies inside a destroyed building's outline (and, with `floor`,
+// above its floor): the mesh is not drawn there and our own scenery is.
+fn cut_vert(k: u32) -> vec2f {
+  let r = G.cut_v[k / 2u];
+  return select(r.xy, r.zw, (k & 1u) == 1u);
+}
+fn photo_cut_at(P: vec3f, floor: bool) -> bool {
+  let n = u32(G.photo.w);
+  for (var i = 0u; i < n; i++) {
+    let h0 = G.cut[i * 3u];
+    let d = P - h0.xyz;
+    let e = G.cut[i * 3u + 1u];
+    let nn = G.cut[i * 3u + 2u];
+    let q = vec2f(dot(d, e.xyz), dot(d, nn.xyz));
+    if (dot(q, q) > h0.w * h0.w) { continue; }
+    if (floor && dot(d, cross(e.xyz, nn.xyz)) < 0.0) { continue; }
+    let first = u32(nn.w);
+    let count = u32(e.w);
+    var c = false;
+    var pj = cut_vert(first + count - 1u);
+    for (var k = 0u; k < count; k++) {
+      let pk = cut_vert(first + k);
+      if ((pk.y > q.y) != (pj.y > q.y) && q.x < (pj.x - pk.x) * (q.y - pk.y) / (pj.y - pk.y) + pk.x) { c = !c; }
+      pj = pk;
+    }
+    if (c) { return true; }
+  }
+  return false;
+}
+fn photo_cut(P: vec3f) -> bool { return photo_cut_at(P, true); }
+// Our own scenery at P stands under the mesh, so casts no shadow (the mesh
+// casts its own): the shadow passes see the coverage mask; the band at the
+// edge of the zone switches over in its middle.
+fn photo_shadow_gone(P: vec3f) -> bool {
+  return G.photo.z > 0.0 && photo_fade(P) < 0.5 && photo_mask(P).r > 0.5 && !photo_cut_at(P, false);
+}
+// Our own scenery at P (pixel px) is hidden by the mesh.
+fn photo_hides(P: vec3f, px: vec2f) -> bool {
+  return photo_covered(P) && photo_keep(P, px) && !photo_cut_at(P, false);
+}
+
 fn night_at(upn: vec3f) -> f32 { return 1.0 - smoothstep(-0.08, 0.1, dot(upn, G.sun_dir.xyz)); }
 // Moonlight arriving at a point (dimmed by the atmosphere near the horizon and
 // by the cloud deck as a whole).
@@ -741,7 +889,7 @@ fn light_at_nv(P: vec3f) -> Light {
   let upn = pp / r;
   let h = r - G.planet.w;
   let mu = dot(upn, G.sun_dir.xyz);
-  let sun = sun_trans(h, mu) * G.sun_dir.w * cloud_shadow(pp, h, mu);
+  let sun = sun_trans(h, mu) * G.sun_dir.w * cloud_sun(pp).vis;
   // Skylight falls off steeply once the sun is down: about half a decade per
   // 3 degrees of twilight (the exp term), so a street at blue hour is far
   // darker than the glowing sky above it rather than as bright as overcast day.

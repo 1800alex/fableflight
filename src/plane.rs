@@ -1,6 +1,9 @@
 //! The aircraft's systems and a six-degree-of-freedom flight model for a
-//! 200 hp retractable single (about a Mooney M20J: 1300 kg, 16 m² of wing):
-//! a constant-speed propeller whose thrust falls off with speed and altitude,
+//! Cessna 172-class four-seater (180 hp, about 1100 kg, 16.2 m² of
+//! strut-braced wing; this one has retractable gear, worth a few knots):
+//! a fixed-pitch propeller whose revs and thrust follow the airspeed, the
+//! engine losing power with altitude in a standard atmosphere, the
+//! airspeed indicator reading indicated (not true) airspeed,
 //! propeller torque and slipstream, adverse yaw, stall buffet and wing drop,
 //! ground effect, and the turbulence the weather stirs up.
 //! The model itself is built in `airframe.rs`; `pose` animates its pieces;
@@ -52,9 +55,13 @@ pub struct Plane {
     rot_b: DVec3,
     /// the pilot's head swaying on its neck as the airframe is shaken (body frame, m)
     pub head: DVec3,
+    /// specific force (what an accelerometer reads: everything but gravity), body frame, m/s²
+    pub sf: DVec3,
     head_v: DVec3,
-    /// engine power actually being made, 0..1 of rated (lags the throttle)
+    /// shaft power being made, as a fraction of rated
     pub power: f64,
+    /// how far open the throttle effectively is (the engine takes a moment to answer it)
+    charge: f64,
     /// which wing a stall would rather drop (slowly wandering, -1..1)
     drop: f64,
     pub rot: DQuat,
@@ -101,18 +108,94 @@ pub struct Plane {
     near_trees: Vec<TreeRef>,
     scan: u32,
     rng: Rng,
+    /// held where it is (waiting on the ground for the terrain under it to load)
+    pub hold: bool,
+    /// where it is splashing through water: position, velocity of the spray
+    pub splashes: Vec<(DVec3, DVec3)>,
+    /// where something is ploughing or rolling through the ground: position,
+    /// velocity the dirt is thrown at, how much (wheel ~1, airframe more)
+    pub dirt: Vec<(DVec3, DVec3, f32)>,
+    /// resting or sliding on the airframe itself rather than the wheels
+    pub on_hull: bool,
+    /// contact points (reused each step)
+    pts: Vec<(DVec3, Part)>,
+    /// moments since the left wing, right wing, tail and nose last broke
+    /// something (so one blow is one break, not one per step)
+    cool: [f64; 4],
+    /// torque the ground puts on each hanging wing this step
+    fold_tq: [f64; 2],
+    /// how far a ditched aircraft has settled into the water
+    sink: f64,
+    /// what made it go up in flames, once it has
+    pub cause: &'static str,
 }
 
-const MASS: f64 = 1300.0;
-/// Rated power at sea level (200 hp) and the propeller's static thrust at full power.
-const POWER: f64 = 149_000.0;
-const STATIC_THRUST: f64 = 3200.0;
-/// Propeller efficiency in the cruise.
-const PROP_ETA: f64 = 0.82;
+/// What a contact point belongs to (see `Plane::contacts`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Part {
+    /// spinner and cowling
+    Nose,
+    /// the propeller's tips
+    Prop,
+    Belly,
+    /// the cabin's sides
+    Side,
+    /// over the cabin and behind the wing
+    Roof,
+    /// the tail cone
+    Tail,
+    Fin,
+    Stab(usize),
+    /// a wing (side) at a span station
+    Wing(usize, f32),
+    /// a wing that is hanging from its stump
+    Fold(usize),
+}
+
+impl Part {
+    fn group(self) -> usize {
+        match self {
+            Part::Nose | Part::Prop => G_ENGINE,
+            Part::Wing(0, _) | Part::Fold(0) => G_LWING,
+            Part::Wing(..) | Part::Fold(_) => G_RWING,
+            Part::Tail | Part::Fin | Part::Stab(_) => G_TAIL,
+            _ => airframe::G_FUSE,
+        }
+    }
+}
+
+/// Two aboard and most of the fuel (maximum takeoff weight is 1157 kg).
+const MASS: f64 = 1100.0;
+/// Rated power at sea level: 180 hp at 2700 rpm.
+const POWER: f64 = 134_000.0;
+const W_RATED: f64 = 2700.0 * std::f64::consts::TAU / 60.0;
+/// Fixed-pitch propeller, 76 in: diameter (m), thrust and power coefficients
+/// at rest, and the advance ratios J = V / nD at which the thrust and then
+/// the power it takes run out (past the second it windmills, driving the engine).
+const PROP_D: f64 = 1.93;
+const CT0: f64 = 0.096;
+const CP0: f64 = 0.059;
+const J_T: f64 = 1.05;
+const J_P: f64 = 1.5;
+/// Propeller, crankshaft and flywheel (kg m²).
+const PROP_I: f64 = 3.0;
+/// About the static thrust at full power (the scale for torque and slipstream effects).
+const STATIC_THRUST: f64 = 2500.0;
+/// Sea-level air density (kg/m³).
+pub const RHO0: f64 = 1.225;
 /// Wing span (m).
 const B: f64 = 11.0;
-const WING_AREA: f64 = 16.0;
-const INERTIA: DVec3 = DVec3::new(1900.0, 2800.0, 1400.0);
+const WING_AREA: f64 = 16.2;
+/// Lift: at zero angle of attack, and the slope per radian (aspect ratio 7.5).
+const CL0: f64 = 0.25;
+const CL_A: f64 = 5.0;
+/// Drag: the clean airframe with its struts, steps and cooling (gear up), the
+/// induced-drag factor, and what the lowered gear adds.
+const CD0: f64 = 0.034;
+const K_IND: f64 = 0.055;
+const CD_GEAR: f64 = 0.009;
+/// Pitch, yaw, roll (kg m², published figures for a 172).
+const INERTIA: DVec3 = DVec3::new(1825.0, 2667.0, 1285.0);
 /// Tyre contact points: nose, left main, right main (see airframe.rs).
 const GEAR: [DVec3; 3] = [DVec3::new(0.0, -1.50, -2.87), DVec3::new(-1.25, -1.50, 0.30), DVec3::new(1.25, -1.50, 0.30)];
 const WHEEL_R: [f64; 3] = [airframe::NOSE_R as f64, airframe::MAIN_R as f64, airframe::MAIN_R as f64];
@@ -128,11 +211,12 @@ pub const HARD: [DVec3; 7] = [
 ];
 const FLAP_RATE: f64 = 1.0 / 7.0;
 const GEAR_RATE: f64 = 1.0 / 6.0;
-/// Never-exceed speed (m/s); beyond it the control surfaces start to flutter.
-pub const VNE: f64 = 95.0;
-const FLUTTER_V: f64 = 108.0;
-/// Flaps must not be out above this.
-pub const VFE: f64 = 60.0;
+/// Never-exceed speed (m/s indicated, 163 kt); beyond it the control surfaces start to flutter.
+pub const VNE: f64 = 83.9;
+const FLUTTER_V: f64 = 95.0;
+/// Flaps must not be out above these (indicated): 110 kt for the first notch, 85 kt beyond.
+pub const VFE_10: f64 = 56.6;
+pub const VFE: f64 = 43.7;
 
 impl Plane {
     pub fn spawn(lat: f64, lon: f64, alt: f64, heading: f64, speed: f64) -> Self {
@@ -141,8 +225,12 @@ impl Plane {
         let f = n * heading.cos() + e * heading.sin();
         // Nose up by the angle of attack that carries the weight at this speed
         // and height, and trimmed there, so it starts out in level flight.
-        let q = 0.5 * 1.225 * (-alt.max(0.0) / 8500.0).exp() * speed * speed;
-        let trim = ((MASS * 9.81 / (q * WING_AREA).max(1.0) - 0.25) / 5.0).clamp(-0.05, 0.24);
+        let rho = density(alt);
+        let trim = Self::alpha_level(speed, rho, 0.0);
+        // Power for level flight too, and the propeller already turning at the
+        // revs that power makes, or it starts out climbing or sinking.
+        let throttle = if speed > 20.0 { Self::level_throttle(speed, rho, 0.0, 0.0) } else { 0.0 };
+        let prop_rate = Self::prop_equilibrium(throttle, speed, rho);
         let rot = DQuat::from_mat3(&DMat3::from_cols(f.cross(u), u, -f)) * DQuat::from_rotation_x(trim);
         Self {
             pos,
@@ -156,13 +244,14 @@ impl Plane {
             rot_a: DVec3::ZERO,
             rot_b: DVec3::ZERO,
             head: DVec3::ZERO,
+            sf: DVec3::new(0.0, 9.81, 0.0),
             head_v: DVec3::ZERO,
-            power: 0.72,
+            power: 0.7,
+            charge: throttle,
             drop: 0.0,
             rot,
             omega: DVec3::ZERO,
-            // About cruise power for the spawn speed.
-            throttle: 0.72,
+            throttle,
             prop: 0.0,
             on_ground: false,
             stalled: false,
@@ -177,7 +266,7 @@ impl Plane {
             compress: [0.0; 3],
             wheel_rot: [0.0; 3],
             wheel_spin: [0.0; 3],
-            prop_rate: 0.0,
+            prop_rate,
             trim,
             tree_hits: Vec::new(),
             brushes: 0.0,
@@ -186,11 +275,40 @@ impl Plane {
             shed: Vec::new(),
             notes: Vec::new(),
             sparks: Vec::new(),
+            dirt: Vec::new(),
             t: 0.0,
             near_trees: Vec::new(),
             scan: 0,
             rng: Rng(pos.x.to_bits() | 1),
+            hold: false,
+            splashes: Vec::new(),
+            on_hull: false,
+            pts: Vec::new(),
+            cool: [0.0; 4],
+            fold_tq: [0.0; 2],
+            sink: 0.0,
+            cause: "",
         }
+    }
+
+    /// Standing on its wheels, engine idling, brakes off: ready to taxi.
+    /// `h` is the ground height under it. It is held still until released.
+    pub fn spawn_ground(lat: f64, lon: f64, h: f64, heading: f64, pitch: f64) -> Self {
+        let mut p = Self::spawn(lat, lon, h - GEAR[0].y, heading, 0.0);
+        let (e, n, u) = geo::enu(p.pos);
+        let f = n * heading.cos() + e * heading.sin();
+        p.rot = DQuat::from_mat3(&DMat3::from_cols(f.cross(u), u, -f)) * DQuat::from_rotation_x(pitch);
+        p.vel = DVec3::ZERO;
+        p.gear = 1.0;
+        p.gear_down = true;
+        p.throttle = 0.0;
+        p.charge = 0.0;
+        p.power = 0.0;
+        p.prop_rate = 65.0;
+        p.trim = 0.08;
+        p.on_ground = true;
+        p.hold = true;
+        p
     }
     pub fn forward(&self) -> DVec3 {
         self.rot * DVec3::NEG_Z
@@ -222,6 +340,41 @@ impl Plane {
     pub fn set_flaps(&mut self, delta: i32) {
         self.flap_set = (self.flap_set as i32 + delta).clamp(0, 3) as u8;
     }
+    /// The highest speed (indicated) the flaps may be out at as they are now.
+    pub fn vfe(&self) -> f64 {
+        if self.flaps <= 0.34 { VFE_10 } else { VFE }
+    }
+    /// Indicated airspeed (m/s): what the pitot tube feels, true airspeed scaled
+    /// by the square root of the density. It is what the wing flies by: the
+    /// aircraft stalls, and its limits are set, at the same indicated speed at any height.
+    pub fn ias(&self) -> f64 {
+        let (_, _, h) = geo::pos_to_lla(self.pos);
+        self.airspeed().length() * (density(h) / RHO0).sqrt()
+    }
+    /// Start out with the flaps at `notch` and the gear as given, re-trimmed
+    /// for the airspeed it has (to fly level, or on a glide of `descent` m/s),
+    /// the power set to match.
+    pub fn configure(&mut self, notch: u8, gear_down: bool, descent: f64) {
+        self.flap_set = notch.min(3);
+        self.flaps = self.flap_set as f64 / 3.0;
+        self.gear_down = gear_down;
+        self.gear = if gear_down { 1.0 } else { 0.0 };
+        let (_, _, h) = geo::pos_to_lla(self.pos);
+        let rho = density(h);
+        let v = self.airspeed().length();
+        let flap_cl = 0.55 * self.flaps;
+        let a_old = self.trim;
+        self.trim = Self::alpha_level(v, rho, flap_cl);
+        // Pitch the nose to the new angle of attack and the flight path down the glide.
+        let up = self.pos.normalize();
+        let fp = (self.airspeed() - up * descent).normalize();
+        self.vel = self.wind + fp * v;
+        let right = self.right();
+        self.rot = DQuat::from_axis_angle(right, self.trim - a_old - (descent / v).asin()) * self.rot;
+        self.throttle = Self::throttle_for(v, rho, self.flaps, self.gear, descent);
+        self.charge = self.throttle;
+        self.prop_rate = Self::prop_equilibrium(self.throttle, v, rho);
+    }
 
     /// Where every piece of the model is, relative to the body, this instant.
     pub fn pose(&self, pieces: &[Piece]) -> Vec<Mat4> {
@@ -237,7 +390,7 @@ impl Plane {
         let comp = self.compress.map(|c| c as f32);
         let t = self.t as f32;
         // Past the never-exceed speed the control surfaces buzz on their hinges.
-        let fl = smooth01(100.0, 125.0, self.vel.length() as f32) * 0.12;
+        let fl = smooth01((VNE + 5.0) as f32, (VNE + 30.0) as f32, self.ias() as f32) * 0.12;
         let d = &self.dmg;
         // Torque link angles for a given oleo compression.
         let link = |c: f32, upper: bool| -> f32 {
@@ -321,23 +474,116 @@ impl Plane {
 
     /// The wing on `side` (0 left) breaks off outboard of span `station`.
     fn break_wing(&mut self, side: usize, station: f32, why: &str) {
+        self.snap_wing(side, station, 0.5, 0.0, true, why);
+    }
+    /// The wing on `side` breaks near span `station`, and how is left to the
+    /// break: `rough` 0 is a clean shear (an edge struck hard), 1 skin torn
+    /// apart, slanting across the chord and through the thickness; `fold` is
+    /// the chance it buckles and hangs on by its skin rather than letting go
+    /// (bending `up` or down). Breaks further in leave the bits between as
+    /// pieces of their own.
+    fn snap_wing(&mut self, side: usize, station: f32, rough: f32, fold: f32, up: bool, why: &str) {
+        // A wing already hanging lets go before it breaks again.
+        if self.dmg.fold[side].on {
+            self.release_fold(side, "");
+        }
+        let station = station.max(0.3);
         if station >= self.dmg.wing[side] - 0.05 {
             return;
         }
         let sgn = if side == 0 { -1.0 } else { 1.0 };
-        let lost = self.dmg.wing[side] - station;
+        let r = &mut self.rng;
+        let tz = r.range(-1.0, 1.0) * (0.12 + 0.6 * rough);
+        let ty = r.range(-1.0, 1.0) * (0.04 + 0.22 * rough);
+        let jag = (0.04 + 0.26 * rough) * r.range(0.6, 1.25);
+        let folds = r.f() < fold;
+        let hold = r.range(500.0, 2600.0);
+        let prev = self.dmg.stump(side);
+        let tear = damage::wing_break(side, station, tz, ty, jag, &prev);
+        let tip = self.dmg.wing[side];
+        let lost = tip - station;
+        let tank = station < airframe::TANK[1] && tip >= airframe::TANK[1];
         self.dmg.wing[side] = station;
-        // The part that leaves: the far side of the break, with whatever flap
-        // or aileron was riding on it.
-        self.shed.push(ShedReq { sel: Sel::Group(Self::wing_group(side)), tear: Tear::new(Vec3::new(sgn, 0.0, 0.0), station, -1.0), kick: Vec3::new(sgn * 2.5, 1.5, 2.0), spin: 5.0 });
-        if station < airframe::AILERON[0] + 0.3 {
+        self.dmg.wing_tear[side] = tear;
+        self.scuff(Self::wing_group(side), 0.5);
+        // On the ground the blow itself does the shoving.
+        let (sg, lo) = (sgn as f64 * if self.on_hull || self.on_ground { 0.3 } else { 1.0 }, lost as f64);
+        if folds && lost > 0.7 {
+            self.dmg.fold[side] = damage::fold_at(side, station, tear, prev, tip, up, hold);
+            // Still attached: less of a shove than losing it.
+            self.kick(DVec3::new(0.15, -sg * 0.3 * lo, -sg * (0.4 + 0.4 * lo)));
+            self.note(format!("{} WING BUCKLED ({why})", Self::lr(side)));
+        } else {
+            // The part that leaves: the far side of the break, with whatever flap
+            // or aileron was riding on it, as one piece.
+            let mut req = ShedReq::new(Sel::GroupAll(Self::wing_group(side)), tear.flip(), Vec3::new(sgn * 2.5, 1.5, 2.0), 5.0);
+            req.tear2 = prev;
+            req.own2 = true;
+            req.rigid = true;
+            self.shed.push(req);
+            if station < airframe::AILERON[0] + 0.3 {
+                self.dmg.aileron[side] = 0.0;
+            }
+            // Shoved: it rolls toward the stump and yaws into the drag of the break.
+            self.kick(DVec3::new(0.3, -sg * 0.6 * lo, -sg * (0.8 + 0.9 * lo)));
+            self.note(format!("{} WING TORN OFF ({why})", Self::lr(side)));
+        }
+        if tank {
+            self.note(format!("{} FUEL TANK RUPTURED", Self::lr(side)));
+        }
+    }
+    /// A buckled wing lets go of the stump.
+    fn release_fold(&mut self, side: usize, why: &str) {
+        let f = self.dmg.fold[side];
+        if !f.on {
+            return;
+        }
+        self.dmg.fold[side].on = false;
+        let cm = f.mat().transform_point3(damage::wing_pt(side, (f.root + f.tip) * 0.5, 0.4, 0.0));
+        let swing = f.axis.cross(cm - f.pivot) * f.rate;
+        let mut req = ShedReq::new(Sel::GroupAll(Self::wing_group(side)), f.tear.flip(), swing + Vec3::new(0.0, 0.5, 1.5), 2.0 + f.rate.abs());
+        req.tear2 = f.outer;
+        req.own2 = true;
+        req.rigid = true;
+        req.pre = f.mat();
+        self.shed.push(req);
+        if f.root < airframe::AILERON[0] + 0.3 {
             self.dmg.aileron[side] = 0.0;
         }
-        self.scuff(Self::wing_group(side), 0.5);
-        // Shoved: it rolls toward the stump and yaws into the drag of the break.
-        let (sg, lo) = (sgn as f64, lost as f64);
-        self.kick(DVec3::new(0.3, -sg * 0.6 * lo, -sg * (0.8 + 0.9 * lo)));
-        self.note(format!("{} WING TORN OFF ({why})", Self::lr(side)));
+        if !why.is_empty() {
+            self.note(format!("{} WING TORN AWAY ({why})", Self::lr(side)));
+        }
+    }
+    /// Let go of anything still hanging (the aircraft is about to go up in flames).
+    fn release_folds(&mut self) {
+        for s in 0..2 {
+            self.release_fold(s, "");
+        }
+    }
+    /// The tail breaks off through the tail cone, somewhere about `z`.
+    fn snap_tail(&mut self, z: f32, why: &str) {
+        if self.dmg.tail.is_some() {
+            return;
+        }
+        let r = &mut self.rng;
+        let tear = damage::tail_break(z, r.range(-0.35, 0.35), r.range(-0.45, 0.45), r.range(0.06, 0.24));
+        let mut req = ShedReq::new(Sel::Group(G_TAIL), tear.flip(), Vec3::new(r.range(-1.0, 1.0), 1.5, 3.0), 4.0);
+        req.rigid = true;
+        self.shed.push(req);
+        self.dmg.tail = tear;
+        self.dmg.stab = [0.0; 2];
+        self.dmg.elevator = [0.0; 2];
+        self.dmg.fin = 0.0;
+        self.dmg.rudder = 0.0;
+        self.dmg.hull = (self.dmg.hull + 0.2).min(1.0);
+        self.kick(DVec3::new(0.8, 0.0, 0.0));
+        self.note(format!("TAIL BROKEN OFF ({why})"));
+    }
+    /// Something hits hard enough to explode: anything still hanging off goes too.
+    fn impact(&mut self, imp: Impact, cause: &'static str) -> Option<Impact> {
+        self.cause = cause;
+        self.release_folds();
+        Some(imp)
     }
     fn lose_aileron(&mut self, side: usize, hanging: bool, why: &str) {
         if self.dmg.aileron[side] <= 0.0 || (hanging && self.dmg.aileron[side] < 1.0) {
@@ -350,7 +596,7 @@ impl Plane {
         }
         self.dmg.aileron[side] = 0.0;
         let name: &'static [&'static str] = if side == 0 { &["left aileron"] } else { &["right aileron"] };
-        self.shed.push(ShedReq { sel: Sel::Names(name), tear: Tear::NONE, kick: Vec3::new(0.0, 1.0, 3.0), spin: 9.0 });
+        self.shed.push(ShedReq::new(Sel::Names(name), Tear::NONE, Vec3::new(0.0, 1.0, 3.0), 9.0));
         self.note(format!("{} AILERON TORN OFF ({why})", Self::lr(side)));
     }
     fn lose_flap(&mut self, side: usize, why: &str) {
@@ -359,7 +605,7 @@ impl Plane {
         }
         self.dmg.flap[side] = 0.0;
         let name: &'static [&'static str] = if side == 0 { &["left flap"] } else { &["right flap"] };
-        self.shed.push(ShedReq { sel: Sel::Names(name), tear: Tear::NONE, kick: Vec3::new(0.0, -1.0, 4.0), spin: 8.0 });
+        self.shed.push(ShedReq::new(Sel::Names(name), Tear::NONE, Vec3::new(0.0, -1.0, 4.0), 8.0));
         self.kick(DVec3::new(0.0, 0.0, if side == 0 { -0.4 } else { 0.4 }));
         self.note(format!("{} FLAP TORN OFF ({why})", Self::lr(side)));
     }
@@ -368,13 +614,13 @@ impl Plane {
             self.dmg.stab[side] = 0.0;
             self.dmg.elevator[side] = 0.0;
             let sgn = if side == 0 { -1.0 } else { 1.0 };
-            self.shed.push(ShedReq { sel: Sel::Names(&["stabiliser", "elevator"]), tear: Tear::new(Vec3::new(sgn, 0.0, 0.0), 0.34, -1.0), kick: Vec3::new(sgn * 2.0, 0.5, 2.0), spin: 6.0 });
+            self.shed.push(ShedReq::new(Sel::Names(&["stabiliser", "elevator"]), Tear::new(Vec3::new(sgn, 0.0, 0.0), 0.34, -1.0), Vec3::new(sgn * 2.0, 0.5, 2.0), 6.0));
             self.kick(DVec3::new(-0.5, 0.0, sgn as f64 * 0.3));
             self.note(format!("{} STABILISER TORN OFF ({why})", Self::lr(side)));
         } else if self.dmg.elevator[side] > 0.5 {
             self.dmg.elevator[side] = 0.0;
             let sgn = if side == 0 { -1.0 } else { 1.0 };
-            self.shed.push(ShedReq { sel: Sel::Names(&["elevator"]), tear: Tear::new(Vec3::new(sgn, 0.0, 0.0), 0.12, -1.0), kick: Vec3::new(sgn, 1.0, 3.0), spin: 9.0 });
+            self.shed.push(ShedReq::new(Sel::Names(&["elevator"]), Tear::new(Vec3::new(sgn, 0.0, 0.0), 0.12, -1.0), Vec3::new(sgn, 1.0, 3.0), 9.0));
             self.note(format!("{} ELEVATOR TORN OFF ({why})", Self::lr(side)));
         }
     }
@@ -384,16 +630,16 @@ impl Plane {
         let fin = fin.min(self.dmg.fin);
         if rudder < self.dmg.rudder - 0.01 {
             if rudder <= 0.0 {
-                self.shed.push(ShedReq { sel: Sel::Names(&["rudder"]), tear: Tear::NONE, kick: Vec3::new(1.0, 1.0, 3.0), spin: 7.0 });
+                self.shed.push(ShedReq::new(Sel::Names(&["rudder"]), Tear::NONE, Vec3::new(1.0, 1.0, 3.0), 7.0));
                 self.note(format!("RUDDER TORN OFF ({why})"));
             } else {
-                self.shed.push(ShedReq { sel: Sel::Names(&["rudder"]), tear: Tear::new(Vec3::Y, 0.22 + 1.57 * rudder, -1.0), kick: Vec3::new(1.0, 1.5, 3.0), spin: 8.0 });
+                self.shed.push(ShedReq::new(Sel::Names(&["rudder"]), Tear::new(Vec3::Y, 0.22 + 1.57 * rudder, -1.0), Vec3::new(1.0, 1.5, 3.0), 8.0));
                 self.note(format!("RUDDER DAMAGED ({why})"));
             }
             self.dmg.rudder = rudder;
         }
         if fin < self.dmg.fin - 0.01 {
-            self.shed.push(ShedReq { sel: Sel::Names(&["stabiliser"]), tear: Tear::new(Vec3::Y, 0.27 + 1.53 * fin, -1.0), kick: Vec3::new(1.0, 2.0, 2.0), spin: 6.0 });
+            self.shed.push(ShedReq::new(Sel::Names(&["stabiliser"]), Tear::new(Vec3::Y, 0.27 + 1.53 * fin, -1.0), Vec3::new(1.0, 2.0, 2.0), 6.0));
             self.dmg.fin = fin;
             self.note(format!("FIN BROKEN ({why})"));
         }
@@ -406,7 +652,7 @@ impl Plane {
         let spinning = self.prop_rate > 40.0;
         if self.dmg.prop > 0.75 {
             self.dmg.prop = 0.5;
-            self.shed.push(ShedReq { sel: Sel::Names(&["blades"]), tear: Tear::new(Vec3::Y, airframe::PROP_HUB.y + 0.42, -1.0), kick: Vec3::new(2.0, 4.0, -3.0), spin: 30.0 });
+            self.shed.push(ShedReq::new(Sel::Names(&["blades"]), Tear::new(Vec3::Y, airframe::PROP_HUB.y + 0.42, -1.0), Vec3::new(2.0, 4.0, -3.0), 30.0));
             self.note(format!("PROPELLER BLADE BROKEN ({why})"));
         }
         if spinning && self.dmg.engine > 0.0 {
@@ -439,7 +685,7 @@ impl Plane {
             return;
         }
         self.dmg.gear[gi] = false;
-        self.shed.push(ShedReq { sel: Sel::Names(damage::GEAR_PIECES[gi]), tear: Tear::NONE, kick: Vec3::new(0.0, -1.0, 2.0), spin: 6.0 });
+        self.shed.push(ShedReq::new(Sel::Names(damage::GEAR_PIECES[gi]), Tear::NONE, Vec3::new(0.0, -1.0, 2.0), 6.0));
         self.note(format!("{} TORN OFF ({why})", ["NOSE GEAR", "LEFT MAIN GEAR", "RIGHT MAIN GEAR"][gi]));
     }
     /// Above the never-exceed speed something lets go: whatever is next.
@@ -466,20 +712,70 @@ impl Plane {
         self.vel - self.wind - self.gust
     }
 
-    /// Thrust (N) at a power fraction, airspeed and air density. The propeller
-    /// turns the engine's power into thrust at ~82% efficiency in the cruise;
-    /// slow, it cannot use all of it and the thrust levels off at its static value.
-    pub fn thrust(power: f64, v: f64, rho: f64, boost: bool) -> f64 {
-        // A normally aspirated engine loses power with the air (Gagg-Ferrar).
-        let sigma = rho / 1.225;
-        let p = POWER * ((sigma - 0.12) / 0.88).max(0.0) * power * if boost { 1.4 } else { 1.0 };
-        let t_static = STATIC_THRUST * sigma * power * if boost { 1.3 } else { 1.0 };
-        let t_power = PROP_ETA * p / v.max(1.0);
-        if t_static <= 0.0 || t_power <= 0.0 {
-            return 0.0;
+    /// The torque the engine's cylinders make (N m, before friction) with the
+    /// throttle `open` (0 at the idle stop .. 1). A normally aspirated engine
+    /// loses power with the air (Gagg-Ferrar); `boost` is the game's
+    /// over-boost, nothing a real 172 has.
+    fn engine_torque(open: f64, rho: f64, boost: bool, health: f64) -> f64 {
+        let sigma = rho / RHO0;
+        let alt = ((sigma - 0.12) / 0.88).max(0.0);
+        (POWER / W_RATED + Self::friction(W_RATED)) * alt * (0.11 + 0.89 * open.clamp(0.0, 1.0)) * health * if boost { 1.35 } else { 1.0 }
+    }
+    /// Friction and pumping losses (N m) at shaft speed `w` (rad/s).
+    fn friction(w: f64) -> f64 {
+        15.0 + 35.0 * (w / W_RATED).powi(2)
+    }
+    /// The fixed-pitch propeller turning at `w` rad/s with the air coming at
+    /// it at `v`: its thrust (N) and the torque it takes (N m; negative when
+    /// the air drives it round). `k` is what is left of the blades.
+    /// Ct = Ct0 (1 - (J/Jt)²), Cp = Cp0 (1 - (J/Jp)²), written in n² so a
+    /// stopped propeller needs no special case.
+    pub fn prop_load(w: f64, v: f64, rho: f64, k: f64) -> (f64, f64) {
+        let n = w / std::f64::consts::TAU;
+        let vd = v.max(0.0) / PROP_D;
+        let t = CT0 * rho * PROP_D.powi(4) * (n * n - (vd / J_T).powi(2));
+        let q = CP0 * rho * PROP_D.powi(5) / std::f64::consts::TAU * (n * n - (vd / J_P).powi(2));
+        // Windmilling, or stopped, it drags no worse than a flat plate the size of its blades.
+        let t = t.max(-0.28 * 0.5 * rho * v * v);
+        (t * k, q * k)
+    }
+    /// The revs (rad/s) an undamaged engine and propeller settle at.
+    pub fn prop_equilibrium(throttle: f64, v: f64, rho: f64) -> f64 {
+        let (mut lo, mut hi) = (0.0, 2.0 * W_RATED);
+        for _ in 0..50 {
+            let w = 0.5 * (lo + hi);
+            if Self::engine_torque(throttle, rho, false, 1.0) - Self::friction(w) > Self::prop_load(w, v, rho, 1.0).1 { lo = w } else { hi = w }
         }
-        // A smooth handover between the two limits.
-        (t_static.powi(-4) + t_power.powi(-4)).powf(-0.25)
+        0.5 * (lo + hi)
+    }
+    /// Thrust (N) once the revs have settled.
+    pub fn thrust(throttle: f64, v: f64, rho: f64) -> f64 {
+        Self::prop_load(Self::prop_equilibrium(throttle, v, rho), v, rho, 1.0).0
+    }
+    /// Angle of attack (rad) that carries the weight at true airspeed `v`.
+    fn alpha_level(v: f64, rho: f64, flap_cl: f64) -> f64 {
+        let q = 0.5 * rho * v * v;
+        ((MASS * 9.81 / (q * WING_AREA).max(1.0) - CL0 - flap_cl) / CL_A).clamp(-0.05, 0.24)
+    }
+    /// Drag (N) in steady flight at true airspeed `v`.
+    fn drag_level(v: f64, rho: f64, flaps: f64, gear: f64) -> f64 {
+        let qs = 0.5 * rho * v * v * WING_AREA;
+        let cl = MASS * 9.81 / qs.max(1.0);
+        qs * (CD0 + K_IND * cl * cl + 0.02 * flaps + 0.06 * flaps * flaps + CD_GEAR * gear)
+    }
+    /// Throttle to fly level at `v`.
+    fn level_throttle(v: f64, rho: f64, flaps: f64, gear: f64) -> f64 {
+        Self::throttle_for(v, rho, flaps, gear, 0.0)
+    }
+    /// Throttle to hold `v` while coming down at `descent` m/s.
+    fn throttle_for(v: f64, rho: f64, flaps: f64, gear: f64, descent: f64) -> f64 {
+        let need = Self::drag_level(v, rho, flaps, gear) - MASS * 9.81 * (descent / v.max(1.0));
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..30 {
+            let t = 0.5 * (lo + hi);
+            if Self::thrust(t, v, rho) < need { lo = t } else { hi = t }
+        }
+        0.5 * (lo + hi)
     }
 
     /// Gaussian noise, unit variance (sum of three uniforms: close enough, and cheap).
@@ -526,10 +822,99 @@ impl Plane {
     }
 
     /// Advance one physics step. Returns an impact if the aircraft was destroyed.
+    /// Points on the airframe that meet the ground (body frame), as it is now:
+    /// what has broken off has no points left, a hanging wing has its own.
+    fn contacts(&self, out: &mut Vec<(DVec3, Part)>) {
+        let d = &self.dmg;
+        let v = DVec3::new;
+        if d.prop > 0.0 {
+            out.push((HARD[0], Part::Prop));
+            out.push((HARD[6], Part::Prop));
+        }
+        out.extend([
+            (v(0.0, -0.035, -3.17), Part::Nose),
+            (v(0.0, -0.60, -2.6), Part::Nose),
+            (v(0.0, 0.31, -2.45), Part::Nose),
+            (v(-0.5, -0.1, -2.6), Part::Nose),
+            (v(0.5, -0.1, -2.6), Part::Nose),
+            (v(0.0, -0.72, -1.5), Part::Belly),
+            (HARD[5], Part::Belly),
+            (v(0.0, -0.70, 0.9), Part::Belly),
+            (v(-0.58, 0.05, -1.2), Part::Side),
+            (v(0.58, 0.05, -1.2), Part::Side),
+            (v(-0.58, 0.05, 0.4), Part::Side),
+            (v(0.58, 0.05, 0.4), Part::Side),
+            (v(0.0, 0.52, -1.35), Part::Roof),
+            (v(0.0, 0.50, 1.6), Part::Roof),
+        ]);
+        if d.tail.is_some() {
+            // The stump of the tail cone, a little ahead of the break.
+            let z = (d.tail.d / d.tail.n.z.max(0.5)) as f64 - 0.15;
+            let s = airframe::sec(z as f32);
+            out.push((v(0.0, s.bot as f64, z), Part::Belly));
+            out.push((v(0.0, s.top as f64, z), Part::Roof));
+        } else {
+            out.extend([(v(0.0, -0.45, 2.4), Part::Tail), (v(0.0, -0.12, 3.6), Part::Tail), (HARD[3], Part::Tail), (v(0.0, 0.34, 3.2), Part::Tail)]);
+            if d.fin > 0.05 {
+                out.push((v(0.0, 0.27 + 1.53 * d.fin as f64, 4.1 + 0.25 * (1.0 - d.fin as f64)), Part::Fin));
+                out.push((v(0.0, 0.27 + 0.8 * d.fin as f64, 4.2), Part::Fin));
+            }
+            for s in 0..2 {
+                if d.stab[s] > 0.5 {
+                    out.push((v(if s == 0 { -1.65 } else { 1.65 }, 0.11, 4.15), Part::Stab(s)));
+                }
+            }
+        }
+        for s in 0..2 {
+            let b = d.wing[s];
+            let mut at = |st: f32, tip: bool| {
+                for (xc, skin) in [(0.35, 1.0), (0.35, -1.0), (0.0, 0.0)] {
+                    out.push((damage::wing_pt(s, st, xc, skin).as_dvec3(), Part::Wing(s, st)));
+                }
+                if tip {
+                    out.push((damage::wing_pt(s, st, 0.92, 0.0).as_dvec3(), Part::Wing(s, st)));
+                }
+            };
+            for st in [0.45f32, 1.5, 2.6, 3.7, 4.7] {
+                if st < b - 0.3 {
+                    at(st, false);
+                }
+            }
+            if b > 0.4 {
+                at(b - 0.08, true);
+            }
+            let f = &d.fold[s];
+            if f.on {
+                let m = f.mat();
+                for (st, skin) in [(f.tip - 0.08, 1.0), (f.tip - 0.08, -1.0), ((f.root + f.tip) * 0.5, -1.0), ((f.root + f.tip) * 0.5, 1.0)] {
+                    out.push((m.transform_point3(damage::wing_pt(s, st, 0.4, skin)).as_dvec3(), Part::Fold(s)));
+                }
+            }
+        }
+    }
+
+    /// Wrecked: it will not fly again (a wing or the tail gone, the cabin
+    /// caved in, or lying on its back).
+    pub fn wrecked(&self) -> bool {
+        let d = &self.dmg;
+        d.wing[0] < 3.2 || d.wing[1] < 3.2 || d.fold.iter().any(|f| f.on) || d.tail.is_some() || d.hull > 0.6 || self.sink > 0.3 || (self.on_hull && self.up().dot(self.pos.normalize()) < 0.2)
+    }
+
     pub fn step(&mut self, dt: f64, c: &Controls, world: &World) -> Option<Impact> {
         self.t += dt;
+        if self.hold {
+            self.vel = self.wind * 0.0;
+            self.omega = DVec3::ZERO;
+            self.prop_rate += ((60.0 + 185.0 * self.throttle) * 0.0 + 65.0 - self.prop_rate) * (dt * 2.0).min(1.0);
+            self.prop += dt * self.prop_rate;
+            return None;
+        }
         self.dmg_prev = self.dmg;
         self.dmg.vibe = 0.0;
+        for c in self.cool.iter_mut() {
+            *c -= dt;
+        }
+        self.fold_tq = [0.0; 2];
         self.throttle = (self.throttle + c.throttle * dt * 0.6).clamp(0.0, 1.0);
         // Control surfaces do not snap.
         let target = DVec3::new(c.pitch, c.yaw, c.roll);
@@ -545,7 +930,9 @@ impl Plane {
 
         let (lat, lon, h) = geo::pos_to_lla(self.pos);
         let upw = self.pos.normalize();
-        let rho = 1.225 * (-h.max(0.0) / 8500.0).exp();
+        let rho = density(h);
+        // Limits are set in indicated airspeed (the dynamic pressure the airframe feels).
+        let eas_k = (rho / RHO0).sqrt();
         let ground = world.ground(lat, lon);
         // The turbulent air the aircraft is flying through this instant.
         let v_air = (self.vel - self.wind).length();
@@ -589,11 +976,12 @@ impl Plane {
                 }
                 _ => 1.0,
             };
-            let cl = ((0.25 + flap_cl + 5.0 * alpha) * (1.0 - stall) + (2.0 * alpha).sin() * 0.95 * stall) * (1.0 + 0.12 * (1.0 - ge));
+            let cl = ((CL0 + flap_cl + CL_A * alpha) * (1.0 - stall) + (2.0 * alpha).sin() * 0.95 * stall) * (1.0 + 0.12 * (1.0 - ge));
             // Ragged stumps and missing fairings all drag.
             let rag = ((SPAN - dm.wing[0]) + (SPAN - dm.wing[1])) as f64;
-            // A clean retractable: Cd0 ~0.024, induced drag for an aspect ratio of 7.6.
-            let cd = 0.024 + 0.055 * cl * cl * ge + stall * 1.2 * alpha.sin().powi(2) + 0.6 * beta * beta + 0.02 * self.flaps + 0.045 * self.flaps * self.flaps + 0.016 * self.gear + 0.02 * rag + 0.03 * (1.0 - st) + 0.01 * (1.0 - rud);
+            // A strut-braced high wing: Cd0 ~0.034 cleaned up, induced drag for an
+            // aspect ratio of 7.5; the big slotted flaps are mostly drag past 20 degrees.
+            let cd = CD0 + K_IND * cl * cl * ge + stall * 1.2 * alpha.sin().powi(2) + 0.6 * beta * beta + 0.02 * self.flaps + 0.06 * self.flaps * self.flaps + CD_GEAR * self.gear + 0.02 * rag + 0.03 * (1.0 - st) + 0.01 * (1.0 - rud);
             // Buffet as the airflow starts to break away over the wing, before it stalls.
             self.dmg.vibe += (smooth(stall_a - 0.07, stall_a + 0.03, alpha.abs()) * (1.0 - 0.5 * stall) * 0.9 * (q / 1500.0).min(1.0)) as f32;
             let lift_dir = DVec3::X.cross(vh).normalize_or_zero();
@@ -614,7 +1002,7 @@ impl Plane {
             // porpoising gently back to that speed. Without an elevator the trim
             // stays where it was.
             let level = self.up().dot(upw).max(0.0);
-            let alpha_1g = ((MASS * 9.81 * level / (q * area).max(1.0) - 0.25 - flap_cl) / 5.0).clamp(-0.05, 0.24);
+            let alpha_1g = ((MASS * 9.81 * level / (q * area).max(1.0) - CL0 - flap_cl) / CL_A).clamp(-0.05, 0.24);
             if el > 0.05 && self.stick.x.abs() > 0.06 {
                 self.trim += (alpha_1g - self.trim) * (dt * 0.5).min(1.0);
             }
@@ -662,30 +1050,45 @@ impl Plane {
                 self.note("ENGINE FAILED");
             }
         }
-        let prop_k = if dm.prop > 0.75 { 1.0 } else if dm.prop > 0.25 { 0.3 } else { 0.0 };
-        let eng = (self.dmg.engine as f64).powf(0.6) * prop_k;
+        let prop_k = if dm.prop > 0.75 { 1.0 } else if dm.prop > 0.25 { 0.45 } else { 0.0 };
+        let eng = (self.dmg.engine as f64).powf(0.6);
         // The engine takes a moment to answer the throttle.
-        self.power += (self.throttle * eng - self.power) * (dt * 2.0).min(1.0);
-        let thrust = Self::thrust(self.power, v, rho, c.boost);
+        self.charge += (self.throttle - self.charge) * (dt * 4.0).min(1.0);
+        // The fixed-pitch propeller: the engine's torque against what the
+        // blades take at these revs and this airspeed. Faster through the air,
+        // the blades meet it at a smaller angle and take less, so the revs
+        // rise (and over-rev in a dive); slow, the propeller holds the engine
+        // well below its rated revs and power. Without power it windmills, and
+        // only slowing nearly to the stall stops it.
+        let w = self.prop_rate.max(0.0);
+        let v_ax = (-vb.z).max(0.0);
+        let (mut thrust, q_prop) = Self::prop_load(w, v_ax, rho, prop_k);
+        let q_eng = Self::engine_torque(self.charge, rho, c.boost, eng);
+        let drive = q_eng - q_prop;
+        if prop_k <= 0.0 {
+            // No blades left: nothing to turn.
+            self.prop_rate += (0.0 - self.prop_rate) * (dt * 2.0).min(1.0);
+        } else if w > 1.0 || drive > 40.0 {
+            self.prop_rate = (w + (drive - Self::friction(w)) / PROP_I * dt).max(0.0);
+        } else {
+            // Stopped: the compression holds it until the air pushes harder.
+            self.prop_rate = 0.0;
+        }
+        self.power = ((q_eng - Self::friction(w)) * w / POWER).max(0.0);
+        if dm.prop <= 0.25 {
+            thrust = 0.0;
+        }
         force_b += DVec3::NEG_Z * thrust;
         // The propeller turns clockwise seen from the cockpit: its torque rolls the
         // aircraft left and its spiralling slipstream (and P-factor, climbing
         // slowly) yaws it left. The fin and ailerons are rigged for the cruise, so
         // it is full power at low speed that needs right rudder.
         if v > 2.0 {
-            let slow = (1.0 - v / 70.0).max(0.0);
-            wdot.y += thrust / STATIC_THRUST * slow * (0.22 + 0.25 * self.alpha.max(0.0));
-            wdot.z += thrust / STATIC_THRUST * slow * 0.12 * if self.on_ground { 0.3 } else { 1.0 };
+            let slow = (1.0 - v / 60.0).max(0.0);
+            let tk = thrust.max(0.0) / STATIC_THRUST;
+            wdot.y += tk * slow * (0.22 + 0.25 * self.alpha.max(0.0));
+            wdot.z += tk * slow * 0.12 * if self.on_ground { 0.3 } else { 1.0 };
         }
-        // An unbalanced propeller cannot be run up without shaking the engine off its mounts.
-        let rate = if dm.prop <= 0.25 {
-            0.0
-        } else if eng > 0.0 {
-            (65.0 + 185.0 * self.throttle * if c.boost { 1.15 } else { 1.0 }) * (0.4 + 0.6 * eng) * if dm.prop < 0.75 { 0.45 } else { 1.0 }
-        } else {
-            (v * 0.45).min(45.0)
-        };
-        self.prop_rate += (rate - self.prop_rate) * (dt * 2.0).min(1.0);
         self.prop += dt * self.prop_rate;
         if dm.prop > 0.25 && dm.prop < 0.75 {
             let spin = (self.prop_rate / 250.0) as f32;
@@ -710,7 +1113,7 @@ impl Plane {
         let mut skidding = false;
         if close {
             if let Some(imp) = self.trees(world) {
-                return Some(imp);
+                return self.impact(imp, "tree");
             }
             let hit = |p: DVec3, world: &World| -> Option<(f64, bool, Option<(geo::TileId, usize)>)> {
                 let (la, lo, ph) = geo::pos_to_lla(p);
@@ -719,87 +1122,218 @@ impl Plane {
                     if ph < b.top && ph > b.base - if b.bridge { 0.0 } else { 3.0 } {
                         return Some((b.top - ph, false, Some((b.tile, b.idx))));
                     }
+                } else if ph < g.h {
+                    // Under the 3D tiles the ground is the mesh, buildings and all:
+                    // into one of them, it is that building that was hit.
+                    if let Some(b) = world.photo_building(la, lo, g.h) {
+                        if ph > b.base - 3.0 {
+                            return Some((g.h - ph, false, Some((b.tile, b.idx))));
+                        }
+                    }
                 }
                 Some((g.h - ph, g.water, None))
             };
-            for (hi, r) in HARD.into_iter().enumerate() {
+            // Every point of the airframe that can touch something, and what it
+            // takes to break it: gentle enough, things only scrape; harder, the
+            // part that hit comes off (a wing, the tail, the gear); only a hit
+            // hard enough to burst the cabin or the tanks ends in fire.
+            let mut pts = std::mem::take(&mut self.pts);
+            pts.clear();
+            self.contacts(&mut pts);
+            let mut walled = false;
+            for &(r, part) in &pts {
                 let p = self.pos + self.rot * r;
-                let Some((pen, water, building)) = hit(p, world) else { continue };
+                let Some((mut pen, water, building)) = hit(p, world) else { continue };
+                if water {
+                    // A ditched aircraft settles lower in the water as it floods.
+                    pen -= self.sink;
+                }
                 if pen <= 0.0 {
                     continue;
                 }
-                let pv = self.vel + self.rot * self.omega.cross(r);
+                let mut pv = self.vel + self.rot * self.omega.cross(r);
+                if let Part::Fold(s) = part {
+                    let f = &self.dmg.fold[s];
+                    pv += self.rot * (f.axis.cross(r.as_vec3() - f.pivot) * f.rate).as_dvec3();
+                }
                 let vn = pv.dot(upw);
+                let closing = (-vn).max(0.0);
                 let sp = pv.length();
                 let crash = Impact { pos: p, vel: self.vel, water, ground_h: geo::pos_to_lla(p).2 + if building.is_some() { 0.0 } else { pen }, building };
-                let side = if hi == 1 { 0 } else { 1 };
-                let sgn = if side == 0 { -1.0 } else { 1.0 };
-                if water {
-                    return Some(crash);
-                }
-                if building.is_some() {
-                    // A wing tip or the tail clipping a roof comes off; anything else is the end.
-                    match hi {
-                        1 | 2 if vn.abs() < 7.0 => {
-                            self.break_wing(side, if sp > 45.0 { 3.5 } else { 4.3 }, "BUILDING");
-                            self.vel *= 0.8;
-                            self.kick(DVec3::new(0.0, -sgn * 0.8, -sgn * 1.2));
-                            self.pos += upw * pen.min(0.5);
-                            continue;
-                        }
-                        3 | 4 if vn.abs() < 7.0 => {
-                            self.lose_tail_top(0.3, 0.5, "BUILDING");
-                            self.lose_elevator((self.scan % 2) as usize, true, "BUILDING");
-                            self.vel *= 0.85;
-                            self.pos += upw * pen.min(0.5);
-                            continue;
-                        }
-                        _ => return Some(crash),
-                    }
-                }
-                // The ground. Gently enough, a dragged wing tip only loses its end,
-                // the tail skids, the belly slides and the propeller strikes.
-                let skid = match hi {
-                    1 | 2 => {
-                        if vn > -5.0 && sp < 70.0 {
-                            self.break_wing(side, if sp > 35.0 { 4.3 } else { 5.0 }, "GROUND");
-                            self.kick(DVec3::new(0.0, -sgn * 0.5, -sgn * 1.0));
-                            self.vel *= 0.92;
-                            self.pos += upw * pen;
-                            continue;
-                        }
-                        false
-                    }
-                    4 => false,
-                    0 | 6 => {
-                        if vn > -3.5 {
-                            if self.dmg.prop > 0.25 {
-                                self.prop_strike("GROUND");
+                let up_right = self.up().dot(upw) > 0.0;
+                if building.is_some() && pen > 1.0 {
+                    // Into the side of a building: all of the speed goes into it.
+                    match part {
+                        Part::Wing(s, st) => {
+                            // A wing's root goes in with the cabin right behind it.
+                            if st < 1.8 && sp > 28.0 {
+                                return self.impact(crash, "wing root into building");
                             }
-                            true
-                        } else {
-                            false
+                            if self.cool[s] <= 0.0 {
+                                let into = self.rng.range(0.1, 0.6) + (sp as f32 / 30.0).min(2.0) * self.rng.f();
+                                let (rough, up) = (self.rng.range(0.0, 0.5), self.rng.f() < 0.5);
+                                self.snap_wing(s, st - into, rough, if sp < 25.0 { 0.35 } else { 0.1 }, up, "BUILDING");
+                                self.cool[s] = 0.25;
+                                self.vel *= 0.85;
+                            }
+                        }
+                        Part::Fold(s) => self.release_fold(s, "BUILDING"),
+                        Part::Fin => self.lose_tail_top(0.0, 0.3, "BUILDING"),
+                        Part::Stab(s) => self.lose_elevator(s, true, "BUILDING"),
+                        Part::Tail if sp > 12.0 => {
+                            let z = self.rng.range(1.5, 2.6);
+                            self.snap_tail(z, "BUILDING");
+                        }
+                        _ if sp > 18.0 => return self.impact(crash, "building"),
+                        _ if !walled => {
+                            // Taxiing into a wall: crumpled, stopped and pushed back off it.
+                            walled = true;
+                            if matches!(part, Part::Prop | Part::Nose) {
+                                self.prop_strike("BUILDING");
+                                if sp > 8.0 {
+                                    self.engine_hit(0.35, "BUILDING");
+                                    self.crack_windshield("BUILDING");
+                                }
+                            }
+                            self.dmg.hull = (self.dmg.hull + sp as f32 * 0.03).min(1.0);
+                            self.scuff(part.group(), 0.6);
+                            let back = (self.vel - upw * self.vel.dot(upw)).normalize_or_zero();
+                            self.pos -= back * 0.25;
+                            self.vel = -self.vel * 0.15;
+                            self.omega *= 0.4;
+                            self.dmg.vibe += 2.0;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                // Ground, a roof or the water. First what this hit breaks.
+                let nose_on = matches!(part, Part::Nose | Part::Prop);
+                let body = matches!(part, Part::Belly | Part::Side | Part::Roof);
+                if water && (nose_on || body) && (closing > 9.0 || (sp > 42.0 && closing > 4.0)) {
+                    return self.impact(crash, "water");
+                }
+                match part {
+                    Part::Prop | Part::Nose => {
+                        if self.dmg.prop > 0.25 && (part == Part::Prop || self.prop_rate > 30.0) && (self.prop_rate > 5.0 || sp > 3.0) {
+                            self.prop_strike(if water { "WATER" } else { "GROUND" });
+                        }
+                        // Nose first into the ground: the engine is driven back into the cabin.
+                        if closing > 15.0 || (sp > 50.0 && closing > 7.5) {
+                            return self.impact(crash, "water");
+                        }
+                        if closing > 6.0 && self.cool[3] <= 0.0 {
+                            self.cool[3] = 0.3;
+                            self.engine_hit(0.15 + (closing as f32 - 6.0) * 0.05, "NOSE IMPACT");
+                            self.crack_windshield("NOSE IMPACT");
+                            self.dmg.hull = (self.dmg.hull + (closing as f32 - 6.0) * 0.04).min(1.0);
+                            if closing > 8.5 {
+                                self.lose_gear(0, "NOSE IMPACT");
+                            }
                         }
                     }
-                    _ => vn > -4.0,
-                };
-                if !skid {
-                    return Some(crash);
+                    Part::Belly | Part::Side | Part::Roof => {
+                        // The cabin can take a hard landing on its belly; on its side or
+                        // its roof it caves in sooner. Fast and steep, nothing survives.
+                        let lim = if part == Part::Belly { 15.0 } else { 12.0 };
+                        if closing > lim || (sp > 55.0 && closing > lim * 0.55) {
+                            return self.impact(crash, "cabin");
+                        }
+                        if closing > 4.5 && self.cool[3] <= 0.0 {
+                            self.cool[3] = 0.3;
+                            self.dmg.hull = (self.dmg.hull + (closing as f32 - 4.5) * 0.05).min(1.0);
+                            self.dmg.vibe += 3.0;
+                            if closing > 6.5 || part != Part::Belly {
+                                self.crack_windshield(if part == Part::Roof { "ROLLED OVER" } else { "HARD IMPACT" });
+                            }
+                            if part == Part::Belly && closing > 7.0 {
+                                for gi in 0..3 {
+                                    if self.gear > 0.5 {
+                                        self.lose_gear(gi, "HARD IMPACT");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Part::Tail => {
+                        // A tail slammed down (or dug in sliding fast) snaps off the cone.
+                        if closing > 7.5 || (closing > 4.0 && sp > 25.0) {
+                            let z = self.rng.range(1.4, 2.7);
+                            self.snap_tail(z, "GROUND");
+                            continue;
+                        }
+                    }
+                    Part::Fin => {
+                        // Scraped along the ground upside down, the fin wears away.
+                        if self.cool[2] <= 0.0 && (closing > 2.5 || (sp > 7.0 && pen > 0.04)) {
+                            self.cool[2] = 0.35;
+                            let fin = (self.dmg.fin - self.rng.range(0.2, 0.5)).max(0.0);
+                            self.lose_tail_top((self.dmg.rudder - 0.4).max(0.0).min(fin + 0.1), fin, "GROUND");
+                            continue;
+                        }
+                    }
+                    Part::Stab(s) => {
+                        if closing > 3.0 || (sp > 12.0 && pen > 0.06) {
+                            self.lose_elevator(s, true, "GROUND");
+                            continue;
+                        }
+                    }
+                    Part::Wing(s, st) => {
+                        // A wing struck into the ground breaks in from where it hit,
+                        // the further the harder; scraped along fast it tears too.
+                        let hard = closing as f32 / 4.0 + sp as f32 / 45.0;
+                        if self.cool[s] <= 0.0 && (closing > 3.5 || (sp > 14.0 && pen > 0.1) || (closing > 2.0 && sp > 25.0)) {
+                            // (One blow takes a couple of metres at most: breaking the
+                            // outer part soaks up what would have hit further in.)
+                            let into = self.rng.range(0.05, 0.5) + (hard - 1.0).clamp(0.0, 3.0) * self.rng.range(0.2, 0.6);
+                            let station = (st - into).max(0.3);
+                            // Through the tank fast: the fuel goes up.
+                            if station < airframe::TANK[1] && sp > 32.0 && closing > 8.0 && !water {
+                                return self.impact(crash, "wing tank");
+                            }
+                            let rough = self.rng.range(0.35, 1.0);
+                            let fold = if water { 0.2 } else if sp < 30.0 { 0.5 } else { 0.25 };
+                            self.snap_wing(s, station, rough, fold, up_right, if water { "WATER" } else { "GROUND" });
+                            self.cool[s] = 0.3;
+                            self.vel *= 0.94;
+                            continue;
+                        }
+                    }
+                    Part::Fold(_) => {}
                 }
-                self.pos += upw * pen;
-                let nf = (pen * 60_000.0 - vn * 9_000.0).clamp(0.0, 120_000.0);
+                // Then it skids: a spring out of the surface, friction along it.
+                // Water gives less and drags far more.
+                self.pos += upw * if water { pen * 0.3 } else { pen };
+                let (k, c, mu) = if water { (25_000.0, 6_000.0, 0.9) } else { (60_000.0, 9_000.0, 0.45) };
+                let nf = (pen * k - vn * c).clamp(0.0, 120_000.0);
                 let tang = pv - upw * vn;
                 let tl = tang.length();
-                let f = upw * nf - tang.normalize_or_zero() * (0.45 * nf).min(tl * 3000.0);
+                let f = upw * nf - tang.normalize_or_zero() * (mu * nf).min(tl * 3000.0);
                 force_w += f;
-                torque_b += r.cross(self.rot.inverse() * f);
+                let fb_ = self.rot.inverse() * f;
+                torque_b += r.cross(fb_);
+                if let Part::Fold(s) = part {
+                    let fd = &self.dmg.fold[s];
+                    self.fold_tq[s] += (r.as_vec3() - fd.pivot).as_dvec3().cross(fb_).dot(fd.axis.as_dvec3());
+                }
                 skidding = true;
-                self.scuff(damage::hard_group(hi), (dt * tl * 0.04) as f32);
+                if water {
+                    self.sink = (self.sink + dt * 0.03).min(1.6);
+                    if tl > 4.0 {
+                        self.splashes.push((p, tang * 0.4 + upw * (tl * 0.15)));
+                    }
+                    continue;
+                }
+                self.scuff(part.group(), (dt * tl * 0.04) as f32);
                 self.dmg.vibe += (tl * 0.03) as f32;
                 if tl > 3.0 {
                     self.sparks.push((p, tang * 0.5));
                 }
+                if tl > 1.5 && building.is_none() {
+                    self.dirt.push((p, tang * 0.45 + upw * (2.0 + tl * 0.12), 2.5));
+                }
             }
+            self.pts = pts;
             let mut touching = [false; 3];
             for (gi, r) in GEAR.into_iter().enumerate() {
                 // Only gear that is down and locked carries the aircraft.
@@ -816,8 +1350,17 @@ impl Plane {
                     }
                     let pv = self.vel + self.rot * self.omega.cross(r);
                     let vn = pv.dot(upw);
-                    if water || building.is_some() || vn < -11.0 || pen > 1.2 {
-                        return Some(Impact { pos: p, vel: self.vel, water, ground_h: geo::pos_to_lla(p).2 + if building.is_some() { 0.0 } else { pen }, building });
+                    // Wheels do nothing in water or against a wall, and a leg driven
+                    // in far too hard just goes: the airframe takes the rest.
+                    if water || (building.is_some() && pen > 1.0) || pen > 1.2 {
+                        if !water {
+                            self.lose_gear(gi, if building.is_some() { "BUILDING" } else { "HARD LANDING" });
+                        }
+                        continue;
+                    }
+                    if vn < -11.0 {
+                        self.lose_gear(gi, "HARD LANDING");
+                        continue;
                     }
                     // Too hard a landing and the leg folds; the airframe comes down on its belly.
                     if vn < if gi == 0 { -4.5 } else { -6.5 } {
@@ -844,6 +1387,9 @@ impl Plane {
                     force_w += f;
                     torque_b += r.cross(self.rot.inverse() * f);
                     self.wheel_spin[gi] = vl / WHEEL_R[gi];
+                    if pv.length() > 3.0 && building.is_none() {
+                        self.dirt.push((p, (pv - upw * vn) * 0.3 + upw * 1.5, 1.0));
+                    }
                 }
             }
             for gi in 0..3 {
@@ -862,13 +1408,23 @@ impl Plane {
             self.wheel_rot[gi] = (self.wheel_rot[gi] + self.wheel_spin[gi] * dt) % std::f64::consts::TAU;
         }
 
+        self.on_hull = skidding;
         let acc = force_w / MASS;
+        self.swing_folds(dt, acc, upw, vb, rho);
         self.g_load = (acc + upw * 9.81).dot(self.up()) / 9.81;
         // The pilot's head on its neck: a stiff, well-damped spring shoved about
         // by every change in the load, about 3 cm per g.
-        let fb = self.rot.inverse() * (acc + upw * 9.81) - DVec3::Y * 9.81;
+        self.sf = self.rot.inverse() * (acc + upw * 9.81);
+        let fb = self.sf - DVec3::Y * 9.81;
         let (w0, zeta) = (11.0, 0.55);
         self.head_v += (-self.head * w0 * w0 - self.head_v * 2.0 * zeta * w0 - fb * 0.35) * dt;
+        if self.on_ground {
+            // Rolling over the pavement's joints and patches: a few millimetres
+            // of shake by taxi speed, more on the takeoff roll.
+            let s = smooth(0.5, 35.0, self.vel.length()) * 0.375 * dt.sqrt();
+            let mut k = || self.rng.range(-1.0, 1.0) as f64;
+            self.head_v += DVec3::new(k() * 0.35, k(), k() * 0.2) * s;
+        }
         self.head = (self.head + self.head_v * dt).clamp_length_max(0.09);
         // Rough air rattles the cabin.
         self.dmg.vibe += ((self.air.sigma_w - 0.6).max(0.0) * 0.07 * smooth(10.0, 40.0, v)) as f32;
@@ -894,15 +1450,17 @@ impl Plane {
                 self.dmg.fatigue = -1.5;
             }
         }
-        let over = (v - FLUTTER_V).max(0.0) as f32;
+        let ve = v * eas_k;
+        let over = (ve - FLUTTER_V).max(0.0) as f32;
         self.dmg.flutter = (self.dmg.flutter + (over * 0.035 - 0.25) * dt as f32).max(0.0);
-        self.dmg.vibe += smooth(VNE + 5.0, VNE + 30.0, v) as f32 * 0.6;
+        self.dmg.vibe += smooth(VNE + 5.0, VNE + 30.0, ve) as f32 * 0.6;
         if self.dmg.flutter > 1.0 {
             self.flutter_loss();
             self.dmg.flutter = 0.35;
         }
-        if self.flaps > 0.25 && v > VFE {
-            self.dmg.flap_stress += (dt * (v - VFE) * 0.06 * self.flaps) as f32;
+        let vfe = self.vfe();
+        if self.flaps > 0.25 && ve > vfe {
+            self.dmg.flap_stress += (dt * (ve - vfe) * 0.06 * self.flaps) as f32;
             if self.dmg.flap_stress > 1.0 {
                 let s = (self.rng.f() * 2.0) as usize;
                 let s = if self.dmg.flap[s] > 0.0 { s } else { 1 - s };
@@ -913,6 +1471,71 @@ impl Plane {
             self.dmg.flap_stress = (self.dmg.flap_stress - dt as f32 * 0.3).max(0.0);
         }
         None
+    }
+
+    /// A buckled wing swings on its torn skin: its weight and the aircraft's
+    /// own acceleration, the air on it as on a flat plate, the ground under
+    /// it, and what stiffness the crumpled skin has left. Load it past what
+    /// the skin holds (as the slipstream does at once in flight) and it goes.
+    fn swing_folds(&mut self, dt: f64, acc: DVec3, upw: DVec3, vb: DVec3, rho: f64) {
+        for s in 0..2 {
+            let mut f = self.dmg.fold[s];
+            if !f.on {
+                continue;
+            }
+            let len = (f.tip - f.root).max(0.3) as f64;
+            let m = 24.0 * len;
+            let inertia = m * len * len / 3.0 + 2.0;
+            let mat = f.mat();
+            let ax = f.axis.as_dvec3();
+            let cm = mat.transform_point3(damage::wing_pt(s, (f.root + f.tip) * 0.5, 0.4, 0.0)).as_dvec3();
+            let arm = cm - f.pivot.as_dvec3();
+            // Weight, and the shove of the aircraft's own acceleration, as the part feels them.
+            let felt = self.rot.inverse() * (acc + upw * 9.81);
+            let t_g = arm.cross(-felt * m).dot(ax);
+            // The air on it: a plate across its swung upper skin, the air meeting
+            // it at the aircraft's speed plus its own swinging.
+            let np = mat.transform_vector3(Vec3::Y).as_dvec3();
+            let area = (Damage::wing_lost(f.root) - Damage::wing_lost(f.tip)) as f64;
+            let rel = -(vb + self.omega.cross(cm)) - ax.cross(arm) * f.rate as f64;
+            let vr = rel.length();
+            let mut t_a = 0.0;
+            if vr > 0.5 {
+                let a_n = (rel.dot(np) / vr).clamp(-1.0, 1.0).asin();
+                let cn = (CL_A * a_n + CL0 * (1.0 - a_n.abs() * 2.0).max(0.0)).clamp(-1.2, 1.2);
+                let fa = np * (0.5 * rho * vr * vr * area * cn);
+                t_a = arm.cross(fa).dot(ax);
+                // The aircraft feels it through the hinge.
+                self.vel += self.rot * fa * (dt / MASS);
+                self.omega += cm.cross(fa) / INERTIA * dt;
+            }
+            // The crumpled skin still springs back a little, and damps the swing.
+            let w = f.rate as f64;
+            let t_s = -350.0 * f.ang as f64 - 220.0 * w - 0.5 * rho * 1.2 * 1.4 * w * w.abs() * len.powi(4) / 4.0;
+            let t_c = self.fold_tq[s];
+            f.rate += ((t_g + t_a + t_s + t_c) / inertia * dt) as f32;
+            f.ang += f.rate * dt as f32;
+            // Folded right over (or down against the strut), it stops hard.
+            let (lo, hi) = (-1.75, 2.7);
+            if f.ang > hi || f.ang < lo {
+                f.ang = f.ang.clamp(lo, hi);
+                f.stress += (f.rate.abs() * 0.04).min(0.3);
+                f.rate *= -0.2;
+            }
+            // How hard the skin is being worked: steady load past what it holds,
+            // and every big swing.
+            let load = (t_g + t_a + t_c).abs() as f32;
+            // Crumpled skin in a fast airflow flutters itself apart in moments.
+            let flog = 0.5 * ((0.5 * rho * vb.length_squared()) / 600.0).powf(1.5);
+            // (Tearing takes a moment, however hard it is pulled: at least a fifth of a second.)
+            let over = (((load - f.hold).max(0.0) / f.hold) * 4.0).min(5.0);
+            f.stress += (over + (f.rate.abs() - 4.0).max(0.0) * 0.1 + 0.01 + flog as f32) * dt as f32;
+            self.dmg.vibe += (f.rate.abs() * 0.05).min(1.0);
+            self.dmg.fold[s] = f;
+            if f.stress >= 1.0 {
+                self.release_fold(s, if self.on_hull || self.on_ground { "GROUND" } else { "AIRFLOW" });
+            }
+        }
     }
 
     /// Trees: refresh the list of nearby ones a few times a second, test every
@@ -972,6 +1595,14 @@ impl Plane {
                         self.vel *= 0.88;
                         self.kick(DVec3::new(-0.8, 0.6, 0.4));
                     }
+                    // Rolling slowly into a trunk crumples the nose and stops it dead.
+                    _ if v < 18.0 => {
+                        self.prop_strike("TREE");
+                        self.crack_windshield("TREE");
+                        self.dmg.hull = (self.dmg.hull + 0.2).min(1.0);
+                        self.vel *= 0.2;
+                        self.omega *= 0.3;
+                    }
                     _ => return Some(Impact { pos: self.pos, vel: self.vel, water: false, ground_h: base_h + 0.2, building: None }),
                 }
                 continue;
@@ -1022,6 +1653,21 @@ impl Plane {
     }
 }
 
+/// Air density (kg/m³) at height `h` (m) in the standard atmosphere: the
+/// troposphere's lapse rate up to 11 km, isothermal above.
+pub fn density(h: f64) -> f64 {
+    let h = h.max(-500.0);
+    let t = 1.0 - 2.25577e-5 * h.min(11_000.0);
+    RHO0 * t.powf(4.2559) * (-(h - 11_000.0).max(0.0) / 6341.6).exp()
+}
+
+/// Static pressure as a fraction of sea level's, in the standard atmosphere.
+pub fn pressure_ratio(h: f64) -> f64 {
+    let h = h.max(-500.0);
+    let t = 1.0 - 2.25577e-5 * h.min(11_000.0);
+    t.powf(5.2559) * (-(h - 11_000.0).max(0.0) / 6341.6).exp()
+}
+
 fn smooth(a: f64, b: f64, x: f64) -> f64 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -1062,30 +1708,92 @@ mod tests {
         (sv / n, svs / n)
     }
 
-    #[test]
-    fn performance_is_a_200hp_single() {
-        let w = empty_world();
-        // Flat out and level near sea level: about 150 kt, not a fighter.
-        let mut p = Plane::spawn(0.6, -2.1, 300.0, 0.0, 68.0);
-        let alt0 = 300.0;
-        let (v, _) = fly(&mut p, &w, 240.0, 1.0, |p| {
+    const KT: f64 = 1.94384;
+    fn rpm(p: &Plane) -> f64 {
+        p.prop_rate * 60.0 / std::f64::consts::TAU
+    }
+    /// An altitude hold for the test pilot (gentle, or it porpoises).
+    fn hold_alt(alt0: f64) -> impl FnMut(&Plane) -> f64 {
+        move |p| {
             let (_, _, h) = geo::pos_to_lla(p.pos);
             let vs = p.vel.dot(p.pos.normalize());
             (alt0 - h) * 0.002 - vs * 0.02
-        });
-        println!("max level speed {:.1} m/s = {:.0} kt", v, v * 1.94384);
-        assert!(v > 70.0 && v < 84.0, "{v}");
+        }
+    }
 
-        // Full power at the best-rate speed (~90 kt): about 1000 fpm.
-        let mut p = Plane::spawn(0.6, -2.1, 300.0, 0.0, 50.0);
-        let (v, vs) = fly(&mut p, &w, 90.0, 1.0, |p| (p.airspeed().length() - 46.0) * 0.04);
-        println!("climb at {:.1} m/s: {:.0} fpm", v, vs * 196.85);
-        assert!(vs * 196.85 > 800.0 && vs * 196.85 < 1400.0, "{vs}");
+    #[test]
+    fn performance_is_a_cessna_172() {
+        let w = empty_world();
+        // Flat out and level near sea level: about 125 kt with the gear up, a
+        // few knots less with it down (a fixed-gear 172 does 126 kt).
+        let mut p = Plane::spawn(0.6, -2.1, 300.0, 0.0, 55.0);
+        let (v, _) = fly(&mut p, &w, 240.0, 1.0, hold_alt(300.0));
+        println!("max level speed {:.1} m/s = {:.0} kt at {:.0} rpm", v, v * KT, rpm(&p));
+        assert!(v * KT > 118.0 && v * KT < 132.0, "{}", v * KT);
+        assert!(rpm(&p) > 2550.0 && rpm(&p) < 2800.0, "{}", rpm(&p));
+        let mut p = Plane::spawn(0.6, -2.1, 300.0, 0.0, 55.0);
+        p.configure(0, true, 0.0);
+        let (vg, _) = fly(&mut p, &w, 240.0, 1.0, hold_alt(300.0));
+        println!("gear down: {:.0} kt", vg * KT);
+        assert!(vg < v - 1.0 && vg * KT > 112.0, "{}", vg * KT);
 
-        // Static thrust is a quarter of the weight, so the takeoff roll is a few hundred metres.
-        let t0 = Plane::thrust(1.0, 0.0, 1.225, false);
-        assert!(t0 / (MASS * 9.81) < 0.3, "{t0}");
-        assert!(Plane::thrust(1.0, 0.0, 1.225, true) < MASS * 9.81 * 0.4);
+        // 75% power at 8000 ft: about 120 kt true.
+        let mut p = Plane::spawn(0.6, -2.1, 2438.0, 0.0, 58.0);
+        let mut thr = 0.8;
+        for _ in 0..40 {
+            fly(&mut p, &w, 5.0, thr, hold_alt(2438.0));
+            thr = (thr + (0.75 - p.power) * 0.5).clamp(0.0, 1.0);
+        }
+        let (v, _) = fly(&mut p, &w, 120.0, thr, hold_alt(2438.0));
+        println!("75% at 8000 ft: {:.0} kt true, {:.0} kt indicated, {:.0} rpm, power {:.2}", v * KT, p.ias() * KT, rpm(&p), p.power);
+        assert!(v * KT > 110.0 && v * KT < 128.0, "{}", v * KT);
+
+        // Full power at the best-rate speed (74 kt): 700-900 fpm.
+        let mut p = Plane::spawn(0.6, -2.1, 300.0, 0.0, 40.0);
+        let (v, vs) = fly(&mut p, &w, 90.0, 1.0, |p| (p.airspeed().length() - 38.0) * 0.04);
+        println!("climb at {:.0} kt: {:.0} fpm, {:.0} rpm", v * KT, vs * 196.85, rpm(&p));
+        assert!(vs * 196.85 > 650.0 && vs * 196.85 < 950.0, "{}", vs * 196.85);
+
+        // Engine at idle at the best glide speed (68 kt): about 9 to 1.
+        let mut p = Plane::spawn(0.6, -2.1, 1500.0, 0.0, 35.0);
+        let (v, vs) = fly(&mut p, &w, 90.0, 0.0, |p| (p.airspeed().length() - 35.0) * 0.04);
+        let glide = (v * v - vs * vs).sqrt() / -vs;
+        println!("idle glide at {:.0} kt: {:.0} fpm, {:.1}:1, {:.0} rpm", v * KT, vs * 196.85, glide, rpm(&p));
+        assert!(glide > 7.5 && glide < 11.0, "{glide}");
+        assert!(rpm(&p) > 700.0 && rpm(&p) < 1600.0, "{}", rpm(&p));
+
+        // Stall: about 50 kt clean, 42 kt with full flaps.
+        let vs_at = |flap_cl: f64, a: f64| (2.0 * MASS * 9.81 / (RHO0 * WING_AREA * (CL0 + flap_cl + CL_A * a))).sqrt() * KT;
+        let (clean, full) = (vs_at(0.0, 0.27), vs_at(0.55, 0.23));
+        println!("stall {clean:.0} kt clean, {full:.0} kt full flaps");
+        assert!(clean > 46.0 && clean < 54.0 && full > 39.0 && full < 46.0);
+
+        // On the ground: about 2300 rpm flat out, 600-800 at idle, static thrust a
+        // quarter of the weight.
+        let ws = Plane::prop_equilibrium(1.0, 0.0, RHO0) * 60.0 / std::f64::consts::TAU;
+        let wi = Plane::prop_equilibrium(0.0, 0.0, RHO0) * 60.0 / std::f64::consts::TAU;
+        let t0 = Plane::thrust(1.0, 0.0, RHO0);
+        println!("static {ws:.0} rpm, idle {wi:.0} rpm, thrust {t0:.0} N = {:.2} W", t0 / (MASS * 9.81));
+        assert!(ws > 2200.0 && ws < 2450.0 && wi > 550.0 && wi < 850.0, "{ws} {wi}");
+        assert!(t0 / (MASS * 9.81) > 0.18 && t0 / (MASS * 9.81) < 0.28, "{t0}");
+        // Diving at Vne at full throttle the fixed-pitch propeller over-revs.
+        let wd = Plane::prop_equilibrium(1.0, VNE, RHO0) * 60.0 / std::f64::consts::TAU;
+        println!("full throttle at Vne: {wd:.0} rpm");
+        assert!(wd > 2850.0, "{wd}");
+    }
+
+    #[test]
+    fn approach_is_trimmed_down_the_glide() {
+        let w = empty_world();
+        // As the game sets up a final approach: 70 kt, flaps 20, a 3 degree glide.
+        let mut p = Plane::spawn(0.6, -2.1, 400.0, 0.0, 36.0);
+        let sink = 36.0 * 3f64.to_radians().sin();
+        p.configure(2, true, sink);
+        let thr = p.throttle;
+        let (v, vs) = fly(&mut p, &w, 30.0, thr, |_| 0.0);
+        println!("approach: throttle {thr:.2}, {:.0} kt, {:.0} fpm, {:.0} rpm", v * KT, vs * 196.85, rpm(&p));
+        assert!((v - 36.0).abs() < 3.0, "{v}");
+        assert!((vs + sink).abs() < 1.0, "{vs}");
     }
 
     #[test]
@@ -1093,10 +1801,9 @@ mod tests {
         let w = empty_world();
         let mut spread = Vec::new();
         for sigma in [0.0, 1.5, 4.0] {
-            let mut p = Plane::spawn(0.6, -2.1, 1000.0, 0.0, 65.0);
+            let mut p = Plane::spawn(0.6, -2.1, 1000.0, 0.0, 55.0);
             p.air = Air { sigma_w: sigma, sigma_h: sigma, len_w: 300.0, len_h: 300.0, draft: 0.0 };
             let dt = 1.0 / 180.0;
-            p.throttle = 0.72;
             let (mut s, mut s2, mut n, mut bank) = (0.0, 0.0, 0.0, 0.0f64);
             for i in 0..(60.0 / dt) as usize {
                 // A pilot holding the wings roughly level.
@@ -1116,4 +1823,143 @@ mod tests {
         }
         assert!(spread[0] < 0.02 && spread[1] > 0.05 && spread[2] > spread[1] * 1.8, "{spread:?}");
     }
+
+    fn flat_world() -> World {
+        let mut w = empty_world();
+        w.flat = Some(0.0);
+        w
+    }
+    /// Run until it explodes or `secs` pass; every note it made along the way.
+    fn run(p: &mut Plane, w: &World, secs: f64, c: Controls) -> (bool, Vec<String>) {
+        run_pushed(p, w, secs, c, 0.0)
+    }
+    /// The same, with something rolling it over (rad/s²) for the first 0.8 s: a gust under one wing.
+    fn run_pushed(p: &mut Plane, w: &World, secs: f64, c: Controls, push: f64) -> (bool, Vec<String>) {
+        let dt = 1.0 / 180.0;
+        let mut notes = Vec::new();
+        for k in 0..(secs / dt) as usize {
+            if (k as f64) * dt < 0.8 {
+                p.omega.z += push * dt;
+            }
+            let imp = p.step(dt, &c, w);
+            notes.extend(p.notes.drain(..));
+            p.shed.clear();
+            if imp.is_some() {
+                return (true, notes);
+            }
+        }
+        (false, notes)
+    }
+    /// Rolling down the runway at `kt`, banked over on one main wheel and
+    /// still rolling `roll` rad/s (a gust under a wing, a botched crosswind landing).
+    fn rolling(kt: f64, roll: f64, seed: u64) -> Plane {
+        let mut p = Plane::spawn_ground(37.8, -122.46, 0.0, 0.5, 0.0);
+        p.hold = false;
+        p.t = 2.0;
+        p.rng = Rng(seed);
+        p.throttle = 0.0;
+        p.charge = 0.0;
+        let bank = 0.12 * roll.signum();
+        // Pivot about the downhill main wheel so it stays on the ground.
+        let wheel = GEAR[if roll > 0.0 { 1 } else { 2 }];
+        let before = p.pos + p.rot * wheel;
+        p.rot = p.rot * DQuat::from_rotation_z(-bank);
+        p.pos += before - (p.pos + p.rot * wheel);
+        p.vel = p.forward() * (kt / KT);
+        p.omega = DVec3::new(0.0, 0.0, -roll);
+        p
+    }
+
+    #[test]
+    fn tipping_over_at_40_kt_breaks_a_wing_without_fire() {
+        let w = flat_world();
+        let mut fires = 0;
+        for seed in 1..=12u64 {
+            let mut p = rolling(40.0, if seed % 2 == 0 { 2.2 } else { -2.2 }, seed * 7919);
+            let (boom, notes) = run_pushed(&mut p, &w, 12.0, Controls::default(), if seed % 2 == 0 { -9.0 } else { 9.0 });
+            println!("seed {seed}: boom {boom} {}, wings {:?}, folds {:?}, speed {:.1}, wrecked {}: {notes:?}", p.cause, p.dmg.wing, p.dmg.fold.map(|f| f.on), p.vel.length(), p.wrecked());
+            fires += boom as usize;
+            assert!(p.dmg.wing.iter().any(|&b| b < SPAN) || p.dmg.fold.iter().any(|f| f.on) || !notes.is_empty(), "something breaks");
+        }
+        assert_eq!(fires, 0, "a slow tip-over never burns");
+    }
+
+    #[test]
+    fn a_cartwheel_at_70_kt_tears_things_off() {
+        let w = flat_world();
+        let mut fires = 0;
+        for seed in 1..=8u64 {
+            let mut p = rolling(70.0, 3.5, seed * 104_729);
+            p.vel += p.pos.normalize() * -3.0;
+            let (boom, notes) = run(&mut p, &w, 14.0, Controls { roll: 1.0, ..Default::default() });
+            println!("seed {seed}: boom {boom} {}, wings {:?}, tail {}, hull {:.2}: {notes:?}", p.cause, p.dmg.wing, p.dmg.tail.is_some(), p.dmg.hull);
+            fires += boom as usize;
+            assert!(boom || !notes.is_empty());
+        }
+        assert!(fires < 8, "not every cartwheel burns");
+    }
+
+    #[test]
+    fn belly_landing_slides_to_a_stop() {
+        let w = flat_world();
+        let mut p = Plane::spawn(37.8, -122.46, 2.0, 0.5, 30.0);
+        p.t = 2.0;
+        p.throttle = 0.0;
+        p.charge = 0.0;
+        p.vel += p.pos.normalize() * -2.0;
+        let (boom, notes) = run(&mut p, &w, 20.0, Controls::default());
+        println!("belly: boom {boom}, speed {:.1}, prop {}, {notes:?}", p.vel.length(), p.dmg.prop);
+        assert!(!boom);
+        assert!(p.vel.length() < 2.0);
+        assert!(p.dmg.wing == [SPAN; 2]);
+    }
+
+    #[test]
+    fn diving_into_the_ground_explodes() {
+        let w = flat_world();
+        let mut p = Plane::spawn(37.8, -122.46, 40.0, 0.5, 60.0);
+        p.t = 2.0;
+        p.rot = p.rot * DQuat::from_rotation_x(-0.7);
+        p.vel = p.forward() * 60.0;
+        let (boom, _) = run(&mut p, &w, 5.0, Controls { pitch: -1.0, ..Default::default() });
+        assert!(boom);
+    }
+
+    #[test]
+    fn a_buckled_wing_rips_off_in_the_slipstream() {
+        let w = empty_world();
+        let mut p = Plane::spawn(37.8, -122.46, 1500.0, 0.5, 50.0);
+        p.dmg.apply_spec("rfold=3.0");
+        let dt = 1.0 / 180.0;
+        let mut gone = None;
+        for k in 0..360 {
+            p.step(dt, &Controls::default(), &w);
+            if !p.dmg.fold[1].on {
+                gone = Some(k as f64 * dt);
+                break;
+            }
+        }
+        println!("fold let go after {gone:?} s");
+        assert!(gone.is_some_and(|t| t < 1.5));
+        assert!(!p.shed.is_empty());
+    }
+
+    #[test]
+    fn breaks_stay_inside_each_other() {
+        let mut rng = Rng(99);
+        for s in 0..2 {
+            let mut prev = Tear::NONE;
+            let mut st = SPAN;
+            while st > 1.0 {
+                st -= rng.range(0.4, 1.4);
+                let t = damage::wing_break(s, st.max(0.5), rng.range(-0.8, 0.8), rng.range(-0.3, 0.3), 0.2, &prev);
+                // The new break's mid-chord point is kept by the old stump, the old tip is not kept by the new.
+                let mid = damage::wing_pt(s, st.max(0.5), 0.45, 0.0);
+                assert!(prev.keeps(mid));
+                assert!(!t.keeps(damage::wing_pt(s, st.max(0.5) + 0.3, 0.45, 0.0)));
+                prev = t;
+            }
+        }
+    }
+
 }

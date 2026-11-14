@@ -46,6 +46,8 @@ pub struct Footprint {
     pub main: (u32, u32),
     pub det: (u32, u32),
     pub fine: (u32, u32),
+    /// index range of its far stand-in
+    pub far: (u32, u32),
     pub alive: bool,
     /// centre of the footprint at ground level, relative to the tile centre
     pub center: Vec3,
@@ -80,12 +82,21 @@ pub struct BuildingData {
     pub radius: f64,
     pub verts: Vec<BVertex>,
     pub indices: Vec<u32>,
-    /// indices of buildings tall enough to matter in the far shadow cascade
-    pub n_tall: u32,
     /// indices without the small rooftop detail
     pub n_main: u32,
-    /// end of the middle level of detail; the finest level runs from here to the end
+    /// end of the middle level of detail; the finest level runs from here to `n_far`
     pub n_det: u32,
+    /// end of the buildings' own part of the base level; the rest of it
+    /// (bridge decks) is drawn at every distance
+    pub n_bld: u32,
+    /// start of the far stand-ins (they run to the end), and end of those of
+    /// buildings tall enough to matter in the far shadow cascade
+    pub n_far: u32,
+    pub n_far_tall: u32,
+    /// Where each height class (see `HCLASS`) ends in the building part of the
+    /// base level, the middle level, the finest level and the far stand-ins
+    /// (absolute indices; buildings are laid down tallest first in each).
+    pub cls: [[u32; 4]; 4],
     pub atlas: Vec<Vec<u8>>,
     pub atlas_size: u32,
     pub ax: [f32; 4],
@@ -229,6 +240,21 @@ impl From<bool> for Lvl {
     }
 }
 pub const FINE: Lvl = Lvl(2);
+/// The simplified stand-in for a building far away (see `far_version`).
+pub const FAR: Lvl = Lvl(3);
+/// Distances (from the camera) over which buildings dissolve from their full
+/// geometry into their far stand-ins. Must match FAR0/FAR1 in buildings.wgsl.
+pub const BFAR: [f32; 2] = [1000.0, 1300.0];
+/// Height classes, tallest first: (least height in metres, distance scale). A
+/// tower stands out against the skyline from much farther off than a house, so
+/// its full geometry, and the middle and finest levels that dress it, are kept
+/// out to `scale` times the usual distances (BFAR, LOD2_FAR in buildings.wgsl
+/// and the tile reaches in world.rs). About height / 50 m: what a 50 m block
+/// shows at a kilometre, a 150 m tower shows at three.
+pub const HCLASS: [(f32, f32); 4] = [(150.0, 3.0), (100.0, 2.0), (65.0, 1.5), (0.0, 1.0)];
+pub fn hclass(h: f32) -> usize {
+    HCLASS.iter().position(|c| h >= c.0).unwrap_or(HCLASS.len() - 1)
+}
 /// Most vertices a tile may spend on its finest level of detail.
 const FINE_BUDGET: usize = 450_000;
 
@@ -238,6 +264,7 @@ pub struct Mesh {
     pub main: Vec<u32>,
     pub det: Vec<u32>,
     pub fine: Vec<u32>,
+    pub far: Vec<u32>,
     pub radius: f32,
     fine_verts: usize,
 }
@@ -273,7 +300,8 @@ impl Mesh {
         let ix = match lvl.0 {
             0 => &mut self.main,
             1 => &mut self.det,
-            _ => &mut self.fine,
+            2 => &mut self.fine,
+            _ => &mut self.far,
         };
         for k in 1..pts.len() as u32 - 1 {
             ix.extend([v0, v0 + k, v0 + k + 1]);
@@ -880,7 +908,7 @@ impl Shape {
 
 /// Walls of one ring from `z0` up to `top` + roof height, following the roof's folds.
 #[allow(clippy::too_many_arguments)]
-fn walls(cx: &Ctx, m: &mut Mesh, sh: &Shape, ring: &[Vec2], z0: f32, top: f32, roof: &Roof, creases: &[(f32, f32, f32)], col: [u8; 4], sty: [u8; 4], extra: f32) {
+fn walls(cx: &Ctx, m: &mut Mesh, lvl: Lvl, sh: &Shape, ring: &[Vec2], z0: f32, top: f32, roof: &Roof, creases: &[(f32, f32, f32)], col: [u8; 4], sty: [u8; 4], extra: f32) {
     let mut along = 0.0;
     let n = ring.len();
     for i in 0..n {
@@ -909,14 +937,14 @@ fn walls(cx: &Ctx, m: &mut Mesh, sh: &Shape, ring: &[Vec2], z0: f32, top: f32, r
             };
             let (h0, h1) = (h(p0), h(p1));
             let (s0, s1) = (along + l * w[0], along + l * w[1]);
-            m.poly(false, &[(cx.pos_m(p0, z0), [s0, z0 - sh.gmin]), (cx.pos_m(p1, z0), [s1, z0 - sh.gmin]), (cx.pos_m(p1, h1), [s1, h1 - sh.gmin]), (cx.pos_m(p0, h0), [s0, h0 - sh.gmin])], col, sty, None);
+            m.poly(lvl, &[(cx.pos_m(p0, z0), [s0, z0 - sh.gmin]), (cx.pos_m(p1, z0), [s1, z0 - sh.gmin]), (cx.pos_m(p1, h1), [s1, h1 - sh.gmin]), (cx.pos_m(p0, h0), [s0, h0 - sh.gmin])], col, sty, None);
         }
         along += l;
     }
 }
 
 /// Roof surface over a set of rings (outer + holes).
-fn roof_surface(cx: &Ctx, m: &mut Mesh, sh: &Shape, rings: &[Vec<Vec2>], top: f32, roof: &Roof, creases: &[(f32, f32, f32)], col: [u8; 4], sty: [u8; 4]) {
+fn roof_surface(cx: &Ctx, m: &mut Mesh, lvl: Lvl, sh: &Shape, rings: &[Vec<Vec2>], top: f32, roof: &Roof, creases: &[(f32, f32, f32)], col: [u8; 4], sty: [u8; 4]) {
     let mut flat: Vec<f64> = Vec::new();
     let mut holes = Vec::new();
     let mut pts = Vec::new();
@@ -950,7 +978,7 @@ fn roof_surface(cx: &Ctx, m: &mut Mesh, sh: &Shape, rings: &[Vec<Vec2>], top: f3
                 (cx.pos_m(world, top + hs[k]), uv)
             })
             .collect();
-        m.poly(false, &p3, col, sty, Some(upv));
+        m.poly(lvl, &p3, col, sty, Some(upv));
     }
 }
 
@@ -1614,7 +1642,7 @@ fn building(cx: &Ctx, m: &mut Mesh, all: &[crate::sources::BuildingPoly], rels: 
     if rmax > 0.0 {
         top -= (rmax * 0.6).min(height * 0.45);
     }
-    let (i_main, i_det, i_fine) = (m.main.len() as u32, m.det.len() as u32, m.fine.len() as u32);
+    let (i_main, i_det, i_fine, i_far) = (m.main.len() as u32, m.det.len() as u32, m.fine.len() as u32, m.far.len() as u32);
     let seed8 = (hash(seed, 0) * 255.0) as u8;
     let w8 = (st.wealth * 255.0) as u8;
     let h8 = (top + rmax - gref).clamp(0.0, 255.0) as u8;
@@ -1650,23 +1678,23 @@ fn building(cx: &Ctx, m: &mut Mesh, all: &[crate::sources::BuildingPoly], rels: 
     if tiers.len() > 1 {
         let mut z0 = base;
         for (k, (ring, zt)) in tiers.iter().enumerate() {
-            walls(cx, m, &sh, ring, z0, *zt, &Roof::Flat, &[], wall, wsty, 0.0);
+            walls(cx, m, Lvl(0), &sh, ring, z0, *zt, &Roof::Flat, &[], wall, wsty, 0.0);
             // Terrace left by the setback, or the top roof.
             let last = k + 1 == tiers.len();
             let rs = if !last { vec![ring.clone(), tiers[k + 1].0.clone()] } else { vec![ring.clone()] };
-            roof_surface(cx, m, &sh, &rs, *zt, &Roof::Flat, &[], kcol(st.roof_col, K_FLAT), [seed8, st.flat_mat | if last { hp } else { 0 }, w8, 0]);
+            roof_surface(cx, m, Lvl(0), &sh, &rs, *zt, &Roof::Flat, &[], kcol(st.roof_col, K_FLAT), [seed8, st.flat_mat | if last { hp } else { 0 }, w8, 0]);
             z0 = *zt - 0.2;
         }
         let last = &tiers[tiers.len() - 1].0;
         roof_clutter(cx, m, &sh, last, top, &st, seed, height, helipad, &avoid);
     } else {
         for r in &sh.rings {
-            walls(cx, m, &sh, r, base, top, &st.roof, &creases, wall, wsty, if flat { st.parapet } else { 0.0 });
+            walls(cx, m, Lvl(0), &sh, r, base, top, &st.roof, &creases, wall, wsty, if flat { st.parapet } else { 0.0 });
         }
         // Pitched roofs carry their ridge height (decimetres) so the shader can cap the ridge.
         let ridge8 = (rmax * 10.0).clamp(0.0, 255.0) as u8;
         let (rk, rsty) = if flat { (K_FLAT, [seed8, st.flat_mat | hp, w8, 0]) } else { (K_PITCH, [seed8, st.roof_mat, w8, ridge8]) };
-        roof_surface(cx, m, &sh, &sh.rings, top, &st.roof, &creases, kcol(st.roof_col, rk), rsty);
+        roof_surface(cx, m, Lvl(0), &sh, &sh.rings, top, &st.roof, &creases, kcol(st.roof_col, rk), rsty);
         if flat && st.parapet > 0.0 && !hidden_roof {
             // Parapet: a low wall around the roof edge with an inner face and a cap.
             if let Some(inner) = inset(&sh.rings[0], 0.28) {
@@ -1714,6 +1742,8 @@ fn building(cx: &Ctx, m: &mut Mesh, all: &[crate::sources::BuildingPoly], rels: 
     }
 
     wall_dressing(cx, m, &sh, &st, seed8, seed, base, top);
+    let far = Far { rect, area, tiers: &tiers, base, top, hidden_roof, wall, wsty, seed8, w8, hp };
+    far_version(cx, m, &sh, &st, &far);
 
     let ring: Vec<[f32; 2]> = outer.iter().map(|p| [p[0] / cx.ext, p[1] / cx.ext]).collect();
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
@@ -1732,6 +1762,7 @@ fn building(cx: &Ctx, m: &mut Mesh, all: &[crate::sources::BuildingPoly], rels: 
         main: (i_main, m.main.len() as u32 - i_main),
         det: (i_det, m.det.len() as u32 - i_det),
         fine: (i_fine, m.fine.len() as u32 - i_fine),
+        far: (i_far, m.far.len() as u32 - i_far),
         alive: true,
         center: cx.pos(cen, gmin),
         area,
@@ -1740,6 +1771,116 @@ fn building(cx: &Ctx, m: &mut Mesh, all: &[crate::sources::BuildingPoly], rels: 
         roof_col: st.roof_col,
         tiers: if tiers.len() > 1 { tier_steps } else { Vec::new() },
     })
+}
+
+/// What `far_version` needs to know about a building.
+struct Far<'a> {
+    rect: f32,
+    area: f32,
+    tiers: &'a [(Vec<Vec2>, f32)],
+    base: f32,
+    top: f32,
+    hidden_roof: bool,
+    wall: [u8; 4],
+    wsty: [u8; 4],
+    seed8: u8,
+    w8: u8,
+    hp: u8,
+}
+
+/// The building as it is seen from more than a mile off, where a metre is
+/// under half a pixel: walls and a roof over a simplified footprint (its
+/// bounding box, if it is nearly rectangular), the roof reduced to at most
+/// one ridge, and none of the dressing. A tower keeps its setbacks. Sheds too
+/// small to make out are left out.
+fn far_version(cx: &Ctx, m: &mut Mesh, sh: &Shape, st: &Style, f: &Far) {
+    if f.area < 30.0 && f.top - sh.gmin < 5.0 {
+        return;
+    }
+    const TOL: f32 = 1.5;
+    let flat_roof = kcol(st.roof_col, K_FLAT);
+    let flat_sty = |hp: u8| [f.seed8, st.flat_mat | hp, f.w8, 0];
+    if f.tiers.len() > 1 {
+        let mut z0 = f.base;
+        for (k, (ring, zt)) in f.tiers.iter().enumerate() {
+            let r = simplify_ring(ring, TOL);
+            walls(cx, m, FAR, sh, &r, z0, *zt, &Roof::Flat, &[], f.wall, f.wsty, 0.0);
+            let hp = if k + 1 == f.tiers.len() { f.hp } else { 0 };
+            roof_surface(cx, m, FAR, sh, &[r], *zt, &Roof::Flat, &[], flat_roof, flat_sty(hp));
+            z0 = *zt - 0.2;
+        }
+        return;
+    }
+    let (hl, hw) = (sh.hl, sh.hw);
+    let outer = if f.rect > 0.85 {
+        let (c, u, v) = (sh.c, sh.u * hl, sh.v * hw);
+        vec![c - u - v, c + u - v, c + u + v, c - u + v]
+    } else {
+        simplify_ring(&sh.rings[0], TOL)
+    };
+    // Courtyards big enough to see stay open.
+    let mut rings = vec![outer];
+    rings.extend(sh.rings[1..].iter().filter(|h| ring_area(h) > 400.0).map(|h| simplify_ring(h, TOL)));
+    let roof = match st.roof {
+        Roof::Mansard(p, cap) => Roof::Hip(p.min(cap / hw.min(hl).max(0.5))),
+        Roof::Multi(_, r) => Roof::Gable(r, 0.0),
+        r => r,
+    };
+    let flat = matches!(roof, Roof::Flat);
+    let creases = roof.creases(hl, hw);
+    for r in &rings {
+        walls(cx, m, FAR, sh, r, f.base, f.top, &roof, &creases, f.wall, f.wsty, if flat { st.parapet } else { 0.0 });
+    }
+    if f.hidden_roof {
+        return;
+    }
+    let ridge8 = (roof.max_h(hl, hw) * 10.0).clamp(0.0, 255.0) as u8;
+    let (col, sty) = if flat { (flat_roof, flat_sty(f.hp)) } else { (kcol(st.roof_col, K_PITCH), [f.seed8, st.roof_mat, f.w8, ridge8]) };
+    roof_surface(cx, m, FAR, sh, &rings, f.top, &roof, &creases, col, sty);
+}
+
+/// Douglas-Peucker on a closed ring: drops the corners that lie within `tol`
+/// metres of the line between the corners kept on either side.
+fn simplify_ring(ring: &[Vec2], tol: f32) -> Vec<Vec2> {
+    let n = ring.len();
+    if n <= 4 {
+        return ring.to_vec();
+    }
+    let far_from = |p: Vec2| (0..n).max_by(|&a, &b| ring[a].distance_squared(p).total_cmp(&ring[b].distance_squared(p))).unwrap_or(0);
+    let a = far_from(ring[0]);
+    let b = far_from(ring[a]);
+    if a == b {
+        return ring.to_vec();
+    }
+    let mut keep = vec![false; n];
+    keep[a] = true;
+    keep[b] = true;
+    let mut todo = vec![(a, b), (b, a)];
+    while let Some((i, j)) = todo.pop() {
+        let (p, d) = (ring[i], ring[j] - ring[i]);
+        let len = d.length();
+        let (mut worst, mut at) = (0.0f32, usize::MAX);
+        let mut k = (i + 1) % n;
+        while k != j {
+            let e = ring[k] - p;
+            let off = if len < 1e-4 { e.length() } else { e.perp_dot(d).abs() / len };
+            if off > worst {
+                (worst, at) = (off, k);
+            }
+            k = (k + 1) % n;
+        }
+        if worst > tol {
+            keep[at] = true;
+            todo.push((i, at));
+            todo.push((at, j));
+        }
+    }
+    let out: Vec<Vec2> = (0..n).filter(|&k| keep[k]).map(|k| ring[k]).collect();
+    if out.len() < 3 { ring.to_vec() } else { out }
+}
+
+fn ring_area(r: &[Vec2]) -> f32 {
+    (0..r.len()).map(|i| r[i].perp_dot(r[(i + 1) % r.len()])).sum::<f32>().abs() * 0.5
 }
 
 /// Load the satellite image for a detail tile: its four children one zoom down.
@@ -1801,7 +1942,9 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
     let rels = relate(cx.unit_m, &vt.buildings);
     let mut order: Vec<usize> = (0..vt.buildings.len()).collect();
     order.sort_by(|a, b| rels[*b].hi.total_cmp(&rels[*a].hi));
-    let mut n_tall = 0;
+    let mut n_far_tall = 0;
+    // Ends of each height class in the four runs (relative to each run's start).
+    let mut cls: [Option<[u32; 4]>; 4] = [None; 4];
     let mut built = vec![0u8; RASTER * RASTER];
     for bi in order {
         let b = &vt.buildings[bi];
@@ -1810,9 +1953,11 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
             raster(&mut built, RASTER, ext, &b.rings[..1], 1);
         }
         if rels[bi].hi >= 12.0 {
-            n_tall = m.main.len() as u32;
+            n_far_tall = m.far.len() as u32;
         }
+        cls[hclass(rels[bi].hi)] = Some([m.main.len(), m.det.len(), m.fine.len(), m.far.len()].map(|n| n as u32));
     }
+    let n_bld = m.main.len() as u32;
 
     let mut roads = crate::roads::build(&cx, &vt, src, &mut m, &mut footprints, &built);
     let parked = crate::roads::park_cars(&cx, &roads.net, &hoods, &built);
@@ -1823,22 +1968,41 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
     let (ax, ay) = (px / px.length_squared(), py / py.length_squared());
     let n_main = m.main.len() as u32;
     let n_det = n_main + m.det.len() as u32;
+    let n_far = n_det + m.fine.len() as u32;
     for f in footprints.iter_mut() {
         f.det.0 += n_main;
         f.fine.0 += n_det;
+        f.far.0 += n_far;
+    }
+    // Empty classes end where the one before does; the last takes the rest of
+    // each run (street furniture in the middle and finest levels).
+    let n_idx = n_far + m.far.len() as u32;
+    let starts = [0, n_main, n_det, n_far];
+    let mut cls_abs = [[0u32; 4]; 4];
+    let mut prev = [0u32; 4];
+    for (c, e) in cls.iter().enumerate() {
+        let e = if c + 1 == HCLASS.len() { [n_bld, n_det - n_main, n_far - n_det, n_idx - n_far] } else { e.unwrap_or(prev) };
+        prev = e;
+        for r in 0..4 {
+            cls_abs[r][c] = starts[r] + e[r];
+        }
     }
     let mut indices = m.main;
     indices.extend(m.det);
     indices.extend(m.fine);
+    indices.extend(m.far);
     Ok(BuildingData {
         id,
         center: cx.center,
         radius: m.radius.max(roads.radius) as f64 + 30.0,
         verts: m.v,
         indices,
-        n_tall,
         n_main,
         n_det,
+        n_bld,
+        n_far,
+        n_far_tall: n_far + n_far_tall,
+        cls: cls_abs,
         atlas: mip_chain(cx.atlas, ATLAS, 4),
         atlas_size: ATLAS as u32,
         ax: [ax.x, ax.y, ax.z, 0.5 - ax.dot(p0)],

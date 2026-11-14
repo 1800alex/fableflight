@@ -862,6 +862,25 @@ pub fn place(cx: &Ctx, vt: &VecTile, hoods: &Hoods, built: &[u8], roads: &[u8]) 
     for (_, rings) in vt.landuse.iter().filter(|l| l.0 == LU_OPEN) {
         crate::buildings::raster(&mut block, RASTER, ext, rings, 1);
     }
+    // Nothing grows on an airfield: inside its fence, and well clear of its
+    // pavement where the map has no fence drawn.
+    for (_, rings) in &vt.aero_polys {
+        crate::buildings::raster(&mut block, RASTER, ext, rings, 1);
+    }
+    let px_m = cx.unit_m * ext / RASTER as f32;
+    for l in &vt.aero_lines {
+        let hw = (l.width * 0.5 + if l.runway { 75.0 } else { 20.0 }) / px_m;
+        let mut pts = l.pts.clone();
+        if l.runway && pts.len() >= 2 {
+            // And the approach and climb-out beyond each end.
+            let (a, b) = (glam::Vec2::from(pts[0]), glam::Vec2::from(pts[pts.len() - 1]));
+            let d = (b - a).normalize_or_zero() * (450.0 / cx.unit_m);
+            pts[0] = (a - d).into();
+            let n = pts.len() - 1;
+            pts[n] = (b + d).into();
+        }
+        crate::sources::thick_line(&pts, RASTER as f32 / ext, hw, RASTER, |i| block[i] = 1);
+    }
     // "Treeness" of each satellite pixel: vegetation that is dark and rough
     // (canopy) rather than bright and smooth (lawn, crops).
     let lum = |x: usize, y: usize| {
@@ -985,28 +1004,31 @@ pub fn place(cx: &Ctx, vt: &VecTile, hoods: &Hoods, built: &[u8], roads: &[u8]) 
             hash(k, tseed) < keep
         });
     }
-    cand.sort_by_key(|c| (c.2, c.1));
-    let mut chunks: Vec<TreeChunk> = Vec::new();
+    // Sorted by variant, then chunk: each chunk's trees of one variant are a
+    // run, and the runs of neighbouring chunks follow on from each other, so
+    // the renderer can draw many chunks of one variant as a single batch.
+    cand.sort_by_key(|c| (c.1, c.2));
+    let mut bounds = vec![(Vec3::splat(1e9), Vec3::splat(-1e9)); CH * CH];
+    let mut runs: Vec<Vec<(u16, u32, u32)>> = vec![Vec::new(); CH * CH];
     let mut i = 0;
     while i < cand.len() {
-        let ch = cand[i].2;
-        let start = i;
-        let mut runs = Vec::new();
-        let (mut lo, mut hi) = (Vec3::splat(1e9), Vec3::splat(-1e9));
-        while i < cand.len() && cand[i].2 == ch {
-            let v = cand[i].1;
-            let rs = i;
-            while i < cand.len() && cand[i].2 == ch && cand[i].1 == v {
-                let p = Vec3::new(cand[i].0.a[0], cand[i].0.a[1], cand[i].0.a[2]);
-                lo = lo.min(p);
-                hi = hi.max(p);
-                i += 1;
-            }
-            runs.push((v as u16, rs as u32, (i - rs) as u32));
+        let (v, ch) = (cand[i].1, cand[i].2 as usize);
+        let rs = i;
+        let (lo, hi) = &mut bounds[ch];
+        while i < cand.len() && cand[i].1 == v && cand[i].2 as usize == ch {
+            let p = Vec3::new(cand[i].0.a[0], cand[i].0.a[1], cand[i].0.a[2]);
+            *lo = lo.min(p);
+            *hi = hi.max(p);
+            i += 1;
         }
-        let _ = start;
-        chunks.push(TreeChunk { center: (lo + hi) * 0.5, radius: (hi - lo).length() * 0.5 + 14.0, runs });
+        runs[ch].push((v as u16, rs as u32, (i - rs) as u32));
     }
+    let chunks: Vec<TreeChunk> = runs
+        .into_iter()
+        .zip(bounds)
+        .filter(|(r, _)| !r.is_empty())
+        .map(|(runs, (lo, hi))| TreeChunk { center: (lo + hi) * 0.5, radius: (hi - lo).length() * 0.5 + 14.0, runs })
+        .collect();
     // What grows underneath: shrubs, ferns, saplings, tussocks and deadwood,
     // thick in the woods and thinning out into open country.
     const UCELL: f32 = 3.4;

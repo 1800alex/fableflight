@@ -140,7 +140,13 @@ fn solid_vertex(pos: vec3f, nrm: vec3f, col: vec4f, ia: vec4f, ib: vec4f, tint: 
   return o;
 }
 @vertex fn vs_shadow(@location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) col: vec4f, @location(3) ia: vec4f, @location(4) ib: vec4f, @location(5) tint: vec4f, @location(6) uv: vec4f) -> @builtin(position) vec4f {
-  if (other_lod(uv.x, ia, tint.a * 255.0)) { return vec4f(2.0, 2.0, 0.0, 1.0); }
+  if (other_lod(uv.x, ia, tint.a * 255.0) || photo_shadow_gone(ia.xyz + T.offset.xyz)) { return vec4f(2.0, 2.0, 0.0, 1.0); }
+  return CS.vp * vec4f(tree_world(pos, nrm, step(0.5, col.a), ia, ib, tint.a * 255.0, vec2f(0.0)).P, 1.0);
+}
+// Whole batches drawn with the one model they are given (the second cascade).
+@vertex fn vs_shadow_fixed(@location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) col: vec4f, @location(3) ia: vec4f, @location(4) ib: vec4f, @location(5) tint: vec4f) -> @builtin(position) vec4f {
+  // (a tree under the 3D tiles' mesh casts nothing: the mesh's own tree does)
+  if (photo_shadow_gone(ia.xyz + T.offset.xyz)) { return vec4f(2.0, 2.0, 0.0, 1.0); }
   return CS.vp * vec4f(tree_world(pos, nrm, step(0.5, col.a), ia, ib, tint.a * 255.0, vec2f(0.0)).P, 1.0);
 }
 
@@ -326,6 +332,8 @@ fn solid_frag(in: VOut, cut: bool) -> Solid {
   return Solid(vec4f(c, 1.0), vec4f(N, 0.0), 1.0, amb_share(c));
 }
 @fragment fn fs(in: VOut) -> GOut {
+  // Inside the 3D tiles zone the mesh stands in for this (tiles3d.rs).
+  if (photo_hides(in.P, in.clip.xy)) { discard; }
   let o = solid_frag(in, false);
   return GOut(o.c, o.n, o.amb);
 }
@@ -333,6 +341,7 @@ fn solid_frag(in: VOut, cut: bool) -> Solid {
 // 1 for the composite). Writing the sample mask costs the early depth test, so
 // only trees close to the camera use this.
 @fragment fn fs_cut(in: VOut) -> COut {
+  if (photo_hides(in.P, in.clip.xy)) { discard; }
   let o = solid_frag(in, true);
   let cnt = min(u32(o.cover * 4.0 + ign(in.clip.xy)), 4u);
   if (cnt == 0u) { discard; }
@@ -417,6 +426,7 @@ fn blades(uv: vec2f, seed: f32, grow: f32) -> vec4f {
 }
 
 @fragment fn fs_card(in: CVOut) -> COut {
+  if (photo_hides(in.P, in.clip.xy)) { discard; }
   let aspect = in.aux.x;
   let p = vec2f(in.uv.x, in.uv.y * aspect);
   // Size of a pixel in card lengths, and the card's true facing.
@@ -712,6 +722,7 @@ struct IOut {
   return o;
 }
 @fragment fn fs_imp(in: IOut) -> COut {
+  if (photo_hides(in.Q, in.clip.xy)) { discard; }
   // Mip level from how big a picture is on screen, a little on the sharp
   // side (the temporal filter takes out the shimmer).
   let lod = clamp(log2(max(length(dpdx(in.uva.xy)), length(dpdy(in.uva.xy))) * 0.5 * IMP_CELL) - 0.5, 0.0, 6.0);

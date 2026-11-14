@@ -12,6 +12,8 @@ pub struct Weather {
     pub cloud_depth: f32,
     /// how many cumulonimbus storm cells tower out of the layer, 0..1
     pub storms: f32,
+    /// how much mid-level cloud (altocumulus, thickening into altostratus), 0..1
+    pub alto: f32,
     /// aerosol haze, as a multiple of a clear day's
     pub haze: f32,
     /// wind 10 m above the ground, m/s, and the compass direction it blows from
@@ -54,14 +56,14 @@ impl Default for Air {
     }
 }
 
-/// (name, cover, base, thickness, storms, haze, wind, gusts)
-const PRESETS: &[(&str, f32, f32, f32, f32, f32, f64, f64)] = &[
-    ("Clear", 0.05, 1500.0, 4500.0, 0.0, 0.6, 2.0, 0.0),
-    ("Fair", 0.45, 1500.0, 4500.0, 0.2, 1.0, 4.0, 0.15),
-    ("Hazy", 0.2, 1800.0, 3000.0, 0.0, 8.0, 2.0, 0.05),
-    ("Overcast", 0.95, 800.0, 2500.0, 0.0, 3.0, 7.0, 0.3),
-    ("Windy", 0.55, 1200.0, 4000.0, 0.1, 1.5, 14.0, 0.7),
-    ("Storms", 0.6, 1300.0, 5000.0, 0.85, 1.4, 9.0, 0.5),
+/// (name, cover, base, thickness, storms, mid-level cloud, haze, wind, gusts)
+const PRESETS: &[(&str, f32, f32, f32, f32, f32, f32, f64, f64)] = &[
+    ("Clear", 0.05, 1500.0, 4500.0, 0.0, 0.0, 0.6, 2.0, 0.0),
+    ("Fair", 0.45, 1500.0, 4500.0, 0.2, 0.25, 1.0, 4.0, 0.15),
+    ("Hazy", 0.2, 1800.0, 3000.0, 0.0, 0.2, 8.0, 2.0, 0.05),
+    ("Overcast", 0.95, 800.0, 2500.0, 0.0, 0.7, 3.0, 7.0, 0.3),
+    ("Windy", 0.55, 1200.0, 4000.0, 0.1, 0.35, 1.5, 14.0, 0.7),
+    ("Storms", 0.6, 1300.0, 5000.0, 0.85, 0.5, 1.4, 9.0, 0.5),
 ];
 /// Where storm towers flatten into anvils (tropopause), metres.
 pub const STORM_TOP: f32 = 11000.0;
@@ -117,7 +119,7 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, haze: 1.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new() }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new() }
     }
 
     /// Top of the cloud layer including any storm towers, metres.
@@ -346,7 +348,10 @@ impl Weather {
             .collapsible(true)
             .resizable(false)
             .default_pos([14.0, 250.0])
-            .show(ctx, |ui| self.controls(ui, utc, doy, lon, false));
+            .show(ctx, |ui| {
+                ui.spacing_mut().slider_width = 200.0;
+                self.controls(ui, utc, doy, lon, false)
+            });
         self.open = open;
     }
 
@@ -365,13 +370,29 @@ impl Weather {
                 self.presets(&mut c[1]);
             });
         } else {
-            ui.spacing_mut().slider_width = 200.0;
             self.day_controls(ui, utc, doy, lon);
             self.sky_controls(ui);
             self.wind_controls(ui);
             ui.add_space(6.0);
             self.presets(ui);
         }
+    }
+
+    /// The start screen's version: local time and date at the chosen spot
+    /// (the clock is set from them on take-off), then the sky and the wind.
+    pub fn start_controls(&mut self, ui: &mut egui::Ui, hour: &mut f64, doy: &mut f64) {
+        self.presets(ui);
+        ui.add_space(4.0);
+        section(ui, "DAY", |ui| {
+            ui.label("Local time");
+            add(ui, Slider::new(hour, 0.0..=23.99).custom_formatter(|v, _| crate::menu::hhmm(v)));
+            ui.end_row();
+            ui.label("Date");
+            add(ui, Slider::new(doy, 0.0..=364.0).step_by(1.0).custom_formatter(|v, _| month_day(v)));
+            ui.end_row();
+        });
+        self.sky_controls(ui);
+        self.wind_controls(ui);
     }
 
     fn day_controls(&mut self, ui: &mut egui::Ui, utc: &mut f64, doy: &mut f64, lon: f64) {
@@ -410,6 +431,9 @@ impl Weather {
             ui.label("Storm cells");
             add(ui, Slider::new(&mut self.storms, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             ui.end_row();
+            ui.label("Mid-level cloud");
+            add(ui, Slider::new(&mut self.alto, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            ui.end_row();
             ui.label("Haze");
             add(ui, Slider::new(&mut self.haze, 0.2..=40.0).logarithmic(true).custom_formatter(|v, _| format!("{v:.1}×")));
             ui.end_row();
@@ -440,9 +464,9 @@ impl Weather {
         crate::menu::heading(ui, "PRESETS");
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
-            for &(name, c, b, d, s, h, w, g) in PRESETS {
+            for &(name, c, b, d, s, a, h, w, g) in PRESETS {
                 if ui.button(name).clicked() {
-                    (self.clouds, self.cloud_base, self.cloud_depth, self.storms, self.haze, self.wind, self.gusts) = (c, b, d, s, h, w, g);
+                    (self.clouds, self.cloud_base, self.cloud_depth, self.storms, self.alto, self.haze, self.wind, self.gusts) = (c, b, d, s, a, h, w, g);
                 }
             }
         });

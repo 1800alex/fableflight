@@ -10,13 +10,16 @@
 struct Obj { model: mat4x4f, tint: vec4f, glow: vec4f, params: array<vec4f, 6>, tear: array<vec4f, 2>, dmg: vec4f, dmg2: vec4f };
 @group(1) @binding(0) var<uniform> O: Obj;
 @group(2) @binding(0) var<uniform> CS: Cascade;
+// The glass pass only: the lit scene before the glass went on, and its depth.
+@group(2) @binding(1) var t_scene: texture_2d<f32>;
+@group(2) @binding(2) var t_gdepth: texture_depth_2d;
 
 // params[0] airspeed kt, altitude ft, vertical speed fpm, heading deg
 // params[1] pitch deg, bank deg, turn rate deg/s, slip
 // params[2] rpm, manifold pressure, fuel left, fuel right (gal)
 // params[3] oil temp F, oil pressure psi, EGT 0..1, amps
 // params[4] suction, clock (s), gear position, flaps deg
-// params[5] nav lights, strobe flash, beacon flash, landing light
+// params[5] nav lights (on: 1000 + the compass card's heading), strobe flash, beacon flash, landing light
 
 const M_PAINT = 0u; const M_LIVERY = 1u; const M_ALU = 2u; const M_STEEL = 3u; const M_RUBBER = 4u;
 const M_PLASTIC = 5u; const M_FABRIC = 6u; const M_GLASS = 7u; const M_LAMP = 8u; const M_GAUGE = 9u;
@@ -601,10 +604,11 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
     case 0u: { // airspeed
       a0 = 0.0; a1 = rad(330.0); vmax = 200.0; tn = 40.0; tper = 4.0;
       ln = 7.0; lfirst = 40.0; lstep = 20.0; lr = 0.62;
-      arcs[0] = vec4f(50.0, 140.0, 0.86, 0.95); arc_col[0] = green;
-      arcs[1] = vec4f(140.0, 175.0, 0.86, 0.95); arc_col[1] = vec3f(0.6, 0.45, 0.02);
-      arcs[2] = vec4f(41.0, 85.0, 0.79, 0.85); arc_col[2] = vec3f(0.6);
-      redline = 175.0;
+      // A 172's markings (indicated): white Vso..Vfe, green Vs1..Vno, yellow to Vne.
+      arcs[0] = vec4f(50.0, 129.0, 0.86, 0.95); arc_col[0] = green;
+      arcs[1] = vec4f(129.0, 163.0, 0.86, 0.95); arc_col[1] = vec3f(0.6, 0.45, 0.02);
+      arcs[2] = vec4f(45.0, 85.0, 0.79, 0.85); arc_col[2] = vec3f(0.6);
+      redline = 163.0;
       nd[0] = vec4f(dial(P0.x, 0.0, 200.0, a0, a1), 0.86, 0.035, 0.18); nn = 1;
     }
     case 2u: { // altimeter: hundreds, thousands, ten thousands, pressure window
@@ -747,7 +751,7 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       tc = vec2f(0.0, 0.66); tcode = pack(0u, 9u, 0u, 0u, 0u, 0u); tlen = 3u; th = 0.15;
     }
     case 17u: { // magnetic compass: a card seen edge-on through a window
-      let hdg = P0.w;
+      let hdg = O.params[5].x % 1000.0;
       let x = uv.x * 32.0 + hdg;
       let k = round(x / 5.0);
       let major = abs(k - round(k / 2.0) * 2.0) < 0.5;
@@ -761,6 +765,12 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       cov = lub;
       bg = vec3f(0.02, 0.02, 0.022) * (1.0 - 0.4 * uv.y * uv.y);
       hub = false;
+    }
+    case 20u: { // outside air temperature, degrees C (the standard atmosphere's at this height)
+      a0 = rad(-135.0); a1 = rad(135.0); vmin = -40.0; vmax = 50.0; tn = 18.0; tper = 2.0;
+      ln = 5.0; lfirst = -40.0; lstep = 20.0; lr = 0.58; lh = 0.2;
+      arcs[0] = vec4f(-40.0, 0.0, 0.88, 0.95); arc_col[0] = vec3f(0.05, 0.15, 0.5);
+      nd[0] = vec4f(dial(15.0 - 1.98 * P0.y / 1000.0, vmin, vmax, a0, a1), 0.84, 0.045, 0.15); nn = 1;
     }
     case 19u: { // fuel selector plate
       let arrow = step(abs(uv.x), (0.8 - uv.y) * 0.35) * step(-0.2, uv.y);
@@ -1022,7 +1032,7 @@ fn surface(in: VOut) -> Shaded {
       var on = 0.0;
       var k = 0.0;
       switch ch {
-        case 0u, 1u, 2u: { on = P5.x; k = mix(0.08, 0.6, night); }
+        case 0u, 1u, 2u: { on = step(999.0, P5.x); k = mix(0.08, 0.6, night); }
         case 3u: { on = P5.y; k = 3.0; }
         case 4u: { on = P5.z; k = mix(0.5, 0.6, night); }
         case 5u: { on = P5.w; k = mix(0.3, 0.8, night); }
@@ -1155,8 +1165,10 @@ fn surface(in: VOut) -> Shaded {
   // Inside the cabin, light bounces around off every surface: a fill that the
   // occlusion term alone would miss.
   let inside = step(abs(L.x), 0.58) * step(-1.42, L.z) * step(L.z, 1.5) * step(L.y, 0.62) * select(0.0, 1.0, id != M_LIVERY && pt != P_FUSE && pt != P_COWL);
-  let amb_ao = mix(ao * ao * (3.0 - 2.0 * ao), 0.25 + 0.75 * ao, inside);
-  let fill = (l.amb * 0.45 + l.sun * max(dot(l.upn, Ls), 0.0) * 0.045) * (0.35 + 0.65 * ao) * inside;
+  // (The baked occlusion already counts only the sky seen through the
+  // windows; the eye adapts to the dimmer cabin, main.rs / cockpit.rs.)
+  let amb_ao = mix(ao * ao * (3.0 - 2.0 * ao), 0.06 + 0.94 * ao, inside);
+  let fill = (l.amb * 0.2 + l.sun * max(dot(l.upn, Ls), 0.0) * 0.03) * (0.25 + 0.75 * ao) * inside;
   let bounce = l.sun * max(dot(l.upn, Ls), 0.0) * 0.05 * sat(0.5 - 0.5 * dot(N, l.upn)) + l.sun * max(dot(l.upn, Ls), 0.0) * 0.025;
   let moon = moon_light(l.upn, l.h) * max(dot(N, G.moon.xyz), 0.0);
   let diffuse = albedo * (1.0 - metal) * ((l.sun * ndl * sh + moon) / PI + (l.amb * (0.55 + 0.45 * dot(N, l.upn)) + bounce) * amb_ao + fill + point_light(in.P, N));
@@ -1182,6 +1194,39 @@ fn surface(in: VOut) -> Shaded {
 }
 
 // ---------------------------------------------------------------- transparent pass
+
+// How far a window bends the view through it (radians along its two in-plane
+// axes). Formed acrylic is never optically flat: broad lens-like swells, faint
+// ripples drawn into the sheet, and worse where it is clamped at the frame and
+// where the windshield is pulled round its corners.
+fn glass_bend(g: vec2f, edge: f32, curve: f32) -> vec2f {
+  let a = textureSampleLevel(t_wave, s_repeat, g * 0.8 + vec2f(0.31, 0.77), 0.0).rg * 2.0 - 1.0;
+  let b = textureSampleLevel(t_wave, s_repeat, vec2f(g.x * 0.3, g.y * 2.4) + vec2f(0.61, 0.23), 0.0).rg * 2.0 - 1.0;
+  let c = textureSampleLevel(t_wave, s_repeat, g * 2.7 + vec2f(0.13, 0.52), 0.0).rg * 2.0 - 1.0;
+  let s = a * 0.005 + vec2f(b.x * 0.3, b.y) * 0.0026 + c * 0.0006;
+  return s * (1.0 + 2.5 * edge + 1.5 * curve);
+}
+// What the inside of a window mirrors, seen from the cabin: the glareshield
+// in the windshield (lit where the sun falls on it), elsewhere the dim cabin.
+fn cabin_mirror(p0: vec3f, r: vec3f, l: Light, ls: vec3f) -> vec3f {
+  var t = 0.01;
+  for (var i = 0; i < 22; i++) {
+    let p = p0 + r * t;
+    let g = (GS_Z + 0.025 - p.z) / 0.46;
+    if (g >= 0.0 && g <= 1.0 && abs(p.x) < 0.56 && p.y < 0.185 + 0.12 * g * g * g) {
+      let up = normalize(O.model[1].xyz);
+      let sg = shadow_at((O.model * vec4f(p, 1.0)).xyz, up);
+      let weave = 0.75 + 0.5 * nz(p * 23.0).g;
+      // Black fabric, a little dusty.
+      return vec3f(0.055, 0.054, 0.056) * weave / PI * (l.sun * max(ls.y, 0.0) * sg + l.amb * 0.55);
+    }
+    if (p.y < 0.17 && p.z < GS_Z + 0.03) { break; }
+    t += 0.03;
+  }
+  // Seats, lining, a shirt: lighter and darker patches as the eye moves.
+  return l.amb * 0.035 * (0.5 + 1.0 * nz(r * 0.9 + vec3f(0.3, 0.1, 0.6)).r);
+}
+const GS_Z = -1.30; // cabin::PANEL_Z
 
 @fragment fn fs_glass(in: VOut) -> @location(0) vec4f {
   let px = max(length(dpdx(in.P)), length(dpdy(in.P)));
@@ -1219,9 +1264,19 @@ fn surface(in: VOut) -> Shaded {
   let ndv = max(dot(N, -V), 0.0);
   let F = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
   let R = reflect(V, N);
+  // The body frame (rigid): where the eye is, and the window's own axes.
+  let ml = transpose(mat3x3f(O.model[0].xyz, O.model[1].xyz, O.model[2].xyz));
+  let eye_l = -(ml * O.model[3].xyz);
+  let in_cabin = from_inside && abs(eye_l.x) < 0.6 && eye_l.y > -0.5 && eye_l.y < 0.85 && eye_l.z > -1.3 && eye_l.z < 1.6;
+  let wind = abs(in.Nl.x) < 0.5;
+  let tb = select(vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 0.0), wind);
+  let bb = select(vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.454, 0.891), wind);
+  let g2 = vec2f(dot(in.L, tb), dot(in.L, bb));
   // Looking out, the glass mostly mirrors the dim cabin.
   var env = l.amb * 0.035;
   if (!from_inside) { env = env_reflect(in.P, R, l.upn, true); }
+  // A sheet has two faces, and from inside both mirror the cabin.
+  if (in_cabin) { env = cabin_mirror(in.L, ml * R, l, ml * Ls) * 2.0 / (1.0 + F); }
   let H = normalize(Ls - V);
   let ndl = max(dot(N, Ls), 0.0);
   let glint = l.sun * ggx(max(dot(N, H), 0.0), 0.02) * vis(max(ndv, 1e-3), ndl, 0.02) * ndl * sh * (0.04 + 0.96 * pow(1.0 - max(dot(-V, H), 0.0), 5.0));
@@ -1232,11 +1287,73 @@ fn surface(in: VOut) -> Shaded {
   let n2 = nz(L * 17.0);
   var haze = 0.012 + 0.03 * smoothstep(0.45, 0.85, n1.r) + 0.02 * smoothstep(0.6, 0.9, n2.g);
   haze += 0.06 * smoothstep(-0.05, 0.0, d);
+  // Dried rain: rings of grime left where drops evaporated, in clusters.
+  var spots = 0.0;
+  let spot_cs = 0.016;
+  let fine = 1.0 - smoothstep(spot_cs * 0.06, spot_cs * 0.25, px);
+  if (fine > 0.0) {
+    let cl = smoothstep(0.5, 0.78, nz(L * 1.6 + vec3f(0.4, 0.0, 0.2)).g);
+    if (cl > 0.0) {
+      let cell = floor(g2 / spot_cs);
+      var sp = 0.0;
+      for (var j = -1; j <= 1; j++) { for (var i = -1; i <= 1; i++) {
+        let c = cell + vec2f(f32(i), f32(j));
+        if (hash2(c + 41.3) > 0.3) { continue; }
+        let o = (c + vec2f(hash2(c + 7.7), hash2(c + 13.1))) * spot_cs;
+        let rad = spot_cs * (0.15 + 0.5 * hash2(c + 23.9) * hash2(c + 29.3));
+        let q = (g2 - o) / rad;
+        let rr = length(q * vec2f(1.0, 1.0 + 0.3 * hash2(c + 3.3))) + 0.12 * (nz(vec3f(q * 0.8 + c, 0.5) * 0.2).r - 0.5);
+        let ring = 1.0 - smoothstep(0.0, max(0.22, px * 1.2 / rad), abs(rr - 0.88));
+        let fill = (1.0 - smoothstep(0.75, 0.95, rr)) * 0.3;
+        sp = max(sp, max(ring, fill));
+      } }
+      spots = sp * cl * fine;
+      haze += spots * 0.05;
+    }
+  }
   let bugs = smoothstep(0.86, 0.9, nz(L * 12.0).a) * step(L.z, -1.25) * smoothstep(0.55, 0.2, L.y) * (1.0 - smoothstep(0.002, 0.008, px));
   let toward = pow(max(dot(V, Ls), 0.0), 6.0);
   let lit = l.sun * sh * (0.15 + 2.5 * toward) + l.amb * 0.6;
   var rgb = env * F + glint + haze * lit * 0.35 + vec3f(0.05, 0.04, 0.02) * bugs * (l.amb + l.sun * sh * 0.2);
+  // The spots scatter forward: they glow round the sun, and are faint grey otherwise.
+  let fwd = max(dot(V, Ls), 0.0);
+  rgb += spots * (l.amb * 0.02 + l.sun * sh * (0.003 + 0.06 * pow(fwd, 6.0) + 0.5 * pow(fwd, 60.0)));
   var trans = (1.0 - F) * (1.0 - haze) * (1.0 - bugs * 0.9) * 0.93;
+  // Hairline scratches from years of wiping, fixed in the plastic. Each one
+  // scatters sunlight only when it lies across the line to the sun, so the
+  // lit ones ring the sun and slide round as the head moves.
+  let face = dot(V, Ls);
+  if (face > 0.2) {
+    let dv = V - Ls;
+    let d2 = vec2f(dot(dv, normalize((O.model * vec4f(tb, 0.0)).xyz)), dot(dv, normalize((O.model * vec4f(bb, 0.0)).xyz)));
+    let dn = d2 / max(length(d2), 1e-5);
+    let cs = 0.014;
+    let cell = floor(g2 / cs);
+    let w = max(px * 0.7, 0.00005);
+    var sc = 0.0;
+    for (var j = -1; j <= 1; j++) { for (var i = -1; i <= 1; i++) {
+      let c = cell + vec2f(f32(i), f32(j));
+      if (hash2(c) > 0.85) { continue; }
+      // Mostly the circular strokes of a polishing cloth, some random.
+      let o = (c + vec2f(hash2(c + 3.1), hash2(c + 5.7))) * cs;
+      let swirl = normalize(vec2f(-(o.y - 0.4), o.x + 0.1) + vec2f(1e-4));
+      let ra = hash2(c + 17.3) * 3.14159;
+      let sd = normalize(mix(vec2f(cos(ra), sin(ra)), swirl, step(0.35, hash2(c + 2.9))));
+      let len = cs * (0.8 + 2.2 * hash2(c + 9.2));
+      let q = g2 - o;
+      let along = dot(q, sd);
+      let across = abs(q.x * sd.y - q.y * sd.x);
+      let ln = (1.0 - smoothstep(w * 0.5, w * 1.5, across)) * (1.0 - smoothstep(len * 0.3, len * 0.5, abs(along)));
+      let m = 1.0 - abs(dot(sd, dn));
+      sc = max(sc, ln * pow(m, 14.0) * (0.25 + 0.75 * hash2(c + 1.7)));
+    } }
+    sc *= sqrt(min(1.0, 0.00015 / w));
+    rgb += l.sun * sh * sc * (0.015 + 0.6 * pow(face, 18.0) + 12.0 * pow(face, 120.0)) * 1.6;
+    // The ones too fine to see one by one, and the smears a rag leaves: a
+    // milky, blotchy glare round the sun.
+    let smear = 0.35 + 1.3 * smoothstep(0.3, 0.8, n1.g) + 0.5 * n2.b;
+    rgb += l.sun * sh * smear * (0.002 + 0.03 * pow(face, 24.0) + 0.12 * pow(face, 400.0)) * 0.5;
+  }
   if (L.z < -0.95) {
     // Engine oil blown back over the windshield: a brown film, thickest low
     // down, drawn up and back by the airflow into streaks.
@@ -1264,6 +1381,25 @@ fn surface(in: VOut) -> Shaded {
         trans *= 1.0 - web * 0.7;
       }
     }
+  }
+  if (in_cabin) {
+    // From inside, the glass replaces what is behind it: the view out, bent
+    // by the acrylic and tinted by it (darker in a band along the top of the
+    // windshield). Whatever lies in front of the glass is not bent.
+    var tint = vec3f(0.95, 0.98, 0.965);
+    if (wind && L.z < -0.95) { tint *= mix(vec3f(1.0), vec3f(0.62, 0.72, 0.69), smoothstep(0.64, 0.77, L.y)); }
+    let edge = 1.0 - smoothstep(0.0, 0.08, -d);
+    let curve = select(0.0, smoothstep(0.12, 0.45, abs(in.Nl.x)), wind);
+    let bend = glass_bend(g2, edge, curve);
+    let dw = (O.model * vec4f(tb * bend.x + bb * bend.y, 0.0)).xyz;
+    var seen = textureLoad(t_scene, vec2i(in.clip.xy), 0).rgb;
+    let cp = G.view_proj * vec4f(V + dw, 0.0);
+    if (cp.w > 1e-4) {
+      let uv = vec2f(0.5 + 0.5 * cp.x / cp.w, 0.5 - 0.5 * cp.y / cp.w);
+      let q = vec2i(clamp(uv * G.screen.xy, vec2f(0.0), G.screen.xy - 1.0));
+      if (textureLoad(t_gdepth, q, 0) <= in.clip.z) { seen = textureSampleLevel(t_scene, s_clamp, uv, 0.0).rgb; }
+    }
+    return vec4f((rgb + seen * trans * tint) * cov, cov);
   }
   let alpha = 1.0 - trans;
   return vec4f(rgb * cov, alpha * cov);

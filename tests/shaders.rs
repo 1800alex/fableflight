@@ -26,19 +26,25 @@ fn shaders_validate() {
     for (name, src) in [
         ("lut", include_str!("../src/shaders/lut.wgsl")),
         ("terrain", include_str!("../src/shaders/terrain.wgsl")),
-        ("buildings", include_str!("../src/shaders/buildings.wgsl")),
+        ("photo", include_str!("../src/shaders/photo.wgsl")),
         ("plane", include_str!("../src/shaders/plane.wgsl")),
         ("post", include_str!("../src/shaders/post.wgsl")),
         ("particles_sim", include_str!("../src/shaders/particles_sim.wgsl")),
         ("particles_draw", include_str!("../src/shaders/particles_draw.wgsl")),
         ("roads", include_str!("../src/shaders/roads.wgsl")),
         ("trees", include_str!("../src/shaders/trees.wgsl")),
-        ("inst", include_str!("../src/shaders/inst.wgsl")),
         ("vol", include_str!("../src/shaders/vol.wgsl")),
         ("ao", include_str!("../src/shaders/ao.wgsl")),
         ("taa", include_str!("../src/shaders/taa.wgsl")),
+        ("airfield", include_str!("../src/shaders/airfield.wgsl")),
+        ("lights", include_str!("../src/shaders/lights.wgsl")),
     ] {
         ok &= check(name, &format!("{common}\n{src}"));
+    }
+    // As in render.rs, buildings and instanced solids share the facade shading.
+    let facade = include_str!("../src/shaders/facade.wgsl");
+    for (name, src) in [("buildings", include_str!("../src/shaders/buildings.wgsl")), ("inst", include_str!("../src/shaders/inst.wgsl"))] {
+        ok &= check(name, &format!("{common}\n{facade}\n{src}"));
     }
     for (name, src) in [("composite", include_str!("../src/shaders/composite.wgsl")), ("clouds", include_str!("../src/shaders/clouds.wgsl"))] {
         ok &= check(name, &format!("{common}\n{sky}\n{src}"));

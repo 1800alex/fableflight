@@ -16,18 +16,24 @@ pub const GV: usize = GRID + 1;
 pub const MASK: usize = 256;
 
 pub struct ElevTile {
+    /// (n + 2 pad) squared samples, row by row
     pub h: Vec<f32>,
+    /// samples across the tile itself
     pub n: usize,
+    /// a border of this many samples taken from the neighbouring tiles, so
+    /// heights interpolate smoothly across tile edges (0 or 1)
+    pub pad: usize,
 }
 impl ElevTile {
     pub fn sample(&self, u: f64, v: f64) -> f32 {
-        let n = self.n as f64;
-        let x = (u * n - 0.5).clamp(0.0, n - 1.0);
-        let y = (v * n - 0.5).clamp(0.0, n - 1.0);
+        let w = self.n + 2 * self.pad;
+        let (n, pad) = (self.n as f64, self.pad as f64);
+        let x = (u * n - 0.5 + pad).clamp(0.0, w as f64 - 1.0);
+        let y = (v * n - 0.5 + pad).clamp(0.0, w as f64 - 1.0);
         let (x0, y0) = (x.floor() as usize, y.floor() as usize);
-        let (x1, y1) = ((x0 + 1).min(self.n - 1), (y0 + 1).min(self.n - 1));
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(w - 1));
         let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
-        let g = |x: usize, y: usize| self.h[y * self.n + x];
+        let g = |x: usize, y: usize| self.h[y * w + x];
         (g(x0, y0) * (1.0 - fx) + g(x1, y0) * fx) * (1.0 - fy) + (g(x0, y1) * (1.0 - fx) + g(x1, y1) * fx) * fy
     }
 }
@@ -79,6 +85,25 @@ pub const LU_COMMERCIAL: u8 = 2;
 pub const LU_INDUSTRIAL: u8 = 3;
 pub const LU_OPEN: u8 = 4; // pitches, playgrounds: nothing grows or gets built here
 
+/// A runway or taxiway centreline.
+pub struct AeroLine {
+    pub pts: Vec<[f32; 2]>,
+    pub runway: bool,
+    /// "10L/28R", or a taxiway's letter
+    pub name: String,
+    /// metres, from the airport database (runways) or the size of the airport
+    pub width: f32,
+    pub paved: bool,
+}
+
+// Airfield polygon kinds.
+pub const AP_APRON: u8 = 1;
+pub const AP_RUNWAY: u8 = 2;
+pub const AP_TAXIWAY: u8 = 3;
+pub const AP_HELIPAD: u8 = 4;
+/// the airport's whole grounds (inside the fence)
+pub const AP_GROUNDS: u8 = 5;
+
 #[derive(Default)]
 pub struct VecTile {
     pub extent: f32,
@@ -88,6 +113,16 @@ pub struct VecTile {
     pub roads: Vec<RoadLine>,
     pub landcover: Vec<(u8, Vec<Vec<[f32; 2]>>)>,
     pub landuse: Vec<(u8, Vec<Vec<[f32; 2]>>)>,
+    pub aero_lines: Vec<AeroLine>,
+    /// (kind, rings) of aprons and other paved areas, one polygon each
+    pub aero_polys: Vec<(u8, Vec<Vec<[f32; 2]>>)>,
+    /// gate positions and their numbers
+    pub gates: Vec<([f32; 2], String)>,
+}
+impl VecTile {
+    pub fn has_aero(&self) -> bool {
+        !self.aero_lines.is_empty() || self.aero_polys.iter().any(|p| p.0 != AP_GROUNDS)
+    }
 }
 
 /// CSS-ish colour as tagged on OSM buildings: #rgb, #rrggbb or a common name.
@@ -153,24 +188,42 @@ impl<T> Lru<T> {
 pub struct Sources {
     pub fetch: Fetcher,
     elev: Mutex<Lru<ElevTile>>,
+    raw: Mutex<Lru<ElevTile>>,
+    /// airfields that have been put together (see airports.rs)
+    pub fields: Mutex<HashMap<u32, Arc<crate::airports::Geo>>>,
     vec: Mutex<Lru<VecTile>>,
     vec_url: Mutex<Option<String>>,
     pub imagery_url: String,
+    /// optional Google satellite imagery, used in place of `imagery_url` when on
+    pub google: Arc<crate::gmaps::Google>,
 }
 
 impl Sources {
     pub fn new(fetch: Fetcher, imagery_url: String) -> Self {
-        Self { fetch, elev: Mutex::new(Lru::new(96)), vec: Mutex::new(Lru::new(96)), vec_url: Mutex::new(None), imagery_url }
+        Self::with_google(fetch, imagery_url, Arc::new(crate::gmaps::Google::disabled()))
     }
 
+    pub fn with_google(fetch: Fetcher, imagery_url: String, google: Arc<crate::gmaps::Google>) -> Self {
+        Self { fetch, elev: Mutex::new(Lru::new(96)), raw: Mutex::new(Lru::new(160)), fields: Mutex::new(HashMap::new()), vec: Mutex::new(Lru::new(96)), vec_url: Mutex::new(None), imagery_url, google }
+    }
+
+    /// Satellite image for a tile: Google's when that is on (and has the
+    /// tile), the default imagery otherwise.
     pub fn imagery(&self, id: TileId) -> Result<image::RgbaImage> {
+        if self.google.enabled() && !self.fetch.offline {
+            match self.google.tile(&self.fetch.root, id.z, id.x, id.y).and_then(|d| Ok(image::load_from_memory(&d)?.to_rgba8())) {
+                Ok(img) => return Ok(img),
+                Err(e) => log::debug!("google tile {id:?}: {e}"),
+            }
+        }
         let url = self.imagery_url.replace("{z}", &id.z.to_string()).replace("{x}", &id.x.to_string()).replace("{y}", &id.y.to_string());
         let data = self.fetch.get_cached(&format!("img/{}/{}/{}.jpg", id.z, id.x, id.y), &url)?;
         Ok(image::load_from_memory(&data)?.to_rgba8())
     }
 
-    pub fn elev(&self, id: TileId) -> Result<Arc<ElevTile>> {
-        if let Some(t) = self.elev.lock().get(id) {
+    /// Elevation as the data has it.
+    pub fn elev_raw(&self, id: TileId) -> Result<Arc<ElevTile>> {
+        if let Some(t) = self.raw.lock().get(id) {
             return Ok(t);
         }
         let url = format!("https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{}/{}/{}.png", id.z, id.x, id.y);
@@ -178,8 +231,8 @@ impl Sources {
         let img = image::load_from_memory(&data)?.to_rgb8();
         let n = img.width() as usize;
         let h = img.pixels().map(|p| p[0] as f32 * 256.0 + p[1] as f32 + p[2] as f32 / 256.0 - 32768.0).collect();
-        let t = Arc::new(ElevTile { h, n });
-        self.elev.lock().put(id, t.clone());
+        let t = Arc::new(ElevTile { h, n, pad: 0 });
+        self.raw.lock().put(id, t.clone());
         Ok(t)
     }
 
@@ -211,7 +264,7 @@ impl Sources {
                 self.fetch.get_cached(&key, &url)?
             }
         };
-        let mut layers = mvt::decode(&data, &["water", "building", "transportation", "landcover", "landuse"]);
+        let mut layers = mvt::decode(&data, &["water", "building", "transportation", "landcover", "landuse", "aeroway"]);
         let mut vt = VecTile { extent: 4096.0, ..Default::default() };
         if let Some(l) = layers.remove("water") {
             vt.extent = l.extent;
@@ -340,9 +393,322 @@ impl Sources {
                 }
             }
         }
+        if let Some(l) = layers.remove("aeroway") {
+            let k = vt.extent / l.extent;
+            let db = crate::airports::Db::get();
+            let unit_m = id.width_m() / vt.extent as f64;
+            for f in l.features {
+                let class = f.props.get("class").and_then(|v| v.str()).unwrap_or("");
+                let name = f.props.get("ref").and_then(|v| v.str()).unwrap_or("").to_string();
+                let scale = |r: Vec<[f32; 2]>| -> Vec<[f32; 2]> { r.into_iter().map(|p| [p[0] * k, p[1] * k]).collect() };
+                match (f.kind, class) {
+                    (2, "runway") | (2, "taxiway") => {
+                        for pts in f.rings {
+                            if pts.len() < 2 {
+                                continue;
+                            }
+                            let pts = scale(pts);
+                            let (a, b) = (pts[0], pts[pts.len() - 1]);
+                            let (lat, lon) = id.lat_lon(((a[0] + b[0]) * 0.5 / vt.extent) as f64, ((a[1] + b[1]) * 0.5 / vt.extent) as f64);
+                            let (lat, lon) = (lat.to_degrees(), lon.to_degrees());
+                            if class == "runway" {
+                                let brg = ((b[0] - a[0]) as f64 * unit_m).atan2(-(b[1] - a[1]) as f64 * unit_m).to_degrees() as f32;
+                                let m = db.runway_meta(lat, lon, brg, &name);
+                                vt.aero_lines.push(AeroLine { pts, runway: true, name: name.clone(), width: m.width, paved: m.paved });
+                            } else {
+                                let kind = db.owner(lat, lon).map(|i| db.apts[i as usize].kind).unwrap_or(0);
+                                vt.aero_lines.push(AeroLine { pts, runway: false, name: name.clone(), width: crate::airports::taxi_width(kind), paved: true });
+                            }
+                        }
+                    }
+                    (3, "apron") | (3, "runway") | (3, "taxiway") | (3, "helipad") | (3, "aerodrome") => {
+                        let kind = match class { "apron" => AP_APRON, "runway" => AP_RUNWAY, "taxiway" => AP_TAXIWAY, "aerodrome" => AP_GROUNDS, _ => AP_HELIPAD };
+                        if f.rings.is_empty() {
+                            continue;
+                        }
+                        let sign = mvt::signed_area(&f.rings[0]).signum();
+                        let mut cur: Vec<Vec<[f32; 2]>> = Vec::new();
+                        for r in f.rings {
+                            if r.len() < 3 {
+                                continue;
+                            }
+                            if mvt::signed_area(&r).signum() == sign && !cur.is_empty() {
+                                vt.aero_polys.push((kind, std::mem::take(&mut cur)));
+                            }
+                            cur.push(scale(r));
+                        }
+                        if !cur.is_empty() {
+                            vt.aero_polys.push((kind, cur));
+                        }
+                    }
+                    (1, "gate") => {
+                        if let Some(p) = f.rings.first().and_then(|r| r.first()) {
+                            vt.gates.push(([p[0] * k, p[1] * k], name));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let t = Arc::new(vt);
         self.vec.lock().put(id, t.clone());
         Ok(t)
+    }
+
+    /// Elevation as the terrain is built: the data as it comes, except that
+    /// airfield pavement is levelled (see `level_airfield`).
+    pub fn elev(&self, id: TileId) -> Result<Arc<ElevTile>> {
+        if let Some(t) = self.elev.lock().get(id) {
+            return Ok(t);
+        }
+        let raw = self.elev_raw(id)?;
+        // Levelling reaches a little past the pavement, so a tile is levelled
+        // when its neighbours have airfield pavement too (or there would be a
+        // step at the border).
+        let aero = id.z == DATA_ZOOM && {
+            let size = 1i64 << id.z;
+            (-1..=1i64).any(|dy| (-1..=1i64).any(|dx| {
+                let (x, y) = ((id.x as i64 + dx).rem_euclid(size), id.y as i64 + dy);
+                y >= 0 && y < size && self.vector(TileId::new(id.z, x as u32, y as u32)).is_ok_and(|vt| vt.has_aero())
+            }))
+        };
+        let t = Arc::new(if aero { self.level_airfield(id, &raw) } else { self.padded(id, &raw) });
+        self.elev.lock().put(id, t.clone());
+        Ok(t)
+    }
+
+    /// Runways, taxiways and aprons are smooth; the elevation data under them
+    /// is not (bumps of a metre every fifty, enough to throw an aircraft
+    /// about on its take-off run). So pavement takes the average height of
+    /// the pavement around it, a ~40 m Gaussian over paved samples only (the
+    /// water or hillside beside a runway does not drag its edge away), and
+    /// the ground eases back to the raw data over the 20 m beyond the edge.
+    /// Works across tile borders: both sides compute the same function from
+    /// the same neighbourhood.
+    fn level_airfield(&self, id: TileId, raw: &ElevTile) -> ElevTile {
+        let n = raw.n;
+        let m = 3 * n;
+        let size = 1i64 << id.z;
+        let mean = raw.h.iter().sum::<f32>() / raw.h.len() as f32;
+        let mut h = vec![mean; m * m];
+        let mut mask = vec![0f32; m * m];
+        let px_m = (id.width_m() / n as f64) as f32;
+        // runway pieces in mosaic pixels: ends, width (m)
+        let mut runs: Vec<(glam::Vec2, glam::Vec2, f32)> = Vec::new();
+        for ty in 0..3usize {
+            for tx in 0..3usize {
+                let (x, y) = ((id.x as i64 + tx as i64 - 1).rem_euclid(size), id.y as i64 + ty as i64 - 1);
+                if y < 0 || y >= size {
+                    continue;
+                }
+                let nid = TileId::new(id.z, x as u32, y as u32);
+                let e = if nid == id { None } else { self.elev_raw(nid).ok() };
+                let e: &ElevTile = match &e { Some(e) if e.n == n => e, _ if nid == id => raw, _ => continue };
+                for j in 0..n {
+                    h[(ty * n + j) * m + tx * n..(ty * n + j) * m + tx * n + n].copy_from_slice(&e.h[j * n..(j + 1) * n]);
+                }
+                let Ok(vt) = self.vector(nid) else { continue };
+                if !vt.has_aero() {
+                    continue;
+                }
+                let mut tile = vec![0u8; n * n];
+                let k = n as f32 / vt.extent;
+                for (_, rings) in vt.aero_polys.iter().filter(|p| p.0 != AP_GROUNDS) {
+                    let px: Vec<Vec<[f32; 2]>> = rings.iter().map(|r| r.iter().map(|p| [p[0] * k, p[1] * k]).collect()).collect();
+                    mvt::fill_rings(&mut tile, n, n, &px, 1);
+                }
+                for l in &vt.aero_lines {
+                    let hw = (l.width * 0.5 + 4.0) / px_m;
+                    thick_line(&l.pts, k, hw, n, |i| tile[i] = 1);
+                    if l.runway {
+                        let o = glam::Vec2::new((tx * n) as f32, (ty * n) as f32);
+                        runs.push((o + glam::Vec2::from(l.pts[0]) * k, o + glam::Vec2::from(l.pts[l.pts.len() - 1]) * k, l.width));
+                    }
+                }
+                for j in 0..n {
+                    for i in 0..n {
+                        mask[(ty * n + j) * m + tx * n + i] = tile[j * n + i] as f32;
+                    }
+                }
+            }
+        }
+        // Three box passes make a near-Gaussian.
+        let blur = |src: &[f32], r: usize, passes: usize| -> Vec<f32> {
+            let mut a = src.to_vec();
+            let mut b = vec![0f32; m * m];
+            let w = (2 * r + 1) as f32;
+            for _ in 0..passes {
+                for horiz in [true, false] {
+                    for line in 0..m {
+                        let at = |k: usize| if horiz { line * m + k } else { k * m + line };
+                        let mut s: f32 = (0..=r.min(m - 1)).map(|k| a[at(k)]).sum::<f32>() + a[at(0)] * r as f32;
+                        for k in 0..m {
+                            b[at(k)] = s / w;
+                            let add = a[at((k + r + 1).min(m - 1))];
+                            let sub = a[at(k.saturating_sub(r))];
+                            s += add - sub;
+                        }
+                    }
+                    std::mem::swap(&mut a, &mut b);
+                }
+            }
+            a
+        };
+        let r = ((42.0 / px_m / 1.1).round() as usize).clamp(2, 12);
+        let hm: Vec<f32> = h.iter().zip(&mask).map(|(h, k)| h * k).collect();
+        let (bh, bm) = (blur(&hm, r, 3), blur(&mask, r, 3));
+        let soft = blur(&mask, ((15.0 / px_m).round() as usize).clamp(1, 4), 2);
+        let mut lev = h.clone();
+        for k in 0..m * m {
+            if bm[k] > 1e-3 {
+                let w = (soft[k] * 2.2).min(1.0);
+                lev[k] += (bh[k] / bm[k] - lev[k]) * w * w * (3.0 - 2.0 * w);
+            }
+        }
+        // Runways want more than that: the data can put a hump of several
+        // metres along one, and a runway climbs or falls by a percent or so
+        // at most, and changes its slope slowly. Each runway takes the
+        // profile along its centreline, smoothed over ~250 m, right across
+        // its width; the ground beside it eases back over the next 40 m.
+        runs.sort_by(|a, b| (b.1 - b.0).length().total_cmp(&(a.1 - a.0).length()));
+        let mut joined: Vec<(glam::Vec2, glam::Vec2, f32)> = Vec::new();
+        for (a, b, w) in runs {
+            let d = (b - a).normalize_or_zero();
+            let hit = joined.iter_mut().find(|j| {
+                let jd = (j.1 - j.0).normalize_or_zero();
+                let (s0, s1) = ((a - j.0).dot(jd), (b - j.0).dot(jd));
+                jd.dot(d).abs() > 0.997 && (a - j.0).perp_dot(jd).abs() < 2.5 && (b - j.0).perp_dot(jd).abs() < 2.5 && s0.min(s1) < (j.1 - j.0).length() + 8.0 && s0.max(s1) > -8.0
+            });
+            match hit {
+                Some(j) => {
+                    let jd = (j.1 - j.0).normalize_or_zero();
+                    let (s0, s1) = ((a - j.0).dot(jd), (b - j.0).dot(jd));
+                    let (lo, hi) = (s0.min(s1).min(0.0), s0.max(s1).max((j.1 - j.0).length()));
+                    (j.0, j.1) = (j.0 + jd * lo, j.0 + jd * hi);
+                }
+                None => joined.push((a, b, w)),
+            }
+        }
+        let sample = |f: &[f32], p: glam::Vec2| {
+            let (x, y) = ((p.x - 0.5).clamp(0.0, m as f32 - 1.001), (p.y - 0.5).clamp(0.0, m as f32 - 1.001));
+            let (x0, y0) = (x as usize, y as usize);
+            let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+            (f[y0 * m + x0] * (1.0 - fx) + f[y0 * m + x0 + 1] * fx) * (1.0 - fy) + (f[(y0 + 1) * m + x0] * (1.0 - fx) + f[(y0 + 1) * m + x0 + 1] * fx) * fy
+        };
+        let sigma = 250.0 / px_m;
+        for (a, b, width) in joined {
+            let len = (b - a).length();
+            if len * px_m < 150.0 {
+                continue;
+            }
+            let d = (b - a) / len;
+            let ns = len.ceil() as usize + 1;
+            let mut prof: Vec<f32> = (0..ns).map(|k| sample(&lev, a + d * (k as f32).min(len))).collect();
+            // The steady slope stays (an altiport's runway is a ramp); only
+            // what departs from it is smoothed.
+            let (mx, my) = ((ns - 1) as f32 * 0.5, prof.iter().sum::<f32>() / ns as f32);
+            let slope = prof.iter().enumerate().map(|(k, v)| (k as f32 - mx) * (v - my)).sum::<f32>() / (0..ns).map(|k| (k as f32 - mx).powi(2)).sum::<f32>().max(1.0);
+            let line = |k: usize| my + slope * (k as f32 - mx);
+            for (k, v) in prof.iter_mut().enumerate() {
+                *v -= line(k);
+            }
+            let reach = (sigma * 3.0) as i64;
+            let smooth: Vec<f32> = (0..ns as i64).map(|k| {
+                let (mut s, mut ws) = (0.0, 0.0);
+                for o in -reach..=reach {
+                    if k + o >= 0 && k + o < ns as i64 {
+                        let w = (-0.5 * (o as f32 / sigma).powi(2)).exp();
+                        s += prof[(k + o) as usize] * w;
+                        ws += w;
+                    }
+                }
+                s / ws + line(k as usize)
+            }).collect();
+            let (half, fade) = ((width * 0.5 + 8.0) / px_m, 40.0 / px_m);
+            let pad = half + fade + 1.0;
+            let (lo, hi) = (a.min(b) - pad, a.max(b) + pad);
+            for y in (lo.y.floor().max(0.0) as usize)..(hi.y.ceil().min(m as f32) as usize) {
+                for x in (lo.x.floor().max(0.0) as usize)..(hi.x.ceil().min(m as f32) as usize) {
+                    let p = glam::Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                    let t = (p - a).dot(d).clamp(0.0, len);
+                    let dist = (a + d * t - p).length();
+                    if dist < half + fade {
+                        let w = 1.0 - ((dist - half) / fade).clamp(0.0, 1.0);
+                        let (k0, f) = (t as usize, t.fract());
+                        let target = smooth[k0] * (1.0 - f) + smooth[(k0 + 1).min(ns - 1)] * f;
+                        lev[y * m + x] += (target - lev[y * m + x]) * w * w * (3.0 - 2.0 * w);
+                    }
+                }
+            }
+        }
+        // The tile and a one-sample border from the mosaic around it.
+        let w = n + 2;
+        let mut out = vec![0f32; w * w];
+        for j in 0..w {
+            for i in 0..w {
+                out[j * w + i] = lev[(n + j - 1) * m + n + i - 1];
+            }
+        }
+        ElevTile { h: out, n, pad: 1 }
+    }
+}
+
+impl Sources {
+    /// A raw tile with a one-sample border from its neighbours (its own edge
+    /// repeated where a neighbour is missing).
+    fn padded(&self, id: TileId, raw: &ElevTile) -> ElevTile {
+        let n = raw.n;
+        let w = n + 2;
+        let size = 1i64 << id.z;
+        let mut out = vec![0f32; w * w];
+        let nb = |dx: i64, dy: i64| -> Option<Arc<ElevTile>> {
+            let (x, y) = ((id.x as i64 + dx).rem_euclid(size), id.y as i64 + dy);
+            if y < 0 || y >= size {
+                return None;
+            }
+            self.elev_raw(TileId::new(id.z, x as u32, y as u32)).ok().filter(|t| t.n == n)
+        };
+        let tiles: Vec<Option<Arc<ElevTile>>> = (-1..=1i64).flat_map(|dy| (-1..=1i64).map(move |dx| (dx, dy))).map(|(dx, dy)| if dx == 0 && dy == 0 { None } else { nb(dx, dy) }).collect();
+        for j in 0..w {
+            for i in 0..w {
+                // Mosaic coordinates of this sample.
+                let (gx, gy) = (i as i64 - 1, j as i64 - 1);
+                let (tx, ty) = (gx.div_euclid(n as i64), gy.div_euclid(n as i64));
+                let (lx, ly) = (gx.rem_euclid(n as i64) as usize, gy.rem_euclid(n as i64) as usize);
+                let v = if tx == 0 && ty == 0 {
+                    raw.h[ly * n + lx]
+                } else {
+                    match &tiles[((ty + 1) * 3 + tx + 1) as usize] {
+                        Some(t) => t.h[ly * n + lx],
+                        None => raw.h[gy.clamp(0, n as i64 - 1) as usize * n + gx.clamp(0, n as i64 - 1) as usize],
+                    }
+                };
+                out[j * w + i] = v;
+            }
+        }
+        ElevTile { h: out, n, pad: 1 }
+    }
+}
+
+/// Visit every pixel of an n x n raster within `hw` pixels of a polyline
+/// (given in tile units; `k` scales them to pixels).
+pub fn thick_line(pts: &[[f32; 2]], k: f32, hw: f32, n: usize, mut hit: impl FnMut(usize)) {
+    for s in pts.windows(2) {
+        let (a, b) = ([s[0][0] * k, s[0][1] * k], [s[1][0] * k, s[1][1] * k]);
+        let (x0, x1) = ((a[0].min(b[0]) - hw).floor().max(0.0) as i64, (a[0].max(b[0]) + hw).ceil().min(n as f32) as i64);
+        let (y0, y1) = ((a[1].min(b[1]) - hw).floor().max(0.0) as i64, (a[1].max(b[1]) + hw).ceil().min(n as f32) as i64);
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let dd = (d[0] * d[0] + d[1] * d[1]).max(1e-6);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = [x as f32 + 0.5 - a[0], y as f32 + 0.5 - a[1]];
+                let t = ((p[0] * d[0] + p[1] * d[1]) / dd).clamp(0.0, 1.0);
+                let (ex, ey) = (p[0] - d[0] * t, p[1] - d[1] * t);
+                if ex * ex + ey * ey < hw * hw {
+                    hit(y as usize * n + x as usize);
+                }
+            }
+        }
     }
 }
 
@@ -367,6 +733,8 @@ pub struct TileData {
     pub imagery: Vec<Vec<u8>>, // mip chain, rgba
     pub img_size: u32,
     pub mask: Vec<Vec<u8>>, // mip chain, rgba (see ground_mask)
+    /// imagery source generation the tile was made with (see `Google::generation`)
+    pub imagery_gen: u32,
 }
 
 pub fn mip_chain(mut data: Vec<u8>, mut size: usize, ch: usize) -> Vec<Vec<u8>> {
@@ -498,8 +866,17 @@ fn ground_mask(vt: &VecTile, ox: f64, oy: f64, scale: f64, tile_m: f64) -> Vec<u
     for (_, rings) in vt.landuse.iter().filter(|l| l.0 == LU_OPEN) {
         stamp(&mut out, rings, GC_PITCH);
     }
-    // Road surface: no grass, crops or rock relief under the road ribbons.
+    // Airfield pavement, and mown strips where a runway is grass.
     let px_m = (tile_m / MASK as f64) as f32;
+    for (_, rings) in vt.aero_polys.iter().filter(|p| p.0 != AP_GROUNDS) {
+        stamp(&mut out, rings, GC_PAVED);
+    }
+    for l in &vt.aero_lines {
+        let class = if l.paved { GC_PAVED } else { GC_PITCH };
+        let px: Vec<[f32; 2]> = l.pts.iter().map(|p| [p[0] - ox as f32, p[1] - oy as f32]).collect();
+        thick_line(&px, k as f32, (l.width * 0.5 + 1.0) / px_m, MASK, |i| out[i * 4 + 2] = class);
+    }
+    // Road surface: no grass, crops or rock relief under the road ribbons.
     for r in &vt.roads {
         if r.brunnel != 0 {
             continue;
@@ -540,6 +917,8 @@ fn ground_mask(vt: &VecTile, ox: f64, oy: f64, scale: f64, tile_m: f64) -> Vec<u
 }
 
 pub fn build_tile(src: &Sources, id: TileId) -> Result<TileData> {
+    // read before the image, so a switch while this tile loads still refreshes it
+    let imagery_gen = src.google.generation();
     let img = src.imagery(id)?;
     let img_size = img.width();
     if img_size != img.height() || !img_size.is_power_of_two() {
@@ -547,6 +926,25 @@ pub fn build_tile(src: &Sources, id: TileId) -> Result<TileData> {
     }
     let (did, ox, oy, sc) = id.ancestor(DATA_ZOOM);
     let elev = src.elev(did).ok();
+    // Coarser tiles near an airfield take their heights from the finer,
+    // levelled data too, or the two would not meet where they join.
+    let (clat0, clon0) = id.lat_lon(0.5, 0.5);
+    let fine_elev = (12..DATA_ZOOM).contains(&id.z) && {
+        let db = crate::airports::Db::get();
+        db.near(clat0.to_degrees(), clon0.to_degrees(), id.width_m() * 0.75 + 5000.0).iter().any(|(i, _)| db.apts[*i as usize].any_paved())
+    };
+    let mut fine_cache: HashMap<TileId, Option<Arc<ElevTile>>> = HashMap::new();
+    let mut height_at = |u: f64, v: f64| -> f32 {
+        if fine_elev {
+            let (lat, lon) = id.lat_lon(u, v);
+            let t = TileId::at(lat, lon, DATA_ZOOM);
+            if let Some(e) = fine_cache.entry(t).or_insert_with(|| src.elev(t).ok()) {
+                let (fu, fv) = t.frac(lat, lon);
+                return e.sample(fu, fv);
+            }
+        }
+        elev.as_ref().map(|t| t.sample(ox + u * sc, oy + v * sc)).unwrap_or(0.0)
+    };
     let mask = match src.vector(did) {
         Ok(vt) => ground_mask(&vt, ox, oy, sc, id.width_m()),
         // No vector data: fall back to "below sea level is ocean".
@@ -577,7 +975,7 @@ pub fn build_tile(src: &Sources, id: TileId) -> Result<TileData> {
         for i in 0..e {
             let (u, v) = ((i as f64 - 1.0) / GRID as f64, (j as f64 - 1.0) / GRID as f64);
             let (uc, vc) = (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0));
-            let raw = elev.as_ref().map(|t| t.sample(ox + uc * sc, oy + vc * sc)).unwrap_or(0.0);
+            let raw = height_at(uc, vc);
             let (mx, my) = (((uc * MASK as f64) as usize).min(MASK - 1), ((vc * MASK as f64) as usize).min(MASK - 1));
             let water = mask[(my * MASK + mx) * 4] > 127;
             let h = if water { raw.max(0.0) } else { raw };
@@ -642,6 +1040,7 @@ pub fn build_tile(src: &Sources, id: TileId) -> Result<TileData> {
         imagery: mip_chain(img.into_raw(), img_size as usize, 4),
         img_size,
         mask: mip_chain(mask, MASK, 4),
+        imagery_gen,
     })
 }
 
@@ -677,10 +1076,12 @@ pub fn tile_indices() -> Vec<u16> {
 pub enum Job {
     Terrain(TileId),
     Buildings(TileId),
+    Airfield(u32),
 }
 pub enum JobResult {
     Terrain(TileId, Result<TileData>),
     Buildings(TileId, Result<crate::buildings::BuildingData>),
+    Airfield(u32, Result<(Arc<crate::airports::Geo>, crate::airfield::FieldMesh)>),
 }
 
 pub struct Loader {
@@ -707,6 +1108,10 @@ impl Loader {
                 let res = match job {
                     Job::Terrain(id) => JobResult::Terrain(id, build_tile(&src, id)),
                     Job::Buildings(id) => JobResult::Buildings(id, crate::buildings::build(&src, id)),
+                    Job::Airfield(i) => JobResult::Airfield(i, crate::airports::geo_for(&src, i).map(|g| {
+                        let m = crate::airfield::build(&g);
+                        (g, m)
+                    })),
                 };
                 if tx.send(res).is_err() {
                     break;

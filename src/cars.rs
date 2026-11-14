@@ -281,6 +281,9 @@ pub struct Car {
     pub dir: Vec3,
     pub shift: Vec3,
     gap: f32,
+    /// Under the 3D tiles: how far the mesh's street is above our road here,
+    /// and the frame it was found on (World::photo_car_lights).
+    pub street: std::cell::Cell<(f32, u32)>,
 }
 
 fn density(class: u8) -> f32 {
@@ -333,7 +336,7 @@ pub fn spawn(net: &RoadNet, tile_seed: u32) -> Vec<Car> {
     let mut cars = Vec::with_capacity(n);
     for k in 0..n as u32 {
         let seed = tile_seed ^ k.wrapping_mul(2654435761);
-        let mut c = Car { path: 0, s: 0.0, fwd: true, lane: 0, v: 0.0, vmul: 0.82 + 0.36 * hash(seed, 5), model: 0, col: [0.5; 3], rank: hash(seed, 6), dir: Vec3::ZERO, shift: Vec3::ZERO, gap: 1e9 };
+        let mut c = Car { path: 0, s: 0.0, fwd: true, lane: 0, v: 0.0, vmul: 0.82 + 0.36 * hash(seed, 5), model: 0, col: [0.5; 3], rank: hash(seed, 6), dir: Vec3::ZERO, shift: Vec3::ZERO, gap: 1e9, street: std::cell::Cell::new((0.0, u32::MAX)) };
         if place(net, &mut c, seed) {
             c.model = car_model(hash(seed, 7), net.paths[c.path as usize].class <= 2);
             c.col = livery(c.model, hash(seed, 8));

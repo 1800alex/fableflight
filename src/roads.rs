@@ -100,6 +100,12 @@ fn cfg(l: &RoadLine, urban: bool) -> Cfg {
     }
 }
 
+/// Width (m) of a road's carriageway, kerb to kerb (parking lanes included).
+/// A tile with more than 150 buildings counts as town, as in `build`.
+pub fn carriageway(l: &RoadLine, urban: bool) -> f32 {
+    cfg(l, urban).drive
+}
+
 /// Countries that drive on the left, as rough boxes.
 fn drives_left(lat: f64, lon: f64) -> bool {
     let b = |la0: f64, la1: f64, lo0: f64, lo1: f64| lat >= la0 && lat <= la1 && lon >= lo0 && lon <= lo1;
@@ -107,7 +113,7 @@ fn drives_left(lat: f64, lon: f64) -> bool {
 }
 
 /// Clip a polyline to the tile square; returns the pieces that lie inside.
-fn clip(pts: &[[f32; 2]], ext: f32) -> Vec<Vec<[f32; 2]>> {
+pub fn clip(pts: &[[f32; 2]], ext: f32) -> Vec<Vec<[f32; 2]>> {
     let mut out: Vec<Vec<[f32; 2]>> = Vec::new();
     let mut cur: Vec<[f32; 2]> = Vec::new();
     for w in pts.windows(2) {
@@ -500,7 +506,7 @@ pub fn build(cx: &Ctx, vt: &VecTile, src: &crate::sources::Sources, mesh: &mut M
                             hi = [hi[0].max(p[0]), hi[1].max(p[1])];
                         }
                         let z = zs[i].min(zs[i + 1]);
-                        footprints.push(Footprint { min: lo, max: hi, ring, base: z - thick - 0.4, top: zs[i].max(zs[i + 1]) + 0.2, kind: 1, col: [150, 148, 142], main: (0, 0), det: (0, 0), fine: (0, 0), alive: true, center: cx.pos(pts[i], z), area: 0.0, sty: [0; 4], gref: 0.0, roof_col: [0; 3], tiers: Vec::new() });
+                        footprints.push(Footprint { min: lo, max: hi, ring, base: z - thick - 0.4, top: zs[i].max(zs[i + 1]) + 0.2, kind: 1, col: [150, 148, 142], main: (0, 0), det: (0, 0), fine: (0, 0), far: (0, 0), alive: true, center: cx.pos(pts[i], z), area: 0.0, sty: [0; 4], gref: 0.0, roof_col: [0; 3], tiers: Vec::new() });
                     }
                     let total = pre + len;
                     let sp = if total > 400.0 { 130.0 } else { 34.0 };

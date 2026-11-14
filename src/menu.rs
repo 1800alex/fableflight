@@ -78,6 +78,26 @@ pub const QUICK: &[(&str, f64, f64)] = &[
     ("Black Forest", 48.0500, 8.1500),
 ];
 
+/// Airports offered as one-click starts: big and small, flat and mountain, beach and city.
+pub const AIRPORTS: &[(&str, &str)] = &[
+    ("KSFO", "San Francisco"),
+    ("KJFK", "New York JFK"),
+    ("KLAX", "Los Angeles"),
+    ("EGLL", "London Heathrow"),
+    ("LFPG", "Paris CDG"),
+    ("LSZH", "Zürich"),
+    ("OMDB", "Dubai"),
+    ("VHHH", "Hong Kong"),
+    ("RJTT", "Tokyo Haneda"),
+    ("YSSY", "Sydney"),
+    ("NZQN", "Queenstown"),
+    ("TNCM", "St Maarten"),
+    ("LXGB", "Gibraltar"),
+    ("LFLJ", "Courchevel"),
+    ("KHAF", "Half Moon Bay"),
+    ("KOSH", "Oshkosh"),
+];
+
 pub struct Menu {
     /// what the camera is looking straight down at, degrees
     pub lat: f64,
@@ -94,11 +114,31 @@ pub struct Menu {
     /// the controls list beside the start panel
     pub show_controls: bool,
     spin: f64,
+    /// the chosen spot is this airport, and how to start there
+    pub airport: Option<u32>,
+    pub start: Start,
+    /// runway end to start on (its ident); None takes the one into the wind
+    pub runway: Option<String>,
+    /// height above the ground for a start in the air (m)
+    pub start_agl: f64,
+    /// airport markers drawn on the globe last frame: (index, x, y in physical pixels)
+    pub markers: Vec<(u32, f32, f32)>,
+}
+
+/// How to start at an airport chosen on the globe.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Start {
+    /// at rest on the runway, lined up for take-off
+    Runway,
+    /// on a 3° final approach to it
+    Approach,
+    /// in the air above it, at the chosen height
+    Overhead,
 }
 
 impl Menu {
     pub fn new(lat: f64, lon: f64, hour: f64) -> Self {
-        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, show_controls: false, spin: 1.0 }
+        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, show_controls: false, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new() }
     }
 
     pub fn look_at(&mut self, lat: f64, lon: f64, alt: f64) {
@@ -158,6 +198,16 @@ impl Menu {
         Some((lat.to_degrees(), lon.to_degrees()))
     }
 
+    /// The airport marker under a screen position (physical pixels), if any.
+    pub fn marker_at(&self, x: f64, y: f64) -> Option<u32> {
+        self.marker_near(x, y, 14.0)
+    }
+
+    /// The airport marker nearest a screen position, within `r` pixels.
+    pub fn marker_near(&self, x: f64, y: f64, r: f64) -> Option<u32> {
+        self.markers.iter().map(|&(i, mx, my)| (i, (mx as f64 - x).hypot(my as f64 - y))).filter(|m| m.1 < r).min_by(|a, b| a.1.total_cmp(&b.1)).map(|m| m.0)
+    }
+
     /// Nearest listed city, for naming a picked spot before the lookup returns.
     pub fn near_city(lat: f64, lon: f64) -> Option<(&'static str, f64)> {
         let p = geo::lla_to_pos(lat.to_radians(), lon.to_radians(), 0.0);
@@ -167,6 +217,7 @@ impl Menu {
 
 // ---- shared look and widgets for the start screen and the in-flight menu
 
+use crate::padui::{self, Hint};
 use egui::{Color32, RichText, Stroke};
 
 pub const ACCENT: Color32 = Color32::from_rgb(255, 196, 64);
@@ -175,30 +226,55 @@ pub const ON_ACCENT: Color32 = Color32::from_rgb(24, 18, 4);
 pub const TEXT: Color32 = Color32::from_rgb(232, 235, 240);
 pub const DIM: Color32 = Color32::from_rgb(150, 158, 170);
 pub const PANEL: Color32 = Color32::from_rgba_premultiplied(9, 12, 17, 228);
+/// the see-through glass of the flight panel, over the running game
+pub const GLASS: Color32 = Color32::from_rgba_premultiplied(5, 8, 12, 140);
 
-/// Pages of the in-flight menu (Tab).
+/// Pages of the in-flight panels: the flight panel (Tab) runs beside the
+/// game; the pause menu (Esc) stops it.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Page {
     Flight,
-    World,
+    Places,
+    Weather,
+    Game,
     Settings,
     Controls,
 }
 
 impl Page {
-    pub const ALL: [Page; 4] = [Page::Flight, Page::World, Page::Settings, Page::Controls];
+    pub const INFO: [Page; 3] = [Page::Flight, Page::Places, Page::Weather];
+    pub const PAUSE: [Page; 3] = [Page::Game, Page::Settings, Page::Controls];
 
     pub fn name(self) -> &'static str {
         match self {
             Page::Flight => "Flight",
-            Page::World => "Weather & time",
+            Page::Places => "Go to",
+            Page::Weather => "Weather",
+            Page::Game => "Game",
             Page::Settings => "Settings",
             Page::Controls => "Controls",
         }
     }
 
+    /// on the flight panel (Tab), not the pause menu
+    pub fn is_info(self) -> bool {
+        Page::INFO.contains(&self)
+    }
+
+    /// The page before or after this one in a set, round and round.
+    pub fn cycle(set: &[Page], p: Page, next: bool) -> Page {
+        let i = set.iter().position(|q| *q == p).unwrap_or(0);
+        set[(i + if next { 1 } else { set.len() - 1 }) % set.len()]
+    }
+
     pub fn parse(s: &str) -> Option<Page> {
-        Page::ALL.into_iter().find(|p| p.name().to_lowercase().starts_with(&s.to_lowercase()))
+        let s = s.to_lowercase();
+        match s.as_str() {
+            "pause" | "menu" => return Some(Page::Game),
+            "airports" | "places" => return Some(Page::Places),
+            _ => {}
+        }
+        Page::INFO.into_iter().chain(Page::PAUSE).find(|p| p.name().to_lowercase().starts_with(&s))
     }
 }
 
@@ -213,11 +289,12 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("B", "wheel brakes"),
         ("F / V", "flaps down / up a notch"),
         ("L", "landing gear down / up"),
+        ("K", "set the heading indicator to the compass"),
     ]),
     ("VIEW", &[
         ("C", "chase / cockpit camera"),
         ("Mouse drag", "look around"),
-        ("Mouse wheel", "camera distance"),
+        ("Mouse wheel", "camera distance / cockpit zoom"),
         ("H", "hide / show the HUD"),
         ("F12", "screenshot"),
     ]),
@@ -227,24 +304,32 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("F3", "weather & time window"),
     ]),
     ("GAME", &[
-        ("Tab", "this menu (pauses)"),
-        ("P", "pause"),
+        ("Tab", "flight panel: instruments, places, weather"),
+        ("Esc", "pause menu: settings, globe, quit"),
+        ("P", "pause without the menu"),
         ("G", "go to a place or address"),
         ("R", "respawn in the air"),
         ("U", "sound on / off"),
         ("F2", "anti-aliasing (TAA) on / off"),
         ("F1", "quick key reference"),
-        ("Esc", "close a window, else back to the globe"),
     ]),
-    ("GAMEPAD", &[
+    ("GAMEPAD (MSFS 2020 layout)", &[
         ("Left stick", "pitch and roll"),
-        ("Right stick", "rudder"),
-        ("Triggers", "throttle up / down"),
-        ("A  /  B", "wheel brakes  /  boost"),
-        ("D-pad up / down", "flaps"),
-        ("Y", "landing gear"),
-        ("Start", "this menu"),
-    ]),
+        ("LT / RT", "rudder left / right"),
+        ("A / B", "throttle up / down (hold)"),
+        ("X", "wheel brakes (hold)"),
+        ("Y + B", "parking brake on / off"),
+        ("Y + D-pad up / dn", "trim nose down / up"),
+        ("LB / RB", "flaps up / down a notch"),
+        ("Left stick click", "landing gear"),
+        ("Right stick", "look around"),
+        ("Right stick click", "reset the view"),
+        ("D-pad", "quick views"),
+        ("View", "chase / cockpit camera"),
+        ("Menu", "pause menu (B closes it)"),
+        ("Y + View", "flight panel"),
+        ("A after a crash", "fly again"),
+]),
 ];
 
 /// The one look shared by every panel: dark glass, amber accent, roomy widgets.
@@ -302,8 +387,9 @@ pub fn panel() -> egui::Frame {
     egui::Frame::new().fill(PANEL).corner_radius(12.0).inner_margin(20.0).stroke(Stroke::new(1.0, Color32::from_white_alpha(18))).shadow(egui::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(110) })
 }
 
-/// A full-width menu button; the primary one is filled with the accent colour.
-pub fn wide_button(ui: &mut egui::Ui, text: &str, hint: &str, primary: bool, enabled: bool) -> bool {
+/// A full-width menu button; the primary one is filled with the accent
+/// colour. Its hint (a key, or the gamepad's buttons) sits after the text.
+pub fn wide_button(ui: &mut egui::Ui, text: &str, hint: Hint, primary: bool, enabled: bool) -> egui::Response {
     let w = ui.available_width();
     let (fill, col) = if !enabled {
         (Color32::from_rgb(40, 44, 50), Color32::from_rgb(110, 114, 120))
@@ -315,12 +401,20 @@ pub fn wide_button(ui: &mut egui::Ui, text: &str, hint: &str, primary: bool, ena
     let mut job = egui::text::LayoutJob::default();
     let font = egui::FontId::proportional(if primary { 17.0 } else { 15.0 });
     job.append(text, 0.0, egui::TextFormat { font_id: font, color: col, ..Default::default() });
-    if !hint.is_empty() {
-        let hc = if primary { ON_ACCENT.gamma_multiply(0.7) } else { DIM };
+    let hc = if primary { ON_ACCENT.gamma_multiply(0.7) } else { DIM };
+    if let Hint::Text(hint) = hint {
         job.append(&format!("   {hint}"), 0.0, egui::TextFormat { font_id: egui::FontId::proportional(12.0), color: hc, ..Default::default() });
     }
     let btn = egui::Button::new(job).fill(fill).corner_radius(8.0).min_size(egui::vec2(w, if primary { 42.0 } else { 34.0 }));
-    ui.add_enabled(enabled, btn).clicked()
+    let resp = ui.add_enabled(enabled, btn);
+    if let Hint::Pad(spec) = hint {
+        // The buttons, right-aligned in the button.
+        let h = if primary { 22.0 } else { 19.0 };
+        let p = ui.painter().with_clip_rect(resp.rect);
+        let x = resp.rect.right() - 10.0 - padui::spec_width(&p, spec, h);
+        padui::paint_spec(&p, x, resp.rect.center().y, spec, h, hc);
+    }
+    resp
 }
 
 /// A small section heading.
@@ -340,8 +434,73 @@ pub fn key_row(ui: &mut egui::Ui, keys: &str, what: &str) {
     ui.end_row();
 }
 
-/// The whole controls list, in two columns of sections.
+/// One `buttons … action` row of the gamepad controls list.
+pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &str) {
+    padui::glyphs(ui, spec, 20.0);
+    ui.label(RichText::new(what).size(13.0).color(TEXT));
+    ui.end_row();
+}
+
+/// The gamepad, flying: (buttons, what they do).
+pub const PAD_FLYING: &[(&str, &str)] = &[
+    ("LS", "pitch and roll"),
+    ("LT / RT", "rudder left / right"),
+    ("A / B", "throttle up / down (hold)"),
+    ("X", "wheel brakes (hold)"),
+    ("Y + B", "parking brake on / off"),
+    ("Y + Up / Down", "trim nose down / up"),
+    ("LB / RB", "flaps up / down a notch"),
+    ("L3", "landing gear"),
+    ("RS", "look around"),
+    ("R3", "reset the view"),
+    ("Dpad", "quick views"),
+    ("View", "chase / cockpit camera"),
+    ("A", "fly again after a crash"),
+];
+
+/// The gamepad, in the menus and on the globe.
+pub const PAD_MENUS: &[(&str, &[(&str, &str)])] = &[
+    ("GAMEPAD · MENUS", &[
+        ("Menu", "pause menu"),
+        ("Y + View", "flight panel (beside the flying)"),
+        ("Dpad", "move between choices"),
+        ("A", "press / choose"),
+        ("Left / Right", "slide a slider"),
+        ("LB / RB", "turn the page"),
+        ("B", "back, close"),
+    ]),
+    ("GAMEPAD · GLOBE", &[
+        ("LS", "turn the globe"),
+        ("LT / RT", "zoom out / in"),
+        ("X", "start at the crosshair"),
+        ("Menu", "take off"),
+        ("View", "this controls list"),
+    ]),
+];
+
+/// The whole controls list, in two columns of sections: the gamepad's while
+/// one is plugged in, else the keyboard's.
 pub fn controls_list(ui: &mut egui::Ui) {
+    if padui::active() {
+        ui.columns(2, |cols| {
+            heading(&mut cols[0], "GAMEPAD · FLYING");
+            egui::Grid::new("pad_fly").num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[0], |ui| {
+                for (k, w) in PAD_FLYING {
+                    pad_row(ui, k, w);
+                }
+            });
+            for (title, rows) in PAD_MENUS {
+                heading(&mut cols[1], title);
+                egui::Grid::new(("pad", *title)).num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[1], |ui| {
+                    for (k, w) in rows.iter() {
+                        pad_row(ui, k, w);
+                    }
+                });
+                cols[1].add_space(4.0);
+            }
+        });
+        return;
+    }
     let half = (CONTROLS.len() + 1) / 2;
     ui.columns(2, |cols| {
         for (c, ui) in cols.iter_mut().enumerate() {

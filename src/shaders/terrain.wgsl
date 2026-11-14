@@ -501,6 +501,19 @@ fn finish(Pin: vec3f, nrm: vec3f, uv: vec2f, depth: f32, skirt: f32) -> VOut {
   return VOut(G.view_proj * vec4f(P, 1.0), P, nrm, uv, depth);
 }
 
+// Our water seen from above, into the green channel of the 3D tiles' coverage
+// mask: the height of its surface, so the mesh can give way to it (photo.wgsl).
+@group(2) @binding(0) var<uniform> CS: Cascade;
+struct TopOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f, @location(1) h: f32, @location(2) skirt: f32 };
+@vertex fn vs_top(@location(0) pos: vec3f, @location(3) skirt: f32, @location(4) uv: vec2f) -> TopOut {
+  let P = pos + T.offset.xyz;
+  return TopOut(CS.vp * vec4f(P, 1.0), uv, height_of(P), skirt);
+}
+@fragment fn fs_top(in: TopOut) -> @location(0) vec4f {
+  if (in.skirt > 0.5 || textureSampleLevel(t_mask, s_clamp, in.uv, 0.0).r < 0.5) { discard; }
+  return vec4f(0.0, in.h, 0.0, 0.0);
+}
+
 @vertex fn vs(@location(0) pos: vec3f, @location(1) depth: f32, @location(2) nrm: vec3f, @location(3) skirt: f32, @location(4) uv: vec2f) -> VOut {
   return finish(pos + T.offset.xyz, nrm, uv, depth, skirt);
 }
@@ -635,6 +648,9 @@ fn relief(P: vec3f, N: vec3f, uv: vec2f, sp: f32) -> f32 {
     var depth = max(mix(min(in.depth, 1.2), in.depth, shore), profile);
     return GOut(vec4f(img, 1.0), vec4f(max(depth, 0.15), wclass, shore, 1.0), 0.0);
   }
+  // Inside the 3D tiles zone the mesh stands in for the land (tiles3d.rs);
+  // our water stays, its waves and reflections over the mesh's still photo.
+  if (photo_hides(in.P, in.clip.xy)) { discard; }
   var albedo = img;
   let dist = length(in.P);
   let V = -in.P / max(dist, 1e-3);

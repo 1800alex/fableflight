@@ -21,6 +21,8 @@ struct VOut {
 
 struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f32 };
 @fragment fn fs(in: VOut) -> GOut {
+  // Inside the 3D tiles zone the mesh stands in for this (tiles3d.rs).
+  if (photo_hides(in.P, in.clip.xy)) { discard; }
   let dist = length(in.P);
   let fw = max(fwidth(in.q.x), fwidth(in.q.y));
   // Which way the nearest junction lies along the road.
@@ -48,4 +50,28 @@ struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f3
   let night = night_at(l.upn);
   if (night > 0.0) { lamps = albedo * LAMP_COL * lamp_pool(in.q.x, in.q.y, in.q.z, in.kind) * night * 0.09 * G.sun_dir.w; }
   return GOut(vec4f(shade(in.P, N, albedo) + l.sun * spec + lamps, a), vec4f(0.0), 0.0);
+}
+
+// Our street lamps seen from above, into the blue channel of the 3D tiles'
+// coverage mask (alpha: the road's height): the photogrammetry mesh, which
+// hides these roads, takes its night light from it (photo.wgsl).
+@group(2) @binding(0) var<uniform> CS: Cascade;
+struct TopOut {
+  @builtin(position) clip: vec4f,
+  @location(0) q: vec4f,
+  @location(1) h: f32,
+  @location(2) @interpolate(flat) kind: u32,
+  @location(3) dist: f32,
+};
+@vertex fn vs_top(@location(0) pos: vec3f, @location(1) q: vec4f, @location(2) kind: f32) -> TopOut {
+  let P = pos + T.offset.xyz;
+  return TopOut(CS.vp * vec4f(P, 1.0), q, height_of(P), u32(kind + 0.5), length(P));
+}
+@fragment fn fs_top(in: TopOut) -> @location(0) vec4f {
+  // (fading out with distance a little sooner than the roads themselves, fs
+  // above: on the mesh the light spills over pavements and building fronts
+  // too, so far streets would read as broad bright bands)
+  let pool = lamp_pool(in.q.x, in.q.y, in.q.z, in.kind) * (1.0 - smoothstep(1500.0, 3800.0, in.dist));
+  if (pool < 0.01) { discard; }
+  return vec4f(0.0, 0.0, pool, in.h);
 }

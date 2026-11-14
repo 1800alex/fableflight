@@ -3,7 +3,7 @@
 //! smoke column, a flash of light and scorched ground.
 use crate::geo;
 use crate::airframe::{self, Mesh};
-use crate::damage::Tear;
+use crate::damage::{self, Tear};
 use crate::fluid::{Domain, FluidSrc};
 use crate::plane::{Impact, Plane};
 use crate::render::Particle;
@@ -48,6 +48,8 @@ pub struct Debris {
     pub sunk: bool,
     /// breaks it already carried when the aircraft came down (see damage.rs)
     pub tear: [Tear; 2],
+    /// how ragged its breaks are
+    pub jag: f32,
     emit_acc: f32,
     trail: f32,
 }
@@ -130,12 +132,49 @@ impl Crash {
         let vn = imp.vel.dot(up);
         let slide = imp.vel - up * vn;
         let carry = slide * 0.55 + up * (vn.abs() * 0.25 + 4.0);
-        for (i, &(pivot, radius)) in GROUP_PIVOTS.iter().enumerate() {
+        // The parts: each group as it was, except that the wings go to pieces
+        // too, snapping across at a station or two (angled, ragged breaks).
+        let mut parts: Vec<(usize, Vec3, f32, [Tear; 2], f32)> = GROUP_PIVOTS.iter().enumerate().map(|(i, &(p, r))| (meshes[i], p, r, tears.get(i).copied().unwrap_or([Tear::NONE; 2]), damage::JAG)).collect();
+        for s in 0..2 {
+            let gi = airframe::G_LWING + s;
+            let end = plane.dmg.wing[s];
+            let cuts = if end < 2.2 || rng.f() < 0.2 { 0 } else if end > 3.6 && rng.f() < 0.25 + 0.3 * (power - 0.7) { 2 } else { 1 };
+            if cuts == 0 {
+                continue;
+            }
+            // From the outer end inward, each break inside the one beyond it.
+            let mut st = end;
+            let mut breaks = Vec::new();
+            let mut prev = plane.dmg.stump(s);
+            for k in 0..cuts {
+                let room = st - 0.9 - 0.8 * (cuts - 1 - k) as f32;
+                if room < 0.8 {
+                    break;
+                }
+                st = rng.range(0.8 + 0.8 * (cuts - 1 - k) as f32, room);
+                let t = damage::wing_break(s, st, rng.range(-0.7, 0.7), rng.range(-0.25, 0.25), rng.range(0.06, 0.32), &prev);
+                breaks.push((st, t));
+                prev = t;
+            }
+            let mesh = parts[gi].0;
+            let stump = plane.dmg.stump(s);
+            let mut outer = (end, stump);
+            for &(st, t) in &breaks {
+                // The piece between this break and the one beyond it.
+                let mid = damage::wing_pt(s, (st + outer.0) * 0.5, 0.4, 0.0);
+                parts.push((mesh, mid, ((outer.0 - st) * 0.5).max(0.4), [t.flip(), outer.1], t.jag));
+                outer = (st, t);
+            }
+            parts[gi] = (mesh, damage::wing_pt(s, outer.0 * 0.5, 0.4, 0.0), (outer.0 * 0.5).max(0.5), [outer.1, Tear::NONE], outer.1.jag.max(0.05));
+        }
+        for (i, &(mesh, pivot, radius, tear, jag)) in parts.iter().enumerate() {
             let wpos = plane.pos + plane.rot * pivot.as_dvec3();
             let out = (wpos - imp.pos).normalize_or_zero() + up * 0.6;
             let v = carry * rng.range(0.5, 1.1) as f64 + out * rng.range(6.0, 22.0) as f64 * power as f64 + rng.dir().as_dvec3() * (speed * 0.12) as f64;
+            // Pieces of wing burn on less long than the fuselage with its tanks' worth.
+            let split = i >= GROUP_PIVOTS.len();
             debris.push(Debris {
-                mesh: meshes[i],
+                mesh,
                 origin: pivot,
                 pos: wpos + up * 0.5,
                 vel: v,
@@ -143,11 +182,12 @@ impl Crash {
                 omega: rng.dir().as_dvec3() * rng.range(2.0, 11.0) as f64,
                 scale: 1.0,
                 radius: radius as f64 * 0.45,
-                burn: if imp.water { rng.range(1.0, 4.0) } else { rng.range(25.0, 70.0) },
+                burn: if imp.water { rng.range(1.0, 4.0) } else if split { rng.range(6.0, 30.0) } else { rng.range(25.0, 70.0) },
                 char: 0.15,
                 resting: false,
                 sunk: false,
-                tear: tears.get(i).copied().unwrap_or([Tear::NONE; 2]),
+                tear,
+                jag,
                 emit_acc: 0.0,
                 trail: 1.0,
             });
@@ -170,6 +210,7 @@ impl Crash {
                 resting: false,
                 sunk: false,
                 tear: [Tear::NONE; 2],
+                jag: damage::JAG,
                 emit_acc: 0.0,
                 trail: rng.range(0.4, 1.0),
             });

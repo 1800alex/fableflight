@@ -30,11 +30,15 @@ fn world(p: vec3f, w: f32, m0: vec4f, m1: vec4f, m2: vec4f) -> vec3f {
   let T = normalize(vec3f(m0.x, m1.x, m2.x)) * sign(ext.z);
   return VOut(G.view_proj * vec4f(P, 1.0), P, N, col, pos * sx, tint, nrm, ext, T);
 }
-@vertex fn vs_shadow(@location(0) pos: vec3f, @location(3) m0: vec4f, @location(4) m1: vec4f, @location(5) m2: vec4f) -> @builtin(position) vec4f {
+@vertex fn vs_shadow(@location(0) pos: vec3f, @location(3) m0: vec4f, @location(4) m1: vec4f, @location(5) m2: vec4f, @location(6) tint: vec4f, @location(7) ext: vec4f) -> @builtin(position) vec4f {
+  // Street traffic hidden under the 3D tiles casts nothing (decided per car).
+  if (tint.a < 0.5 && ext.w > 0.5 && photo_shadow_gone(vec3f(m0.w, m1.w, m2.w))) { return vec4f(2.0, 2.0, 0.0, 1.0); }
   return CS.vp * vec4f(world(pos, 1.0, m0, m1, m2), 1.0);
 }
 
 @fragment fn fs(in: VOut) -> GOut {
+  // Street traffic (ext.w = 1) gives way to the 3D tiles (tiles3d.rs).
+  if (in.tint.a < 0.5 && in.ext.w > 0.5 && photo_hides(in.P, in.clip.xy)) { discard; }
   var N = in.N;
   if (dot(N, N) < 1e-10) { N = -normalize(in.P); }
   N = normalize(N);

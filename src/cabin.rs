@@ -29,6 +29,7 @@ pub mod gauge {
     pub const COMPASS: f32 = 17.0;
     pub const CHT: f32 = 18.0;
     pub const FUEL_SEL: f32 = 19.0;
+    pub const OAT: f32 = 20.0;
 }
 
 const PANEL_COL: Mat = mt(mat::PLASTIC, 0.035, 0.036, 0.038);
@@ -43,6 +44,7 @@ pub fn build(b: &mut Builder) {
     panel(&mut m);
     seats(&mut m);
     fittings(&mut m);
+    extras(&mut m);
     b.fixed("cabin", G_FUSE, m);
     controls(b);
     glass(b);
@@ -87,6 +89,18 @@ fn inner_x(z: f32, y: f32) -> f32 {
     sec_pt(&s, (a + c) * 0.5).x
 }
 
+/// Height of the cabin lining's roof at station z, lateral position x.
+fn inner_top_y(z: f32, x: f32) -> f32 {
+    let s = inner(z);
+    let x = x.abs();
+    let (mut a, mut c) = (0.0f32, FRAC_PI_2);
+    for _ in 0..30 {
+        let mid = (a + c) * 0.5;
+        if sec_pt(&s, mid).x < x { a = mid } else { c = mid }
+    }
+    sec_pt(&s, (a + c) * 0.5).y
+}
+
 fn lining(m: &mut Mesh) {
     // Side walls and headliner, one side then its mirror; the windows are cut
     // out of it in the shader, as they are out of the skin.
@@ -99,9 +113,10 @@ fn lining(m: &mut Mesh) {
             let z = z0 + (z1 - z0) * i as f32 / nz as f32;
             let s = inner(z);
             let (mut a, mut c) = (0.0f32, PI);
+            // (A little below the carpet, so no light shows along the seam.)
             for _ in 0..30 {
                 let mid = (a + c) * 0.5;
-                if sec_pt(&s, mid).y > FLOOR_Y { a = mid } else { c = mid }
+                if sec_pt(&s, mid).y > FLOOR_Y - 0.015 { a = mid } else { c = mid }
             }
             let thf = a;
             let mut arc = 0.0;
@@ -143,8 +158,8 @@ fn lining(m: &mut Mesh) {
     let carpet = mt(mat::FABRIC, 0.045, 0.048, 0.055).pat(pat::CARPET);
     m.patch(&carpet, 80, 16, false, |a, c| {
         let z = z0 + (z1 - z0) * a;
-        // Wall to wall: out to where the lining meets the floor.
-        let x = (c - 0.5) * 2.0 * (inner_x(z, floor_y(z)) - 0.002);
+        // Wall to wall: tucked a little under the lining where it meets the floor.
+        let x = (c - 0.5) * 2.0 * (inner_x(z, floor_y(z)) + 0.008);
         (Vec3::new(x, floor_y(z), z), [z, x], 0.0)
     });
     // The nose wheel stows under the hump, through a notch in the firewall.
@@ -159,9 +174,13 @@ fn lining(m: &mut Mesh) {
     m.append(&tubs);
     // Firewall.
     for (x0, x1, y0) in [(-0.55f32, -0.145f32, -0.47f32), (-0.145, 0.145, -0.30), (0.145, 0.55, -0.47)] {
+        // Inside the lining at its front edge: its top corners would
+        // otherwise stand up through the cowl deck in front of the windshield.
         m.patch(&GREY, 6, 6, false, |a, c| {
             let x = x0 + (x1 - x0) * a;
-            let y = y0 + (0.30 - y0) * c;
+            let top = 0.30f32.min(inner_top_y(-2.03, x) - 0.005);
+            let y = y0 + (top - y0) * c;
+            let x = x.signum() * x.abs().min(inner_x(-2.03, y) - 0.005);
             (Vec3::new(x, y, -2.03), [x, y], 0.0)
         });
     }
@@ -223,7 +242,7 @@ fn panel(m: &mut Mesh) {
     m.slab(&PANEL_COL.pat(pat::PANEL), &outline, &holes, Vec3::new(0.0, 0.0, z), Vec3::X, Vec3::Y, 0.012);
     // The glareshield: a padded shelf from the panel lip to the windshield.
     let gs = mt(mat::FABRIC, 0.03, 0.03, 0.032);
-    m.patch(&gs, 24, 10, true, |a, c| {
+    m.patch(&gs, 24, 10, false, |a, c| {
         let x = (a - 0.5) * 1.09;
         let t = c;
         let zz = z + 0.025 - t * 0.46;
@@ -231,7 +250,12 @@ fn panel(m: &mut Mesh) {
         let y = 0.166 + arch + 0.022 * (t * PI).sin() * (1.0 - t).max(0.0).sqrt() + 0.12 * t * t * t;
         // Tucked under the cowl deck and the windshield at the sides.
         let y = y.min(fuse_top_y(zz, x) - 0.025);
-        (Vec3::new(x, y, zz), [x, t], 0.0)
+        // ...and inside the side walls, which close in as they rise toward
+        // the windshield (else the corners poke out through the skin).
+        let xc = x.signum() * x.abs().min(inner_x(zz, y) - 0.012);
+        let y = y.min(fuse_top_y(zz, xc) - 0.025);
+        let xc = xc.signum() * xc.abs().min(inner_x(zz, y) - 0.012);
+        (Vec3::new(xc, y, zz), [x, t], 0.0)
     });
     m.tube(&gs, &[Vec3::new(-0.545, 0.172, z + 0.022), Vec3::new(0.0, 0.180, z + 0.022), Vec3::new(0.545, 0.172, z + 0.022)], &|_| 0.012, 10, true);
 
@@ -426,6 +450,94 @@ fn fittings(m: &mut Mesh) {
     }
 }
 
+// ---------------------------------------------------------------- odds and ends
+
+/// The things that make it somebody's aeroplane: the outside air thermometer
+/// poking through the windshield, the overhead console, a headset and a
+/// checklist left on the right seat, the parking brake and cowl flap handles.
+fn extras(m: &mut Mesh) {
+    // Outside air thermometer: a dial on a stem through the top left of the windshield.
+    let gp = Vec3::new(-0.36, fuse_top_y(-1.2, -0.36), -1.2);
+    let n_in = Vec3::new(0.0, -0.89, 0.455).normalize();
+    let face = (EYE - (gp + n_in * 0.03)).normalize();
+    let c = gp + n_in * 0.03;
+    let up = (Vec3::Y - face * face.y).normalize();
+    m.tube(&CHROME, &[gp - n_in * 0.05, c - face * 0.006], &|_| 0.0035, 8, true);
+    m.lathe(&CHROME, gp, n_in, &[[0.009, -0.002], [0.009, 0.004], [0.0, 0.004]], 14, false);
+    m.lathe(&BLACK, c - face * 0.012, face, &[[0.004, 0.0], [0.025, 0.002], [0.026, 0.011], [0.0255, 0.0125], [0.022, 0.013]], 28, false);
+    m.disc(&mt(mat::GAUGE, 0.02, 0.02, 0.02).x(gauge::OAT), c + face * 0.0005, face, up, 0.0215, 32);
+
+    // Overhead console: speaker grille, map light, two switches, a placard.
+    let (z0, z1) = (-0.88f32, -0.60f32);
+    let top = inner(-0.75).top;
+    let con = mt(mat::PLASTIC, 0.28, 0.27, 0.255).pat(pat::PANEL);
+    m.rbox(&con, Vec3::new(0.0, top - 0.012, (z0 + z1) * 0.5), Vec3::new(0.085, 0.016, (z1 - z0) * 0.5), 0.008, Quat::IDENTITY);
+    let fy = top - 0.0285;
+    for i in 0..7 {
+        for j in 0..5 {
+            let p = Vec3::new(-0.045 + j as f32 * 0.0125 + (i % 2) as f32 * 0.006, fy, -0.70 + i as f32 * 0.011);
+            m.disc(&BLACK, p, Vec3::NEG_Y, Vec3::Z, 0.0035, 8);
+        }
+    }
+    m.lathe(&mt(mat::PLASTIC, 0.6, 0.6, 0.57), Vec3::new(0.045, fy, -0.82), Vec3::NEG_Y, &[[0.016, 0.0], [0.016, 0.004], [0.012, 0.008], [0.0, 0.009]], 18, true);
+    m.lathe(&CHROME, Vec3::new(0.045, fy - 0.009, -0.82), Vec3::NEG_Y, &[[0.006, 0.0], [0.006, 0.004], [0.0, 0.005]], 10, true);
+    for (k, x) in [-0.055f32, -0.03].iter().enumerate() {
+        let p = Vec3::new(*x, fy, -0.82);
+        m.lathe(&CHROME, p, Vec3::NEG_Y, &[[0.006, 0.0], [0.006, 0.002], [0.004, 0.003], [0.0, 0.003]], 12, false);
+        let lean = if k == 0 { 0.35 } else { -0.35 };
+        let d = Quat::from_rotation_x(lean) * Vec3::NEG_Y;
+        m.tube(&CHROME, &[p, p + d * 0.014], &|t| 0.0022 - 0.0007 * t, 8, true);
+    }
+    m.rbox(&PAINT_WHITE.pat(pat::PLACARD), Vec3::new(-0.0425, fy - 0.0002, -0.795), Vec3::new(0.022, 0.0003, 0.006), 0.0002, Quat::IDENTITY);
+
+    // A headset left on the right seat: cups face down, the band lying flat
+    // between them, the mic boom forward and the cord trailing off the cushion.
+    let seat_y = -0.36 + 0.045 + 0.004;
+    let cup = mt(mat::PLASTIC, 0.06, 0.062, 0.068);
+    let seal = mt(mat::FABRIC, 0.02, 0.02, 0.022);
+    let (ca, cb) = (Vec3::new(0.19, seat_y, -0.70), Vec3::new(0.35, seat_y, -0.64));
+    for c in [ca, cb] {
+        m.lathe(&seal, c, Vec3::Y, &[[0.0, 0.0], [0.042, 0.0], [0.047, 0.008], [0.044, 0.016]], 22, false);
+        m.lathe(&cup, c + Vec3::Y * 0.014, Vec3::Y, &[[0.043, 0.0], [0.045, 0.012], [0.04, 0.03], [0.026, 0.04], [0.0, 0.042]], 22, false);
+        m.disc(&mt(mat::PAINT, 0.5, 0.5, 0.5).pat(pat::PLACARD), c + Vec3::Y * 0.0565, Vec3::Y, Vec3::Z, 0.012, 14);
+    }
+    let mid = (ca + cb) * 0.5;
+    let side = (cb - ca).normalize();
+    let bow = Vec3::Y.cross(side).normalize() * -1.0;
+    let band: Vec<Vec3> = (0..=16).map(|k| {
+        let t = k as f32 / 16.0;
+        let a = (t - 0.5) * PI;
+        mid + side * (a.sin() * 0.085) + bow * (a.cos() * 0.10) + Vec3::Y * 0.03
+    }).collect();
+    m.tube(&cup, &band, &|_| 0.0055, 8, true);
+    m.tube(&seal, &band[4..13], &|_| 0.011, 10, true);
+    let boom: Vec<Vec3> = [(0.0, 0.03, 0.0), (-0.03, 0.028, -0.04), (-0.04, 0.02, -0.10), (-0.025, 0.012, -0.14)].iter().map(|&(x, y, z)| ca + Vec3::new(x, y, z)).collect();
+    m.tube(&BLACK, &boom, &|_| 0.0022, 6, true);
+    m.dome(&seal, *boom.last().unwrap(), Vec3::new(0.3, 0.2, -1.0).normalize(), 0.011, 0.016, 12, 0.0);
+    let cord: Vec<Vec3> = [(0.0, 0.01, 0.03), (0.03, -0.003, 0.09), (-0.05, -0.004, 0.13), (-0.10, -0.004, 0.06), (-0.16, -0.01, -0.01), (-0.17, -0.07, -0.05), (-0.165, -0.16, -0.08)]
+        .iter().map(|&(x, y, z)| ca + Vec3::new(x, y, z)).collect();
+    m.tube(&BLACK, &cord, &|_| 0.0028, 6, true);
+
+    // A laminated checklist beside it.
+    let card = Quat::from_rotation_y(0.35);
+    let cc = Vec3::new(0.33, seat_y + 0.0015, -0.80);
+    m.rbox(&mt(mat::PLASTIC, 0.75, 0.74, 0.70).pat(pat::PLACARD), cc, Vec3::new(0.055, 0.0012, 0.08), 0.001, card);
+    m.rbox(&mt(mat::PLASTIC, 0.04, 0.12, 0.35), cc + card * Vec3::new(0.0, 0.0006, -0.068), Vec3::new(0.0545, 0.0008, 0.011), 0.0006, card);
+
+    // Parking brake: a T handle under the left of the panel.
+    let pb = Vec3::new(-0.40, -0.265, PANEL_Z + 0.01);
+    m.tube(&CHROME, &[pb - Vec3::Z * 0.03, pb + Vec3::Z * 0.02], &|_| 0.0035, 8, false);
+    m.rbox(&mt(mat::PLASTIC, 0.35, 0.03, 0.02), pb + Vec3::Z * 0.026, Vec3::new(0.028, 0.007, 0.007), 0.005, Quat::IDENTITY);
+    m.rbox(&PAINT_WHITE.pat(pat::PLACARD), pb + Vec3::new(0.0, 0.016, -0.009), Vec3::new(0.02, 0.0045, 0.0004), 0.0002, Quat::IDENTITY);
+    // Cowl flaps: a lever in a gated slot low on the pedestal.
+    let rot = Quat::from_rotation_x(0.12);
+    let cf = Vec3::new(0.0, -0.53, PANEL_Z + 0.01);
+    m.rbox(&BLACK, cf, Vec3::new(0.008, 0.035, 0.003), 0.002, rot);
+    m.tube(&CHROME, &[cf, cf + Vec3::new(0.0, 0.01, 0.04)], &|_| 0.003, 8, false);
+    m.rbox(&mt(mat::PLASTIC, 0.03, 0.03, 0.03), cf + Vec3::new(0.0, 0.012, 0.045), Vec3::new(0.018, 0.006, 0.01), 0.004, rot);
+    m.rbox(&PAINT_WHITE.pat(pat::PLACARD), cf + Vec3::new(0.022, 0.0, 0.004), Vec3::new(0.01, 0.03, 0.0004), 0.0002, rot);
+}
+
 // ---------------------------------------------------------------- controls
 
 fn controls(b: &mut Builder) {
@@ -514,4 +626,65 @@ fn glass(b: &mut Builder) {
     let k = b.fixed("windows", G_FUSE, g);
     b.pieces[k].glass = true;
     b.pieces[k].occluder = false;
+}
+
+// ---------------------------------------------------------------- what the eye sees
+
+/// The lining's half width on a grid of stations and heights, for quick tests.
+struct Shell {
+    z0: f32,
+    y0: f32,
+    nz: usize,
+    ny: usize,
+    half: Vec<f32>,
+}
+const SHELL_STEP: f32 = 0.02;
+fn shell() -> &'static Shell {
+    static S: std::sync::OnceLock<Shell> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let (z0, y0) = (-2.06f32, FLOOR_Y);
+        let nz = ((1.60 - z0) / SHELL_STEP) as usize + 1;
+        let ny = ((0.75 - y0) / SHELL_STEP) as usize + 1;
+        let mut half = vec![0.0; nz * ny];
+        for i in 0..nz {
+            let z = z0 + i as f32 * SHELL_STEP;
+            let top = inner(z).top;
+            for j in 0..ny {
+                let y = y0 + j as f32 * SHELL_STEP;
+                half[i * ny + j] = if y >= top { -1.0 } else { inner_x(z, y) };
+            }
+        }
+        Shell { z0, y0, nz, ny, half }
+    })
+}
+
+/// Whether a look from `eye` along `d` (body frame) ends on something in the
+/// cabin (true) or goes out through the glass (false).
+pub fn sees_inside(eye: Vec3, d: Vec3) -> bool {
+    let s = shell();
+    let mut t = 0.02;
+    while t < 3.5 {
+        let p = eye + d * t;
+        if p.y < FLOOR_Y + 0.01 {
+            return true;
+        }
+        // The panel, and the glareshield over it.
+        if p.z < PANEL_Z + 0.01 {
+            let g = ((PANEL_Z + 0.025 - p.z) / 0.46).clamp(0.0, 1.0);
+            if p.y < 0.185 + 0.12 * g * g * g {
+                return true;
+            }
+        }
+        let i = ((p.z - s.z0) / SHELL_STEP).round();
+        let j = ((p.y - s.y0) / SHELL_STEP).round();
+        if i < 0.0 || i >= s.nz as f32 || j >= s.ny as f32 {
+            return window(p) >= 0.0;
+        }
+        let half = s.half[i as usize * s.ny + j as usize];
+        if p.x.abs() > half || p.z > 1.55 || p.z < -2.03 {
+            return window(p) >= 0.0;
+        }
+        t += 0.015 + t * 0.01;
+    }
+    true
 }

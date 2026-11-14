@@ -1177,6 +1177,8 @@ fn inspection_plate(m: &mut Mesh, c: Vec3, n: Vec3, up: Vec3, r: f32, screws: us
 pub const SPAN: f32 = 5.5;
 pub const FLAP: [f32; 2] = [0.62, 3.05];
 pub const AILERON: [f32; 2] = [3.07, 5.13];
+/// The span the fuel tank in each wing fills.
+pub const TANK: [f32; 2] = [0.62, 2.55];
 
 /// Right wing section at span station xs.
 pub fn wing_sect(xs: f32) -> Sect {

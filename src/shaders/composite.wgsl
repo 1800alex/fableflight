@@ -61,7 +61,9 @@ fn water(P: vec3f, V: vec3f, dist: f32, tint: vec3f, aux: vec4f, jit: f32) -> ve
   let shore = clamp(aux.z, 0.0, 1.0);
   var l = light_at(P);
   let upn = l.upn;
-  l.sun *= shadow_at(P, upn);
+  // (looked up a little above our waves inside the 3D tiles' zone: the
+  // mesh's own still water, a metre or two above ours, casts too)
+  l.sun *= shadow_at(P + upn * select(0.0, 4.0, photo_covered(P)), upn);
   let e = normalize(G.east.xyz - upn * dot(G.east.xyz, upn));
   let n = cross(upn, e);
   let wc = wave_coord(P);
@@ -329,7 +331,7 @@ fn water(P: vec3f, V: vec3f, dist: f32, tint: vec3f, aux: vec4f, jit: f32) -> ve
     let t0 = max(top.x, 0.0);
     let t1 = min(dist, top.y);
     if (t1 > t0) {
-      let sc = atm_march(oc, rd, t0, t1, 10, jit);
+      let sc = atm_march(oc, rd, t0, t1, 12, fract(jit + G.time.w * 0.618034));
       col = col * sc.T + sc.L + SKYGLOW * 0.004 * G.misc.y * night_cam() * (1.0 - luma(sc.T));
     }
   }
