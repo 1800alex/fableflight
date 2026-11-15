@@ -15,7 +15,10 @@
 //! The cockpit warnings: stall horn, terrain / pull-up, nose-dive, too-low
 //! and sink-rate beepers, the overspeed clacker and the gear-up horn.
 //!
-//! And the world: explosions and fire.
+//! And the world: explosions and fire, thunder (a crack and a tearing roar
+//! close by, a long low rumble rolling in from far off, arriving at the speed
+//! of sound), and rain (a hiss all round; in the cockpit, drops drumming on
+//! the windshield and roof, turning into a roar at speed).
 use parking_lot::Mutex;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::num::NonZero;
@@ -92,6 +95,8 @@ pub struct Params {
     pub dist: f32,
     /// fire burning near the camera 0..1
     pub fire: f32,
+    /// rain falling where the camera is 0..1
+    pub rain: f32,
     pub warn: Warn,
 }
 
@@ -118,6 +123,10 @@ pub enum Event {
     Crunch(f32),
     /// something big going into the water (~0.2 .. 2)
     Splash(f32),
+    /// lightning struck: the thunder reaches the ear `delay` s from now, from
+    /// the nearest bit of its channel `near` m away to the farthest `far` m;
+    /// strength ~0.5..2; pan -1 (left) .. 1 (right)
+    Thunder { delay: f32, near: f32, far: f32, power: f32, pan: f32 },
 }
 
 #[derive(Default)]
@@ -1033,9 +1042,190 @@ struct World {
     lp_wind: f32,
     booms: Vec<(f32, f32)>,
     crackle: f32,
+    thunder: Vec<Thunder>,
+    /// the land and the cloud base throwing the thunder back: a long, dark echo
+    echo: Vec<f32>,
+    echo_pos: usize,
+    echo_lp: f32,
+}
+
+/// One thunderclap rolling in. Every bit of the channel sends out its own
+/// clap; the nearest arrives first, the farthest seconds later, and the air
+/// soaks up the highs the further each has come. So close by it is a crack, a
+/// tearing roar and a boom; far off a long, low rumble.
+struct Thunder {
+    /// seconds since the first sound arrived (negative: still on its way)
+    t: f32,
+    /// arrival time, strength, one-pole cutoff coefficient (brightness)
+    claps: Vec<(f32, f32, f32)>,
+    next: usize,
+    /// the claps arriving now, and the rumble they leave
+    env: f32,
+    roll: f32,
+    k: f32,
+    lp: [f32; 4],
+    /// the crack and tearing of a strike close by
+    crack: f32,
+    tear: Bq,
+    tear_env: f32,
+    boom_ph: f32,
+    pan: f32,
+    gain: f32,
+    dur: f32,
+}
+
+impl Thunder {
+    fn new(delay: f32, near: f32, far: f32, power: f32, pan: f32, rng: &mut Rng) -> Self {
+        let near = near.max(30.0);
+        let far = far.max(near + 50.0);
+        let span = (far - near) / 343.0;
+        let bright = |d: f32| kf(9000.0 / (1.0 + d / 350.0));
+        let n = (25.0 + span * 14.0).min(300.0) as usize;
+        let mut claps = vec![(0.0, 1.6, bright(near))];
+        for _ in 0..n {
+            let d = near + (far - near) * rng.u().powf(1.6);
+            let u = rng.u();
+            claps.push(((d - near) / 343.0, (near / d).powf(0.7) * (0.2 + 1.5 * u * u * u), bright(d)));
+        }
+        claps.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let close = 1.0 - smooth(300.0, 2500.0, near);
+        Self {
+            t: -delay,
+            claps,
+            next: 0,
+            env: 0.0,
+            roll: 0.0,
+            k: bright(near),
+            lp: [0.0; 4],
+            crack: close * power.min(2.0),
+            tear: Bq::new(Bq::hp, 1800.0, 0.7),
+            tear_env: 0.0,
+            boom_ph: 0.0,
+            pan: pan.clamp(-1.0, 1.0) * 0.7,
+            gain: power.min(2.0) * (1500.0 / (near + 700.0)).powf(0.6).min(1.6),
+            dur: span + 6.0 + near / 2500.0,
+        }
+    }
+
+    fn sample(&mut self, rng: &mut Rng) -> f32 {
+        let t = self.t;
+        self.t += DT;
+        if t < 0.0 {
+            return 0.0;
+        }
+        while self.next < self.claps.len() && self.claps[self.next].0 <= t {
+            let (_, a, k) = self.claps[self.next];
+            self.env += a;
+            // Brighter claps brighten the sound for a moment.
+            self.k = self.k.max(k * (0.4 + 0.6 * (a / 1.6).min(1.0)));
+            self.next += 1;
+        }
+        self.env *= decay(0.13);
+        self.roll += (self.env - self.roll) * kf(0.6);
+        self.k += (kf(70.0) - self.k) * kf(0.8);
+        let x = rng.f() * (self.env + self.roll * 2.0);
+        let k = self.k;
+        self.lp[0] += (x - self.lp[0]) * k;
+        self.lp[1] += (self.lp[0] - self.lp[1]) * k;
+        self.lp[2] += (self.lp[1] - self.lp[2]) * k;
+        self.lp[3] += (self.lp[2] - self.lp[3]) * k;
+        // The low-passed noise loses level as it darkens: give some back.
+        let mut y = self.lp[3] * (1.0 + 0.15 / k.sqrt()).min(14.0);
+        // A deep boom under the first claps.
+        self.boom_ph = (self.boom_ph + (38.0 + 25.0 * (-t * 3.0).exp()) * DT).fract();
+        y += (TAU * self.boom_ph).sin() * self.env.min(2.0) * 0.35 * (-t * 0.8).exp();
+        if self.crack > 0.0 {
+            // The shock: a sharp N-wave, then the channel's segments tearing in
+            // a quick burst of cracks.
+            if t < 0.0025 {
+                y += self.crack * 1.8;
+            } else if t < 0.005 {
+                y -= self.crack * 1.8;
+            }
+            if t < 0.7 && rng.u() < (900.0 * (-t * 5.0).exp()) * DT {
+                self.tear_env += self.crack * rng.range(0.3, 1.0);
+            }
+            self.tear_env *= decay(0.012);
+            y += self.tear.run(rng.f() * self.tear_env) * 2.2;
+        }
+        y * self.gain
+    }
+
+    fn done(&self) -> bool {
+        self.t > self.dur
+    }
+}
+
+/// Rain: a hiss falling all round; in the cockpit drops drumming on the glass
+/// and roof (more of them the faster the aircraft sweeps through the rain),
+/// running into a roar at speed.
+struct Rain {
+    hiss: Bq,
+    hiss2: Bq,
+    roar: Bq,
+    panel: [Bq; 2],
+    drum: Bq,
+}
+
+impl Rain {
+    fn new() -> Self {
+        Self { hiss: Bq::new(Bq::hp, 1500.0, 0.6), hiss2: Bq::new(Bq::lp, 9000.0, 0.6), roar: Bq::new(Bq::bp, 900.0, 0.5), panel: [Bq::new(Bq::ring, 2300.0, 6.0), Bq::new(Bq::ring, 4100.0, 5.0)], drum: Bq::new(Bq::ring, 420.0, 3.0) }
+    }
+    /// (outside, inside)
+    fn sample(&mut self, p: &Params, rng: &mut Rng) -> (f32, f32) {
+        let r = p.rain;
+        if r < 0.002 {
+            return (0.0, 0.0);
+        }
+        let v = p.airspeed.max(0.0);
+        let n = rng.f();
+        let hiss = self.hiss2.run(self.hiss.run(n));
+        let out = hiss * 0.09 * r.sqrt();
+        if p.cabin < 0.001 {
+            return (out, 0.0);
+        }
+        // Drops striking: a few hundred a second at rest, thousands at speed.
+        let rate = r * (250.0 + 60.0 * v);
+        let mut hit = 0.0;
+        if rng.u() < (rate * DT).min(1.0) {
+            hit = rng.range(0.2, 1.0) * if rng.u() < 0.1 { 2.0 } else { 1.0 };
+        }
+        let tick = self.panel[0].run(hit) * 0.16 + self.panel[1].run(hit) * 0.1 + self.drum.run(hit) * 0.12;
+        let roar = self.roar.run(n) * r * 0.05 * smooth(15.0, 90.0, v);
+        (out, tick * r.sqrt() + roar + hiss * 0.05 * r)
+    }
 }
 
 impl World {
+    /// The thunder (left, right: panned, through its echo), and the rest.
+    fn thunder(&mut self, rng: &mut Rng) -> (f32, f32) {
+        if self.thunder.is_empty() && self.echo_lp.abs() < 1e-5 {
+            return (0.0, 0.0);
+        }
+        let (mut l, mut r) = (0.0, 0.0);
+        let mut i = 0;
+        while i < self.thunder.len() {
+            let th = &mut self.thunder[i];
+            let y = th.sample(rng);
+            let (a, b) = pan(y, th.pan);
+            l += a;
+            r += b;
+            if th.done() {
+                self.thunder.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        // Echoes off the ground and the cloud base, 0.4..1.7 s later, darker.
+        let n = self.echo.len();
+        let tap = |d: f32| (self.echo_pos + n - (d * RATE as f32) as usize) % n;
+        let e = self.echo[tap(0.43)] * 0.3 + self.echo[tap(0.97)] * 0.22 + self.echo[tap(1.71)] * 0.2;
+        self.echo_lp += ((l + r) * 0.5 + e * 0.45 - self.echo_lp) * kf(500.0);
+        self.echo[self.echo_pos] = self.echo_lp;
+        self.echo_pos = (self.echo_pos + 1) % n;
+        (l + e, r + e)
+    }
+
     fn sample(&mut self, fire: f32, rng: &mut Rng) -> f32 {
         let mut out = 0.0;
         // A sub thump, a long low roar, and a crack at the front.
@@ -1115,6 +1305,9 @@ struct Synth {
     voices: Vec<Voice>,
     alarms: Alarms,
     world: World,
+    rain: Rain,
+    /// the thunder heard through the cabin's walls
+    thunder_lp: [f32; 2],
     cab: Cabin,
     dist_gain: f32,
     lim: f32,
@@ -1141,7 +1334,9 @@ impl Synth {
             body: Body::new(),
             voices: Vec::with_capacity(MAX_VOICES),
             alarms: Alarms::new(),
-            world: World { lp_boom: 0.0, lp_boom2: 0.0, lp_wind: 0.0, booms: Vec::new(), crackle: 0.0 },
+            world: World { lp_boom: 0.0, lp_boom2: 0.0, lp_wind: 0.0, booms: Vec::new(), crackle: 0.0, thunder: Vec::new(), echo: vec![0.0; RATE as usize * 2], echo_pos: 0, echo_lp: 0.0 },
+            rain: Rain::new(),
+            thunder_lp: [0.0; 2],
             cab: Cabin::new(),
             dist_gain: 1.0,
             lim: 0.0,
@@ -1209,6 +1404,13 @@ impl Synth {
                     self.push(v);
                 }
             }
+            Event::Thunder { delay, near, far, power, pan } => {
+                if self.world.thunder.len() >= 12 {
+                    self.world.thunder.remove(0);
+                }
+                let th = Thunder::new(delay, near, far, power, pan, &mut self.rng);
+                self.world.thunder.push(th);
+            }
         }
     }
 
@@ -1265,6 +1467,7 @@ impl Synth {
         sm(&mut p.cabin, t.cabin, 0.05);
         sm(&mut p.dist, t.dist, 0.08);
         sm(&mut p.fire, t.fire, 0.3);
+        sm(&mut p.rain, t.rain, 0.6);
         sm(&mut p.n1, t.n1, 0.12);
         sm(&mut p.burner, t.burner, 0.05);
         (p.jet, p.fighter, p.vne) = (t.jet, t.fighter, t.vne);
@@ -1403,6 +1606,18 @@ impl Iterator for Synth {
         let world = self.world.sample(p.fire, rng);
         l += world;
         r += world;
+        // Thunder: in the cockpit heard through the airframe, muffled.
+        let (tl, tr) = self.world.thunder(rng);
+        let kc = kf(700.0);
+        self.thunder_lp[0] += (tl - self.thunder_lp[0]) * kc;
+        self.thunder_lp[1] += (tr - self.thunder_lp[1]) * kc;
+        l += tl * (1.0 - x) + self.thunder_lp[0] * x * 0.9;
+        r += tr * (1.0 - x) + self.thunder_lp[1] * x * 0.9;
+        // Rain: all round outside; on the glass and roof inside.
+        let (ro, ri) = self.rain.sample(&p, rng);
+        let rn = ro * (1.0 - x) + ri * x;
+        l += rn;
+        r += rn * 0.9 + ro * 0.1 * (1.0 - x);
         let alarm = self.alarms.sample(&p.warn) * (0.55 + 0.45 * x) * 0.32;
         l += alarm;
         r += alarm;
@@ -1491,7 +1706,7 @@ mod tests {
         p.warn = Warn { stall: 1.0, pull_up: true, overspeed: 1.0, gear: true, ..Default::default() };
         for cabin in [0.0, 1.0] {
             p.cabin = cabin;
-            let ev = [Event::Boom(2.0), Event::Snap(2.0), Event::Bump(3.0), Event::Touch(8.0), Event::Clunk(1.0), Event::Crunch(2.0), Event::Splash(2.0)];
+            let ev = [Event::Boom(2.0), Event::Snap(2.0), Event::Bump(3.0), Event::Touch(8.0), Event::Clunk(1.0), Event::Crunch(2.0), Event::Splash(2.0), Event::Thunder { delay: 0.0, near: 100.0, far: 4000.0, power: 2.0, pan: 1.0 }];
             let x = render(p, &ev, 1.5);
             assert!(x.iter().all(|s| s[0].is_finite() && s[1].is_finite() && s[0].abs() <= 1.0 && s[1].abs() <= 1.0));
         }
@@ -1599,6 +1814,13 @@ mod tests {
             ("tree strike", f, vec![Event::Crunch(1.0)], 2.0),
             ("crash", Params { live: 0.0, fire: 0.8, ..f }, vec![Event::Boom(1.5)], 5.0),
             ("crash into water", Params { live: 0.0, ..f }, vec![Event::Splash(1.5)], 5.0),
+            ("thunder 600 m, outside", Params { rain: 0.6, ..f }, vec![Event::Thunder { delay: 0.3, near: 600.0, far: 5500.0, power: 1.2, pan: 0.4 }], 9.0),
+            ("thunder 600 m, cockpit", Params { rain: 0.6, cabin: 1.0, ..f }, vec![Event::Thunder { delay: 0.3, near: 600.0, far: 5500.0, power: 1.2, pan: 0.4 }], 9.0),
+            ("thunder 3 km, outside", f, vec![Event::Thunder { delay: 0.3, near: 3000.0, far: 8000.0, power: 1.0, pan: -0.5 }], 10.0),
+            ("thunder 12 km, outside", f, vec![Event::Thunder { delay: 0.3, near: 12000.0, far: 17000.0, power: 1.0, pan: 0.0 }], 12.0),
+            ("rain, outside", Params { rain: 0.8, ..f }, vec![], 3.0),
+            ("rain, cockpit, 60 m/s", Params { rain: 0.8, cabin: 1.0, ..f }, vec![], 3.0),
+            ("rain, cockpit, parked", Params { rain: 0.8, cabin: 1.0, rpm: 700.0, power: 0.05, throttle: 0.0, airspeed: 0.0, ..f }, vec![], 3.0),
         ];
         let mut out: Vec<i16> = Vec::new();
         for (name, p, ev, secs) in scenes {

@@ -2107,7 +2107,7 @@ mod tests {
         let mut spread = Vec::new();
         for sigma in [0.0, 1.5, 4.0] {
             let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
-            p.air = Air { sigma_w: sigma, sigma_h: sigma, len_w: 300.0, len_h: 300.0, draft: 0.0 };
+            p.air = Air { sigma_w: sigma, sigma_h: sigma, len_w: 300.0, len_h: 300.0, draft: 0.0, ..Default::default() };
             let dt = 1.0 / 180.0;
             let (mut s, mut s2, mut n, mut bank) = (0.0, 0.0, 0.0, 0.0f64);
             for i in 0..(60.0 / dt) as usize {

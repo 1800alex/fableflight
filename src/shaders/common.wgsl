@@ -65,6 +65,17 @@ struct Globals {
   foam: array<vec4f, 16>,
   // The start screen: x = 1 while it shows (deep-space sky, no clouds).
   start: vec4f,
+  // Storms close up (storm.rs): x bit mask of the cells near enough to darken
+  // the ground (storm_shade), y rain at the camera 0..1, z lightning flashes
+  // lit, w how deep the camera is in a storm's shade 0..1.
+  stormfx: vec4f,
+  // Lightning lighting the scene, two each: one end of the lit stretch
+  // (camera-relative) + brightness; the other end + kind (1 = to the ground).
+  flash: array<vec4f, 8>,
+  // The rain falling around the camera (precip.wgsl): how far it has moved past
+  // the camera (east, north, up, m, wrapped) + intensity; its velocity relative
+  // to the camera (m/s) + nearest drop drawn (m).
+  rain: array<vec4f, 2>,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -210,6 +221,8 @@ fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32) -
   var L = vec3f(0.0);
   let len = max(tmax - tmin, 0.0);
   var tp = tmin;
+  // Under a storm the air around is in its shade too (fading out over ~15 km).
+  let sdark = G.stormfx.w;
   for (var i = 0; i < steps; i++) {
     let f = f32(i + 1) / f32(steps);
     let tn = tmin + len * f * f;
@@ -227,7 +240,13 @@ fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32) -
     let cl = cloud_sun(p, false);
     var msl = ms_lut(h, mu);
     msl = mix(msl, vec3f(luma(msl)), cl.closed * 0.75) * (1.0 - 0.45 * cl.closed);
-    var S = sun_trans(h, mu) * cl.vis * (sr * pr + vec3f(sm * pm)) + msl * (sr + vec3f(sm));
+    var vis = cl.vis;
+    if (sdark > 0.0) {
+      let k = 1.0 - 0.8 * sdark * exp(-mix(tp, tn, 0.5) / 15000.0);
+      msl *= k;
+      vis *= k;
+    }
+    var S = sun_trans(h, mu) * vis * (sr * pr + vec3f(sm * pm)) + msl * (sr + vec3f(sm));
     if (moon_on) {
       let mum = dot(p / r, moon);
       S += (sun_trans(h, mum) * (sr * prm + vec3f(sm * pmm)) + ms_lut(h, mum) * (sr + vec3f(sm))) * mk;
@@ -308,8 +327,11 @@ fn storm_anvil(sc: vec4f, sp: vec4f) -> vec3f {
 // (A cheaper look-alike for the long light steps was tried: steps that missed
 // the lobes and flanking towers left those flat-lit.)
 var<private> g_anvil: f32;
+// How much the wall cloud is the part of the envelope that counts (set by storm_sd).
+var<private> g_wall: f32;
 fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   g_anvil = 0.0;
+  g_wall = 0.0;
   if (sc.w <= 0.0) { return -1e6; }
   let R = sc.w * 1000.0;
   let mature = smoothstep(0.5, 0.8, sp.x);
@@ -415,9 +437,15 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   if (hb < 0.0) {
     let low = mature * smoothstep(1500.0, 5000.0, R);
     let drop = STORM_BELOW * 0.75 * low;
-    let rw = length(vec2f(dw0 + R * 0.35, cx));
-    let ww = R * 0.42 * (1.0 + 0.4 * hb / max(drop, 1.0));
-    sd = max(sd, min(ww - rw, hb + drop));
+    let wv = vec2f(dw0 + R * 0.35, cx);
+    let rw = length(wv);
+    // Lobed and tapering, not a drum: a lowered, ragged base under the updraft.
+    let wa = atan2(wv.y, wv.x);
+    let wl = 1.0 + 0.22 * sin(3.0 * wa + sp.w * 23.0) + 0.14 * sin(5.0 * wa - sp.w * 41.0);
+    let ww = R * 0.42 * wl * (1.0 + 0.5 * hb / max(drop, 1.0));
+    let swc = min(ww - rw, hb + drop);
+    g_wall = smoothstep(-300.0, 300.0, swc - sd);
+    sd = max(sd, swc);
   }
   return sd;
 }
@@ -637,9 +665,14 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     let tw = tn.g * 0.5 + tn.b * 0.3 + n.g * 0.2;
     let bl = 1.0 - (1.0 - tw) * (1.0 - tw);
     // Flat, rain-free base: the turrets only bulge out higher up.
-    let sdn = sd + (bl - 0.78) * bulge * mix(1.3, 0.12, anvil) * select(mix(0.12, 1.0, smoothstep(0.0, 2500.0, hb)), 0.5, hb < 0.0);
+    // Under the base (the wall cloud) ragged scud: the finer base noise as well,
+    // and a soft edge, or it hangs as a box with straight walls. (Not more bulge:
+    // everything under the base sits within ~30 m of the envelope there, and
+    // stronger noise filled the whole band under it with cloud.)
+    let under = 1.0 - smoothstep(-200.0, 0.0, hb);
+    let sdn = sd + (mix(bl, base * 0.6 + bl * 0.4, under) - 0.78) * bulge * mix(1.3, 0.12, anvil) * select(mix(0.3, 1.0, smoothstep(0.0, 2000.0, hb)), mix(0.5, 1.4, g_wall), hb < 0.0);
     // The anvil's underside is a soft, sagging veil, not a crisp wall.
-    let env = smoothstep(0.0, mix(220.0, 500.0, anvil), sdn);
+    let env = smoothstep(0.0, mix(mix(220.0, 500.0, anvil), 700.0, under), sdn);
     // Anvils are smooth ice sheets; the tower is solid and keeps the noise.
     let body = mix(0.6 + base * 0.6, 0.55 + base * 0.3, anvil);
     d = max(d, mix(remap(body * env, 0.2, 1.0, 0.0, 1.0), body * env, anvil));
@@ -754,7 +787,8 @@ fn cloud_sun(pc: vec3f, hq: bool) -> CloudSun {
   let od = max(v.z - below, 0.0);
   let fade = smoothstep(0.85, 1.0, eo);
   let t = exp(-od);
-  o.vis = mix(t + (1.0 - t) * 0.22 / (1.0 + 0.12 * od), 1.0, fade);
+  // (The forward-scattered glow fades out under really thick cloud: a storm.)
+  o.vis = mix(t + (1.0 - t) * 0.22 / (1.0 + 0.12 * od + 0.01 * od * od), 1.0, fade);
   o.closed = v.w * (1.0 - fade) * (1.0 - smoothstep(base, base + 600.0, h));
   return o;
 }
@@ -1144,6 +1178,70 @@ fn vol_light(P: vec3f) -> vec4f {
   return textureSampleLevel(t_vlight, s_clamp, uvw, 0.0) * smoothstep(0.0, 0.05, e);
 }
 
+// ----------------------------------------------------------- storms close up
+// Colour of lightning's light: a hot, slightly blue-violet white.
+const FLASH_COL = vec3f(0.82, 0.86, 1.0);
+// Light a flash of brightness 1 throws: illuminance FLASH_E / (d^2 + FLASH_D^2)
+// at d metres from its channel (the lit cloud around it spreads it out close by).
+// An in-cloud flash's light mostly stays in the cloud (half reaches the ground).
+// FLASH_C: the same inside the cloud, where it diffuses (clouds.wgsl flash_cloud).
+const FLASH_E = 4.0e5;
+const FLASH_D = 2000.0;
+const FLASH_C = 3.0e6;
+fn seg_dist(p: vec3f, a: vec3f, b: vec3f) -> f32 {
+  let ab = b - a;
+  let k = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-3), 0.0, 1.0);
+  return length(p - a - ab * k);
+}
+// Lightning's light arriving at P (camera-relative).
+fn flash_light(P: vec3f) -> vec3f {
+  let n = u32(G.stormfx.z);
+  var e = 0.0;
+  for (var i = 0u; i < n; i++) {
+    let a = G.flash[2u * i];
+    let b = G.flash[2u * i + 1u];
+    let d = seg_dist(P, a.xyz, b.xyz);
+    e += a.w * FLASH_E * (0.5 + 0.5 * b.w) / (d * d + FLASH_D * FLASH_D);
+  }
+  return FLASH_COL * e;
+}
+// How deep in a storm's shade a point (planet-centred) lies, 0..1: under the
+// tower and its rain nearly all the sky is dark cloud; under the anvil a thick
+// grey lid. Must match storm.rs `shade`.
+fn storm_shade(pp: vec3f) -> f32 {
+  let m = u32(G.stormfx.x);
+  if (m == 0u) { return 0.0; }
+  let un = normalize(pp);
+  let h = length(pp) - G.planet.w;
+  let W = G.storm.xyz;
+  let X = normalize(cross(un, W));
+  let q = un * 6371.0 + G.weather.xyz * 0.001;
+  var dark = 0.0;
+  let n = u32(G.storm.w);
+  for (var i = 0u; i < n; i++) {
+    if ((m & (1u << i)) == 0u) { continue; }
+    let c = G.storm_cells[2u * i];
+    let sp = G.storm_cells[2u * i + 1u];
+    let R = c.w * 1000.0;
+    let dv = (q - c.xyz) * 1000.0;
+    let dw0 = dot(dv, W);
+    let cx = dot(dv, X);
+    let rc = length(vec2f(dw0 - 0.25 * R, cx)) / R;
+    let core = (1.0 - smoothstep(0.7, 1.7, rc)) * smoothstep(0.3, 0.75, sp.x) * smoothstep(1500.0, 4000.0, R);
+    let an = storm_anvil(c, sp);
+    let lc = an.z + max(dw0, 0.0) * 0.45;
+    let rn = length(vec2f(dw0 / select(an.y, an.x, dw0 > 0.0), cx / lc));
+    let lid = (1.0 - smoothstep(0.5, 1.05, rn)) * 0.55 * smoothstep(0.5, 0.8, sp.x);
+    dark = max(dark, max(core, lid));
+  }
+  return dark * (1.0 - smoothstep(G.cloud.y, G.cloud.y + 3000.0, h));
+}
+// Storm light: under a storm the sky light dims to a dull, faintly green grey.
+fn storm_light(amb: vec3f, dark: f32) -> vec3f {
+  let grey = vec3f(luma(amb)) * vec3f(0.93, 0.97, 1.0);
+  return mix(amb, grey, dark * 0.75) * (1.0 - 0.7 * dark);
+}
+
 struct Light { sun: vec3f, amb: vec3f, upn: vec3f, h: f32 };
 // Sun and sky light at a point, shaded by the smoke of any fire nearby.
 fn light_at(P: vec3f) -> Light {
@@ -1181,7 +1279,15 @@ fn light_at_nv(P: vec3f) -> Light {
   let night = 1.0 - smoothstep(-0.12, 0.02, mu);
   amb += vec3f(0.30, 0.45, 0.85) * 0.16 * smoothstep(-0.1, 0.35, mum) * G.moon.w * mix(1.0, 0.7, G.cloud.x);
   amb += (vec3f(0.0016, 0.0024, 0.0048) + SKYGLOW * 0.0022 * G.misc.y * (0.6 + 0.6 * G.cloud.x)) * night;
-  return Light(sun, amb, upn, h);
+  var sun_s = sun;
+  if (G.stormfx.x > 0.0) {
+    // (The sun can still slant in under the edge of an anvil, not under the core.)
+    let dark = storm_shade(pp);
+    amb = storm_light(amb, dark);
+    sun_s *= 1.0 - dark * dark;
+  }
+  if (G.stormfx.z > 0.0) { amb += flash_light(P); }
+  return Light(sun_s, amb, upn, h);
 }
 // What a mirror at P sees along R: the sky (with clouds), or below the
 // horizon the hazy ground and city.

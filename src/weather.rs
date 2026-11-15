@@ -16,8 +16,12 @@ pub struct Weather {
     pub alto: f32,
     /// aerosol haze, as a multiple of a clear day's
     pub haze: f32,
-    /// rain falling where the aircraft is, 0..1 (wets the windows, rain.rs)
+    /// rain falling where the aircraft is, 0..1 (wets the windows, rain.rs;
+    /// falling streaks, precip.wgsl): from the storm cells (storm.rs `local`)
+    /// unless set by hand
     pub rain: f32,
+    /// rain set by hand (`--rain`, the slider) instead of following the storms
+    pub rain_set: Option<f32>,
     /// wind 10 m above the ground, m/s, and the compass direction it blows from
     pub wind: f64,
     pub wind_from: f64,
@@ -52,11 +56,13 @@ pub struct Air {
     pub len_h: f64,
     /// steady vertical motion of the air (thermals, storm drafts), m/s, + up
     pub draft: f64,
+    /// a storm's outflow along the ground (the gust front), planet frame m/s
+    pub gust: DVec3,
 }
 
 impl Default for Air {
     fn default() -> Self {
-        Self { sigma_w: 0.0, sigma_h: 0.0, len_w: 300.0, len_h: 300.0, draft: 0.0 }
+        Self { sigma_w: 0.0, sigma_h: 0.0, len_w: 300.0, len_h: 300.0, draft: 0.0, gust: DVec3::ZERO }
     }
 }
 
@@ -127,7 +133,7 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new() }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new() }
     }
 
     /// Top of the cloud layer including any storm towers, metres.
@@ -152,6 +158,25 @@ impl Weather {
         // one cloud repeated.
         let seed = (0.37 + dist_km * 0.1373 + bearing * 0.0619 + rad_km * 0.271).fract() as f32;
         self.placed.push([[cen.x as f32, cen.y as f32, cen.z as f32, rad_km as f32], [1.0, STORM_TOP + 500.0, 600.0 + (STORM_OVERSHOOT - 600.0) * size as f32, seed]]);
+    }
+
+    /// Set a named preset (case-insensitive, e.g. "storms"); false if there is none.
+    pub fn preset(&mut self, name: &str) -> bool {
+        let Some(&(_, c, b, d, s, a, h, w, g)) = PRESETS.iter().find(|p| p.0.eq_ignore_ascii_case(name) || p.0.to_lowercase().trim_end_matches('s') == name.to_lowercase().trim_end_matches('s')) else { return false };
+        (self.clouds, self.cloud_base, self.cloud_depth, self.storms, self.alto, self.haze, self.wind, self.gusts) = (c, b, d, s, a, h, w, g);
+        true
+    }
+
+    /// Thunderstorms all round `pos` (`--weather storm`): the Storms preset, a
+    /// big mature cell a few km ahead along `heading` with its rain shaft across
+    /// the way, and more around it.
+    pub fn storm_field(&mut self, pos: DVec3, heading: f64) {
+        self.preset("Storms");
+        self.place_storm(pos, 8.0, heading, 6.5);
+        self.place_storm(pos, 24.0, heading + 55.0, 5.0);
+        self.place_storm(pos, 30.0, heading - 45.0, 8.0);
+        self.place_storm(pos, 42.0, heading + 150.0, 4.5);
+        self.place_storm(pos, 55.0, heading - 120.0, 6.0);
     }
 
     /// Storm cells (cumulonimbus) near the camera, nearest first, two vec4s each for
@@ -341,29 +366,12 @@ impl Weather {
         // A light background chop everywhere, as there always is a little.
         let background = 0.12 + 0.03 * self.wind;
 
-        // Storm cells: severe turbulence in and around a tower, an updraft in its
-        // heart that pulls in air from below the base, and a downdraft (the rain
-        // shaft) on its flank that spreads out over the ground.
-        let mut storm = 0.0f64;
-        let mut draft = 0.0;
-        if !self.cells.is_empty() {
-            let q = pos.normalize() * 6371.0 + self.cloud_off / 1000.0;
-            for c in &self.cells {
-                let cen = DVec3::new(c[0][0] as f64, c[0][1] as f64, c[0][2] as f64);
-                let (rad, age) = (c[0][3] as f64, c[1][0] as f64);
-                let d = cen.distance(q.normalize() * 6371.0);
-                if d > rad * 3.0 {
-                    continue;
-                }
-                let tower_top = base + (c[1][1] as f64 - base) * age.min(1.0).sqrt();
-                let up = if alt < base { smoothstep(0.0, base, alt) * 0.45 } else { 1.0 - smoothstep(tower_top - 1500.0, tower_top + 500.0, alt) };
-                let core = (-(d / (rad * 0.55)).powi(2)).exp();
-                let shaft = (-((d - rad * 1.05) / (rad * 0.35)).powi(2)).exp();
-                draft += age * (14.0 * core * up - 9.0 * shaft * (1.0 - smoothstep(base, tower_top, alt) * 0.6) * smoothstep(0.0, 200.0, agl));
-                storm = storm.max(age * 7.0 * (1.0 - smoothstep(rad * 0.8, rad * 2.6, d)) * (0.35 + 0.65 * up.max(inside)));
-            }
-        }
-
+        // Storm cells (storm.rs): severe, gusty turbulence in and around a tower,
+        // the updraft feeding it, the downdraft in its rain and the gust front
+        // that spreads out from under it.
+        let st = crate::storm::local(self, pos, agl, t);
+        let storm = st.sigma;
+        let draft = st.draft;
         let sigma_w = (mech * mech + convt * convt + cloud * cloud + storm * storm + background * background).sqrt().min(9.0);
         // Near the ground the eddies are as small as the height and the horizontal
         // gusts larger than the vertical; aloft they are a few hundred metres across.
@@ -371,7 +379,7 @@ impl Weather {
         let len_w = agl.clamp(12.0, 530.0);
         let len_h = (agl / k.powf(1.2)).clamp(40.0, 530.0);
         let sigma_h = sigma_w / k.powf(0.4).max(0.5).min(1.0);
-        Air { sigma_w, sigma_h, len_w, len_h, draft: self.thermal(pos, agl, t) * if water { 0.2 } else { 1.0 } + draft }
+        Air { sigma_w, sigma_h, len_w, len_h, draft: self.thermal(pos, agl, t) * if water { 0.2 } else { 1.0 } + draft, gust: st.gust }
     }
 
     /// The floating weather & time window (F3). `utc` and `doy` belong to the
@@ -487,7 +495,17 @@ impl Weather {
             add(ui, Slider::new(&mut self.alto, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             ui.end_row();
             ui.label("Rain");
-            add(ui, Slider::new(&mut self.rain, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            ui.horizontal(|ui| {
+                let mut r = self.rain;
+                if add(ui, Slider::new(&mut r, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0))).changed() {
+                    self.rain_set = Some(r);
+                }
+                // Unset, the rain is wherever the storm cells drop it.
+                let mut auto = self.rain_set.is_none();
+                if ui.checkbox(&mut auto, "auto").changed() {
+                    self.rain_set = if auto { None } else { Some(self.rain) };
+                }
+            });
             ui.end_row();
             ui.label("Haze");
             add(ui, Slider::new(&mut self.haze, 0.2..=40.0).logarithmic(true).custom_formatter(|v, _| format!("{v:.1}×")));

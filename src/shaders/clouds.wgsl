@@ -121,6 +121,21 @@ fn alto_march(oc: vec3f, rd: vec3f, t0: f32, t1: f32, a: f32, jit: f32, cs: f32,
   return vec4f(L, T);
 }
 
+// --------------------------------------------------------------- lightning
+// A flash lights the cloud around its channel from inside: the light diffuses
+// through a few km of cloud, blinding white close to the channel, a glow
+// further out (on top of the plain falloff that lights the base from below).
+fn flash_cloud(P: vec3f) -> vec3f {
+  let n = u32(G.stormfx.z);
+  var e = 0.0;
+  for (var i = 0u; i < n; i++) {
+    let a = G.flash[2u * i];
+    let d = seg_dist(P, a.xyz, G.flash[2u * i + 1u].xyz);
+    e += a.w * FLASH_C * (1.0 + 6.0 * exp(-d / 2500.0)) / (d * d + 1000.0 * 1000.0);
+  }
+  return FLASH_COL * e;
+}
+
 // ------------------------------------------------------------- rain shafts
 // Under a mature storm the rain hangs from the base to the ground as a grey
 // curtain, downwind of the updraft, streaked and thickest in the middle. Each
@@ -144,12 +159,14 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
     let up = normalize(c.xyz - G.weather.xyz * 0.001);
     let cen = up * rg + G.storm.xyz * (R * 0.45);
     let rr = R * 0.8;
+    // (The test cylinder also holds the shaft's slant and its foot.)
+    let rt = rr * 1.75 + base * 0.15;
     let v = cen - oc;
     let vh = v - up * dot(v, up);
     let rh = rd - up * dot(rd, up);
     let a = dot(rh, rh);
     let b = dot(vh, rh);
-    let cc = dot(vh, vh) - rr * rr;
+    let cc = dot(vh, vh) - rt * rt;
     var t0 = 0.0;
     var t1 = tmax;
     if (a > 1e-7) {
@@ -165,28 +182,43 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
     if (t1 <= t0) { continue; }
     let ns = 6;
     let dt = (t1 - t0) / f32(ns);
+    // The sun reaching the shaft, looked up once in its middle.
+    let vis = cloud_sun(oc + rd * (0.5 * (t0 + t1)), false).vis;
     for (var k = 0; k < ns; k++) {
       let ts = t0 + dt * (f32(k) + jit);
       let p = oc + rd * ts;
       let h = length(p) - rg;
-      let ph = p - cen;
-      let rad = length(ph - up * dot(ph, up)) / rr;
+      // The shaft slants: the rain lower down has been carried further
+      // downwind, and spreads out in a foot where the downdraft meets the ground.
+      let below = clamp(base - h, 0.0, base);
+      let ph = p - cen - G.storm.xyz * (below * 0.15);
+      let rad = length(ph - up * dot(ph, up)) / (rr * (1.0 + 0.3 * smoothstep(500.0, 0.0, h)));
       // Curtains and streaks: noise squashed flat along the vertical (columnar),
       // drifting with the wind; fading out towards the ground in places (virga).
       let q = p + G.weather.xyz;
-      let sn = textureSampleLevel(t_noise, s_repeat, (q - up * dot(q, up) * 0.93) / 9000.0 + vec3f(0.6, 0.2, 0.4), 0.0);
-      let streak = smoothstep(0.25, 0.75, sn.g * 0.6 + sn.b * 0.4);
+      let qc = q - up * dot(q, up) * 0.93;
+      let sn = textureSampleLevel(t_noise, s_repeat, qc / 9000.0 + vec3f(0.6, 0.2, 0.4), 0.0);
+      // Finer sheets of heavier rain within the shaft.
+      let sf = textureSampleLevel(t_noise, s_repeat, qc / 2600.0 + vec3f(0.17, 0.83, 0.52), 0.0);
+      let streak = smoothstep(0.25, 0.75, sn.g * 0.45 + sn.b * 0.3 + sf.g * 0.35 - 0.05);
       let core = (1.0 - smoothstep(0.35, 1.0, rad + (sn.r - 0.5) * 0.5));
       let vert = smoothstep(0.0, 250.0, base - h) * mix(0.55, 1.0, smoothstep(0.0, base, h) * sn.a + (1.0 - sn.a));
-      let e = 0.00045 * amt * core * mix(0.35, 1.0, streak) * vert;
+      // Heavy rain: a few km of it is all one sees through.
+      let e = 0.0015 * amt * core * mix(0.1, 1.0, streak * streak) * vert;
       if (e <= 1e-7) { continue; }
       let upn = p / length(p);
       let mu = dot(upn, G.sun_dir.xyz);
       // Under the storm the rain is in deep shade: the storm above takes most of
       // the sky light, and the sun only gets in where the shadow map lets it (low
       // sun under the anvil's edge). So it stands out dark against the sky.
-      let vis = cloud_sun(p, false).vis;
-      let S = (sun_trans(h, mu) * G.sun_dir.w * vis * 0.05 + sky_amb * 0.17 + gnd_amb * 0.35) * vec3f(0.9, 0.95, 1.0);
+      // Inside it, under the storm, the light is the storm's dull grey.
+      // (Its own cell's shade only, as storm_shade has it: looping over every
+      // cell per sample cost a few % fps whenever a shaft was in view.)
+      let pc = ph - up * dot(ph, up) + G.storm.xyz * (0.2 * R);
+      let dark = (1.0 - smoothstep(0.7, 1.7, length(pc) / R)) * smoothstep(0.3, 0.75, sp.x) * smoothstep(1500.0, 4000.0, R);
+      var S = (sun_trans(h, mu) * G.sun_dir.w * vis * 0.03 + storm_light(sky_amb * 0.13 + gnd_amb * 0.3, dark)) * vec3f(0.88, 0.93, 0.97);
+      // Lightning lights up the rain around it.
+      if (G.stormfx.z > 0.0) { S += flash_light(p - oc) * 0.08; }
       let st = exp(-e * dt);
       o.L += o.T * S * (1.0 - st);
       let w = o.T * (1.0 - st);
@@ -258,6 +290,8 @@ fn depth_match(a: f32, b: f32) -> f32 {
   let sky_raw = sky_up * 0.55 + sky_side * 0.45;
   let sky_amb = mix(sky_raw, vec3f(luma(sky_raw)), 0.45);
   var gnd_amb = vec3f(0.11, 0.11, 0.1) * sun_trans(0.0, mu0) * max(mu0, 0.0) * G.sun_dir.w / PI * mix(1.0, 0.45, G.cloud.x);
+  // Under a storm the ground below is in its shade: little sunlight comes back up.
+  gnd_amb *= 1.0 - 0.9 * G.stormfx.w;
   // At night the cloud bases catch the city's glow from below.
   gnd_amb += SKYGLOW * 0.0045 * G.misc.y * (1.0 - smoothstep(-0.2, 0.05, mu0));
 
@@ -438,7 +472,9 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // Deep inside, light arrives by diffusion, which falls off like 1/depth rather
       // than exponentially (two-stream approximation, g ~ 0.85).
       ms += 0.4 / (4.0 * PI) / (1.0 + 0.25 * od);
-      ms += cloud_glow(cs, od);
+      // (A storm's light march stops a few km in, far short of all the cloud
+      // between: its glow toward the sun would light up the dark base.)
+      ms += cloud_glow(cs, od * (1.0 + 4.0 * wx.cb));
       // In-scatter probability: wispy edges and the undersides of clouds collect
       // less multiply-scattered light, which gives the dark creases between puffs.
       let dprob = 0.08 + pow(d, remap(clamp(hn, 0.3, 0.85), 0.3, 0.85, 0.5, 2.0));
@@ -452,9 +488,14 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // below (taken by height in the column it got the tower top's deep shade and
       // read as a dark plate on a stem).
       occ = mix(occ, max(occ, 0.6), anv);
-      let amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn * (1.0 - 0.7 * anv))) * mix(0.5, 1.0, powder);
+      // (The ground under a storm is in its shade: its base gets little bounce.)
+      let amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn * (1.0 - 0.7 * anv)) * (1.0 - 0.7 * wx.cb)) * mix(0.5, 1.0, powder);
       let moonc = moon_light(upn, hl);
-      let S = ((sunc + moonc) * ms * MS_GAIN * powder + amb) * d * SIGMA;
+      var S = ((sunc + moonc) * ms * MS_GAIN * powder + amb) * d * SIGMA;
+      // Lightning: the cloud lit from inside (diffuse, so an even phase). Per
+      // sample: added once per ray at the cloud's mean distance it lit the whole
+      // tower as one flat veil.
+      if (G.stormfx.z > 0.0) { S += flash_cloud(pl - oc) * (0.1 * d * SIGMA); }
       let e = d * SIGMA;
       let st = exp(-e * dl);
       L += T * S * (1.0 - st) / e;
@@ -473,7 +514,9 @@ fn depth_match(a: f32, b: f32) -> f32 {
     // than the march resolves. Its partly transparent edge pixels stand in for it:
     // single scattering through a slab of optical depth tau = -ln T is tau e^-tau.
     // Only the share the march did not already light (litw) is added.
-    if (cw > 0.0 && cs > 0.5) {
+    // (Not through cloud the march found opaque: T was zeroed, and the floor's
+    // tau e^-tau times the sharp lobe lit a disc round the sun on a storm's base.)
+    if (cw > 0.0 && cs > 0.5 && T > 0.0) {
       let tau = -log(max(T, 1e-4));
       let lit = litw / cw;
       L += (sunw / cw) * (RIM * hg(cs, 0.94) * tau * exp(-tau) * (1.0 - lit));
