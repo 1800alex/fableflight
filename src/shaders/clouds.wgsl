@@ -121,6 +121,84 @@ fn alto_march(oc: vec3f, rd: vec3f, t0: f32, t1: f32, a: f32, jit: f32, cs: f32,
   return vec4f(L, T);
 }
 
+// ------------------------------------------------------------- rain shafts
+// Under a mature storm the rain hangs from the base to the ground as a grey
+// curtain, downwind of the updraft, streaked and thickest in the middle. Each
+// flagged cell's shaft is a vertical cylinder; the ray's stretch through it (under
+// the base, before the scene) is integrated in a few samples. Returns premultiplied
+// colour and transmittance; z of dist = where along the ray it mostly is.
+struct Rain { L: vec3f, T: f32, t: f32 };
+fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec3f, gnd_amb: vec3f) -> Rain {
+  var o = Rain(vec3f(0.0), 1.0, 0.0);
+  let n = u32(G.storm.w);
+  let rg = G.planet.w;
+  let base = G.cloud.y;
+  var wsum = 0.0;
+  for (var i = 0u; i < n; i++) {
+    if ((mask & (1u << i)) == 0u) { continue; }
+    let c = G.storm_cells[2u * i];
+    let sp = G.storm_cells[2u * i + 1u];
+    let R = c.w * 1000.0;
+    let amt = smoothstep(0.45, 0.8, sp.x) * smoothstep(1800.0, 3500.0, R);
+    if (amt <= 0.0) { continue; }
+    let up = normalize(c.xyz - G.weather.xyz * 0.001);
+    let cen = up * rg + G.storm.xyz * (R * 0.45);
+    let rr = R * 0.8;
+    let v = cen - oc;
+    let vh = v - up * dot(v, up);
+    let rh = rd - up * dot(rd, up);
+    let a = dot(rh, rh);
+    let b = dot(vh, rh);
+    let cc = dot(vh, vh) - rr * rr;
+    var t0 = 0.0;
+    var t1 = tmax;
+    if (a > 1e-7) {
+      let disc = b * b - a * cc;
+      if (disc <= 0.0) { continue; }
+      let sq = sqrt(disc);
+      t0 = max((b - sq) / a, 0.0);
+      t1 = min((b + sq) / a, tmax);
+    } else if (cc > 0.0) { continue; }
+    // Only under the cloud base.
+    let sb = ray_sphere(oc, rd, rg + base);
+    if (G.up.w < base) { t1 = min(t1, sb.y); } else { t0 = max(t0, select(t1, sb.x, sb.x > 0.0)); }
+    if (t1 <= t0) { continue; }
+    let ns = 6;
+    let dt = (t1 - t0) / f32(ns);
+    for (var k = 0; k < ns; k++) {
+      let ts = t0 + dt * (f32(k) + jit);
+      let p = oc + rd * ts;
+      let h = length(p) - rg;
+      let ph = p - cen;
+      let rad = length(ph - up * dot(ph, up)) / rr;
+      // Curtains and streaks: noise squashed flat along the vertical (columnar),
+      // drifting with the wind; fading out towards the ground in places (virga).
+      let q = p + G.weather.xyz;
+      let sn = textureSampleLevel(t_noise, s_repeat, (q - up * dot(q, up) * 0.93) / 9000.0 + vec3f(0.6, 0.2, 0.4), 0.0);
+      let streak = smoothstep(0.25, 0.75, sn.g * 0.6 + sn.b * 0.4);
+      let core = (1.0 - smoothstep(0.35, 1.0, rad + (sn.r - 0.5) * 0.5));
+      let vert = smoothstep(0.0, 250.0, base - h) * mix(0.55, 1.0, smoothstep(0.0, base, h) * sn.a + (1.0 - sn.a));
+      let e = 0.00045 * amt * core * mix(0.35, 1.0, streak) * vert;
+      if (e <= 1e-7) { continue; }
+      let upn = p / length(p);
+      let mu = dot(upn, G.sun_dir.xyz);
+      // Under the storm the rain is in deep shade: the storm above takes most of
+      // the sky light, and the sun only gets in where the shadow map lets it (low
+      // sun under the anvil's edge). So it stands out dark against the sky.
+      let vis = cloud_sun(p, false).vis;
+      let S = (sun_trans(h, mu) * G.sun_dir.w * vis * 0.05 + sky_amb * 0.17 + gnd_amb * 0.35) * vec3f(0.9, 0.95, 1.0);
+      let st = exp(-e * dt);
+      o.L += o.T * S * (1.0 - st);
+      let w = o.T * (1.0 - st);
+      o.t += ts * w;
+      wsum += w;
+      o.T *= st;
+    }
+  }
+  if (wsum > 0.0) { o.t /= wsum; }
+  return o;
+}
+
 // dist.x: distance (km) to the clouds this texel sees; dist.y: distance (km) to the
 // scene surface the march stopped at, for the depth-aware passes below.
 struct CloudOut { @location(0) col: vec4f, @location(1) dist: vec2f };
@@ -180,23 +258,25 @@ fn depth_match(a: f32, b: f32) -> f32 {
   // At night the cloud bases catch the city's glow from below.
   gnd_amb += SKYGLOW * 0.0045 * G.misc.y * (1.0 - smoothstep(-0.2, 0.05, mu0));
 
-  // Only rays that pass near a storm cell march up to the storm ceiling and look the
-  // storms up; the rest keep to the ordinary layer.
-  let smask = storm_mask(oc, rd, min(tscene, 200000.0));
-  let topa = select(base + G.cloud.z, G.cloud.w, smask != 0u);
+  // Only rays that pass near a storm cell march up to the storm ceiling (and down
+  // to the wall and shelf clouds under the base) and look the storms up; the rest
+  // keep to the ordinary layer. Storms tower high enough to be seen much further.
+  let smask = storm_mask(oc, rd, min(tscene, 320000.0));
+  let topa = select(base + G.cloud.z, clamp(g_storm_top, base + G.cloud.z, G.cloud.w), smask != 0u);
+  let bot = select(base, base - STORM_BELOW, smask != 0u);
   let outer = ray_sphere(oc, rd, rg + topa);
-  let inner = ray_sphere(oc, rd, rg + base);
+  let inner = ray_sphere(oc, rd, rg + bot);
   var ta = 0.0;
   var tb = outer.y;
   var march = outer.y > 0.0;
-  if (alt < base) {
+  if (alt < bot) {
     if (z == 0.0 && ray_sphere(oc, rd, rg).x > 0.0) { march = false; }
     ta = inner.y;
   } else {
     if (alt > topa) { ta = outer.x; }
     if (inner.x > 0.0) { tb = inner.x; }
   }
-  tb = min(min(tb, tscene), ta + 160000.0);
+  tb = min(min(tb, tscene), ta + select(160000.0, 320000.0, smask != 0u));
   if (tb <= ta || ta < 0.0) { march = false; }
 
   // The mid-level layer is composited where the march passes its middle (in front
@@ -211,15 +291,41 @@ fn depth_match(a: f32, b: f32) -> f32 {
   var alto_on = aamt > 0.0;
   let atm_ = 0.5 * (ar.x + ar.y);
 
+  // Rain shafts under the storms: in front of the cloud seen from under the base,
+  // behind it seen from above.
+  var rain = Rain(vec3f(0.0), 1.0, 0.0);
+  if (smask != 0u) { rain = storm_rain(oc, rd, min(tscene, 320000.0), smask, jit, sky_amb, gnd_amb); }
+  let rain_front = alt < base;
+  if (rain_front && rain.T < 1.0) {
+    L += rain.L;
+    tw += rain.t * (1.0 - rain.T);
+    ws += 1.0 - rain.T;
+    T = rain.T;
+  }
+
   if (march) {
     // Steps grow with distance (a pixel covers more ground further out), and
     // stretch while the ray is in clear air.
     var t = ta;
     var clear = 0.0;
+    // How much further along the ray is sure to be clear of every storm cell's
+    // envelope (and its turrets): the storms need not be looked up until then, and
+    // no step may be longer.
+    var sclear = 0.0;
+    var pts = ta;        // the previous sample, and whether it was in clear air
+    var pempty = true;
     for (var i = 0; i < 200; i++) {
-      let dt = clamp(t * 0.016, 40.0, 2500.0) * (1.0 + clear);
+      // Never run out of steps before the end of the ray: long grazing rays through
+      // the layer used to stop short, cutting off the clouds beyond. Late in the
+      // budget, steps through clear air stretch to whatever reaches the end (never
+      // inside cloud: coarse steps there turned near towers ghostly).
+      let dt0 = clamp(t * 0.016, 40.0, 2500.0);
+      var dt = dt0 * (1.0 + clear);
+      if (smask != 0u) { dt = min(dt, max(sclear, dt0)); }
+      if (i >= 110 && clear > 0.0) { dt = max(dt, (tb - t) / f32(max(196 - i, 4))); }
       let ts = t + dt * jit;
       t += dt;
+      sclear -= dt;
       if (alto_on && ts > atm_) {
         alto_on = false;
         let la = alto_march(oc, rd, ar.x, ar.y, aamt, jit, cs, sky_amb, gnd_amb);
@@ -234,33 +340,71 @@ fn depth_match(a: f32, b: f32) -> f32 {
       let p = oc + rd * ts;
       let r = length(p);
       let h = r - rg;
-      let wx = cloud_weather_m(p, smask);
+      let wx = cloud_weather_m(p, select(0u, smask, sclear <= 0.0));
       // The close-up erosion octave only pays off within a few km.
       let fine = 1.0 - smoothstep(1500.0, 4500.0, ts);
+      g_erode = 1.0 - smoothstep(12000.0, 45000.0, ts);
       let d = cloud_shape_f(p, h, wx, true, fine);
+      // Clear-air strides used to step right over distant towers a few km wide
+      // (they came out ghostly, half the samples missing them): near a storm cell
+      // its envelope's distance bounds the stride, far from one it lets the ray
+      // skip ahead safely.
+      if (sclear <= 0.0 && smask != 0u) {
+        sclear = max(-wx.sd - storm_bulge(wx.sc), 0.0) * 0.8;
+      }
       // Stride faster through the empty storm-only air above the ordinary layer.
-      if (d <= 0.002) { clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); continue; }
+      if (d <= 0.002) { pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, min(sclear, h - base - G.cloud.z + dt0) / dt0 - 1.0); } continue; }
       clear = 0.0;
-      let upn = p / r;
+      // Light the cloud near where the ray went in, not where the (long, far
+      // off) step happened to land: a sample hundreds of metres deep sees the sun
+      // through that much cloud, which turned distant sunlit towers dull grey. A
+      // few halvings between the last clear sample and this one find the surface.
+      var pl = p;
+      var hl = h;
+      if (pempty && dt > 150.0) {
+        var lo = pts;
+        var hi = ts;
+        for (var k = 0; k < 4; k++) {
+          let tm = 0.5 * (lo + hi);
+          let pm = oc + rd * tm;
+          if (cloud_shape(pm, length(pm) - rg, wx, false) > 0.002) { hi = tm; } else { lo = tm; }
+        }
+        pl = oc + rd * min(hi + 40.0, ts);
+        hl = length(pl) - rg;
+      }
+      pempty = false;
+      pts = ts;
+      let upn = pl / length(pl);
       let ctop = column_top(wx);
-      let hn = clamp((h - base) / ctop, 0.0, 1.0);
+      let hn = clamp((hl - base) / ctop, 0.0, 1.0);
       // Optical depth towards the sun; the column's weather is reused along the way.
       // Tall columns take one more, long step (out to ~3 km) so towers shade their neighbours.
       var od = 0.0;
-      var ls = 36.0;
+      // Far off (a pixel spans hundreds of metres) fewer, longer steps reach as far.
+      let farl = ts > 30000.0;
+      var ls = select(36.0, 90.0, farl);
       var lt = 0.0;
-      let nl = select(6, 7, ctop > 2500.0);
+      let nl = select(select(6, 7, ctop > 2500.0), 4, farl);
+      let lg = select(1.85, 2.5, farl);
       for (var j = 0; j < nl; j++) {
-        let lp = p + sun * (lt + ls * (0.5 + 0.4 * (jit - 0.5)));
-        od += cloud_shape(lp, length(lp) - rg, wx, j < 2) * ls;
+        let lp = pl + sun * (lt + ls * (0.5 + 0.4 * (jit - 0.5)));
+        od += cloud_shape(lp, length(lp) - rg, wx, j < 2 && !farl) * ls;
         lt += ls;
-        ls *= 1.85;
+        ls *= lg;
       }
       od *= SIGMA;
       // Cloud overhead blocks the sky light: a probe straight up, diffusion falloff.
-      let pu = p + upn * 450.0;
-      let od_up = cloud_shape(pu, h + 450.0, wx, false) * 900.0 * SIGMA;
-      let occ = mix(1.0 / (1.0 + 0.15 * od_up), 1.0, 0.12);
+      let pu = pl + upn * 450.0;
+      let od_up = cloud_shape(pu, hl + 450.0, wx, false) * 900.0 * SIGMA;
+      var occ = mix(1.0 / (1.0 + 0.15 * od_up), 1.0, 0.12);
+      // Under a storm's anvil (km overhead) the sky is mostly cloud: a second,
+      // long probe greys and darkens the tower's shaded flanks, so they read as
+      // massive cloud instead of fading into the sky behind.
+      if (wx.cb > 0.0) {
+        let pu2 = pl + upn * 2500.0;
+        let od2 = cloud_shape(pu2, hl + 2500.0, wx, false) * 3000.0 * SIGMA;
+        occ *= mix(1.0 / (1.0 + 0.06 * od2), 1.0, 0.3);
+      }
       // Multiple scattering as a sum of ever dimmer, softer, more isotropic octaves.
       var ms = 0.0;
       var a = 1.0;
@@ -283,9 +427,9 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // Looking towards the sun thin edges glow instead (forward scattering): no powder.
       let powder = mix(1.0, clamp(dprob * vprob * 1.25, 0.0, 1.0), 0.55 * (1.0 - smoothstep(0.0, 0.6, cs)));
       let mu = dot(upn, sun);
-      let sunc = sun_trans(h, mu) * G.sun_dir.w;
+      let sunc = sun_trans(hl, mu) * G.sun_dir.w;
       let amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn)) * mix(0.5, 1.0, powder);
-      let moonc = moon_light(upn, h);
+      let moonc = moon_light(upn, hl);
       let S = ((sunc + moonc) * ms * MS_GAIN * powder + amb) * d * SIGMA;
       let e = d * SIGMA;
       let st = exp(-e * dt);
@@ -318,6 +462,13 @@ fn depth_match(a: f32, b: f32) -> f32 {
     tw += atm_ * wa;
     ws += wa;
     T *= la.a;
+  }
+  if (!rain_front && rain.T < 1.0) {
+    L += T * rain.L;
+    let wr = T * (1.0 - rain.T);
+    tw += rain.t * wr;
+    ws += wr;
+    T *= rain.T;
   }
   // Distant clouds sink into the haze.
   if (ws > 0.0) {
@@ -475,7 +626,7 @@ fn cshadow_ray(px: vec2f, ext: f32) -> vec4f {
   var b = vec3f(0.0);
   // Only rays that pass near a storm cell climb to the storm ceiling.
   let smask = storm_mask(q, sun, 120000.0);
-  let lid = select(base + G.cloud.z, G.cloud.w, smask != 0u);
+  let lid = select(base + G.cloud.z, clamp(g_storm_top, base + G.cloud.z, G.cloud.w), smask != 0u);
   let tl = min(ray_sphere(q, sun, rg + lid).y, 120000.0);
   // Long slanting rays (a low sun) take more steps, so the puffs they cross are not
   // skipped over. A per-texel offset along the ray turns the steps' banding into
@@ -485,7 +636,7 @@ fn cshadow_ray(px: vec2f, ext: f32) -> vec4f {
   let dt = tl / f32(n);
   let jit = ign(px);
   // The column weather changes slowly along the ray: look it up every other step.
-  var wx = Weather(0.0, 0.0, 0.0, 0.0, vec4f(0.0), 0.0, 0.0);
+  var wx = no_weather();
   for (var i = 0; i < n; i++) {
     let p = q + sun * (dt * (f32(i) + jit));
     let h = length(p) - rg;

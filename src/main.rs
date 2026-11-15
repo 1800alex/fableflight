@@ -166,6 +166,8 @@ struct Args {
     clouds: f32,
     /// cumulonimbus storm cell amount 0..1
     storms: Option<f32>,
+    /// storm cells placed by hand: distance (km), compass bearing (deg), tower radius (km)
+    storm_at: Vec<(f64, f64, f64)>,
     time_rate: Option<f64>,
     alto: Option<f32>,
     /// wind in knots and the direction it blows from, haze, day of year; open the F3 panel
@@ -229,6 +231,7 @@ fn parse_args() -> Args {
         hour: 16.6,
         clouds: 0.5,
         storms: None,
+        storm_at: Vec::new(),
         time_rate: None,
         alto: None,
         wind: None,
@@ -330,6 +333,13 @@ fn parse_args() -> Args {
             "--time" => a.hour = num(&v, i).unwrap_or(a.hour),
             "--clouds" => a.clouds = num(&v, i).unwrap_or(0.5) as f32,
             "--storms" => a.storms = num(&v, i).map(|x| x as f32),
+            "--storm-at" => {
+                // km,bearing[,radius km]: a mature cumulonimbus that far from the spawn (repeatable)
+                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if p.len() >= 2 {
+                    a.storm_at.push((p[0], p[1], p.get(2).copied().unwrap_or(6.0)));
+                }
+            }
             "--time-rate" => a.time_rate = num(&v, i),
             "--alto" => a.alto = num(&v, i).map(|x| x as f32),
             "--wind" => {
@@ -699,6 +709,9 @@ impl Game {
         }
         if let Some(s) = args.alto {
             wx.alto = s.clamp(0.0, 1.0);
+        }
+        for &(d, b, r) in &args.storm_at {
+            wx.place_storm(plane.pos, d, b, r.clamp(1.0, 12.0));
         }
         if let Some(r) = args.time_rate {
             wx.time_rate = r.clamp(0.0, 3600.0);

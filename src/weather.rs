@@ -35,6 +35,8 @@ pub struct Weather {
     pub thermal_off: DVec3,
     /// the storm cells handed to the shaders last frame (see `storm_cells`)
     pub cells: Vec<[[f32; 4]; 2]>,
+    /// storm cells placed by hand (`--storm-at`), in cloud space; always handed on first
+    pub placed: Vec<[[f32; 4]; 2]>,
 }
 
 /// What the air around the aircraft is doing beyond the mean wind.
@@ -65,14 +67,18 @@ const PRESETS: &[(&str, f32, f32, f32, f32, f32, f32, f64, f64)] = &[
     ("Windy", 0.55, 1200.0, 4000.0, 0.1, 0.35, 1.5, 14.0, 0.7),
     ("Storms", 0.6, 1300.0, 5000.0, 0.85, 0.5, 1.4, 9.0, 0.5),
 ];
-/// Where storm towers flatten into anvils (tropopause), metres.
-pub const STORM_TOP: f32 = 11000.0;
+/// Where storm towers flatten into anvils (tropopause), metres; each cell's
+/// anvil sits a little above or below it.
+pub const STORM_TOP: f32 = 11500.0;
+/// Most a mature storm's core overshoots its anvil, metres (clouds.wgsl keeps the
+/// ceiling above anvil + overshoot, so nothing is sliced off flat).
+pub const STORM_OVERSHOOT: f32 = 1800.0;
 /// Most storm cells handed to the shaders at once (nearest first).
 pub const MAX_STORMS: usize = 16;
 /// Spacing of candidate storm sites, km.
 const STORM_GRID: f64 = 40.0;
 /// Storm cells are found out to this distance from the camera, km.
-const STORM_RANGE: f64 = 190.0;
+const STORM_RANGE: f64 = 260.0;
 
 fn shash(x: u32) -> u32 {
     let h = x.wrapping_mul(747796405).wrapping_add(2891336453);
@@ -119,13 +125,28 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new() }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new() }
     }
 
     /// Top of the cloud layer including any storm towers, metres.
     pub fn cloud_ceiling(&self) -> f32 {
         let top = self.cloud_base + self.cloud_depth;
-        if self.storms > 0.0 { top.max(STORM_TOP).max(top + 1500.0) } else { top }
+        if self.storms > 0.0 || !self.placed.is_empty() { top.max(STORM_TOP + 700.0 + STORM_OVERSHOOT + 300.0).max(top + 1500.0) } else { top }
+    }
+
+    /// Put a mature cumulonimbus `dist_km` from `pos` (planet frame) towards
+    /// compass `bearing` (degrees), its tower `rad_km` in radius (8 = a giant
+    /// supercell). It drifts with the cloud field from there on. For testing:
+    /// `--storm-at`.
+    pub fn place_storm(&mut self, pos: DVec3, dist_km: f64, bearing: f64, rad_km: f64) {
+        let (e, n, up) = geo::enu(pos);
+        let b = bearing.to_radians();
+        let dir = e * b.sin() + n * b.cos();
+        let a = dist_km / 6371.0;
+        let p = up * a.cos() + dir * a.sin();
+        let cen = (p * 6371.0 + self.cloud_off / 1000.0).normalize() * 6371.0;
+        let size = smoothstep(2.0, 7.0, rad_km);
+        self.placed.push([[cen.x as f32, cen.y as f32, cen.z as f32, rad_km as f32], [1.0, STORM_TOP + 500.0, 600.0 + (STORM_OVERSHOOT - 600.0) * size as f32, 0.37]]);
     }
 
     /// Storm cells (cumulonimbus) near the camera, nearest first, two vec4s each for
@@ -138,7 +159,7 @@ impl Weather {
         let mut out: Vec<(f64, [[f32; 4]; 2])> = Vec::new();
         let prob_amount = self.storms as f64 * 0.5 * smoothstep(0.12, 0.45, self.clouds as f64);
         if prob_amount <= 0.0 {
-            return Vec::new();
+            return self.placed.iter().take(MAX_STORMS).copied().collect();
         }
         let q = cam.normalize() * 6371.0 + self.cloud_off / 1000.0;
         let reach = (STORM_RANGE / STORM_GRID).ceil() as i32 + 1;
@@ -174,16 +195,25 @@ impl Weather {
                         continue;
                     }
                     // A cell fading out shrinks into a smaller, younger (lower) tower.
-                    let rad = (2.2 + 3.0 * unit(h2)) * (0.6 + 0.4 * on);
-                    // Stormier days have more mature cells (with anvils).
+                    // Sizes have a long tail: mostly single towers a few km across,
+                    // now and then a giant multicell / supercell 12-18 km wide.
+                    let us = unit(h2);
+                    let giant = smoothstep(0.82, 1.0, us) * (0.5 + 0.5 * self.storms as f64);
+                    let rad = (2.4 + 2.6 * us + 4.0 * giant * giant) * (0.6 + 0.4 * on);
+                    // Stormier days have more mature cells (with anvils); giants always are.
                     let u = unit(h2 >> 16);
-                    let age = (u + (1.0 - (1.0 - u) * (1.0 - u) - u) * self.storms as f64) * on;
-                    out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, 0.0, 0.0, 0.0]]));
+                    let age = (u + (1.0 - (1.0 - u) * (1.0 - u) - u) * self.storms as f64).max(giant * 1.6).min(1.0) * on;
+                    // Anvil height (the tropopause varies a little) and how far the
+                    // strongest updraft overshoots it: big, mature cells the most.
+                    let h3 = shash(h2 ^ 0x9e3779b9);
+                    let top = STORM_TOP + 700.0 * (unit(h3) as f32 * 2.0 - 1.0);
+                    let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
+                    out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, top, over, unit(h3 >> 16) as f32]]));
                 }
             }
         }
         out.sort_by(|a, b| a.0.total_cmp(&b.0));
-        out.into_iter().take(MAX_STORMS).map(|c| c.1).collect()
+        self.placed.iter().copied().chain(out.into_iter().map(|c| c.1)).take(MAX_STORMS).collect()
     }
 
     /// Visibility at sea level through the haze (Koschmieder, green light), km.
@@ -320,7 +350,7 @@ impl Weather {
                 if d > rad * 3.0 {
                     continue;
                 }
-                let tower_top = base + (STORM_TOP as f64 - base) * age.min(1.0).sqrt();
+                let tower_top = base + (c[1][1] as f64 - base) * age.min(1.0).sqrt();
                 let up = if alt < base { smoothstep(0.0, base, alt) * 0.45 } else { 1.0 - smoothstep(tower_top - 1500.0, tower_top + 500.0, alt) };
                 let core = (-(d / (rad * 0.55)).powi(2)).exp();
                 let shaft = (-((d - rad * 1.05) / (rad * 0.35)).powi(2)).exp();
