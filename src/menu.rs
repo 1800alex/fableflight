@@ -123,8 +123,14 @@ pub struct Menu {
     pub start_agl: f64,
     /// airport markers drawn on the globe last frame: (index, x, y in physical pixels)
     pub markers: Vec<(u32, f32, f32)>,
-    /// which aircraft to fly (index into `aircraft::ALL`)
+    /// which aircraft to fly (index into `aircraft::list()`)
     pub aircraft: usize,
+    /// the hangar (every aircraft, and more to download) while it is open
+    pub hangar: Option<crate::hangar_ui::Tab>,
+    /// the collection entry picked out on its download page, what its search has, and whether it lists the unflyable ones too
+    pub hangar_sel: Option<String>,
+    pub hangar_find: String,
+    pub hangar_all: bool,
     /// fuel to start with (fraction of full tanks), and an engine left off for a start on the ground
     pub fuel: f64,
     pub cold: bool,
@@ -145,7 +151,7 @@ pub enum Start {
 
 impl Menu {
     pub fn new(lat: f64, lon: f64, hour: f64) -> Self {
-        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, show_controls: false, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, fuel: 0.5, cold: false, payload: None }
+        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, show_controls: false, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, hangar: None, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
     }
 
     pub fn look_at(&mut self, lat: f64, lon: f64, alt: f64) {

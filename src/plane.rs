@@ -1116,6 +1116,10 @@ impl Plane {
         if !self.gear_down && self.on_ground {
             self.gear_down = true;
         }
+        if spec.gear_rate <= 0.0 {
+            // fixed gear (a downloaded aircraft's): always down
+            (self.gear, self.gear_down) = (1.0, true);
+        }
         self.gear = (self.gear + if self.gear_down { spec.gear_rate * dt } else { -spec.gear_rate * dt }).clamp(0.0, 1.0);
 
         let (lat, lon, h) = geo::pos_to_lla(self.pos);

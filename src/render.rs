@@ -608,6 +608,8 @@ pub struct MeshGpu {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     n_idx: u32,
+    /// its own textures (a downloaded aircraft's), in place of `bg_obj`'s
+    bind: Option<std::sync::Arc<wgpu::BindGroup>>,
 }
 pub struct DrawObj {
     pub mesh: usize,
@@ -808,6 +810,7 @@ pub struct Renderer {
     build_ub: wgpu::Buffer,
     obj_ub: wgpu::Buffer,
     bg_obj: wgpu::BindGroup,
+    l_obj: wgpu::BindGroupLayout,
     tile_ibuf: wgpu::Buffer,
     tile_nidx: u32,
     p_sky: wgpu::RenderPipeline,
@@ -1027,6 +1030,53 @@ fn upload_mips(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, size: u3
         );
     }
     view(&t)
+}
+
+/// An array texture with mip chains from RGBA layers (sRGB) of one size.
+fn array_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, w: u32, h: u32, layers: &[&[u8]]) -> wgpu::TextureView {
+    let mips = 32 - w.max(h).leading_zeros();
+    let t = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: layers.len() as u32 },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer, data) in layers.iter().enumerate() {
+        let mut cur: Vec<u8> = data.to_vec();
+        let (mut cw, mut ch) = (w, h);
+        for level in 0..mips {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &t, mip_level: level, origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 }, aspect: wgpu::TextureAspect::All },
+                &cur,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cw * 4), rows_per_image: Some(ch) },
+                wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+            );
+            // The next level: each texel the mean of the four under it (in linear light, alpha weighted).
+            let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+            let mut next = vec![0u8; (nw * nh * 4) as usize];
+            let lin = |v: u8| { let c = v as f32 / 255.0; if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } };
+            let enc = |c: f32| -> u8 { let c = c.clamp(0.0, 1.0); ((if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }) * 255.0 + 0.5) as u8 };
+            for y in 0..nh {
+                for x in 0..nw {
+                    let at = |dx: u32, dy: u32| (((y * 2 + dy).min(ch - 1) * cw + (x * 2 + dx).min(cw - 1)) * 4) as usize;
+                    let px = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+                    let a: f32 = px.iter().map(|&i| cur[i + 3] as f32).sum::<f32>();
+                    let o = ((y * nw + x) * 4) as usize;
+                    for c in 0..3 {
+                        let v = if a > 0.0 { px.iter().map(|&i| lin(cur[i + c]) * cur[i + 3] as f32).sum::<f32>() / a } else { px.iter().map(|&i| lin(cur[i + c])).sum::<f32>() / 4.0 };
+                        next[o + c] = enc(v);
+                    }
+                    next[o + 3] = ((a / 4.0) + 0.5) as u8;
+                }
+            }
+            (cur, cw, ch) = (next, nw, nh);
+        }
+    }
+    t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
 
 /// The Hornet's paint (assets/fa18_paint.jpg, baked by assets/blender/fa18_paint.py):
@@ -1935,7 +1985,7 @@ impl Renderer {
             ground_mats,
             casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
-            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, build_ub, obj_ub, bg_obj, tile_ibuf, tile_nidx: ix.len() as u32,
+            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, build_ub, obj_ub, bg_obj, l_obj, tile_ibuf, tile_nidx: ix.len() as u32,
             p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
@@ -2183,16 +2233,31 @@ impl Renderer {
     }
 
     pub fn add_mesh(&mut self, verts: &[PartVertex], idx: &[u32]) -> usize {
+        // (an empty piece, a hinge other pieces hang from, still gets a buffer: nothing is drawn from it)
+        let pad = [PartVertex::zeroed()];
+        let verts = if verts.is_empty() { &pad[..] } else { verts };
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
-        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(idx), usage: wgpu::BufferUsages::INDEX });
-        self.meshes.push(MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32 });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(if idx.is_empty() { &[0u32][..] } else { idx }), usage: wgpu::BufferUsages::INDEX });
+        self.meshes.push(MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32, bind: None });
         self.meshes.len() - 1
+    }
+    /// A downloaded aircraft's textures, as the object bind group its meshes draw with.
+    pub fn texture_set(&self, t: &crate::fgmodel::TexSet) -> std::sync::Arc<wgpu::BindGroup> {
+        let white = vec![255u8; (t.size * t.size * 4) as usize];
+        let layers: Vec<&[u8]> = if t.layers.is_empty() { vec![&white[..]] } else { t.layers.iter().map(|l| &l[..]).collect() };
+        let view = array_texture(&self.device, &self.queue, "aircraft textures", t.size, t.size, &layers);
+        std::sync::Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_obj, entries: &[buf_res(0, &self.obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &view)] }))
+    }
+    /// Draw a mesh with its own textures.
+    pub fn set_mesh_bind(&mut self, i: usize, bind: std::sync::Arc<wgpu::BindGroup>) {
+        self.meshes[i].bind = Some(bind);
     }
     /// Swap the geometry behind an existing mesh id.
     pub fn replace_mesh(&mut self, i: usize, verts: &[PartVertex], idx: &[u32]) {
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
         let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(idx), usage: wgpu::BufferUsages::INDEX });
-        self.meshes[i] = MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32 };
+        let bind = self.meshes[i].bind.take();
+        self.meshes[i] = MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32, bind };
     }
 
     /// Append particles to the ring buffer (oldest are overwritten).
@@ -2679,7 +2744,10 @@ impl Renderer {
                     cur = Some(o.cut);
                 }
                 let m = &self.meshes[o.mesh];
-                rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                if m.n_idx == 0 {
+                    continue;
+                }
+                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[i as u32 * 256]);
                 rp.set_vertex_buffer(0, m.vbuf.slice(..));
                 rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..m.n_idx, 0, 0..1);
@@ -2827,7 +2895,10 @@ impl Renderer {
                     }
                     rp.set_pipeline(if o.cut { &self.p_obj_shadow } else { &self.p_obj_shadow_solid });
                     let m = &self.meshes[o.mesh];
-                    rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                    if m.n_idx == 0 {
+                    continue;
+                }
+                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[i as u32 * 256]);
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
                     rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     rp.draw_indexed(0..m.n_idx, 0, 0..1);
@@ -3004,7 +3075,10 @@ impl Renderer {
                     continue;
                 }
                 let m = &self.meshes[o.mesh];
-                rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                if m.n_idx == 0 {
+                    continue;
+                }
+                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[i as u32 * 256]);
                 rp.set_vertex_buffer(0, m.vbuf.slice(..));
                 rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..m.n_idx, 0, 0..1);

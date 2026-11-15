@@ -555,7 +555,7 @@ pub fn v2(a: [[f32; 2]; 4]) -> [Vec2; 4] {
 }
 /// Does this surface pattern have the openings (windows, gear wells) cut out of it?
 pub fn cut_by(pattern: f32) -> bool {
-    pattern == pat::FUSE || pattern == pat::LINING || pattern == pat::COWL
+    pattern == pat::FUSE || pattern == pat::LINING || pattern == pat::COWL || pattern == crate::fgmodel::P_TEX
 }
 /// Only the skin has the gear wells cut in it (a cabin lining runs down to the floor above them).
 pub fn well_cut_by(pattern: f32) -> bool {
@@ -788,6 +788,8 @@ pub struct Model {
     pub pieces: Vec<Piece>,
     /// every group's pieces merged at rest, for the wreckage
     pub groups: Vec<Mesh>,
+    /// a downloaded aircraft's own textures (see fgmodel.rs), drawn from by its M_TEX surfaces
+    pub tex: Option<std::sync::Arc<crate::fgmodel::TexSet>>,
 }
 
 impl Model {
@@ -800,7 +802,7 @@ impl Model {
                 groups[p.group].append(&p.mesh);
             }
         }
-        Model { pieces, groups }
+        Model { pieces, groups, tex: None }
     }
     /// Centre and half size of everything solid in it (body frame, at rest).
     pub fn bounds(&self) -> (Vec3, Vec3) {
