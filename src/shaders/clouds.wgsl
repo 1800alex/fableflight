@@ -237,6 +237,9 @@ fn depth_match(a: f32, b: f32) -> f32 {
   let sun = G.sun_dir.xyz;
   let cs = dot(rd, sun);
   let jit = fract(ign(in.pos.xy) + G.time.w * 0.618034);
+  // A second, independent jitter for the light steps: tied to jit, the light offsets
+  // moved in step with the sample positions and left rings of equal distance.
+  let jit2 = fract(ign(in.pos.xy + vec2f(23.0, 61.0)) + G.time.w * 0.7548777);
 
   var T = 1.0;
   var L = vec3f(0.0);
@@ -345,6 +348,7 @@ fn depth_match(a: f32, b: f32) -> f32 {
       let fine = 1.0 - smoothstep(1500.0, 4500.0, ts);
       g_erode = 1.0 - smoothstep(12000.0, 45000.0, ts);
       let d = cloud_shape_f(p, h, wx, true, fine);
+      let anv = g_anvil;  // (the lookups below overwrite it)
       // Clear-air strides used to step right over distant towers a few km wide
       // (they came out ghostly, half the samples missing them): near a storm cell
       // its envelope's distance bounds the stride, far from one it lets the ray
@@ -361,16 +365,27 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // few halvings between the last clear sample and this one find the surface.
       var pl = p;
       var hl = h;
-      if (pempty && dt > 150.0) {
+      // The sample stands for its whole step, but after a long clear stride only
+      // the stretch from the surface on is cloud: weighting it by the full stride
+      // made the opacity jump with the stride length.
+      // Refined whenever the step is longer than the 40 m the light is taken at:
+      // switching on only past 150 m steps (~9 km) lit nearer and farther parts of
+      // a tower differently, a seam that drew a box on its face and contour lines
+      // where the stride count changed.
+      var dl = dt;
+      if (pempty && dt > 40.0) {
         var lo = pts;
         var hi = ts;
-        for (var k = 0; k < 4; k++) {
+        // Far off the strides are km long: two more halvings, or the light is taken
+        // a few hundred metres inside and distant towers go grey.
+        for (var k = 0; k < select(4, 6, dt > 600.0); k++) {
           let tm = 0.5 * (lo + hi);
           let pm = oc + rd * tm;
           if (cloud_shape(pm, length(pm) - rg, wx, false) > 0.002) { hi = tm; } else { lo = tm; }
         }
         pl = oc + rd * min(hi + 40.0, ts);
         hl = length(pl) - rg;
+        dl = clamp(t - hi, 0.5 * (t - ts), dt);
       }
       pempty = false;
       pts = ts;
@@ -386,8 +401,12 @@ fn depth_match(a: f32, b: f32) -> f32 {
       var lt = 0.0;
       let nl = select(select(6, 7, ctop > 2500.0), 4, farl);
       let lg = select(1.85, 2.5, farl);
+      // Storm towers: the light steps take the full jitter (TAA averages it), or
+      // where they cross the anvil's flat underside the shadow steps into
+      // horizontal bands down the tower.
+      let jl = select(0.5 + 0.4 * (jit - 0.5), jit2, wx.cb > 0.0);
       for (var j = 0; j < nl; j++) {
-        let lp = pl + sun * (lt + ls * (0.5 + 0.4 * (jit - 0.5)));
+        let lp = pl + sun * (lt + ls * jl);
         od += cloud_shape(lp, length(lp) - rg, wx, j < 2 && !farl) * ls;
         lt += ls;
         ls *= lg;
@@ -401,7 +420,7 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // long probe greys and darkens the tower's shaded flanks, so they read as
       // massive cloud instead of fading into the sky behind.
       if (wx.cb > 0.0) {
-        let pu2 = pl + upn * 2500.0;
+        let pu2 = pl + upn * (2500.0 * (0.6 + 0.8 * jit2));
         let od2 = cloud_shape(pu2, hl + 2500.0, wx, false) * 3000.0 * SIGMA;
         occ *= mix(1.0 / (1.0 + 0.06 * od2), 1.0, 0.3);
       }
@@ -428,11 +447,16 @@ fn depth_match(a: f32, b: f32) -> f32 {
       let powder = mix(1.0, clamp(dprob * vprob * 1.25, 0.0, 1.0), 0.55 * (1.0 - smoothstep(0.0, 0.6, cs)));
       let mu = dot(upn, sun);
       let sunc = sun_trans(hl, mu) * G.sun_dir.w;
-      let amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn)) * mix(0.5, 1.0, powder);
+      // The anvil is a sheet high above the ground and open to the sky at its edges:
+      // its underside still sees the sky around and the sunlit ground and cloud
+      // below (taken by height in the column it got the tower top's deep shade and
+      // read as a dark plate on a stem).
+      occ = mix(occ, max(occ, 0.6), anv);
+      let amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn * (1.0 - 0.7 * anv))) * mix(0.5, 1.0, powder);
       let moonc = moon_light(upn, hl);
       let S = ((sunc + moonc) * ms * MS_GAIN * powder + amb) * d * SIGMA;
       let e = d * SIGMA;
-      let st = exp(-e * dt);
+      let st = exp(-e * dl);
       L += T * S * (1.0 - st) / e;
       let wgt = T * (1.0 - st);
       sunw += wgt * sunc;

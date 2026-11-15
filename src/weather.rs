@@ -148,7 +148,10 @@ impl Weather {
         let p = up * a.cos() + dir * a.sin();
         let cen = (p * 6371.0 + self.cloud_off / 1000.0).normalize() * 6371.0;
         let size = smoothstep(2.0, 7.0, rad_km);
-        self.placed.push([[cen.x as f32, cen.y as f32, cen.z as f32, rad_km as f32], [1.0, STORM_TOP + 500.0, 600.0 + (STORM_OVERSHOOT - 600.0) * size as f32, 0.37]]);
+        // Each placed storm gets its own seed (turret layout), so a line of them is not
+        // one cloud repeated.
+        let seed = (0.37 + dist_km * 0.1373 + bearing * 0.0619 + rad_km * 0.271).fract() as f32;
+        self.placed.push([[cen.x as f32, cen.y as f32, cen.z as f32, rad_km as f32], [1.0, STORM_TOP + 500.0, 600.0 + (STORM_OVERSHOOT - 600.0) * size as f32, seed]]);
     }
 
     /// Storm cells (cumulonimbus) near the camera, nearest first, two vec4s each for
