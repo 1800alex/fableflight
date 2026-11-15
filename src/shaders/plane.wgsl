@@ -2165,7 +2165,9 @@ const GS_Z = -1.30; // cabin::PANEL_Z
           let fr = 0.02 + 0.98 * pow(1.0 - ct, 5.0);
           // The lensed view out: whatever lies that way on screen beyond
           // the glass, else the sky or the ground.
-          var look = env_reflect(in.P, vo, l.upn, false) + l.sun * sh * pow(max(dot(vo, Ls), 0.0), 3000.0) * 0.5;
+          // (Under a storm that sky is its dark base: the clear sky's blue
+          // lit every runner and bead up as a bright cyan hairline.)
+          var look = (env_reflect(in.P, vo, l.upn, false) + l.sun * sh * pow(max(dot(vo, Ls), 0.0), 3000.0) * 0.5) * (1.0 - 0.85 * G.stormfx.w);
           let cq = G.view_proj * vec4f(vo, 0.0);
           if (cq.w > 1e-4) {
             let uv = vec2f(0.5 + 0.5 * cq.x / cq.w, 0.5 - 0.5 * cq.y / cq.w);

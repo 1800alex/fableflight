@@ -214,6 +214,8 @@ struct Seg {
     level: u8,
     /// when the leader reaches it, 0..1 of the leader's time
     t: f32,
+    /// brightness along it: branches fade out towards their tips
+    f: f32,
 }
 
 /// One flash: its channel and its strokes.
@@ -301,22 +303,28 @@ impl Lightning {
         }
     }
 
-    /// A jagged channel from a to b by midpoint displacement: `levels`
-    /// halvings, each point pushed sideways by `rough` of its piece's length.
-    fn channel(&mut self, a: DVec3, b: DVec3, levels: u32, rough: f64, w: f32, level: u8, t0: f32, t1: f32, out: &mut Vec<Seg>) -> Vec<DVec3> {
+    /// A tortuous channel from a to b by midpoint displacement: `levels`
+    /// halvings, each new point pushed sideways by up to `rough` of its piece's
+    /// length on the coarse levels and much less on the fine ones, so a bolt is
+    /// a few long, crooked strokes with medium kinks, not a fizzy squiggle at
+    /// every scale (equal roughness per level made a self-similar fractal that
+    /// read as electric fuzz). Branches (`fade`) dim towards their tips.
+    fn channel(&mut self, a: DVec3, b: DVec3, levels: u32, rough: f64, w: f32, level: u8, t0: f32, t1: f32, fade: bool, out: &mut Vec<Seg>) -> Vec<DVec3> {
+        const PROFILE: [f64; 8] = [1.6, 1.45, 1.35, 1.25, 0.9, 0.42, 0.18, 0.1];
         let mut pts = vec![a, b];
         let axis = (b - a).normalize_or_zero();
         for l in 0..levels {
             let mut next = Vec::with_capacity(pts.len() * 2);
-            // Coarse kinks are bigger relative to their piece than fine ones.
-            let k = rough * if l < 2 { 1.25 } else { 1.0 };
+            let k = rough * PROFILE[(l as usize).min(7)];
             for i in 0..pts.len() - 1 {
                 let (p, q) = (pts[i], pts[i + 1]);
                 let len = p.distance(q);
                 let mut off = self.unit();
                 off -= axis * off.dot(axis) * 0.7;
+                // Kinks off-centre, so the pieces are of uneven length.
+                let m = self.range(0.3, 0.7);
                 next.push(p);
-                next.push((p + q) * 0.5 + off * len * k);
+                next.push(p + (q - p) * m + off * len * k);
             }
             next.push(*pts.last().unwrap());
             pts = next;
@@ -324,7 +332,8 @@ impl Lightning {
         let n = pts.len() - 1;
         for i in 0..n {
             let t = t0 + (t1 - t0) * (i as f32 / n as f32);
-            out.push(Seg { a: pts[i], b: pts[i + 1], w, level, t });
+            let f = if fade { 1.0 - 0.85 * ((i as f32 + 0.5) / n as f32).powf(0.8) } else { 1.0 };
+            out.push(Seg { a: pts[i], b: pts[i + 1], w, level, t, f });
         }
         pts
     }
@@ -341,7 +350,7 @@ impl Lightning {
             let p = pts[k];
             let dir = (pts[(k + 1).min(n - 1)] - p).normalize_or_zero();
             let h = (p.length() - geo::R - ground).max(50.0);
-            let len = h * self.range(0.12, 0.42) / (1.0 + level as f64);
+            let len = h * self.range(0.25, 0.6) / (1.0 + level as f64);
             let side = self.unit();
             let mut d = (dir * 0.6 + (side - up * side.dot(up)).normalize_or_zero() * 0.8 - up * 0.35).normalize_or_zero();
             if level == 1 && self.u() < 0.3 {
@@ -350,9 +359,9 @@ impl Lightning {
             let tb = t0 + (t1 - t0) * (k as f32 / n as f32);
             let w = if level == 1 { 0.45 } else { 0.25 };
             let lv = if level == 1 { 5 } else { 4 };
-            let bp = self.channel(p, p + d * len, lv, 0.2, w, level, tb, (tb + 0.5 * (t1 - tb)).min(t1), out);
-            if level == 1 && self.u() < 0.55 {
-                let nb = 1 + (self.u() * 2.0) as usize;
+            let bp = self.channel(p, p + d * len, lv, 0.2, w, level, tb, (tb + 0.5 * (t1 - tb)).min(t1), true, out);
+            if level == 1 && self.u() < 0.35 {
+                let nb = 1;
                 self.branches(&bp, up, ground, nb, 2, tb, t1, out);
             }
         }
@@ -364,12 +373,12 @@ impl Lightning {
         let mut segs = Vec::new();
         // The part in the cloud runs off sideways from where the leader started.
         let h = top.distance(foot);
-        let pts = self.channel(top, foot, 7, 0.17, 1.0, 0, 0.0, 1.0, &mut segs);
-        let nb = 4 + (self.u() * 6.0) as usize;
+        let pts = self.channel(top, foot, 7, 0.17, 1.0, 0, 0.0, 1.0, false, &mut segs);
+        let nb = 2 + (self.u() * 3.5) as usize;
         self.branches(&pts, up, ground, nb, 1, 0.0, 1.0, &mut segs);
         let side = self.unit();
         let root = top + (side - up * side.dot(up)).normalize_or_zero() * h * 0.35 + up * h * 0.08;
-        self.channel(top, root, 5, 0.22, 0.7, 1, 0.0, 0.0, &mut segs);
+        self.channel(top, root, 5, 0.22, 0.7, 1, 0.0, 0.0, true, &mut segs);
         // Strokes: the first and strongest, then up to four more down the same channel.
         let mut strokes = vec![(0.0, 1.0)];
         let n = if forced { 4 } else { 1 + (self.u().powf(0.8) * 4.0) as usize };
@@ -403,12 +412,12 @@ impl Lightning {
         }
         let mut segs = Vec::new();
         let [a, b] = spans[0];
-        let pts = self.channel(a, b, 6, 0.2, 0.7, 0, 0.0, 0.0, &mut segs);
+        let pts = self.channel(a, b, 6, 0.2, 0.7, 0, 0.0, 0.0, false, &mut segs);
         let nb = 2 + (self.u() * 4.0) as usize;
         for _ in 0..nb {
             let p = pts[(self.u() * (pts.len() - 1) as f64) as usize];
             let d = flat(self.unit()) * spread * self.range(0.2, 0.6);
-            self.channel(p, p + d, 4, 0.22, 0.4, 1, 0.0, 0.0, &mut segs);
+            self.channel(p, p + d, 4, 0.22, 0.4, 1, 0.0, 0.0, true, &mut segs);
         }
         Flash { kind: Kind::Cloud, age: 0.0, leader: 0.0, end: t + 0.3, strokes, spans, segs, power }
     }
@@ -572,7 +581,8 @@ impl Lightning {
                     Some(_) => 0.0,
                     None => if s.level == 0 { main } else { side * if s.level == 1 { 0.55 } else { 0.35 } },
                 } * f.power.min(1.5)
-                    * kind;
+                    * kind
+                    * s.f as f64;
                 if b < 0.002 || out.len() >= MAX_SEGS {
                     continue;
                 }

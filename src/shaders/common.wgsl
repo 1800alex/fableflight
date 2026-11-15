@@ -305,6 +305,11 @@ const STORM_BELOW = 800.0;
 
 // How far the turrets push a storm cell's surface out past its envelope, m.
 fn storm_bulge(sc: vec4f) -> f32 { return clamp(sc.w * 280.0, 800.0, 2200.0); }
+// How far out past the envelope there can be any cloud at all: the billows push
+// out by at most 0.22 x 1.3 of the bulge (cloud_shape_f; under the base, hb < 0,
+// a quarter of that), the low scud by 300 m. (The whole bulge is a far looser
+// bound than that.)
+fn storm_reach(sc: vec4f, hb: f32) -> f32 { return select(0.3, 0.08, hb < 0.0) * storm_bulge(sc) + 320.0; }
 // How high a storm cell grows, as a share of base..anvil: young towers stop short.
 fn storm_top(sm: f32) -> f32 { return mix(0.3, 1.0, smoothstep(0.0, 0.55, sm)); }
 // How far a storm cell's anvil streams downwind (x) and upwind (y) of its core,
@@ -368,7 +373,10 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     // (The flare is the dense head the anvil streams out of: without it, seen from
     // afar, the anvil was a thin veil on a narrow stem.)
     let fq = smoothstep(0.72, 1.0, hc);
-    let Rt = R * 0.82 * lob * taper * mix(dome, 1.0 + 1.5 * fq * sqrt(fq), mature);
+    // Its foot tucks in over the lowest few hundred metres, a rounded edge to
+    // the base instead of a square corner (a straight dark wall seen from afar).
+    let foot = 1.0 - 0.1 * (1.0 - smoothstep(0.0, 700.0, hb));
+    let Rt = R * 0.82 * lob * taper * foot * mix(dome, 1.0 + 1.5 * fq * sqrt(fq), mature);
     sd = min(min(Rt - r, htop - hb), hb + 30.0);
     if (r < R * 1.6 && hb < htop * 0.92) {
       // Five turrets around the core, each a column of its own height ending
@@ -403,7 +411,7 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
       sd = max(sd, min(min(fr * fd - rf, ft - hb), hb + 30.0));
     }
   } else {
-    sd = max(sd, min(R * 2.2 - length(fc - fl * (R * 2.05)), fh0 + 500.0 - hb));
+    sd = max(sd, min(min(R * 2.2 - length(fc - fl * (R * 2.05)), fh0 + 500.0 - hb), hb + 30.0));
   }
   // Mature cells: anvil, overshooting top.
   if (mature > 0.0) {
@@ -419,10 +427,14 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     let ab = at - th * smoothstep(0.0, 0.45, edge) * (0.8 + 0.2 * edge) - 150.0;
     let atop = at + 350.0 * edge;
     let sa = min(min(hb - ab, atop - hb), (1.0 - rn) * 4000.0);
-    let ro = length(vec2f(xa, cx));
-    let Ro = R * mix(0.45, 0.6, size);
-    let ho = at + sp.z * sqrt(max(1.0 - (ro / Ro) * (ro / Ro), 0.0));
-    let so = max(sd, min(ho - hb, Ro - ro));
+    // The overshooting top: a dome on a column that leans with the tower and
+    // rounds off inside it lower down. (As an upright cylinder with no bottom
+    // it poked out of the tower's leaning flank as a straight-walled drum and
+    // hung under the base as a flat-bottomed dark slab down to STORM_BELOW.)
+    let ro = length(vec2f(dw0 - min(hb, at) * mix(0.12, 0.22, mature), cx));
+    let Ro = R * mix(0.45, 0.6, size) * sqrt(smoothstep(0.3 * at, 0.75 * at, hb));
+    let ho = at + sp.z * sqrt(max(1.0 - (ro / max(Ro, 1.0)) * (ro / max(Ro, 1.0)), 0.0));
+    let so = max(sd, min(min(ho - hb, Ro - ro), hb - 0.3 * at));
     // Where the anvil is the part of the envelope that counts (cloud_shape_f
     // smooths it there instead of growing turrets, which hung from its underside
     // in pillars when this went by height alone).
@@ -434,16 +446,26 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   // Under the base (only big, mature cells): a wall cloud under the updraft, a
   // little upwind of the core. (A shelf cloud along the gust front was tried: as
   // a smooth ring outside the tower it caught full sun and read as a white box.)
+  // It hangs as a lumpy lens, deepest in the middle and rising to the base at
+  // its rim, its underside in rounded lumps about a km across: as a lobed drum
+  // (vertical sides, flat bottom) it stood under the storm as a dark slab with
+  // straight edges from every side. The bound takes the deepest lumps.
   if (hb < 0.0) {
     let low = mature * smoothstep(1500.0, 5000.0, R);
-    let drop = STORM_BELOW * 0.75 * low;
+    let drop = STORM_BELOW * 0.5 * low;
     let wv = vec2f(dw0 + R * 0.35, cx);
     let rw = length(wv);
-    // Lobed and tapering, not a drum: a lowered, ragged base under the updraft.
     let wa = atan2(wv.y, wv.x);
     let wl = 1.0 + 0.22 * sin(3.0 * wa + sp.w * 23.0) + 0.14 * sin(5.0 * wa - sp.w * 41.0);
-    let ww = R * 0.42 * wl * (1.0 + 0.5 * hb / max(drop, 1.0));
-    let swc = min(ww - rw, hb + drop);
+    let ww = R * 0.5 * wl;
+    var lump = 1.0;
+    if (full && rw < ww * 1.1) {
+      let nz = textureSampleLevel(t_noise, s_repeat, (pp + G.weather.xyz) / 3200.0 + vec3f(0.27, 0.61, 0.09), 0.0);
+      lump = nz.g * 0.65 + nz.b * 0.35;
+    }
+    let s2 = rw * rw / (ww * ww);
+    let zb = -drop * (1.0 - s2) * (0.4 + 0.9 * lump);
+    let swc = (hb - zb) * 0.8;
     g_wall = smoothstep(-300.0, 300.0, swc - sd);
     sd = max(sd, swc);
   }
@@ -585,7 +607,7 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
   if (wx.sc.w > 0.0) {
     sd = storm_sd(pp, hb, wx.sc, wx.sp, true);
     bulge = storm_bulge(wx.sc);
-    storm = sd > -bulge;
+    storm = sd > -storm_reach(wx.sc, hb);
   }
   let cumulus = hb > 0.0 && hn < 1.0 && wx.cov > 0.02;
   if (!storm && !cumulus) { return 0.0; }
@@ -670,7 +692,13 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // everything under the base sits within ~30 m of the envelope there, and
     // stronger noise filled the whole band under it with cloud.)
     let under = 1.0 - smoothstep(-200.0, 0.0, hb);
-    let sdn = sd + (mix(bl, base * 0.6 + bl * 0.4, under) - 0.78) * bulge * mix(1.3, 0.12, anvil) * select(mix(0.3, 1.0, smoothstep(0.0, 2000.0, hb)), mix(0.5, 1.4, g_wall), hb < 0.0);
+    var sdn = sd + (mix(bl, base * 0.6 + bl * 0.4, under) - 0.78) * bulge * mix(1.3, 0.12, anvil) * select(mix(0.3, 1.0, smoothstep(0.0, 2000.0, hb)), mix(0.1, 0.25, g_wall), hb < 0.0);
+    // Low down (the lower flanks, the base, the wall cloud) the big billows are
+    // weak, and with nothing finer the outline ran straight for kilometres:
+    // lumps a few hundred metres across break it up into ragged scud, fading
+    // out towards the bottom of the band under the base.
+    let lowz = (1.0 - smoothstep(0.0, 1500.0, hb)) * smoothstep(-STORM_BELOW, -STORM_BELOW + 250.0, hb);
+    sdn += (wv.x * 0.7 + wv.y * 0.3 + 0.08) * 650.0 * lowz * (1.0 - anvil);
     // The anvil's underside is a soft, sagging veil, not a crisp wall.
     let env = smoothstep(0.0, mix(mix(220.0, 500.0, anvil), 700.0, under), sdn);
     // Anvils are smooth ice sheets; the tower is solid and keeps the noise.

@@ -349,6 +349,11 @@ fn depth_match(a: f32, b: f32) -> f32 {
     // envelope (and its turrets): the storms need not be looked up until then, and
     // no step may be longer.
     var sclear = 0.0;
+    // Inside the ordinary layer the storms are looked up further out than
+    // that, wherever they push the cumulus aside (Weather.cb): skipping them
+    // there let cumulus puffs show through a storm's base.
+    var slook = 0.0;
+    var ufree = false;
     var pts = ta;        // the previous sample, and whether it was in clear air
     var pempty = true;
     for (var i = 0; i < 200; i++) {
@@ -356,13 +361,15 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // the layer used to stop short, cutting off the clouds beyond. Late in the
       // budget, steps through clear air stretch to whatever reaches the end (never
       // inside cloud: coarse steps there turned near towers ghostly).
-      let dt0 = clamp(t * 0.016, 40.0, 2500.0);
+      let dt0 = clamp(t * select(0.016, 0.03, ufree), 40.0, 2500.0);
+      ufree = false;
       var dt = dt0 * (1.0 + clear);
       if (smask != 0u) { dt = min(dt, max(sclear, dt0)); }
       if (i >= 110 && clear > 0.0) { dt = max(dt, (tb - t) / f32(max(196 - i, 4))); }
       let ts = t + dt * jit;
       t += dt;
       sclear -= dt;
+      slook -= dt;
       if (alto_on && ts > atm_) {
         alto_on = false;
         let la = alto_march(oc, rd, ar.x, ar.y, aamt, jit, cs, sky_amb, gnd_amb);
@@ -377,7 +384,8 @@ fn depth_match(a: f32, b: f32) -> f32 {
       let p = oc + rd * ts;
       let r = length(p);
       let h = r - rg;
-      let wx = cloud_weather_m(p, select(0u, smask, sclear <= 0.0));
+      let look = sclear <= 0.0 || (slook <= 0.0 && h >= base && h < base + G.cloud.z);
+      let wx = cloud_weather_m(p, select(0u, smask, look));
       // The close-up erosion octave only pays off within a few km.
       let fine = 1.0 - smoothstep(1500.0, 4500.0, ts);
       g_erode = 1.0 - smoothstep(12000.0, 45000.0, ts);
@@ -387,11 +395,16 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // (they came out ghostly, half the samples missing them): near a storm cell
       // its envelope's distance bounds the stride, far from one it lets the ray
       // skip ahead safely.
-      if (sclear <= 0.0 && smask != 0u) {
-        sclear = max(-wx.sd - storm_bulge(wx.sc), 0.0) * 0.8;
+      if (look && smask != 0u) {
+        sclear = max(-wx.sd - storm_reach(wx.sc, h - base), 0.0) * 0.8;
+        slook = max(-wx.sd - storm_bulge(wx.sc), 0.0) * 0.8;
       }
       // Stride faster through the empty storm-only air above the ordinary layer.
-      if (d <= 0.002) { pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, min(sclear, h - base - G.cloud.z + dt0) / dt0 - 1.0); } continue; }
+      if (d <= 0.002) { pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, min(sclear, h - base - G.cloud.z + dt0) / dt0 - 1.0); }
+        // Under a storm's base the clear air between the scud takes longer
+        // steps (grazing rays cross kilometres of it).
+        ufree = h < base && smask != 0u;
+        continue; }
       clear = 0.0;
       // Light the cloud near where the ray went in, not where the (long, far
       // off) step happened to land: a sample hundreds of metres deep sees the sun

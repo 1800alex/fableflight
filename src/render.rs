@@ -154,7 +154,7 @@ pub struct Globals {
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).
-pub const RAIN_DROPS: u32 = 16384;
+pub const RAIN_DROPS: u32 = 131072;
 
 /// The cloud shadow map: the sun's view of the cloud layer (common.wgsl
 /// `cloud_sun`). Each texel is a ray along the sun from a point on the cloud
@@ -744,6 +744,7 @@ pub struct Renderer {
     dyn_lights: wgpu::Buffer,
     /// falling rain and lightning channels (precip.wgsl), over the clouds
     p_rain: wgpu::RenderPipeline,
+    p_veil: wgpu::RenderPipeline,
     p_bolt: wgpu::RenderPipeline,
     bolt_buf: wgpu::Buffer,
     /// loose trees; `p_tree_near` draws the rest short of IMP_DIST (with the
@@ -1752,7 +1753,7 @@ impl Renderer {
         // cover into alpha (hdr alpha is otherwise 1) so the anti-aliasing takes
         // them from this frame instead of smearing them into the history.
         const A_BOLT: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
-        let precip = |label: &str, vs: &str, fs: &str, color: wgpu::BlendComponent, buffers: &[Option<wgpu::VertexBufferLayout>]| {
+        let precip = |label: &str, vs: &str, fs: &str, color: wgpu::BlendComponent, alpha: wgpu::BlendComponent, buffers: &[Option<wgpu::VertexBufferLayout>]| {
             d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pl(&l_cloud_apply)),
@@ -1766,7 +1767,7 @@ impl Renderer {
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: HDR,
-                        blend: Some(wgpu::BlendState { color, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add } }),
+                        blend: Some(wgpu::BlendState { color, alpha }),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -1774,8 +1775,13 @@ impl Renderer {
                 cache: None,
             })
         };
-        let p_rain = precip("rain", "vs_rain", "fs_rain", wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add }, &[]);
-        let p_bolt = precip("lightning", "vs_bolt", "fs_bolt", wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, &[vb(32, true, &A_BOLT)]);
+        // (Alpha: the share of this frame the anti-aliasing must take.)
+        let cover = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+        let over = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+        let p_rain = precip("rain", "vs_rain", "fs_rain", over, cover, &[]);
+        let p_bolt = precip("lightning", "vs_bolt", "fs_bolt", wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, cover, &[vb(32, true, &A_BOLT)]);
+        // The veil of distant rain is smooth and steady: it leaves alpha alone.
+        let p_veil = precip("rain veil", "vs_veil", "fs_veil", over, wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, &[]);
         let p_tree = geom("tree", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 0);
         let imp = crate::impostor::Impostors::new(d, &l0, &l_tileu, &m_tree);
         let p_tree_near = geom("trees near", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 7);
@@ -1856,7 +1862,7 @@ impl Renderer {
         }
         Ok(Self {
             ground_mats,
-            casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_rain, p_bolt, bolt_buf, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
+            casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_rain, p_veil, p_bolt, bolt_buf, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, build_ub, obj_ub, bg_obj, tile_ibuf, tile_nidx: ix.len() as u32,
             p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
@@ -2791,6 +2797,10 @@ impl Renderer {
             let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], Some(ds)));
             rp.set_bind_group(0, &self.bg0, &[]);
             rp.set_bind_group(1, &t.bg_cloud_apply[cf], &[]);
+            if f.rain_drops > 0 {
+                rp.set_pipeline(&self.p_veil);
+                rp.draw(0..3, 0..1);
+            }
             if n_bolt > 0 {
                 rp.set_pipeline(&self.p_bolt);
                 rp.set_vertex_buffer(0, self.bolt_buf.slice(..));
