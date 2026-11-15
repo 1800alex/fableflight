@@ -24,6 +24,7 @@ mod padui;
 mod pave;
 mod photonight;
 mod relight;
+mod rain;
 mod weather;
 mod mvt;
 mod plane;
@@ -217,6 +218,11 @@ struct Args {
     aircraft: Option<String>,
     /// start with the HUD hidden (H), for screenshots
     no_hud: bool,
+    /// rain 0..1 (wets the windows), and how wet the glass starts (default: settled in that rain)
+    rain: Option<f32>,
+    wet: Option<f32>,
+    /// airborne start speed (kt) instead of the aircraft's cruise
+    speed: Option<f64>,
 }
 
 fn parse_args() -> Args {
@@ -266,6 +272,9 @@ fn parse_args() -> Args {
         approach: false,
         aircraft: None,
         no_hud: false,
+        rain: None,
+        wet: None,
+        speed: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -401,6 +410,9 @@ fn parse_args() -> Args {
                 a.taa = false;
                 used = 1;
             }
+            "--rain" => a.rain = num(&v, i).map(|x| x as f32),
+            "--wet" => a.wet = num(&v, i).map(|x| x as f32),
+            "--speed" => a.speed = num(&v, i),
             "--no-hud" => {
                 a.no_hud = true;
                 used = 1;
@@ -441,7 +453,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--wet 0..1] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -601,6 +613,8 @@ struct Game {
     cockpit_fov: f32,
     /// the instruments' own state: lags, gyros, the compass card
     gauges: gauges::Gauges,
+    /// water on the windows (rain.rs)
+    glass: rain::Glass,
     head_live: bool,
     /// the cockpit warnings sounding, and when each latched one last tripped
     /// (pull up, too low, sink rate, gear) so they do not flicker
@@ -679,7 +693,7 @@ impl Game {
         }
         let alt = args.alt.unwrap_or_else(|| ground_elev(&src, lat, lon) + args.agl.unwrap_or(450.0));
         let spec = args.aircraft.as_deref().and_then(aircraft::by_key).unwrap_or(aircraft::ALL[0]);
-        let mut plane = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt, args.heading.to_radians(), spec.cruise);
+        let mut plane = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt, args.heading.to_radians(), args.speed.map(|kt| kt / 1.94384).unwrap_or(spec.cruise));
         if let Some(spec) = &args.damage {
             plane.dmg.apply_spec(spec);
         }
@@ -709,6 +723,11 @@ impl Game {
         }
         if let Some(s) = args.alto {
             wx.alto = s.clamp(0.0, 1.0);
+        }
+        wx.rain = args.rain.unwrap_or(0.0).clamp(0.0, 1.0);
+        let mut glass = rain::Glass::new(wx.rain);
+        if let Some(w) = args.wet {
+            glass.wet = w.clamp(0.0, 1.0);
         }
         for &(d, b, r) in &args.storm_at {
             wx.place_storm(plane.pos, d, b, r.clamp(1.0, 12.0));
@@ -749,7 +768,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane,
+            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, plane,
             airport_rx: None, hold_spot: None,
             pending_airport: args.airport.as_deref().and_then(|c| {
                 let i = airports::Db::get().find(c);
@@ -1880,6 +1899,7 @@ impl Game {
             self.plane.air = air;
             self.plane.wind = self.wx.at(self.plane.pos, agl, self.time) + self.plane.pos.normalize() * air.draft;
             self.wx.advance(dt, self.plane.pos);
+            self.glass.step(dt, self.wx.rain, self.plane.ias() * 1.94384);
         }
 
         // Physics at a fixed step.
@@ -2426,7 +2446,8 @@ impl Game {
             shore_vp: [[0.0; 4]; 4],
             shore: [0.0; 4],
             foam: [[0.0; 4]; 16],
-            start: [if in_menu { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            // (yzw: the rain, how wet the windows are, and the airspeed over them in kt; plane.wgsl rain_water)
+            start: [if in_menu { 1.0 } else { 0.0 }, self.wx.rain, self.glass.wet, (self.plane.ias() * 1.94384) as f32],
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -2510,6 +2531,7 @@ impl Game {
             let blur = ((self.plane.prop_rate - 30.0) / 25.0).clamp(0.0, 1.0) as f32;
             let dm = self.plane.dmg;
             let kind = self.spec.id as f32;
+            let rain_ph = self.glass.phases();
             // What the exhaust shows (plane.wgsl, the plume and the nozzles): how far the
             // afterburners are lit, and how hard the engines are running dry (0 idle .. 1).
             let (burner, dry) = match &self.spec.engine {
@@ -2536,8 +2558,9 @@ impl Game {
                 objs.push(DrawObj {
                     mesh: self.piece_mesh[i],
                     model: base * pose[i],
-                    tint: [blur, burner, dry, 0.0],
-                    glow: [0.0, kind, 0.0, 0.0],
+                    // (Windows: the phases of the water on them, rain.rs Glass::phases.)
+                    tint: [blur, burner, dry, if p.glass { rain_ph[2] } else { 0.0 }],
+                    glow: if p.glass { [0.0, kind, rain_ph[0], rain_ph[1]] } else { [0.0, kind, 0.0, 0.0] },
                     params,
                     cast: 1 << render::PLANE_LAYER,
                     glass: p.glass,

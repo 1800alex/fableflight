@@ -16,6 +16,8 @@ pub struct Weather {
     pub alto: f32,
     /// aerosol haze, as a multiple of a clear day's
     pub haze: f32,
+    /// rain falling where the aircraft is, 0..1 (wets the windows, rain.rs)
+    pub rain: f32,
     /// wind 10 m above the ground, m/s, and the compass direction it blows from
     pub wind: f64,
     pub wind_from: f64,
@@ -125,7 +127,7 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new() }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new() }
     }
 
     /// Top of the cloud layer including any storm towers, metres.
@@ -480,6 +482,9 @@ impl Weather {
             ui.end_row();
             ui.label("Mid-level cloud");
             add(ui, Slider::new(&mut self.alto, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            ui.end_row();
+            ui.label("Rain");
+            add(ui, Slider::new(&mut self.rain, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             ui.end_row();
             ui.label("Haze");
             add(ui, Slider::new(&mut self.haze, 0.2..=40.0).logarithmic(true).custom_formatter(|v, _| format!("{v:.1}×")));

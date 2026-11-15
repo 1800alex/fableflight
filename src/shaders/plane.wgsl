@@ -1670,6 +1670,207 @@ fn surface(in: VOut) -> Shaded {
   return Shaded(vec4f(c, 1.0), vec4f(N, -reflect_w), select(0.0, 1.0, kill), amb_share(c));
 }
 
+// ---------------------------------------------------------------- rain on the glass
+
+// Rain on the windows (rain.rs): G.start.y is the rain falling (0..1), .z how
+// wet the glass is (0..1), .w the airspeed over it (kt indicated). A window
+// piece carries the phases of its water: glow.z the beads' turnover
+// (lifetimes), glow.w how far drops have run down (m), tint.w how far the
+// airflow has driven them (m). The water is on the outside: from the cabin
+// each drop is a tiny lens that shows the scene behind it upside down and
+// shrunk, ringed by a dark band where the light is reflected back inside it.
+
+// How hard the airflow drags a drop against the surface tension pinning it,
+// and how fast it then drives the drops (m/s); match rain.rs.
+fn rain_mob(kt: f32) -> f32 { return smoothstep(8.0, 40.0, kt); }
+fn rain_flow_speed(kt: f32) -> f32 { let s = kt / 60.0; return min(rain_mob(kt) * 0.25 * s * s, 6.0); }
+// An integer hash of a cell (exact at any phase, unlike the sine hash).
+fn rh(c: vec2f, s: u32) -> f32 {
+  var x = bitcast<u32>(i32(c.x)) * 1664525u + bitcast<u32>(i32(c.y)) * 2246822519u + s * 3266489917u;
+  x ^= x >> 15u; x *= 2654435761u; x ^= x >> 13u; x *= 1274126177u; x ^= x >> 16u;
+  return f32(x >> 8u) * (1.0 / 16777216.0);
+}
+
+// Water over a point of the glass: height above it (m), its slope along the
+// window's two axes, and how much of the pixel a drop covers.
+struct Water { h: f32, g: vec2f, cov: f32, f: f32 };
+
+// A drop sitting on the glass: a spherical cap of footprint radius r meeting
+// it at a contact angle with sine sc. q is the offset from its middle, y along
+// the way it moves; e stretches it that way (running drops elongate, and a
+// fast one smears over a frame), taper narrows it behind into a tail, k
+// flattens it (a film-thin streak), fade is the share of the frame it is
+// there for (a smeared drop only passes over a point for part of it).
+fn rain_cap(w: ptr<function, Water>, q0: vec2f, r: f32, e: f32, taper: f32, sc: f32, k: f32, px: f32, fade: f32) {
+  let sx = 1.0 + taper * max(-q0.y, 0.0) / r;
+  let q = vec2f(q0.x * sx, q0.y / e);
+  let rho2 = dot(q, q);
+  let rp = r + px;
+  if (rho2 >= rp * rp) { return; }
+  let rho = sqrt(rho2);
+  let R = r / sc;
+  let cc = sqrt(1.0 - sc * sc);
+  let s = sqrt(max(R * R - min(rho2, r * r), 1e-12));
+  let h = max(s - R * cc, 0.0) * k;
+  // Footprint edge, a pixel wide (the cap's own slope is steepest there).
+  let cov = sat((r - rho) / max(px * 0.75, 1e-6) + 0.5) * fade;
+  if (h > (*w).h || ((*w).h == 0.0 && cov > (*w).cov)) {
+    let g = -q / s * k;
+    (*w).h = h;
+    (*w).g = vec2f(g.x * sx, g.y / e);
+  }
+  (*w).cov = max((*w).cov, cov);
+}
+
+// Drops running along a (across c) at speed set by phase, one at most per
+// cell of a column, each with the trail it leaves: a thin rivulet narrowing
+// behind it and the beads it strands (fixed to the glass, so they stay put
+// as the drop moves on). Columns slip at their own pace, in fits and starts
+// (stick) where the drag barely beats the pinning.
+fn rain_run(w: ptr<function, Water>, a: f32, c: f32, cw: f32, cl: f32, phase: f32, r0: f32, dens: f32, e: f32, trail: f32, stick: f32, k: f32, px: f32, seed: u32) {
+  let col = floor(c / cw);
+  let hs = rh(vec2f(col, 0.0), seed);
+  let fq = 6.2831853 / (cl * (0.6 + 0.8 * rh(vec2f(col, 1.0), seed)));
+  let off = (0.55 + 0.9 * hs) * (phase + stick * 0.85 / fq * sin(fq * phase + 6.2831853 * hs));
+  let as_ = a - off;
+  let row = floor(as_ / cl);
+  let kc = vec2f(col, row);
+  if (rh(kc, seed + 1u) > dens) { return; }
+  let r = r0 * (0.6 + 0.8 * rh(kc, seed + 2u));
+  // The drop near the head of its cell, so its trail stays inside it.
+  let ad = (row + 0.72 + 0.2 * rh(kc, seed + 3u)) * cl + off;
+  // The path it wanders down, a function of where along the glass it is.
+  let amp = max(cw * 0.5 - r * 1.6, 0.0) * 0.6;
+  let h1 = rh(kc, seed + 4u) * 6.2831853;
+  let wob = sin(a * 31.0 + h1) * 0.6 + sin(a * 83.0 + h1 * 2.3) * 0.4;
+  let xc = (col + 0.5) * cw + amp * wob;
+  let x = c - xc;
+  let t = ad - a;
+  if (abs(x) > cw * 0.5 || t < -r * e * 1.5 || t > trail + r) { return; }
+  // (Smeared once e is mostly motion blur: fainter, as it passes in part of a frame.)
+  let fade = min(1.0, sqrt(2.5 / e));
+  rain_cap(w, vec2f(x, -t), r, e, 0.35, 0.82, k, px, fade);
+  if (t > r * 0.5 && trail > 0.0) {
+    // The rivulet: a thin cylindrical bead of water (meeting the glass at
+    // some 35 degrees), narrowing to nothing.
+    let f = sat((t - r * 0.5) / trail);
+    let wt = r * 0.32 * sqrt(1.0 - f);
+    if (abs(x) < wt + px) {
+      let R = wt / 0.57;
+      let xm = min(abs(x), wt);
+      let s = sqrt(max(R * R - xm * xm, 1e-12));
+      let h = max(s - R * 0.82, 0.0) * k;
+      let cov = sat((wt - abs(x)) / max(px * 0.75, 1e-6) + 0.5) * (1.0 - f * f) * fade;
+      if (h > (*w).h || ((*w).h == 0.0 && cov > (*w).cov)) { (*w).h = h; (*w).g = vec2f(-sign(x) * xm / s * k, 0.0); }
+      (*w).cov = max((*w).cov, cov);
+    }
+    // Stranded beads, every few millimetres along the glass.
+    let ds = r * 1.3;
+    let bi = floor(a / ds);
+    let kb = vec2f(col, bi);
+    if (rh(kb, seed + 5u) < 0.55) {
+      let ab = (bi + 0.5) * ds;
+      let tb = ad - ab;
+      if (tb > r && tb < trail * (0.6 + 0.4 * rh(kb, seed + 6u))) {
+        let rb = r * (0.18 + 0.22 * rh(kb, seed + 7u));
+        let xb = (col + 0.5) * cw + amp * (sin(ab * 31.0 + h1) * 0.6 + sin(ab * 83.0 + h1 * 2.3) * 0.4) + (rh(kb, seed + 8u) - 0.5) * r * 0.6;
+        rain_cap(w, vec2f(c - xb, a - ab), rb, 1.0, 0.0, 0.85, k, px, 1.0);
+      }
+    }
+  }
+}
+
+// Beads that land and sit, one at most per cell, each living part of every
+// turnover before it merges away and another lands elsewhere in the cell.
+fn rain_beads(w: ptr<function, Water>, p: vec2f, cs: f32, rmin: f32, rmax: f32, dens: f32, phase: f32, px: f32, seed: u32) {
+  let c = floor(p / cs);
+  let ph = phase * (0.6 + 0.8 * rh(c, seed)) + rh(c, seed + 1u);
+  let kc = c + vec2f(floor(ph) * 7.0, 0.0);
+  if (rh(kc, seed + 2u) > dens) { return; }
+  let fr = fract(ph);
+  let r = mix(rmin, rmax, pow(rh(kc, seed + 3u), 2.2)) * smoothstep(0.0, 0.02, fr) * (1.0 - smoothstep(0.96, 1.0, fr));
+  if (r <= 0.0) { return; }
+  let m = rmax / cs;
+  let o = (c + 0.5 + (vec2f(rh(kc, seed + 4u), rh(kc, seed + 5u)) - 0.5) * (1.0 - 2.0 * m)) * cs;
+  // Bigger beads sag a little and sit flatter.
+  let sc = mix(0.88, 0.72, sat((r - 0.0012) / 0.002));
+  rain_cap(w, p - o, r, 1.0, 0.0, sc, 1.0, px, 1.0);
+}
+
+// Folds one layer's water (slopes along its own across/along axes, given as
+// directions in the window's axes) into the total, the higher surface winning.
+fn rain_merge(w: ptr<function, Water>, s: Water, dc: vec2f, da: vec2f) {
+  if (s.h > (*w).h || ((*w).h == 0.0 && s.cov > (*w).cov)) {
+    (*w).h = s.h;
+    (*w).g = s.g.x * dc + s.g.y * da;
+  }
+  (*w).cov = max((*w).cov, s.cov);
+}
+
+// All the water on one window, in its own axes p (m): the airflow runs along
+// fdir over it (unit, in those axes; up a windshield, aft along the side),
+// gravity toward -y. gt: how steeply the glass leans (1 = upright), edge: 1
+// at the frame where the air is slow and beads cling. Returns the film's
+// share in .f.
+fn rain_water(p: vec2f, fdir: vec2f, gt: f32, edge: f32, px: f32) -> Water {
+  var w = Water(0.0, vec2f(0.0), 0.0, 0.0);
+  let rain = G.start.y;
+  let wet = G.start.z;
+  let kt = G.start.w;
+  let mob = rain_mob(kt);
+  let vs = rain_flow_speed(kt);
+  let fast = smoothstep(55.0, 170.0, kt);
+  // Patchy, as rain on glass always is.
+  let patchy = 0.65 + 0.7 * nz(vec3f(p * 0.9, 0.37)).r;
+  // Beads: swept off once the drag beats the pinning, except in the slow air along the frame.
+  let keep = max(1.0 - smoothstep(18.0, 110.0, kt), edge * 0.8 * (1.0 - 0.7 * fast));
+  let bd = sat(wet * 1.25) * keep * patchy;
+  if (bd > 0.0) {
+    rain_beads(&w, p, 0.0072, 0.0007, 0.0021, bd * 0.85, O.glow.z, px, 11u);
+    rain_beads(&w, p + vec2f(0.0041, 0.0023), 0.0145, 0.0015, 0.0044, bd * 0.6, O.glow.z * 0.7, px, 23u);
+  }
+  // Big drops running down while the airflow is weak (and the glass leans enough).
+  let gd = sat(wet * 1.4 - 0.25) * (1.0 - mob) * smoothstep(0.25, 0.6, gt) * patchy;
+  if (gd > 0.0) {
+    var s = Water(0.0, vec2f(0.0), 0.0, 0.0);
+    rain_run(&s, -p.y, p.x, 0.032, 0.17, O.glow.w, 0.004, gd * 0.55, 1.25, 0.10, 1.0, 1.0, px, 37u);
+    rain_merge(&w, s, vec2f(1.0, 0.0), vec2f(0.0, -1.0));
+  }
+  // Driven by the airflow: up and back over a windshield, aft along the side.
+  // (Where the glass curves, so does the flow, and the streams with it.)
+  let da = fdir;
+  let dc = vec2f(da.y, -da.x);
+  let fa = dot(p, da);
+  let fc = dot(p, dc);
+  // Smeared over a frame (1/60 s) once they move fast.
+  let blur = vs * 0.016;
+  let fd = sat(max(wet * 1.3, rain * 0.6)) * mob * (1.0 - fast * 0.85) * patchy;
+  if (fd > 0.0) {
+    let r = 0.0024;
+    var s = Water(0.0, vec2f(0.0), 0.0, 0.0);
+    rain_run(&s, fa, fc, 0.021, 0.13, O.tint.w, r, fd * 0.6, 1.15 + blur / r, 0.05 + 0.04 * mob, 1.0 - mob * 0.7, 1.0, px, 53u);
+    rain_merge(&w, s, dc, da);
+  }
+  // Fast flight: fresh drops torn into streaks that race over the glass.
+  let sd = sat(rain * 0.9 + wet * 0.5) * fast;
+  if (sd > 0.0) {
+    let r = 0.0011;
+    var s = Water(0.0, vec2f(0.0), 0.0, 0.0);
+    rain_run(&s, fa, fc, 0.0075, 0.24, O.tint.w * 1.3, r, sd * 0.3, min(1.6 + blur / r, 60.0), 0.16, 0.0, 0.25, px, 71u);
+    rain_merge(&w, s, dc, da);
+  }
+  // The thin film the airflow leaves, rippled into streaks along the flow.
+  let film = sat(wet * 1.5) * smoothstep(25.0, 140.0, kt);
+  if (film > 0.0) {
+    let n = nz(vec3f(fc * 9.0, (fa - O.tint.w * 0.8) * 0.45, 0.61));
+    let m = nz(vec3f(fc * 31.0, (fa - O.tint.w) * 1.4, 0.13));
+    let gf = ((n.gb - 0.5) * vec2f(0.05, 0.012) + (m.gb - 0.5) * vec2f(0.03, 0.006)) * film;
+    w.g += gf.x * dc + gf.y * da;
+    w.f = film;
+  }
+  return w;
+}
+
 // ---------------------------------------------------------------- transparent pass
 
 // How far a window bends the view through it (radians along its two in-plane
@@ -1888,6 +2089,98 @@ const GS_Z = -1.30; // cabin::PANEL_Z
       let uv = vec2f(0.5 + 0.5 * cp.x / cp.w, 0.5 - 0.5 * cp.y / cp.w);
       let q = vec2i(clamp(uv * G.screen.xy, vec2f(0.0), G.screen.xy - 1.0));
       if (textureLoad(t_gdepth, q, 0) <= in.clip.z) { seen = textureSampleLevel(t_scene, s_clamp, uv, 0.0).rgb; }
+    }
+    // The Hornet's canopy runs on down inside the sills, in front of the
+    // consoles: no rain where the tub's own parts are what lies behind it.
+    var skirt = false;
+    if (kind() == 2u && (G.start.y > 0.0 || G.start.z > 0.002)) {
+      let uvp = in.clip.xy * G.screen.zw;
+      let pb = G.inv_view_proj * vec4f(uvp.x * 2.0 - 1.0, 1.0 - uvp.y * 2.0, textureLoad(t_gdepth, vec2i(in.clip.xy), 0), 1.0);
+      let lb = ml * (pb.xyz / pb.w - O.model[3].xyz);
+      skirt = abs(lb.x) < 0.6 && lb.z > -6.2 && lb.z < -3.1 && lb.y > 0.0 && lb.y < in.L.y;
+    }
+    if ((G.start.y > 0.0 || G.start.z > 0.002) && !skirt) {
+      // Rain on the outside (rain_water). Its axes: those of the spots, and
+      // on the Hornet's one-piece canopy both sets, blended where they meet.
+      let nl = normalize(in.Nl);
+      let down = ml * -l.upn;
+      let gt = length(down - nl * dot(down, nl));
+      let edge_r = select(1.0 - smoothstep(0.0, 0.05, -d), 0.0, kind() == 2u);
+      let side_w = smoothstep(0.42, 0.58, abs(nl.x));
+      var wa = Water(0.0, vec2f(0.0), 0.0, 0.0);
+      var ws = Water(0.0, vec2f(0.0), 0.0, 0.0);
+      let tw = vec3f(1.0, 0.0, 0.0);
+      let bw = vec3f(0.0, 0.454, 0.891);
+      let ts = vec3f(0.0, 0.0, 1.0);
+      let bs = vec3f(0.0, 1.0, 0.0);
+      // The airflow over the glass: straight back, along it.
+      let f3 = vec3f(0.0, 0.0, 1.0) - nl * nl.z;
+      let fw = vec2f(dot(f3, tw), dot(f3, bw));
+      let fs = vec2f(dot(f3, ts), dot(f3, bs));
+      // Axes about the middle of the cockpit glass, so the turn of the flow
+      // over curved glass bends the streams rather than shearing them apart.
+      var lr = L - vec3f(0.0, 0.4, -1.3);
+      if (kind() == 1u) { lr = L - vec3f(0.0, 4.0, -26.5); }
+      if (kind() == 2u) { lr = L - vec3f(0.0, 1.0, -4.6); }
+      if (side_w < 1.0) { wa = rain_water(vec2f(dot(lr, tw), dot(lr, bw)), select(vec2f(0.0, 1.0), normalize(fw), length(fw) > 0.05), gt, edge_r, px); }
+      if (side_w > 0.0) { ws = rain_water(vec2f(dot(lr, ts), dot(lr, bs)), select(vec2f(1.0, 0.0), normalize(fs), length(fs) > 0.05), gt, edge_r, px); }
+      // Slopes into the body frame, then the world.
+      var gl = wa.g.x * tw + wa.g.y * bw;
+      var wc = wa.cov;
+      var wf = wa.f;
+      if (side_w > 0.0) {
+        let gs = ws.g.x * ts + ws.g.y * bs;
+        let pick = ws.h * side_w > wa.h * (1.0 - side_w);
+        gl = select(select(gl, gs, pick), gs, side_w >= 1.0);
+        wc = mix(wa.cov, ws.cov, side_w);
+        wf = mix(wa.f, ws.f, side_w);
+      }
+      let wv = max(wc, wf);
+      if (wv > 0.0) {
+        let nout = -N;
+        var gw = (O.model * vec4f(gl, 0.0)).xyz;
+        gw -= nout * dot(gw, nout);
+        let nd = normalize(nout - gw);
+        // Through the glass into the water (the flat sheet only bends the
+        // ray once, air to water), then out through the drop's curved face.
+        let vw = refract(V, N, 1.0 / 1.333);
+        let vo = refract(vw, -nd, 1.333);
+        let night = night_at(l.upn);
+        // Bent back inside: the dim cabin and its lights.
+        let inner = env + l.amb * 0.05 + vec3f(1.0, 0.62, 0.38) * G.sun_dir.w * 0.0025 * night * 0.12;
+        // Drops are not perfect lenses: each also scatters some of the light
+        // round it, most at its rim, so bright lights gather a halo of lit drops.
+        var near = vec3f(0.0);
+        let a0 = hash2(in.clip.xy) * 6.2831853;
+        for (var i = 0; i < 8; i++) {
+          let ang = a0 + f32(i) * 2.3999632;
+          let rad = select(9.0, 30.0, i >= 4) * (G.screen.x / 1600.0);
+          let uv = (in.clip.xy + vec2f(cos(ang), sin(ang)) * rad) * G.screen.zw;
+          near += textureSampleLevel(t_scene, s_clamp, uv, 0.0).rgb;
+        }
+        near *= 0.125;
+        var thru = inner + near * 0.3;
+        if (dot(vo, vo) > 0.5) {
+          let ct = max(dot(vo, nd), 0.0);
+          let fr = 0.02 + 0.98 * pow(1.0 - ct, 5.0);
+          // The lensed view out: whatever lies that way on screen beyond
+          // the glass, else the sky or the ground.
+          var look = env_reflect(in.P, vo, l.upn, false) + l.sun * sh * pow(max(dot(vo, Ls), 0.0), 3000.0) * 0.5;
+          let cq = G.view_proj * vec4f(vo, 0.0);
+          if (cq.w > 1e-4) {
+            let uv = vec2f(0.5 + 0.5 * cq.x / cq.w, 0.5 - 0.5 * cq.y / cq.w);
+            if (all(uv > vec2f(0.0)) && all(uv < vec2f(1.0))) {
+              let q = vec2i(uv * G.screen.xy);
+              if (textureLoad(t_gdepth, q, 0) <= in.clip.z) { look = textureSampleLevel(t_scene, s_clamp, uv, 0.0).rgb; }
+            }
+          }
+          // Light scattered through the drops toward the sun.
+          look += l.sun * sh * pow(max(dot(vo, Ls), 0.0), 300.0) * 0.004;
+          thru = look * (1.0 - fr) + (inner + near * 0.3) * fr + near * 0.05;
+        }
+        rgb *= 1.0 - 0.5 * wc;
+        seen = mix(seen, thru, wv);
+      }
     }
     return vec4f((rgb + seen * trans * tint) * cov, cov);
   }
