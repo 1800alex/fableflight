@@ -3,9 +3,9 @@
 FableFlight can expose the running aircraft and its world to an AI assistant
 through the [Model Context Protocol](https://modelcontextprotocol.io).  The
 assistant works as a copilot: it reads the instruments and the environment,
-tunes radios, handles flaps, gear and engine state, changes weather or time,
-repositions the aircraft when asked, and captures screenshots of the view.  It
-does not move the stick or the throttle.
+tunes radios, handles the throttle, flaps, gear and engine state, changes weather
+or time, repositions the aircraft when asked, and captures screenshots of the
+view.  It does not move the stick.
 
 The setup has two processes:
 
@@ -109,7 +109,7 @@ Units are feet, knots, ft/min, degrees true, hPa and kg.
 
 | Tool | What it changes |
 |---|---|
-| `set_aircraft_config` | Flap notch or one-notch move, gear, speedbrake/braking parachute, parking brake, mixture (pistons) and pitch trim. |
+| `set_aircraft_config` | Throttle/power lever, flap notch or one-notch move, gear, speedbrake/braking parachute, parking brake, mixture (pistons) and pitch trim. |
 | `set_engine` | Normal start/stop, ignition or fuel control, and the jet starters. |
 | `set_radios` | NAV1 by ident or VOR frequency, ADF by ident or kHz, OBS, and the altimeter setting (a value, or `"qnh"`). |
 | `set_environment` | Clouds, cloud base/depth, storms, mid-level cloud, visibility, wind and gusts, time of day, day of year, clock rate, live weather and real time. Setting weather turns live weather off; setting the clock turns real time off unless asked otherwise. |
@@ -127,8 +127,9 @@ FableFlight config folder's `screenshots` directory.
 
 - The MCP service is on by default and binds only to `127.0.0.1`.  Use
   `--no-mcp` when you do not want it.
-- The stick and throttle are deliberately not writable.  The human pilot keeps
-  positive control; the copilot handles systems and navigation.
+- The stick is deliberately not writable: the human pilot keeps positive
+  control of attitude.  The copilot can set the throttle; the pilot's own
+  throttle input from the keys, gamepad or a bound lever takes it back.
 - A tool call is processed on the game thread at the start of the next frame,
   so reads are live rather than cached.  When the game is paused or in the
   menu, read tools still work; `place_aircraft` can start or move a flight.

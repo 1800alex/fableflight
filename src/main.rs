@@ -773,6 +773,10 @@ struct Game {
     mcp_calls: Option<crossbeam_channel::Receiver<mcp::rpc::Call>>,
     mcp_shots: Vec<copilot::PendingShot>,
     mcp_shot_n: u64,
+    /// the copilot's throttle setting, held until the pilot moves the throttle
+    mcp_throttle: Option<f64>,
+    /// the bound throttle axis's last reading, to notice the pilot moving it
+    throttle_axis: Option<f64>,
 }
 
 impl Game {
@@ -921,6 +925,8 @@ impl Game {
             mcp_calls: None,
             mcp_shots: Vec::new(),
             mcp_shot_n: 0,
+            mcp_throttle: None,
+            throttle_axis: None,
         };
         if args.mcp {
             match mcp::rpc::serve(args.mcp_port) {
@@ -1170,6 +1176,7 @@ impl Game {
     fn respawn_at(&mut self, lat: f64, lon: f64, alt: f64, heading: f64, speed: f64) {
         self.hold_spot = None;
         self.parking_brake = false;
+        self.mcp_throttle = None;
         self.plane = Plane::spawn(self.spec, lat, lon, alt, heading, speed);
         self.plane.fuel = self.spec.fuel_kg * self.menu.fuel;
         self.plane.payload = self.start_payload();
@@ -1542,9 +1549,19 @@ impl Game {
         }
         // A throttle lever sets the power, unless the keys are moving it.
         if let Some(t) = b.axis(A::Throttle) {
-            if c.throttle == 0.0 {
+            // The copilot's setting holds until the pilot moves the throttle;
+            // any key, gamepad or lever input takes the power back.
+            if c.throttle != 0.0 || self.mcp_throttle.is_some_and(|_| self.throttle_axis.is_some_and(|last| (t - last).abs() > 0.02)) {
+                self.mcp_throttle = None;
+            }
+            self.throttle_axis = Some(t);
+            if let Some(t) = self.mcp_throttle {
+                c.throttle_set = Some(t);
+            } else if c.throttle == 0.0 {
                 c.throttle_set = Some(t);
             }
+        } else {
+            self.throttle_axis = None;
         }
         if b.axis(A::BrakeLeft).unwrap_or(0.0).max(b.axis(A::BrakeRight).unwrap_or(0.0)) > 0.3 {
             c.brake = true;

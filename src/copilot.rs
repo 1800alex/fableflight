@@ -780,6 +780,15 @@ impl Game {
         let mut notes: Vec<String> = Vec::new();
         let p = &mut self.plane;
         let mut any = false;
+        if let Some(throttle) = args.throttle {
+            any = true;
+            let t = throttle.clamp(0.0, 1.0);
+            if (t - throttle).abs() > 1e-9 {
+                notes.push(format!("throttle clamped to {:.0}%", t * 100.0));
+            }
+            p.throttle = t;
+            self.mcp_throttle = Some(t);
+        }
         if let Some(notch) = args.flaps_notch {
             any = true;
             let max = p.spec.max_notch() as i32;
@@ -836,7 +845,7 @@ impl Game {
             p.trim = clamped;
         }
         if !any {
-            return Err("nothing to set: give at least one of flaps_notch, flaps_delta, gear_down, speedbrake, parking_brake, mixture, trim_deg".into());
+            return Err("nothing to set: give at least one of throttle, flaps_notch, flaps_delta, gear_down, speedbrake, parking_brake, mixture, trim_deg".into());
         }
         let config = self.config_state();
         Ok(json!({ "ok": true, "notes": notes, "configuration": config }))

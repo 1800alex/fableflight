@@ -80,7 +80,7 @@ impl Tool {
             Tool::GetEnvironment => "Read the weather and clock: wind, gusts, clouds, visibility, QNH, turbulence, the live-weather report and the time of day. Read-only.",
             Tool::GetTraffic => "Read the live ADS-B traffic around the aircraft: callsign, type, altitude, speed, distance and bearing. Read-only.",
             Tool::GetAirportInfo => "Read the current or a named airport: runways, active runway, ILS, and on an approach the distance, centreline error and glide-path deviation. Read-only.",
-            Tool::SetAircraftConfig => "Change the aircraft's configuration: flaps notch or delta, gear, speedbrake, parking brake, mixture and trim. It cannot move the stick or the throttle. Returns the resulting configuration.",
+            Tool::SetAircraftConfig => "Change the aircraft's configuration: throttle/power lever, flaps notch or delta, gear, speedbrake, parking brake, mixture and trim. It cannot move the stick. Returns the resulting configuration.",
             Tool::SetEngine => "Start or stop the engine, or set the magnetos/fuel control and the starters. Returns the resulting engine state.",
             Tool::SetRadios => "Tune NAV1 or the ADF by ident or frequency, set the OBS, or set the altimeter setting. Returns the resulting radio state.",
             Tool::SetEnvironment => "Set the weather and/or the clock. Any weather change turns live weather off; any manual time change turns real time off. Returns the new environment.",
@@ -136,6 +136,7 @@ impl Tool {
             Tool::SetAircraftConfig => json!({
                 "type": "object",
                 "properties": {
+                    "throttle": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Throttle/power lever, 0 idle to 1 full power (dry thrust on a jet)." },
                     "flaps_notch": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Absolute flap lever notch (0 = up, higher = more). Clamped to the aircraft's notches." },
                     "flaps_delta": { "type": "integer", "minimum": -1, "maximum": 1, "description": "Move the flap lever one notch: -1 up, +1 down. Ignored when flaps_notch is given." },
                     "gear_down": { "type": "boolean", "description": "Landing gear handle: true down, false up. The squat switch blocks retraction on the ground." },
@@ -241,6 +242,7 @@ pub struct AirportArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AircraftConfigArgs {
+    pub throttle: Option<f64>,
     pub flaps_notch: Option<i32>,
     pub flaps_delta: Option<i32>,
     pub gear_down: Option<bool>,
@@ -407,6 +409,8 @@ mod tests {
     fn arguments_parse() {
         let a: NavigationArgs = parse(&json!({ "radius_nm": 25.0, "limit": 3 })).unwrap();
         assert_eq!((a.radius_nm, a.limit), (Some(25.0), Some(3)));
+        let a: AircraftConfigArgs = parse(&json!({ "throttle": 0.7, "flaps_delta": 1 })).unwrap();
+        assert_eq!((a.throttle, a.flaps_delta), (Some(0.7), Some(1)));
         let a: PlaceArgs = parse(&json!({ "airport": "ksfo", "approach": true })).unwrap();
         assert_eq!((a.airport.as_deref(), a.approach), (Some("ksfo"), Some(true)));
         assert!(parse::<EngineArgs>(&json!({ "action": "start" })).is_ok());

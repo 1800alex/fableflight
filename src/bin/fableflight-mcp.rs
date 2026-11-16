@@ -119,8 +119,8 @@ fn initialize(params: &Value) -> Value {
         "serverInfo": { "name": "fableflight", "version": env!("CARGO_PKG_VERSION") },
         "instructions": "You are the copilot of a running FableFlight flight simulator. \
             Read get_aircraft_state before acting. Units: feet, knots, ft/min, degrees true, hPa, kg. \
-            You may set aircraft configuration, engine, radios, weather, time and the aircraft's position. \
-            You cannot move the stick or the throttle; the human pilot keeps power and attitude. \
+            You may set the throttle, aircraft configuration, engine, radios, weather, time and the aircraft's position. \
+            You cannot move the stick; the human pilot keeps attitude. \
             Do not change weather, time or position unless the pilot asks. \
             Use get_navigation and get_airport_info for approach and radio work. \
             take_screenshot returns an image when seeing the panel or the view helps."

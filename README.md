@@ -91,7 +91,7 @@ For OpenCode, add a local server to `opencode.json` (or use `opencode mcp add fa
 
 For Claude Code: `claude mcp add fableflight /absolute/path/to/fableflight-mcp`. Claude Desktop uses the same command in its `mcpServers` configuration. The bridge attaches to the running game over `127.0.0.1:42761`; start a flight, then ask the AI to read the aircraft state, tune radios, set flaps or weather, or take a screenshot. `--mcp-port PORT` changes the game's port and `FABLEFLIGHT_MCP_PORT` tells the bridge where to look. `--no-mcp` disables the service.
 
-The copilot can read the aircraft, navigation, weather, traffic and airports, and can set flaps, gear, speedbrake, parking brake, mixture, trim, engine state, radios, weather, time and the aircraft's position. It cannot move the stick or the throttle: those stay with the human pilot. See [docs/mcp.md](docs/mcp.md) for the full tool list, units and examples.
+The copilot can read the aircraft, navigation, weather, traffic and airports, and can set the throttle, flaps, gear, speedbrake, parking brake, mixture, trim, engine state, radios, weather, time and the aircraft's position. It cannot move the stick: attitude stays with the human pilot. See [docs/mcp.md](docs/mcp.md) for the full tool list, units and examples.
 
 # Contributions
 Please contribute anything if you want to! Improvements to flight sim realism, graphics, optimization, UI, and especially plane models are needed! (((=
