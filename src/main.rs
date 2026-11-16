@@ -1722,6 +1722,28 @@ impl Game {
         ui.label(dim(t!("The altimeter reads {:.0} ft (true altitude {:.0} ft).", "L'altimètre indique {:.0} ft (altitude vraie {:.0} ft).", true_ft + self.radios.alt_error_ft(qnh), true_ft)));
     }
 
+    /// NAV 1 as the cockpit's course deviation indicators show it (Globals::nav).
+    fn nav_globals(&self) -> [f32; 4] {
+        let obs = self.radios.obs as f32;
+        let Some(st) = self.radios.nav.as_ref().filter(|_| self.plane.sys.powered()) else {
+            return [0.0, 0.0, obs, 0.0];
+        };
+        let r = nav::nav_reading(st, self.radios.obs, self.plane.pos);
+        if !r.live {
+            return [0.0, 0.0, obs, 0.0];
+        }
+        let mut flags = 1.0;
+        match r.to {
+            Some(true) => flags += 2.0,
+            Some(false) => flags += 4.0,
+            None => {}
+        }
+        if r.gs.is_some() {
+            flags += 8.0;
+        }
+        [r.cdi as f32, r.gs.unwrap_or(0.0) as f32, obs, flags]
+    }
+
     /// The navigation instruments over the game: a course deviation
     /// indicator for NAV 1 (with the glide slope on an ILS) and an ADF dial.
     fn nav_overlay(&self, ctx: &egui::Context, hdg: f64) {
@@ -3353,6 +3375,7 @@ impl Game {
             glow_e: glow[1],
             glow_n: glow[2],
             spot: [[0.0; 4]; 3],
+            nav: self.nav_globals(),
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
