@@ -67,10 +67,12 @@ pub fn downwind(wx: &Weather, pos: DVec3) -> DVec3 {
     if w.length() > 0.1 { w.normalize() } else { geo::enu(pos).0 }
 }
 
-/// How high a cell grows, as a share of base..anvil (common.wgsl `storm_top`).
-fn storm_top(age: f64) -> f64 {
-    0.3 + 0.7 * smoothstep(0.0, 0.55, age)
-}
+use crate::weather::storm_top_share as storm_top;
+
+/// Lightning needs a tower reaching well above the freezing level, where ice
+/// and graupel collide: cells topping out below about this (m above sea
+/// level) are showers and never flash.
+pub const LIGHTNING_TOP: f64 = 7500.0;
 
 fn cell_at(wx: &Weather, c: &[[f32; 4]; 2], pos: DVec3, w: DVec3) -> At {
     let un = pos.normalize();
@@ -83,9 +85,11 @@ fn cell_at(wx: &Weather, c: &[[f32; 4]; 2], pos: DVec3, w: DVec3) -> At {
     At { dw0: dv.dot(w), cx: dv.dot(x), hb: alt - wx.base() as f64, r: c[0][3] as f64 * 1000.0, age, htop: at * storm_top(age), w, x }
 }
 
-/// How much rain a cell's shaft carries (clouds.wgsl `storm_rain`: mature, big enough).
+/// How much rain a cell's shaft carries (clouds.wgsl `storm_rain`): once its
+/// tower is a few km deep; a shower's light to moderate, an ordinary storm's
+/// heavy, a big mature one's the heaviest.
 fn shaft_amount(a: &At) -> f64 {
-    smoothstep(0.45, 0.8, a.age) * smoothstep(1800.0, 3500.0, a.r)
+    smoothstep(1800.0, 3500.0, a.htop) * smoothstep(900.0, 2200.0, a.r) * (0.35 + 0.4 * smoothstep(0.45, 0.8, a.age) + 0.25 * smoothstep(2500.0, 6000.0, a.r))
 }
 
 /// The storm cells' rain, cloud and air at a point (planet frame) `agl` metres
@@ -135,12 +139,14 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
         let up_prof = if a.hb < 0.0 { 0.15 + 0.35 * smoothstep(-1500.0, 0.0, a.hb) } else { (1.0 - smoothstep(0.55, 1.05, hc)) * (0.75 + 0.5 * smoothstep(0.0, 0.5, hc)) };
         let shaft = (-(rs / 0.85).powi(2)).exp();
         let dn_prof = if a.hb < 0.0 { smoothstep(0.0, 300.0, agl) } else { 1.0 - smoothstep(0.0, 0.5, hc) };
-        o.draft += a.age.min(1.0) * ((7.0 + 13.0 * size) * core * up_prof) - amt * (5.0 + 7.0 * size) * shaft * dn_prof;
+        // (Even a young shower tower has a brisk updraft and some bumps.)
+        let vigour = 0.35 + 0.65 * a.age.min(1.0);
+        o.draft += vigour * ((7.0 + 13.0 * size) * core * up_prof) - amt * (5.0 + 7.0 * size) * shaft * dn_prof;
         // Turbulence: severe in the cloud and where updraft meets downdraft,
         // moderate in the rain, light around the cell. It comes in bursts.
         let shear = core * shaft * 4.0;
         let near = 1.0 - smoothstep(1.0, 3.0, a.dw0.hypot(a.cx) / r);
-        let s = a.age.min(1.0) * (1.2 * near + 4.5 * inside * (0.6 + 0.4 * size) + 2.8 * amt * heavy + 3.0 * shear.min(1.0));
+        let s = vigour * (1.2 * near + 4.5 * inside * (0.6 + 0.4 * size) + 2.8 * amt * heavy + 3.0 * shear.min(1.0));
         let k = i as f64 * 1.731;
         let burst = ((0.21 * t + k).sin() * 0.6 + (0.53 * t + 2.3 * k).sin() * 0.4 + (1.37 * t + 4.1 * k).sin() * 0.25) / 1.25;
         o.sigma = o.sigma.max(s * (0.6 + 0.65 * smoothstep(-0.2, 0.7, burst)));
@@ -467,8 +473,9 @@ impl Lightning {
             let c = wx.cells[ci];
             let r = c[0][3] as f64 * 1000.0;
             let age = c[1][0] as f64;
-            let strength = smoothstep(0.55, 0.95, age) * smoothstep(2500.0, 8000.0, r) * (0.5 + 0.5 * wx.storms.max(0.6) as f64);
-            // A big mature cell: ~10 flashes a minute.
+            let tall = smoothstep(LIGHTNING_TOP - 800.0, LIGHTNING_TOP + 800.0, c[1][1] as f64 - (c[1][1] as f64 - base) * (1.0 - storm_top(age)));
+            let strength = tall * smoothstep(0.5, 0.9, age) * (0.12 + 0.88 * smoothstep(2500.0, 8000.0, r)) * (0.5 + 0.5 * wx.storms.max(0.6) as f64);
+            // A big mature cell: ~10 flashes a minute; an ordinary one, one or two.
             let rate = strength * 10.0 / 60.0;
             if rate <= 0.0 || self.flashes.len() >= 12 || self.u() >= rate * dt {
                 continue;
@@ -642,7 +649,7 @@ mod tests {
         wx.storms = 0.0;
         (wx.wind, wx.wind_from) = (8.0, 270.0);
         let p = geo::lla_to_pos(0.65, -2.14, 600.0);
-        wx.place_storm(p, 0.0, 0.0, 6.0);
+        wx.place_storm(p, 0.0, 0.0, 6.0, None);
         wx.cells = wx.storm_cells(p);
         (wx, p)
     }
@@ -670,6 +677,41 @@ mod tests {
         let l = local(&wx, core, 4000.0, 0.0);
         assert!(l.cloud > 0.9 && l.draft > 5.0, "{l:?}");
         let _ = u;
+    }
+
+    #[test]
+    fn a_shower_rains_and_bumps_but_never_flashes() {
+        let mut wx = Weather::new(0.4);
+        wx.storms = 0.0;
+        (wx.wind, wx.wind_from) = (8.0, 270.0);
+        let p = geo::lla_to_pos(0.65, -2.14, 600.0);
+        wx.place_storm(p, 0.0, 0.0, 1.8, Some(crate::weather::CellKind::Shower));
+        wx.cells = wx.storm_cells(p);
+        let (e, _, _) = geo::enu(p);
+        // Under its shaft: light to moderate rain, some turbulence.
+        let under = (p + e * 800.0).normalize() * (geo::R + 600.0);
+        let l = local(&wx, under, 600.0, 0.0);
+        assert!(l.rain > 0.2 && l.rain < 0.5 && l.sigma > 0.3 && l.sigma < 2.5, "{l:?}");
+        // A few km away: dry.
+        let l = local(&wx, (p + e * 5000.0).normalize() * (geo::R + 600.0), 600.0, 0.0);
+        assert!(l.rain == 0.0, "{l:?}");
+        let mut lt = Lightning::new();
+        for i in 0..36000 {
+            lt.step(1.0 / 60.0, i as f64 / 60.0, &wx, p, p, &|_| 0.0);
+        }
+        assert!(lt.thunder.is_empty(), "{} thunderclaps from a shower", lt.thunder.len());
+        // An ordinary thunderstorm flashes now and then.
+        let mut wx2 = Weather::new(0.4);
+        wx2.storms = 0.0;
+        wx2.place_storm(p, 0.0, 0.0, 3.5, Some(crate::weather::CellKind::Thunder));
+        wx2.cells = wx2.storm_cells(p);
+        let mut lt = Lightning::new();
+        let mut n = 0;
+        for i in 0..36000 {
+            lt.step(1.0 / 60.0, i as f64 / 60.0, &wx2, p, p, &|_| 0.0);
+            n += lt.thunder.drain(..).count();
+        }
+        assert!((3..=30).contains(&n), "{n} thunderclaps in 10 minutes from an ordinary storm");
     }
 
     #[test]

@@ -70,6 +70,46 @@ pub struct Weather {
     pub live_raw: String,
     /// the clock follows the real time and date (see `real_clock`)
     pub real_time: bool,
+    /// live weather reports showers but no thunder (SH without TS, no CB):
+    /// its convective cells are showers (with `live`)
+    pub showers_only: bool,
+}
+
+/// What kind of convective cell: a shower (towering cumulus or a small
+/// cumulonimbus, no anvil, tops 4-7 km, a narrow light-to-moderate rain
+/// shaft, no lightning), an ordinary thunderstorm (anvil, occasional
+/// lightning) or a severe one (big, heavy rain, frequent lightning). The
+/// shaders know only a cell's radius, maturity and top height; a shower is a
+/// small young cell whose tower stops below the height where lightning starts
+/// (`LIGHTNING_TOP`, storm.rs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CellKind {
+    Shower,
+    Thunder,
+    Severe,
+}
+
+impl CellKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "shower" | "showers" | "sh" | "cu" | "tcu" => Some(Self::Shower),
+            "thunder" | "ts" | "ordinary" | "storm" => Some(Self::Thunder),
+            "severe" | "supercell" | "cb" => Some(Self::Severe),
+            _ => None,
+        }
+    }
+}
+
+/// How high a cell grows, as a share of base..anvil (common.wgsl `storm_top`).
+pub fn storm_top_share(age: f64) -> f64 {
+    0.3 + 0.7 * smoothstep(0.0, 0.55, age)
+}
+
+/// A shower cell's "anvil" height (the shaders' sp.y) for its tower to top out
+/// at `top` m (above sea level) at maturity `age`, over a cloud base `base`.
+fn shower_anvil(base: f64, top: f64, age: f64) -> f32 {
+    let top = top.max(base + 2200.0);
+    (base + (top - base) / storm_top_share(age)) as f32
 }
 
 /// What the air around the aircraft is doing beyond the mean wind.
@@ -191,7 +231,7 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false, showers_only: false }
     }
 
     /// The rain deck's mean base and top, metres above sea level: the heavier
@@ -408,11 +448,12 @@ impl Weather {
         self.live_cells.retain(|c| c.alive || c.on > 0.0);
     }
 
-    /// Put a mature cumulonimbus `dist_km` from `pos` (planet frame) towards
+    /// Put a convective cell `dist_km` from `pos` (planet frame) towards
     /// compass `bearing` (degrees), its tower `rad_km` in radius (8 = a giant
-    /// supercell). It drifts with the cloud field from there on. For testing:
-    /// `--storm-at`.
-    pub fn place_storm(&mut self, pos: DVec3, dist_km: f64, bearing: f64, rad_km: f64) {
+    /// supercell). None = a mature cumulonimbus as big as asked; a shower is a
+    /// young tower topping out around 6 km. It drifts with the cloud field from
+    /// there on. For testing: `--storm-at KM,BEARING[,R[,KIND]]`.
+    pub fn place_storm(&mut self, pos: DVec3, dist_km: f64, bearing: f64, rad_km: f64, kind: Option<CellKind>) {
         let (e, n, up) = geo::enu(pos);
         let b = bearing.to_radians();
         let dir = e * b.sin() + n * b.cos();
@@ -423,7 +464,12 @@ impl Weather {
         // Each placed storm gets its own seed (turret layout), so a line of them is not
         // one cloud repeated.
         let seed = (0.37 + dist_km * 0.1373 + bearing * 0.0619 + rad_km * 0.271).fract() as f32;
-        self.placed.push([[cen.x as f32, cen.y as f32, cen.z as f32, rad_km as f32], [1.0, STORM_TOP + 500.0, 600.0 + (STORM_OVERSHOOT - 600.0) * size as f32, seed]]);
+        let (age, top, over) = match kind {
+            Some(CellKind::Shower) => (0.3, shower_anvil(self.base() as f64, 6000.0, 0.3), 0.0),
+            Some(CellKind::Thunder) => (0.75, STORM_TOP, 0.4 * STORM_OVERSHOOT * size as f32),
+            _ => (1.0, STORM_TOP + 500.0, 600.0 + (STORM_OVERSHOOT - 600.0) * size as f32),
+        };
+        self.placed.push([[cen.x as f32, cen.y as f32, cen.z as f32, rad_km as f32], [age, top, over, seed]]);
     }
 
     /// Set a named preset (case-insensitive, e.g. "storms"); false if there is none.
@@ -438,11 +484,11 @@ impl Weather {
     /// the way, and more around it.
     pub fn storm_field(&mut self, pos: DVec3, heading: f64) {
         self.preset("Storms");
-        self.place_storm(pos, 8.0, heading, 6.5);
-        self.place_storm(pos, 24.0, heading + 55.0, 5.0);
-        self.place_storm(pos, 30.0, heading - 45.0, 8.0);
-        self.place_storm(pos, 42.0, heading + 150.0, 4.5);
-        self.place_storm(pos, 55.0, heading - 120.0, 6.0);
+        self.place_storm(pos, 8.0, heading, 6.5, None);
+        self.place_storm(pos, 24.0, heading + 55.0, 5.0, None);
+        self.place_storm(pos, 30.0, heading - 45.0, 8.0, None);
+        self.place_storm(pos, 42.0, heading + 150.0, 4.5, None);
+        self.place_storm(pos, 55.0, heading - 120.0, 6.0, None);
     }
 
     /// Storm cells (cumulonimbus) near the camera, nearest first, two vec4s each for
@@ -462,10 +508,19 @@ impl Weather {
             }
             let rad = c.rad * (0.6 + 0.4 * c.on);
             let age = c.age * c.on;
+            // Weak echoes are showers; where the report has showers but no
+            // thunder, all but the strongest (~47 dBZ and up) are.
+            let shower = c.age < 0.4 || (self.live && self.showers_only && c.age < 0.8);
+            let (age, top) = if shower { let a = age.min(0.35); (a, shower_anvil(self.base() as f64, 4500.0 + 2500.0 * c.seed as f64, a)) } else { (age, c.top) };
             let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
-            out.push((dist, [[c.at.x as f32, c.at.y as f32, c.at.z as f32, rad as f32], [age as f32, c.top, over, c.seed]]));
+            out.push((dist, [[c.at.x as f32, c.at.y as f32, c.at.z as f32, rad as f32], [age as f32, top, over, c.seed]]));
         }
-        let prob_amount = self.storms as f64 * 0.5 * smoothstep(0.12, 0.45, self.clouds as f64);
+        // (Showers are many and small: a low setting still has a fair few.)
+        let st = self.storms as f64;
+        let prob_amount = (0.15 + 0.35 * st) * (st * 8.0).min(1.0) * smoothstep(0.12, 0.45, self.clouds as f64);
+        // Share of cells that are showers: nearly all on a showery day, a few
+        // on a stormy one (and all where live weather says no thunder).
+        let p_shower = if self.live && self.showers_only { 1.0 } else { (0.95 - 0.85 * st * st.sqrt()).clamp(0.1, 0.95) };
         if prob_amount <= 0.0 {
             out.sort_by(|a, b| a.0.total_cmp(&b.0));
             return self.placed.iter().copied().chain(out.into_iter().map(|c| c.1)).take(MAX_STORMS).collect();
@@ -509,20 +564,31 @@ impl Weather {
                         continue;
                     }
                     // A cell fading out shrinks into a smaller, younger (lower) tower.
-                    // Sizes have a long tail: mostly single towers a few km across,
-                    // now and then a giant multicell / supercell 12-18 km wide.
                     let us = unit(h2);
-                    let giant = smoothstep(0.82, 1.0, us) * (0.5 + 0.5 * self.storms as f64);
-                    let rad = (2.4 + 2.6 * us + 4.0 * giant * giant) * (0.6 + 0.4 * on);
-                    // Stormier days have more mature cells (with anvils); giants always are.
                     let u = unit(h2 >> 16);
-                    let age = (u + (1.0 - (1.0 - u) * (1.0 - u) - u) * self.storms as f64).max(giant * 1.6).min(1.0) * on;
+                    let h3 = shash(h2 ^ 0x9e3779b9);
+                    let seed = unit(h3 >> 16) as f32;
+                    if unit(shash(h3 ^ 0x5bd1e995)) < p_shower {
+                        // A shower: a tower 2.4-5 km across, no anvil, topping out at
+                        // 4-7 km (higher on stormier days).
+                        let rad = (1.2 + 1.3 * us) * (0.6 + 0.4 * on);
+                        let age = (0.12 + 0.25 * u) * on;
+                        let top = 4000.0 + 3000.0 * (unit(h3) * (0.6 + 0.4 * st));
+                        out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, shower_anvil(self.base() as f64, top, age), 0.0, seed]]));
+                        continue;
+                    }
+                    // Thunderstorms. Sizes have a long tail: mostly single towers a
+                    // few km across, now and then a giant multicell / supercell 12-18 km wide.
+                    let giant = smoothstep(0.82, 1.0, us) * (0.5 + 0.5 * st);
+                    let rad = (2.4 + 2.6 * us + 4.0 * giant * giant) * (0.6 + 0.4 * on);
+                    // Mature (with anvils); stormier days have more of the older,
+                    // bigger ones; giants always are.
+                    let age = (0.5 + 0.5 * (u + (1.0 - (1.0 - u) * (1.0 - u) - u) * st)).max(giant * 1.6).min(1.0) * on;
                     // Anvil height (the tropopause varies a little) and how far the
                     // strongest updraft overshoots it: big, mature cells the most.
-                    let h3 = shash(h2 ^ 0x9e3779b9);
                     let top = STORM_TOP + 700.0 * (unit(h3) as f32 * 2.0 - 1.0);
                     let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
-                    out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, top, over, unit(h3 >> 16) as f32]]));
+                    out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, top, over, seed]]));
                 }
             }
         }
@@ -1040,6 +1106,36 @@ mod tests {
         w.radar_cover = Some(crate::radar::analyse(&e, (la.to_degrees(), lo.to_degrees())).cover);
         let near = w.storm_cells(cam).iter().filter(|s| DVec3::new(s[0][0] as f64, s[0][1] as f64, s[0][2] as f64).distance(q) < 150.0).count();
         assert_eq!(near, 0);
+    }
+
+    #[test]
+    fn showery_days_mostly_showers_stormy_days_thunderstorms() {
+        let cam = geo::lla_to_pos(0.71, -1.68, 1000.0);
+        // A shower tops out below the lightning height, a thunderstorm above it.
+        let tops = |storms: f32, live_showers: bool| {
+            let mut w = Weather::new(0.5);
+            w.storms = storms;
+            (w.live, w.showers_only) = (live_showers, live_showers);
+            let base = w.base() as f64;
+            let cells = w.storm_cells(cam);
+            let top = |c: &[[f32; 4]; 2]| base + (c[1][1] as f64 - base) * storm_top_share(c[1][0] as f64);
+            let showers = cells.iter().filter(|c| c[1][0] > 0.0 && top(c) < crate::storm::LIGHTNING_TOP - 800.0).count();
+            let storms = cells.iter().filter(|c| top(c) > crate::storm::LIGHTNING_TOP).count();
+            (showers, storms)
+        };
+        let (sh, ts) = tops(0.3, false);
+        assert!(sh > 2 * ts && sh >= 4, "showery: {sh} showers, {ts} thunderstorms");
+        let (sh, ts) = tops(1.0, false);
+        assert!(ts > sh && ts >= 4, "stormy: {sh} showers, {ts} thunderstorms");
+        let (sh, ts) = tops(0.5, true);
+        assert!(ts == 0 && sh > 0, "live, SH without TS: {sh} showers, {ts} thunderstorms");
+        // A shower placed by hand: young, no anvil, topping out around 6 km.
+        let mut w = Weather::new(0.5);
+        w.storms = 0.0;
+        w.place_storm(cam, 10.0, 90.0, 1.8, CellKind::parse("shower"));
+        let c = w.storm_cells(cam)[0];
+        let top = w.base() as f64 + (c[1][1] as f64 - w.base() as f64) * storm_top_share(c[1][0] as f64);
+        assert!(c[1][0] < 0.45 && (top - 6000.0).abs() < 1.0 && c[1][2] == 0.0, "{c:?} top {top}");
     }
 
     #[test]

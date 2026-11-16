@@ -137,7 +137,7 @@ fn flash_cloud(P: vec3f) -> vec3f {
 }
 
 // ------------------------------------------------------------- rain shafts
-// Under a mature storm the rain hangs from the base to the ground as a grey
+// Under a storm or a shower the rain hangs from the base to the ground as a grey
 // curtain, downwind of the updraft, streaked and thickest in the middle. Each
 // flagged cell's shaft is a vertical cylinder; the ray's stretch through it (under
 // the base, before the scene) is integrated in a few samples. Returns premultiplied
@@ -154,8 +154,13 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
     let c = G.storm_cells[2u * i];
     let sp = G.storm_cells[2u * i + 1u];
     let R = c.w * 1000.0;
-    let amt = smoothstep(0.45, 0.8, sp.x) * smoothstep(1800.0, 3500.0, R);
+    // Rain once the tower is a few km deep: a shower's light to moderate, an
+    // ordinary storm's heavy, a big mature one's the heaviest (storm.rs
+    // shaft_amount).
+    let htop = (sp.y - base) * storm_top(sp.x);
+    let amt = smoothstep(1800.0, 3500.0, htop) * smoothstep(900.0, 2200.0, R) * (0.35 + 0.4 * smoothstep(0.45, 0.8, sp.x) + 0.25 * smoothstep(2500.0, 6000.0, R));
     if (amt <= 0.0) { continue; }
+    let young = 1.0 - smoothstep(0.4, 0.6, sp.x);
     let up = normalize(c.xyz - G.weather.xyz * 0.001);
     let cen = up * rg + G.storm.xyz * (R * 0.45);
     let rr = R * 0.8;
@@ -204,7 +209,10 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
       let core = (1.0 - smoothstep(0.35, 1.0, rad + (sn.r - 0.5) * 0.5));
       let vert = smoothstep(0.0, 250.0, base - h) * mix(0.55, 1.0, smoothstep(0.0, base, h) * sn.a + (1.0 - sn.a));
       // Heavy rain: a few km of it is all one sees through.
-      let e = 0.0015 * amt * core * mix(0.1, 1.0, streak * streak) * vert;
+      // (A shower's shaft is narrow and its rain lighter, but still stands out
+      // grey from afar: extinction goes as the square root of the amount.)
+      // A young cell's (a shower's) rain falls as one denser, more even shaft.
+      let e = 0.0015 * sqrt(amt) * core * mix(mix(0.5, 0.1, young), 1.0, streak * streak) * vert * (1.0 + 2.0 * young);
       if (e <= 1e-7) { continue; }
       let upn = p / length(p);
       let mu = dot(upn, G.sun_dir.xyz);
@@ -215,7 +223,8 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
       // (Its own cell's shade only, as storm_shade has it: looping over every
       // cell per sample cost a few % fps whenever a shaft was in view.)
       let pc = ph - up * dot(ph, up) + G.storm.xyz * (0.2 * R);
-      let dark = (1.0 - smoothstep(0.7, 1.7, length(pc) / R)) * smoothstep(0.3, 0.75, sp.x) * smoothstep(1500.0, 4000.0, R);
+      // (Even a shower's base hides half the sky from its rain.)
+      let dark = (1.0 - smoothstep(0.7, 1.7, length(pc) / R)) * max(smoothstep(0.3, 0.75, sp.x) * smoothstep(1500.0, 4000.0, R), 0.5);
       var S = (sun_trans(h, mu) * G.sun_dir.w * vis * 0.03 + storm_light(sky_amb * 0.13 + gnd_amb * 0.3, dark)) * vec3f(0.88, 0.93, 0.97);
       // Lightning lights up the rain around it.
       if (G.stormfx.z > 0.0) { S += flash_light(p - oc) * 0.08; }

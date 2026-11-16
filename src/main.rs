@@ -194,7 +194,7 @@ struct Args {
     /// cumulonimbus storm cell amount 0..1
     storms: Option<f32>,
     /// storm cells placed by hand: distance (km), compass bearing (deg), tower radius (km)
-    storm_at: Vec<(f64, f64, f64)>,
+    storm_at: Vec<(f64, f64, f64, Option<weather::CellKind>)>,
     /// km,bearing: where the rain deck's area is centred, from the spawn
     rain_at: Option<(f64, f64)>,
     time_rate: Option<f64>,
@@ -400,10 +400,14 @@ fn parse_args() -> Args {
             "--clouds" => a.clouds = num(&v, i).unwrap_or(0.5) as f32,
             "--storms" => a.storms = num(&v, i).map(|x| x as f32),
             "--storm-at" => {
-                // km,bearing[,radius km]: a mature cumulonimbus that far from the spawn (repeatable)
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                // km,bearing[,radius km[,shower|thunder|severe]]: a convective cell that far
+                // from the spawn, a mature cumulonimbus unless a kind says otherwise (repeatable)
+                let f: Vec<&str> = v.get(i + 1).map(|s| s.split(',').collect()).unwrap_or_default();
+                let p: Vec<f64> = f.iter().take(3).map_while(|x| x.parse().ok()).collect();
+                let kind = f.iter().skip(p.len()).find_map(|x| weather::CellKind::parse(x));
                 if p.len() >= 2 {
-                    a.storm_at.push((p[0], p[1], p.get(2).copied().unwrap_or(6.0)));
+                    let r = p.get(2).copied().unwrap_or(if kind == Some(weather::CellKind::Shower) { 1.8 } else { 6.0 });
+                    a.storm_at.push((p[0], p[1], r, kind));
                 }
             }
             "--rain-at" => {
@@ -557,7 +561,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -889,8 +893,8 @@ impl Game {
         if let Some(w) = args.wet {
             glass.wet = w.clamp(0.0, 1.0);
         }
-        for &(d, b, r) in &args.storm_at {
-            wx.place_storm(plane.pos, d, b, r.clamp(1.0, 12.0));
+        for &(d, b, r, kind) in &args.storm_at {
+            wx.place_storm(plane.pos, d, b, r.clamp(1.0, 12.0), kind);
         }
         if let Some(r) = args.time_rate {
             wx.time_rate = r.clamp(0.0, 3600.0);

@@ -41,6 +41,8 @@ pub struct Target {
     pub depth_m: f32,
     pub alto: f32,
     pub storms: f32,
+    /// showers but no thunder reported: the convective cells are showers
+    pub showers_only: bool,
     /// rain falling at the station, 0..1 (the Rain slider: it brings the
     /// nimbostratus rain deck); 0 = none
     pub rain: f32,
@@ -157,6 +159,7 @@ impl LiveWx {
         wx.cloud_depth = mix(wx.cloud_depth, t.depth_m);
         wx.alto = mix(wx.alto, t.alto);
         wx.storms = mix(wx.storms, t.storms);
+        wx.showers_only = t.showers_only;
         wx.haze = mix(wx.haze, t.haze);
         // Beyond the radar, a rain deck round the aircraft as heavy as the
         // report says.
@@ -496,6 +499,7 @@ fn from_metar(m: &serde_json::Value) -> Option<Target> {
         depth_m: depth(clouds, storms),
         alto,
         storms,
+        showers_only: storms > 0.0 && !p.thunder && !cb,
         rain: p.rain,
         haze: haze(if cavok { None } else { vis_km }, foggy),
         wind,
@@ -638,6 +642,7 @@ fn from_open_meteo(j: &serde_json::Value) -> Option<Target> {
         depth_m: depth(clouds, storms),
         alto: mid,
         storms,
+        showers_only: (80..=82).contains(&code),
         rain,
         haze: haze(f("visibility").map(|v| v / 1000.0), matches!(code, 45 | 48)),
         wind,
