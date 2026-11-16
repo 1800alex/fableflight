@@ -6,6 +6,7 @@ mod audio;
 mod buildings;
 mod aircraft;
 mod cockpit;
+mod copilot;
 mod cars;
 mod crash;
 mod damage;
@@ -77,6 +78,7 @@ enum PauseAct {
 
 use crash::Crash;
 use damage::Tear;
+use fablegame::mcp;
 use glam::{DMat4, DQuat, DVec2, DVec3, Mat4, Vec2, Vec3};
 use i18n::{t, tr};
 use padui::Hint;
@@ -265,6 +267,9 @@ struct Args {
     /// fuel to start with (fraction of full tanks), and the engine off on the ground
     fuel: Option<f64>,
     cold: bool,
+    /// the AI copilot's loopback control service (on unless --no-mcp)
+    mcp: bool,
+    mcp_port: u16,
 }
 
 fn parse_args() -> Args {
@@ -323,6 +328,8 @@ fn parse_args() -> Args {
         no_hud: false,
         fuel: None,
         cold: false,
+        mcp: true,
+        mcp_port: mcp::rpc::DEFAULT_PORT,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -476,6 +483,15 @@ fn parse_args() -> Args {
                 a.cold = true;
                 used = 1;
             }
+            "--mcp" => {
+                a.mcp = true;
+                used = 1;
+            }
+            "--no-mcp" => {
+                a.mcp = false;
+                used = 1;
+            }
+            "--mcp-port" => a.mcp_port = num(&v, i).map(|p| p.clamp(1.0, 65535.0) as u16).unwrap_or(a.mcp_port),
             "--photo-detail" => {
                 a.photo_detail = Some(v.get(i + 1).and_then(|s| gmaps::Detail::parse(s)).unwrap_or_else(|| {
                     eprintln!("--photo-detail takes low, medium, high or ultra");
@@ -518,7 +534,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -753,6 +769,10 @@ struct Game {
     radios: nav::Radios,
     /// waiting on the ground for the terrain to load: where, and until when at most
     hold_spot: Option<(f64, f64, f64)>,
+    /// the AI copilot's tool calls, and the screenshots waiting for a frame
+    mcp_calls: Option<crossbeam_channel::Receiver<mcp::rpc::Call>>,
+    mcp_shots: Vec<copilot::PendingShot>,
+    mcp_shot_n: u64,
 }
 
 impl Game {
@@ -898,7 +918,16 @@ impl Game {
                 }
                 i.map(|i| (i, args.runway.clone(), args.approach))
             }),
+            mcp_calls: None,
+            mcp_shots: Vec::new(),
+            mcp_shot_n: 0,
         };
+        if args.mcp {
+            match mcp::rpc::serve(args.mcp_port) {
+                Ok(rx) => g.mcp_calls = Some(rx),
+                Err(e) => log::warn!("AI copilot service on 127.0.0.1:{}: {e}", args.mcp_port),
+            }
+        }
         // With --menu, an --airport is chosen on the globe rather than flown from.
         if args.menu == Some(true) {
             if let Some((i, rw, appr)) = g.pending_airport.take() {
@@ -2661,6 +2690,7 @@ impl Game {
         self.last = now;
         self.real += dt_real;
         self.frame += 1;
+        self.pump_mcp();
         if self.record.is_none() {
             self.fps += (1.0 / dt_real.max(1e-4) - self.fps) * 0.05;
         }
@@ -3623,6 +3653,7 @@ impl Game {
         let (skin_slots, skins) = if in_menu { (Vec::new(), Vec::new()) } else { self.destr.skin_draws() };
         self.r.stats[0] += now.elapsed().as_secs_f64();
         self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: in_menu.then(|| self.window.scale_factor() as f32), cover, glow: glow_px });
+        self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
         }
@@ -5266,7 +5297,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
-        if let Some(g) = &self.game {
+        if let Some(g) = &mut self.game {
+            // Tool calls keep being answered even when the window is not
+            // producing redraws (minimised, say); screenshots still wait for
+            // the next frame.
+            g.pump_mcp();
             g.window.request_redraw();
         }
     }

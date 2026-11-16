@@ -853,6 +853,7 @@ dependencies = [
  "pollster",
  "rodio",
  "roxmltree",
+ "serde",
  "serde_json",
  "ureq",
  "wgpu",
