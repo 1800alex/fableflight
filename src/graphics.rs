@@ -94,7 +94,7 @@ impl Graphics {
     pub fn apply(&mut self, l: Level) {
         let l = if l == Level::Off { Level::Low } else { l };
         // each preset down roughly halves gpu work, resolution first, then shadows.
-        self.scale = l.pick(0.5, 0.7, 1.0, 1.5) as f32;
+        self.scale = l.pick(0.6, 0.75, 1.0, 1.5) as f32;
         self.shadows = match l {
             Level::Off | Level::Low => Level::Off,
             Level::Medium => Level::Low,
@@ -120,7 +120,7 @@ impl Graphics {
 
     /// msaa samples, 2 on low, applied on next start.
     pub fn samples(&self) -> u32 {
-        if self.matches() == Some(Level::Low) || self.scale <= 0.5 { 2 } else { 4 }
+        if self.matches() == Some(Level::Low) { 2 } else { 4 }
     }
 
     /// Side of the sun's shadow map (texels; Off keeps a small unused one).
@@ -192,8 +192,12 @@ impl Graphics {
     pub fn load() -> Self {
         let j: serde_json::Value = Self::path().and_then(|p| std::fs::read(p).ok()).and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
         let mut g = Self::default();
+        // a saved preset follows the code, so retuned presets reach old saves.
         if let Some(l) = j["preset"].as_str().and_then(Level::parse) {
             g.apply(l);
+            g.taa = j["taa"].as_bool().unwrap_or(g.taa);
+            g.vsync = j["vsync"].as_bool().unwrap_or(g.vsync);
+            return g;
         }
         let lvl = |k: &str, d: Level| j[k].as_str().and_then(Level::parse).filter(|l| *l != Level::Off).unwrap_or(d);
         if let Some(s) = j["scale"].as_f64() {
@@ -258,8 +262,8 @@ impl Graphics {
             }
         });
         ui.label(RichText::new(match self.matches() {
-            Some(Level::Low) => "Low: 50% resolution, no shadows, quicker clouds, nearer scenery, simpler cities and trees, light traffic, no ambient occlusion.",
-            Some(Level::Medium) => "Medium: 70% resolution, a coarse shadow map, no ambient occlusion and a lighter version of everything else.",
+            Some(Level::Low) => "Low: 60% resolution, no shadows, quicker clouds, nearer scenery, simpler cities and trees, light traffic, no ambient occlusion.",
+            Some(Level::Medium) => "Medium: 75% resolution, a coarse shadow map, no ambient occlusion and a lighter version of everything else.",
             Some(Level::High) => "High: the full look at the window's own resolution (what the game has always drawn).",
             Some(Level::Ultra) => "Ultra: past High. Supersampled at 150%, a 6K shadow map, finer clouds, terrain and scenery further out. Wants a strong GPU.",
             _ => "Custom: tuned below.",
