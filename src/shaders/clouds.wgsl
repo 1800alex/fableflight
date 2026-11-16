@@ -428,7 +428,10 @@ fn depth_match(a: f32, b: f32) -> f32 {
     var sclear = 0.0;
     // Inside the ordinary layer the storms are looked up further out than
     // that, wherever they push the cumulus aside (Weather.cb): skipping them
-    // there let cumulus puffs show through a storm's base.
+    // there let cumulus puffs show through a storm's base. (Out to 2.6 km at
+    // least, as far as Weather.cb thins them out: short of that, rays that
+    // skipped the lookup and rays that made it drew blocky, dithered patches
+    // of cumulus round the storms.)
     var slook = 0.0;
     var ufree = false;
     var pts = ta;        // the previous sample, and whether it was in clear air
@@ -467,14 +470,16 @@ fn depth_match(a: f32, b: f32) -> f32 {
       let fine = 1.0 - smoothstep(1500.0, 4500.0, ts);
       g_erode = 1.0 - smoothstep(12000.0, 45000.0, ts);
       let d = cloud_shape_f(p, h, wx, true, fine);
-      let anv = g_anvil;  // (the lookups below overwrite it)
+      // (The lookups below overwrite it; the envelope's distance packed in, see
+      // cloud_shape_f. Far from any storm, none.)
+      let anvp = select(255.0, g_anvil, wx.sc.w > 0.0);
       // Clear-air strides used to step right over distant towers a few km wide
       // (they came out ghostly, half the samples missing them): near a storm cell
       // its envelope's distance bounds the stride, far from one it lets the ray
       // skip ahead safely.
       if (look && smask != 0u) {
         sclear = max(-wx.sd - storm_reach(wx.sc, h - base), 0.0) * 0.8;
-        slook = max(-wx.sd - storm_bulge(wx.sc), 0.0) * 0.8;
+        slook = max(-wx.sd - max(storm_bulge(wx.sc), 2600.0), 0.0) * 0.8;
       }
       // Stride faster through the empty storm-only air above the ordinary layer.
       if (d <= 0.002) { pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, min(sclear, h - base - G.cloud.z + dt0) / dt0 - 1.0); }
@@ -515,7 +520,6 @@ fn depth_match(a: f32, b: f32) -> f32 {
       pts = ts;
       let upn = pl / length(pl);
       let ctop = column_top(wx);
-      let hn = clamp((hl - base - (1.0 - wx.ns) * G.nimbo[3].y) / ctop, 0.0, 1.0);
       // Optical depth towards the sun; the column's weather is reused along the way.
       // Tall columns take one more, long step (out to ~3 km) so towers shade their neighbours.
       var od = 0.0;
@@ -536,23 +540,44 @@ fn depth_match(a: f32, b: f32) -> f32 {
         ls *= lg;
       }
       od *= SIGMA;
+      // (After the light march, like everything below: any value carried
+      // through it cost ~18% of the cloud pass in every view.)
+      let sdq = floor(anvp);
+      let anv = (anvp - sdq) / 0.99;
+      // How much of the cloud here is the rain deck's, not a storm tower's
+      // standing in it (lit with the deck's flat glow, the tower's lower half
+      // came out as one pale drum up to the layer's top): not at the tower's
+      // face, nor above the deck's top, raised where it swells up against it.
+      var nsw = wx.ns;
+      var ntop = G.nimbo[2].w;
+      if (nsw > 0.0 && sdq < 255.0) {
+        let sdp = -16.0 * sdq;
+        ntop += deck_swell(sdp, wx);
+        nsw *= 1.0 - max(smoothstep(-600.0, 0.0, sdp), smoothstep(ntop - 150.0, ntop + 150.0, hl));
+      }
+      let hn = clamp((hl - base - (1.0 - nsw) * G.nimbo[3].y) / column_top(wx), 0.0, 1.0);
       // Cloud overhead blocks the sky light: a probe straight up, diffusion falloff.
-      let pu = pl + upn * 450.0;
-      let od_up = cloud_shape(pu, hl + 450.0, wx, false) * 900.0 * SIGMA;
+      // (Near storms at a jittered height, averaged over frames: at one height
+      // the probe was either in a billow or out of it, which left flat dark
+      // blotches with hard edges all over the towers.)
+      let hup = select(450.0, 150.0 + 1150.0 * fract(jit2 + 0.5), wx.cb > 0.0);
+      let od_up = cloud_shape(pl + upn * hup, hl + hup, wx, false) * 900.0 * SIGMA;
       var occ = mix(1.0 / (1.0 + 0.15 * od_up), 1.0, 0.12);
       // Under a storm's anvil (km overhead) the sky is mostly cloud: a second,
       // long probe greys and darkens the tower's shaded flanks, so they read as
       // massive cloud instead of fading into the sky behind.
       if (wx.cb > 0.0) {
-        let pu2 = pl + upn * (2500.0 * (0.6 + 0.8 * jit2));
-        let od2 = cloud_shape(pu2, hl + 2500.0, wx, false) * 3000.0 * SIGMA;
+        let hu2 = 2500.0 * (0.6 + 0.8 * jit2);
+        let od2 = cloud_shape(pl + upn * hu2, hl + hu2, wx, false) * 3000.0 * SIGMA;
         occ *= mix(1.0 / (1.0 + 0.06 * od2), 1.0, 0.3);
       }
       // The rain deck is kilometres deep, and the light march stops ~1.5 km in:
       // its base came out as bright as a thin stratus's. Light gets down by
-      // diffusing through all of the deck above, and the sky above it is hidden.
-      if (wx.ns > 0.0) {
-        let tau = SIGMA * 0.55 * max(G.nimbo[2].w - hl, 0.0) * wx.ns;
+      // diffusing through all of the deck above (from its top, raised where it
+      // swells up against a storm tower: from its mean top the swell came out
+      // lit like thin cloud), and the sky above it is hidden.
+      if (nsw > 0.0) {
+        let tau = SIGMA * 0.55 * max(ntop - hl, 0.0) * nsw;
         od = max(od, tau / max(dot(upn, sun), 0.3));
         occ = min(occ, 0.1 + 0.9 / (1.0 + 0.1 * tau));
       }
@@ -593,9 +618,9 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // Deep in the rain deck (and on its base) the light is what diffuses down
       // through it, a little lighter and darker where the deck is thinner and thicker.
       // The ragged scud hanging below it is darker (dense and in its shadow).
-      if (wx.ns > 0.0) {
+      if (nsw > 0.0) {
         let scud = 1.0 - smoothstep(0.0, G.nimbo[3].z * 1.3, hl - G.nimbo[1].w + G.nimbo[3].z);
-        S = max(S, nimbo_down(nim_top, hl) * (mix(0.75, 1.2, wx.cell) * mix(0.55, 1.0, powder) * mix(1.0, 0.5, scud) * wx.ns * d * SIGMA));
+        S = max(S, nimbo_down(nim_top, hl) * (mix(0.75, 1.2, wx.cell) * mix(0.55, 1.0, powder) * mix(1.0, 0.5, scud) * nsw * d * SIGMA));
       }
       // Lightning: the cloud lit from inside (diffuse, so an even phase). Per
       // sample: added once per ray at the cloud's mean distance it lit the whole
