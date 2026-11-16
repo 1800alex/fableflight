@@ -2,6 +2,7 @@ mod airframe;
 mod airfield;
 mod airmodels;
 mod airports;
+mod approach;
 mod audio;
 mod buildings;
 mod aircraft;
@@ -29,6 +30,7 @@ mod impostor;
 mod materials;
 mod logo;
 mod menu;
+mod minimap;
 mod padui;
 mod pave;
 mod photonight;
@@ -122,8 +124,8 @@ fn attribution_default() -> &'static str {
 }
 fn attribution_rest() -> &'static str {
     t!(
-        "Elevation: Mapzen / AWS Terrain Tiles  ·  Buildings, roads, land cover & water © OpenStreetMap contributors, OpenFreeMap  ·  Night lights: NASA Black Marble",
-        "Relief : Mapzen / AWS Terrain Tiles  ·  Bâtiments, routes, occupation du sol et eau © contributeurs OpenStreetMap, OpenFreeMap  ·  Lumières nocturnes : NASA Black Marble"
+        "Elevation: Mapzen / AWS Terrain Tiles  ·  Buildings, roads, land cover & water © OpenStreetMap contributors, OpenFreeMap / © OpenMapTiles  ·  Night lights: NASA Black Marble",
+        "Relief : Mapzen / AWS Terrain Tiles  ·  Bâtiments, routes, occupation du sol et eau © contributeurs OpenStreetMap, OpenFreeMap / © OpenMapTiles  ·  Lumières nocturnes : NASA Black Marble"
     )
 }
 
@@ -216,6 +218,8 @@ struct Args {
     fps_log: bool,
     /// draw without showing anything (benchmarks and scripted shots with the screen off)
     headless: bool,
+    minimap_plan: Option<bool>,
+    minimap_heading_up: Option<bool>,
     offline: bool,
     shots: Vec<(f64, PathBuf, Option<(f64, f64, f64)>)>,
     /// record frames + audio to a directory: (dir, start, seconds), fixed 30 fps steps
@@ -292,6 +296,8 @@ fn parse_args() -> Args {
         render_scale: None,
         fps_log: false,
         headless: false,
+        minimap_plan: None,
+        minimap_heading_up: None,
         offline: false,
         shots: Vec::new(),
         record: None,
@@ -331,6 +337,8 @@ fn parse_args() -> Args {
     while i < v.len() {
         let mut used = 2;
         match v[i].as_str() {
+            "--minimap" => a.minimap_plan = v.get(i + 1).and_then(|s| match s.as_str() { "plan" => Some(true), "satellite" => Some(false), _ => None }),
+            "--minimap-up" => a.minimap_heading_up = v.get(i + 1).and_then(|s| match s.as_str() { "north" => Some(false), "heading" => Some(true), _ => None }),
             "--lat" => {
                 a.lat = num(&v, i).unwrap_or(a.lat);
                 a.menu.get_or_insert(false);
@@ -519,7 +527,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -619,6 +627,7 @@ struct Game {
     crashed: bool,
     crash: Option<Crash>,
     crash_real: f64,
+    minimap: minimap::Minimap,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     keys: HashSet<KeyCode>,
@@ -915,7 +924,7 @@ impl Game {
         // for the gear, flaps and control surfaces as they move.
         let (cy, cp, cd) = args.cam.unwrap_or((0.0, 0.2, spec.cam_dist));
         let mut g = Self {
-            gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: vec![None; aircraft::ALL.len()], window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
+            minimap: minimap::Minimap::new(&prefs), gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: vec![None; aircraft::ALL.len()], window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
@@ -947,6 +956,8 @@ impl Game {
                 i.map(|i| (i, args.runway.clone(), args.approach))
             }),
         };
+        if let Some(plan) = args.minimap_plan { g.minimap.plan = plan; }
+        if let Some(up) = args.minimap_heading_up { g.minimap.heading_up = up; }
         // With --menu, an --airport is chosen on the globe rather than flown from.
         if args.menu == Some(true) {
             if let Some((i, rw, appr)) = g.pending_airport.take() {
@@ -2959,7 +2970,7 @@ impl Game {
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
@@ -4470,6 +4481,11 @@ impl Game {
                                         self.heading = hd.to_radians();
                                     }
                                     ui.end_row();
+                                    if !ground {
+                                        ui.label("");
+                                        menu::heading_compass(ui, &mut self.heading);
+                                        ui.end_row();
+                                    }
                                 });
                             });
                         });
@@ -4781,6 +4797,19 @@ impl Game {
                             ui.label("HUD");
                             let t = if self.show_hud { t!("shown", "affiché") } else { t!("hidden", "masqué") };
                             ui.checkbox(&mut self.show_hud, t);
+                            ui.end_row();
+                            ui.label(t!("Map", "Carte"));
+                            ui.checkbox(&mut self.minimap.visible, t!("Show minimap", "Afficher la mini-carte"));
+                            ui.end_row();
+                            ui.label(t!("Landing guidance", "Aide à l’atterrissage"));
+                            ui.checkbox(&mut self.minimap.landing_guidance, t!("Approach arrows and tunnel", "Flèches et tunnel d’approche"));
+                            ui.end_row();
+                            ui.label(t!("Minimap width", "Largeur de la mini-carte"));
+                            ui.add(egui::Slider::new(&mut self.minimap.size.x, 240.0..=640.0).step_by(10.0).suffix(" px"))
+                                .on_hover_text(t!("The map fits the window and keeps this size when you resume flight.", "La carte s’adapte à la fenêtre et conserve cette taille à la reprise du vol."));
+                            ui.end_row();
+                            ui.label(t!("Minimap height", "Hauteur de la mini-carte"));
+                            ui.add(egui::Slider::new(&mut self.minimap.size.y, 240.0..=640.0).step_by(10.0).suffix(" px"));
                             ui.end_row();
                             menu::heading(ui, t!("TRAFFIC", "TRAFIC"));
                             ui.end_row();
@@ -5190,6 +5219,13 @@ impl Game {
         let mut act = None;
         let stats = self.world.stats;
         let airport_hud = self.airport_hud();
+        let landing_guide = if self.minimap.landing_guidance && !self.crashed {
+            self.world.airfield_near(self.plane.pos, 18_000.0).and_then(|field| {
+                let g = &field.geo;
+                field.traffic.active.or_else(|| g.active(self.wx.wind_from as f32, (self.wx.wind * 1.94384) as f32))
+                    .map(|(runway, end)| approach::Guide::new(g, runway, end))
+            })
+        } else { None };
         self.src.google.update_attribution(lat.to_degrees(), lon.to_degrees(), agl);
         self.flash.retain(|(_, t)| self.real - t < 4.0);
         let out = self.egui_ctx.clone().run_ui(raw, |root| {
@@ -5382,6 +5418,11 @@ impl Game {
                     }
                 }
             }
+            if self.show_hud && !self.pause_open && !self.plane.on_ground {
+                if let (Some(guide), Some((vp, camera))) = (&landing_guide, self.live_view) {
+                    guide.draw_world(ctx, vp, camera, self.plane.pos);
+                }
+            }
             // The loading screen, over everything else.
             self.loading_overlay(ctx);
             // Google's imagery has to carry its credit, HUD or not.
@@ -5494,6 +5535,16 @@ impl Game {
                         }
                     });
                 });
+            }
+            if self.show_hud && !self.pause_open && !self.show_help && !self.goto_open {
+                if self.minimap.visible {
+                    let horizontal = f.dot(e).hypot(f.dot(n));
+                    self.minimap.show(ctx, &self.src, lat, lon, (horizontal > 1e-5).then_some(hdg.to_radians()), self.info_open, landing_guide.as_ref(), &self.world);
+                } else {
+                    egui::Area::new(egui::Id::unique("show_minimap")).anchor(Align2::LEFT_BOTTOM, [14.0, -65.0]).show(ctx, |ui| {
+                        if ui.button(t!("Map", "Carte")).clicked() { self.minimap.visible = true; }
+                    });
+                }
             }
             if self.show_help {
                 egui::Area::new(egui::Id::unique("help")).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
