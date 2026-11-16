@@ -431,10 +431,12 @@ impl World {
     /// Height of our own terrain surface (or water surface) at a lat/lon, from
     /// the most detailed tile currently loaded there.
     pub fn terrain_ground(&self, lat: f64, lon: f64) -> Option<Ground> {
+        let (mx, my) = (geo::lon_to_merc_x(lon).rem_euclid(1.0), geo::lat_to_merc_y(lat));
         for z in (2..=self.max_zoom).rev() {
-            let id = TileId::at(lat, lon, z);
+            let id = TileId::at_merc(mx, my, z);
             if let Some(Slot::Ready(t)) = self.tiles.get(&id) {
-                let (u, v) = id.frac(lat, lon);
+                let n = (1u64 << z) as f64;
+                let (u, v) = (mx * n - id.x as f64, my * n - id.y as f64);
                 let (x, y) = ((u * GRID as f64).clamp(0.0, GRID as f64 - 1e-6), (v * GRID as f64).clamp(0.0, GRID as f64 - 1e-6));
                 let (x0, y0) = (x as usize, y as usize);
                 let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
@@ -1075,7 +1077,8 @@ impl World {
 
     /// Zoom of the most detailed terrain tile loaded at a spot.
     pub fn ground_zoom(&self, lat: f64, lon: f64) -> Option<u8> {
-        (2..=self.max_zoom).rev().find(|z| matches!(self.tiles.get(&TileId::at(lat, lon, *z)), Some(Slot::Ready(_))))
+        let (mx, my) = (geo::lon_to_merc_x(lon).rem_euclid(1.0), geo::lat_to_merc_y(lat));
+        (2..=self.max_zoom).rev().find(|z| matches!(self.tiles.get(&TileId::at_merc(mx, my, *z)), Some(Slot::Ready(_))))
     }
 
     /// The nearest airfield that is loaded, within `r` metres.
