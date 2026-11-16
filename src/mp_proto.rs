@@ -24,6 +24,8 @@ pub const NAME_MAX: usize = 24;
 pub const HELLO_MIN: usize = 48;
 /// at most this many players in one Peers packet (it stays under ~1100 bytes)
 pub const PEERS_PER_PACKET: usize = 10;
+/// at most this many relays in one Directory packet (likewise)
+pub const DIRECTORY_PER_PACKET: usize = 20;
 
 /// The aircraft by `PlayerState::aircraft` (`aircraft::Spec::id`), for the
 /// relay's status page; ids past the end are shown as unknown. (The game's
@@ -39,6 +41,7 @@ const K_STATE: u8 = 3;
 const K_PEERS: u8 = 4;
 const K_BYE: u8 = 5;
 const K_FED: u8 = 6;
+const K_DIRECTORY: u8 = 7;
 
 /// One player's aircraft at one instant. Positions are in the game's world
 /// frame (metres from the planet's centre), the attitude a unit quaternion
@@ -88,6 +91,10 @@ pub enum Msg {
     /// its clock (unix seconds), `seq` counts up; `tag` signs everything
     /// before it with the network's shared secret (see `fed_tag`).
     Fed { relay: u32, relay_name: String, ts: u64, seq: u32, players: Vec<(u32, String, PlayerState)>, tag: u64 },
+    /// Relay → relay: the other relays the sender knows (their id, address
+    /// as it sees it, name), so that every relay of the network finds every
+    /// other. Signed and numbered as a Fed.
+    Directory { relay: u32, ts: u64, seq: u32, members: Vec<(u32, std::net::SocketAddr, String)>, tag: u64 },
 }
 
 /// A name as it may be shown: printable characters only, trimmed, at most
@@ -257,6 +264,31 @@ impl Msg {
                 w.u64(*tag);
                 w.0
             }
+            Msg::Directory { relay, ts, seq, members, tag } => {
+                let mut w = W::new(K_DIRECTORY);
+                w.u32(*relay);
+                w.u64(*ts);
+                w.u32(*seq);
+                let n = members.len().min(DIRECTORY_PER_PACKET);
+                w.u8(n as u8);
+                for (id, addr, name) in &members[..n] {
+                    w.u32(*id);
+                    match addr.ip() {
+                        std::net::IpAddr::V4(ip) => {
+                            w.u8(4);
+                            w.0.extend_from_slice(&ip.octets());
+                        }
+                        std::net::IpAddr::V6(ip) => {
+                            w.u8(6);
+                            w.0.extend_from_slice(&ip.octets());
+                        }
+                    }
+                    w.0.extend_from_slice(&addr.port().to_le_bytes());
+                    w.name(name);
+                }
+                w.u64(*tag);
+                w.0
+            }
         }
     }
 
@@ -300,6 +332,25 @@ impl Msg {
                 }
                 Msg::Fed { relay, relay_name, ts, seq, players, tag: r.u64()? }
             }
+            K_DIRECTORY => {
+                let (relay, ts, seq) = (r.u32()?, r.u64()?, r.u32()?);
+                let n = r.u8()? as usize;
+                if n > DIRECTORY_PER_PACKET {
+                    return None;
+                }
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let id = r.u32()?;
+                    let ip: std::net::IpAddr = match r.u8()? {
+                        4 => <[u8; 4]>::try_from(r.take(4)?).ok()?.into(),
+                        6 => <[u8; 16]>::try_from(r.take(16)?).ok()?.into(),
+                        _ => return None,
+                    };
+                    let port = u16::from_le_bytes(r.take(2)?.try_into().ok()?);
+                    members.push((id, std::net::SocketAddr::new(ip, port), r.name()?));
+                }
+                Msg::Directory { relay, ts, seq, members, tag: r.u64()? }
+            }
             _ => return None,
         };
         Some(m)
@@ -338,6 +389,7 @@ mod tests {
             Msg::Peers { peers: vec![(1, "Dany".into(), state()), (2, "Roland".into(), state())] },
             Msg::Bye { cookie: 5 },
             Msg::Fed { relay: 77, relay_name: "danux.be".into(), ts: 1_800_000_000, seq: 4, players: vec![(1, "Dany".into(), state())], tag: 9 },
+            Msg::Directory { relay: 77, ts: 1_800_000_000, seq: 5, members: vec![(3, "203.0.113.7:7480".parse().unwrap(), "Asia".into()), (4, "[2001:db8::1]:7480".parse().unwrap(), "US".into())], tag: 11 },
         ] {
             let b = m.encode();
             assert_eq!(Msg::decode(&b), Some(m.clone()), "{m:?}");

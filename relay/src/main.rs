@@ -15,9 +15,14 @@
 //!
 //! - `FFMP_NAME`: this relay's name, as the other relays and the status page
 //!   show it (say its host name);
-//! - `FFMP_PEERS` (none): the other relays of the network, `host[:port]`
-//!   separated by commas, and `FFMP_PEER_SECRET`, the network's shared
-//!   secret (16 characters at least, the same on every relay). See below.
+//! - `FFMP_PEER_SECRET`: the network's shared secret (16 characters at
+//!   least, the same on every relay): without it, no federation;
+//! - `FFMP_HUB`: the network's main relay (`host[:port]`). A relay with the
+//!   secret makes itself known to it, which lists it to every other, and
+//!   they all find each other; a relay forgotten for a minute drops out.
+//!   (The main relay itself has the secret and no FFMP_HUB.)
+//! - `FFMP_PEERS` (none): other relays to reach directly, `host[:port]`
+//!   separated by commas, as well or instead. See below.
 //!
 //! Federation: relays that list each other pass their own players to each
 //! other ten times a second, so a player on one sees the players near them on
@@ -72,6 +77,9 @@ struct PeerRelay {
     relay: u32,
     last_seq: u32,
     heard: Option<Instant>,
+    /// found by itself (it came forward, or another relay listed it), not
+    /// configured: forgotten once it goes quiet
+    found: Option<Instant>,
 }
 
 /// A player on another relay, as last reported.
@@ -87,6 +95,10 @@ const REMOTE_IDLE: Duration = Duration::from_secs(3);
 const CLOCK_SLACK: u64 = 30;
 /// local player ids stay below this; players from the n-th relay are n << 24 | theirs
 const LOCAL_IDS: u32 = 1 << 24;
+/// a relay that found its own way in is forgotten after this long without a word
+const PEER_IDLE: Duration = Duration::from_secs(60);
+/// how often each relay tells the others which relays it knows
+const DIRECTORY_EVERY: Duration = Duration::from_secs(10);
 
 /// Packets a second an address may send (it sends ~15), and the burst.
 const RATE: f64 = 40.0;
@@ -109,7 +121,8 @@ struct Relay {
     /// federation: the other relays, the players they report (by relay index
     /// and their id), our id for this run and the number of our next datagram
     peers: Vec<PeerRelay>,
-    remote: HashMap<(usize, u32), Remote>,
+    /// (keyed by the relay's id for its run and the player's id there)
+    remote: HashMap<(u32, u32), Remote>,
     me: u32,
     fed_seq: u32,
 }
@@ -123,7 +136,7 @@ impl Relay {
 
     /// Looks the other relays' names up again (their addresses may change).
     fn resolve_peers(&mut self) {
-        for p in &mut self.peers {
+        for p in self.peers.iter_mut().filter(|p| p.found.is_none()) {
             match p.host.to_socket_addrs() {
                 Ok(a) => p.addrs = a.filter(|a| a.is_ipv4()).collect(),
                 Err(e) => eprintln!("peer {}: {e}", p.host),
@@ -131,32 +144,85 @@ impl Relay {
         }
     }
 
-    /// A datagram from another relay: its players, if it is one of ours, the
-    /// signature holds, and it is new.
+    /// A signed datagram from another relay: the index of that relay among
+    /// ours if the signature holds, it is recent and newer than the last, and
+    /// it is not our own. A relay we did not know yet joins (it has the
+    /// network's secret: it is one of us).
     #[allow(clippy::too_many_arguments)]
-    fn federate(&mut self, addr: SocketAddr, data: &[u8], relay: u32, name: String, ts: u64, seq: u32, players: Vec<(u32, String, PlayerState)>, tag: u64, now: Instant, unix: u64) {
-        let Some(secret) = &self.cfg.secret else { return };
-        // (Our own datagrams, come back somehow: not other players.)
-        if relay == self.me {
-            return;
+    fn admit(&mut self, addr: SocketAddr, data: &[u8], relay: u32, name: Option<String>, ts: u64, seq: u32, tag: u64, now: Instant, unix: u64) -> Option<usize> {
+        let secret = self.cfg.secret.as_ref()?;
+        // (Our own datagrams, come back somehow: not another relay.)
+        if relay == self.me || data.len() < 8 || proto::fed_tag(secret, &data[..data.len() - 8]) != tag || ts.abs_diff(unix) > CLOCK_SLACK {
+            return None;
         }
-        // (The relay at that very address; else at that IP, should a NAT have changed the port.)
-        let Some(i) = self.peers.iter().position(|p| p.addrs.contains(&addr)).or_else(|| self.peers.iter().position(|p| p.addrs.iter().any(|a| a.ip() == addr.ip()))) else { return };
-        if data.len() < 8 || proto::fed_tag(secret, &data[..data.len() - 8]) != tag || ts.abs_diff(unix) > CLOCK_SLACK {
-            return;
-        }
+        // (Known by its address; a relay from an address we do not know joins.)
+        let i = match self.peers.iter().position(|p| p.addrs.contains(&addr)) {
+            Some(i) => i,
+            None => {
+                self.peers.push(PeerRelay { host: addr.to_string(), addrs: vec![addr], name: String::new(), relay: 0, last_seq: 0, heard: None, found: Some(now) });
+                self.peers.len() - 1
+            }
+        };
         let p = &mut self.peers[i];
         // (The same run of that relay: only newer datagrams. A restarted one has a new id.)
         if p.relay == relay && seq <= p.last_seq && p.last_seq - seq < u32::MAX / 2 {
-            return;
+            return None;
+        }
+        if let Some(n) = name {
+            p.name = n;
         }
         if p.heard.is_none() || p.relay != relay {
-            println!("~ relay {} ({}) joined", name, p.host);
+            println!("~ relay {} ({}) joined", p.name, p.host);
         }
-        (p.relay, p.last_seq, p.name, p.heard) = (relay, seq, name, Some(now));
+        (p.relay, p.last_seq, p.heard) = (relay, seq, Some(now));
+        Some(i)
+    }
+
+    /// A Fed: that relay's players.
+    #[allow(clippy::too_many_arguments)]
+    fn federate(&mut self, addr: SocketAddr, data: &[u8], relay: u32, name: String, ts: u64, seq: u32, players: Vec<(u32, String, PlayerState)>, tag: u64, now: Instant, unix: u64) {
+        if self.admit(addr, data, relay, Some(name), ts, seq, tag, now, unix).is_none() {
+            return;
+        }
         for (id, name, state) in players {
-            self.remote.insert((i, id), Remote { name, state, last: now });
+            self.remote.insert((relay, id), Remote { name, state, last: now });
         }
+    }
+
+    /// A Directory: the relays another one knows. Those new to us are added;
+    /// they and we then find each other with our Fed datagrams.
+    #[allow(clippy::too_many_arguments)]
+    fn directory(&mut self, addr: SocketAddr, data: &[u8], relay: u32, ts: u64, seq: u32, members: Vec<(u32, SocketAddr, String)>, tag: u64, now: Instant, unix: u64) {
+        if self.admit(addr, data, relay, None, ts, seq, tag, now, unix).is_none() {
+            return;
+        }
+        for (id, a, name) in members {
+            if id == self.me || self.peers.iter().any(|p| (p.relay == id && id != 0) || p.addrs.contains(&a)) {
+                continue;
+            }
+            println!("~ relay {name} ({a}) listed by another");
+            self.peers.push(PeerRelay { host: a.to_string(), addrs: vec![a], name, relay: 0, last_seq: 0, heard: None, found: Some(now) });
+        }
+    }
+
+    /// The relays we know and have heard from lately, signed, for every other.
+    fn directory_packets(&mut self, unix: u64, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        let Some(secret) = self.cfg.secret.clone() else { return Vec::new() };
+        let members: Vec<(u32, SocketAddr, String)> = self.peers.iter().filter(|p| p.heard.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(30))).filter_map(|p| Some((p.relay, *p.addrs.first()?, p.name.clone()))).collect();
+        let mut out = Vec::new();
+        for c in members.chunks(proto::DIRECTORY_PER_PACKET) {
+            self.fed_seq = self.fed_seq.wrapping_add(1);
+            let mut d = Msg::Directory { relay: self.me, ts: unix, seq: self.fed_seq, members: c.to_vec(), tag: 0 }.encode();
+            let n = d.len() - 8;
+            let tag = proto::fed_tag(&secret, &d[..n]);
+            d[n..].copy_from_slice(&tag.to_le_bytes());
+            for p in &self.peers {
+                if let Some(a) = p.addrs.first() {
+                    out.push((*a, d.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// Our own players for every other relay, signed, ten to a datagram (an
@@ -247,6 +313,10 @@ impl Relay {
                 self.federate(addr, data, relay, relay_name, ts, seq, players, tag, now, unix);
                 None
             }
+            Msg::Directory { relay, ts, seq, members, tag } => {
+                self.directory(addr, data, relay, ts, seq, members, tag, now, unix);
+                None
+            }
             Msg::Welcome { .. } | Msg::Peers { .. } => None,
         }
     }
@@ -266,9 +336,10 @@ impl Relay {
                     let d = dist(&s);
                     (d < self.cfg.range_m).then_some((d, p.id, p.name.as_str(), s))
                 })
-                .chain(self.remote.iter().filter_map(|((i, id), r)| {
+                .chain(self.remote.iter().filter_map(|((rel, id), r)| {
                     let d = dist(&r.state);
-                    (d < self.cfg.range_m).then_some((d, ((*i as u32 + 1) << 24) | (id & (LOCAL_IDS - 1)), r.name.as_str(), r.state))
+                    let i = self.peers.iter().position(|p| p.relay == *rel).unwrap_or(254) as u32;
+                    (d < self.cfg.range_m).then_some((d, ((i + 1) << 24) | (id & (LOCAL_IDS - 1)), r.name.as_str(), r.state))
                 }))
                 .collect();
             near.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -288,7 +359,7 @@ impl Relay {
     /// What the status page shows: the players, as JSON.
     fn status_json(&self, started: Instant, packets: u64) -> String {
         let mut list: Vec<(&str, &str, PlayerState)> = self.players.values().filter_map(|p| Some((self.cfg.name.as_str(), p.name.as_str(), p.state?))).collect();
-        list.extend(self.remote.iter().map(|((i, _), r)| (self.peers[*i].name.as_str(), r.name.as_str(), r.state)));
+        list.extend(self.remote.iter().map(|((rel, _), r)| (self.peers.iter().find(|p| p.relay == *rel).map_or("?", |p| p.name.as_str()), r.name.as_str(), r.state)));
         list.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         let here = self.players.values().filter(|p| p.state.is_some()).count();
         let players: Vec<String> = list
@@ -311,10 +382,10 @@ impl Relay {
         // The network: this relay first, then the others, each up or not and
         // how many fly on it (a relay passes on all its players, near or not).
         let mut network = vec![format!("{{\"name\":{},\"up\":true,\"self\":true,\"flying\":{}}}", json_str(&self.cfg.name), here)];
-        network.extend(self.peers.iter().enumerate().map(|(i, p)| {
+        network.extend(self.peers.iter().map(|p| {
             let up = p.heard.is_some_and(|t| t.elapsed() < Duration::from_secs(5));
             let name = if p.name.is_empty() { p.host.as_str() } else { p.name.as_str() };
-            let n = self.remote.keys().filter(|(j, _)| *j == i).count();
+            let n = self.remote.keys().filter(|(rel, _)| *rel == p.relay).count();
             format!("{{\"name\":{},\"up\":{},\"self\":false,\"flying\":{}}}", json_str(name), up, if up { n } else { 0 })
         }));
         format!(
@@ -342,6 +413,14 @@ impl Relay {
         }
         self.pending.retain(|_, (_, t)| now.saturating_duration_since(*t) < IDLE);
         self.remote.retain(|_, r| now.saturating_duration_since(r.last) < REMOTE_IDLE);
+        // Relays that found their own way in and have gone quiet.
+        self.peers.retain(|p| {
+            let keep = p.found.is_none_or(|f| now.saturating_duration_since(p.heard.unwrap_or(f)) < PEER_IDLE);
+            if !keep {
+                println!("~ relay {} ({}) gone", if p.name.is_empty() { &p.host } else { &p.name }, p.host);
+            }
+            keep
+        });
     }
 }
 
@@ -404,10 +483,10 @@ fn unix_now() -> u64 {
 fn main() -> std::io::Result<()> {
     let port: u16 = env("FFMP_PORT", proto::DEFAULT_PORT);
     let name = proto::clean_name(&env("FFMP_NAME", "relay".to_string()));
-    let peers: Vec<String> = env("FFMP_PEERS", String::new()).split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| if s.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { s.to_string() } else { format!("{s}:{}", proto::DEFAULT_PORT) }).collect();
+    let peers: Vec<String> = format!("{},{}", env("FFMP_HUB", String::new()), env("FFMP_PEERS", String::new())).split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| if s.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { s.to_string() } else { format!("{s}:{}", proto::DEFAULT_PORT) }).collect();
     let mut secret = std::env::var("FFMP_PEER_SECRET").ok().filter(|s| !s.is_empty());
-    if !peers.is_empty() && secret.as_ref().is_none_or(|s| s.len() < 16) {
-        eprintln!("FFMP_PEERS needs FFMP_PEER_SECRET (16 characters at least, the same on every relay): no federation");
+    if secret.as_ref().is_some_and(|s| s.len() < 16) || (!peers.is_empty() && secret.is_none()) {
+        eprintln!("FFMP_HUB and FFMP_PEERS need FFMP_PEER_SECRET (16 characters at least, the same on every relay): no federation");
         secret = None;
     }
     let cfg = Config { max_players: env("FFMP_MAX_PLAYERS", 64usize).clamp(1, 10_000), range_m: env("FFMP_RANGE_KM", 150.0f64).clamp(1.0, 20_000.0) * 1000.0, name, secret };
@@ -417,9 +496,13 @@ fn main() -> std::io::Result<()> {
     let federated = cfg.secret.is_some();
     let mut relay = Relay::new(cfg);
     if federated {
-        relay.peers = peers.iter().map(|h| PeerRelay { host: h.clone(), addrs: Vec::new(), name: String::new(), relay: 0, last_seq: 0, heard: None }).collect();
+        relay.peers = peers.iter().map(|h| PeerRelay { host: h.clone(), addrs: Vec::new(), name: String::new(), relay: 0, last_seq: 0, heard: None, found: None }).collect();
         relay.resolve_peers();
-        println!("federated with {} relay(s): {}", relay.peers.len(), peers.join(", "));
+        if peers.is_empty() {
+            println!("federation on: other relays with the secret may join (FFMP_HUB pointing here)");
+        } else {
+            println!("federated with {}", peers.join(", "));
+        }
     }
     let started = Instant::now();
     let mut packets: u64 = 0;
@@ -432,7 +515,7 @@ fn main() -> std::io::Result<()> {
         std::thread::spawn(move || serve_http(listener, st));
     }
     let mut buf = [0u8; 2048];
-    let (mut last_send, mut last_expire, mut last_resolve) = (Instant::now(), Instant::now(), Instant::now());
+    let (mut last_send, mut last_expire, mut last_resolve, mut last_dir) = (Instant::now(), Instant::now(), Instant::now(), Instant::now());
     loop {
         match sock.recv_from(&mut buf) {
             Ok((n, addr)) => {
@@ -451,6 +534,12 @@ fn main() -> std::io::Result<()> {
                 let _ = sock.send_to(&p, addr);
             }
             for (addr, p) in relay.fed_packets(unix_now()) {
+                let _ = sock.send_to(&p, addr);
+            }
+        }
+        if federated && now.duration_since(last_dir) >= DIRECTORY_EVERY {
+            last_dir = now;
+            for (addr, p) in relay.directory_packets(unix_now(), now) {
                 let _ = sock.send_to(&p, addr);
             }
         }
@@ -483,7 +572,7 @@ mod tests {
     /// Relay `name` at 10.0.0.<ip>, federated with the relays at the other ips.
     fn fed_relay(name: &str, peers: &[u8]) -> Relay {
         let mut r = Relay::new(Config { max_players: 10, range_m: 150_000.0, name: name.into(), secret: Some(SECRET.into()) });
-        r.peers = peers.iter().map(|ip| PeerRelay { host: format!("10.0.0.{ip}:7480"), addrs: vec![SocketAddr::from(([10, 0, 0, *ip], 7480))], name: String::new(), relay: 0, last_seq: 0, heard: None }).collect();
+        r.peers = peers.iter().map(|ip| PeerRelay { host: format!("10.0.0.{ip}:7480"), addrs: vec![SocketAddr::from(([10, 0, 0, *ip], 7480))], name: String::new(), relay: 0, last_seq: 0, heard: None, found: None }).collect();
         r
     }
     fn addr(n: u16) -> SocketAddr {
@@ -575,16 +664,63 @@ mod tests {
     }
 
     #[test]
-    fn forged_replayed_or_stray_relay_datagrams_are_dropped() {
+    fn relays_join_through_the_hub_and_find_each_other() {
+        let now = Instant::now();
+        let from = |ip: u8| SocketAddr::from(([10, 0, 0, ip], 7480));
+        // The hub (.1) lists nobody; B (.2) and C (.3) only know the hub.
+        let (mut hub, mut b, mut c) = (fed_relay("Hub", &[]), fed_relay("B", &[1]), fed_relay("C", &[1]));
+        join(&mut b, addr(2), "Roland", 0.0, now);
+        join(&mut c, addr(3), "Marc", 2_000.0, now);
+        // B and C say they are up to the hub: it takes them in.
+        for (_, d) in b.fed_packets(T) {
+            hub.receive(from(2), &d, now, T);
+        }
+        for (_, d) in c.fed_packets(T) {
+            hub.receive(from(3), &d, now, T);
+        }
+        assert_eq!(hub.peers.len(), 2);
+        // The hub tells each of them about the other.
+        for (to, d) in hub.directory_packets(T, now) {
+            if to == from(2) {
+                b.receive(from(1), &d, now, T);
+            } else if to == from(3) {
+                c.receive(from(1), &d, now, T);
+            }
+        }
+        assert!(b.peers.iter().any(|p| p.addrs.contains(&from(3))), "B learnt of C");
+        assert!(c.peers.iter().any(|p| p.addrs.contains(&from(2))), "C learnt of B");
+        // Now C's players reach B directly.
+        for (to, d) in c.fed_packets(T) {
+            if to == from(2) {
+                b.receive(from(3), &d, now, T);
+            }
+        }
+        assert_eq!(peers_of(&b.broadcast(), addr(2)), vec!["Marc"]);
+        // Without the secret, nobody joins.
+        let mut stranger = Relay::new(Config { max_players: 3, range_m: 150_000.0, name: "X".into(), secret: Some("not the network's secret".into()) });
+        stranger.peers = vec![PeerRelay { host: "hub".into(), addrs: vec![from(1)], name: String::new(), relay: 0, last_seq: 0, heard: None, found: None }];
+        for (_, d) in stranger.fed_packets(T) {
+            hub.receive(from(9), &d, now, T);
+        }
+        assert_eq!(hub.peers.len(), 2, "no stranger");
+        // A relay that came in by itself and went quiet drops out; a configured one stays.
+        b.expire(now + Duration::from_secs(61));
+        assert!(b.peers.iter().all(|p| p.found.is_none()) && b.peers.len() == 1);
+    }
+
+    #[test]
+    fn forged_replayed_or_stale_relay_datagrams_are_dropped() {
         let now = Instant::now();
         let mut a = fed_relay("A", &[2]);
         join(&mut a, addr(1), "Dany", 0.0, now);
         let d = a.fed_packets(T).remove(0).1;
         let from = |ip: u8| SocketAddr::from(([10, 0, 0, ip], 7480));
-        // From an address that is not one of B's relays.
+        // From an address that is not one of B's relays, but signed: one of
+        // the network all the same, it joins (that is how relays come in).
         let mut b = fed_relay("B", &[1]);
         b.receive(from(9), &d, now, T);
-        assert!(b.remote.is_empty(), "stray");
+        assert_eq!(b.remote.len(), 1, "a signed newcomer joins");
+        let mut b = fed_relay("B", &[1]);
         // Signed with another secret.
         let mut wrong = fed_relay("B", &[1]);
         wrong.cfg.secret = Some("another secret, same length".into());

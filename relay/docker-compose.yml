@@ -18,10 +18,13 @@ services:
       FFMP_RANGE_KM: "150"
       # This relay's name, as the network and the status page show it.
       FFMP_NAME: "my relay"
-      # Federation: the other relays (host[:port], comma-separated) and the
-      # network's shared secret (16+ characters, the same on every relay).
-      FFMP_PEERS: ""
+      # Federation: the network's shared secret (16+ characters, the same on
+      # every relay), and its main relay: this one makes itself known there and
+      # finds all the others. (On the main relay itself, leave FFMP_HUB empty.)
       FFMP_PEER_SECRET: ""
+      FFMP_HUB: ""
+      # Other relays to reach directly, if any (host[:port], comma-separated).
+      FFMP_PEERS: ""
     ports:
       - "7480:7480/udp"
       - "127.0.0.1:7481:7481/tcp"
