@@ -312,7 +312,7 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("F / V", "flaps down / up a notch"),
         ("L", "landing gear down / up"),
         ("/", "speedbrake (airliners)"),
-        ("3", "slide the canopy open / shut (Robin)"),
+        ("6", "slide the canopy open / shut (Robin)"),
         ("Z", "thrust reversers, on the ground (hold)"),
         ("K", "set the heading indicator to the compass"),
         ("Num 7 / Num 1", "trim nose down / up"),

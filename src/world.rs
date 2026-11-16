@@ -6,6 +6,7 @@ use crate::geo::{self, TileId};
 use crate::render::{BuildGpu, DetailDraw, Inst, NearDraw, Renderer, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
 use crate::roads::RoadNet;
 use crate::trees::{lod_span, tree_jit, NearCell, TreeDim, Under, CARDS, CARD_RANGE, IMP_DIST, LODS, LOD_DIST, LOD_JITTER, TREE_SPECIES, VARIANTS};
+use crate::weapons::{Target, TargetKey};
 use crate::sources::{Job, JobResult, Loader, DATA_ZOOM, GRID, GV};
 use glam::{DMat4, DVec3, DVec4, Vec3};
 use std::collections::{HashMap, VecDeque};
@@ -1101,6 +1102,26 @@ impl World {
             });
             f.traffic.step(&f.geo, dt, wind_from, wind_kt, activity, pl);
         }
+    }
+
+    /// The airborne aircraft at nearby airports, as missile targets.
+    pub fn air_targets(&self, near: DVec3) -> Vec<Target> {
+        let mut out = Vec::new();
+        for s in self.fields.values() {
+            let FSlot::Ready(f) = s else { continue };
+            if (f.geo.center - near).length() > 40_000.0 {
+                continue;
+            }
+            f.traffic.targets(&f.geo, &mut out);
+        }
+        out
+    }
+
+    /// A missile hit an airport mover: take it out of the traffic.
+    pub fn down_air_target(&mut self, key: &TargetKey) -> bool {
+        let TargetKey::Airport { apt, mover } = key else { return false };
+        let Some(FSlot::Ready(f)) = self.fields.get_mut(apt) else { return false };
+        f.traffic.down(*mover)
     }
 
     /// Pavement to draw: each airfield with its centre relative to the camera.
