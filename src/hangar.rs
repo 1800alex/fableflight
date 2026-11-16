@@ -30,7 +30,7 @@
 //! when the player asks for them.
 
 use crate::aircraft::{self, Engine, Origin, Spec};
-use crate::jsbsim;
+use crate::{jsbsim, yasim};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,6 +72,8 @@ pub struct Summary {
     pub body: &'static str,
     /// drawn with its own 3D model (else as `body`)
     pub own_model: bool,
+    /// the flight model fitted to ours: "JSBSim" or "YASim"
+    pub fdm: &'static str,
 }
 
 /// Where the license shown for an aircraft comes from.
@@ -558,16 +560,26 @@ fn read_entry(agent: &ureq::Agent, folder: &str) -> Result<Info, String> {
     let fetch = |p: &str| svn(agent, folder, &rev, p);
     let set = read_set(&fetch, &id, folder)?;
     let author = if cat_author.is_empty() { set.author.clone() } else { cat_author };
-    if set.fdm != "jsb" {
-        let what = match set.fdm.as_str() {
-            "yasim" => "it flies on YASim, not JSBSim: only JSBSim aircraft can be flown here yet".to_string(),
-            "" => "its files name no flight model".to_string(),
-            f => format!("it flies on FlightGear's {f} flight model, not JSBSim"),
-        };
-        return Ok(Info { name: cat_name, author, description: set.description, license: REPO_LICENSE.into(), license_url: REPO_LICENSE_URL.into(), license_from: LicenseFrom::Repository, notes: String::new(), fit: Err(what) });
+    let main = format!("{}.xml", set.aero);
+    match set.fdm.as_str() {
+        "jsb" => {}
+        "yasim" => {
+            // One file holds it all.
+            let xml = fetch(&main).map(|d| xml_text(&d)).ok_or_else(|| format!("its YASim file {main} can't be read"))?;
+            let (j, parts) = read_yasim(&xml, &set, folder);
+            let mut i = info(&xml, j, &parts, folder, &cat_name, !set.model.is_empty());
+            i.author = author;
+            if i.description.is_empty() {
+                i.description = set.description;
+            }
+            return Ok(i);
+        }
+        f => {
+            let what = if f.is_empty() { "its files name no flight model".to_string() } else { format!("it flies on FlightGear's {f} flight model: only JSBSim and YASim aircraft can be flown here") };
+            return Ok(Info { name: cat_name, author, description: set.description, license: REPO_LICENSE.into(), license_url: REPO_LICENSE_URL.into(), license_from: LicenseFrom::Repository, notes: String::new(), fit: Err(what) });
+        }
     }
     // The JSBSim file and the files it keeps sections in, then its engines.
-    let main = format!("{}.xml", set.aero);
     let xml = fetch(&main).map(|d| xml_text(&d)).ok_or_else(|| format!("its JSBSim file {main} can't be read"))?;
     for f in file_refs(&xml) {
         for p in [f.clone(), format!("Systems/{f}")] {
@@ -577,7 +589,7 @@ fn read_entry(agent: &ureq::Agent, folder: &str) -> Result<Info, String> {
         }
     }
     let dir = scratch(folder, &rev);
-    let j = jsbsim::Aircraft::parse(&xml, &dir);
+    let j = jsbsim::Aircraft::parse(&xml, &dir).map_err(|e| format!("our reader can't read its JSBSim file: {e}"));
     let mut parts = Vec::new();
     if let Ok(j) = &j {
         for (eng, th) in &j.engines {
@@ -591,6 +603,37 @@ fn read_entry(agent: &ureq::Agent, folder: &str) -> Result<Info, String> {
         i.description = set.description;
     }
     Ok(i)
+}
+
+/// A YASim aircraft's file, read as what the fit takes (see yasim.rs), with its engines.
+fn read_yasim(xml: &str, set: &SetInfo, folder: &str) -> (Result<jsbsim::Aircraft, String>, Vec<(Option<Part>, Option<Part>)>) {
+    let y = match yasim::Airplane::parse(xml) {
+        Ok(y) => y,
+        Err(e) => return (Err(format!("our reader can't read its YASim file: {e}")), Vec::new()),
+    };
+    if y.engines.contains(&yasim::Engine::Rotor) {
+        return (Err("it flies on rotors (a helicopter or an autogyro): rotors can't be flown yet".into()), Vec::new());
+    }
+    let part = |kind: &str| Part { kind: kind.to_string(), ..Default::default() };
+    let parts = y
+        .engines
+        .iter()
+        .map(|e| match *e {
+            yasim::Engine::Prop { hp, turbine, .. } => (Some(Part { hp, ..part(if turbine { "turboprop_engine" } else { "piston_engine" }) }), Some(part("propeller"))),
+            yasim::Engine::Jet { thrust, afterburner } => (Some(Part { mil: thrust, max: afterburner.max(thrust), augmented: afterburner > thrust, ..part("turbine_engine") }), Some(part("nozzle"))),
+            yasim::Engine::Rotor => (Some(part("turbine_engine")), Some(part("rotor"))),
+        })
+        .collect();
+    let j = y.to_jsbsim(folder).map(|mut j| {
+        j.author = squash(&set.author);
+        j.description = squash(&set.description);
+        j
+    });
+    (j, parts)
+}
+
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The files a JSBSim file keeps sections in (`file="..."`), with .xml.
@@ -620,7 +663,7 @@ fn info(xml: &str, j: Result<jsbsim::Aircraft, String>, parts: &[(Option<Part>, 
             });
             Info { name: if name.is_empty() { display_name(&j, folder) } else { name.to_string() }, author: j.author.clone(), description: j.description.clone(), license, license_url, license_from, notes: j.notes.clone(), fit }
         }
-        Err(e) => Info { name: if name.is_empty() { folder.to_string() } else { name.to_string() }, author: String::new(), description: String::new(), license, license_url, license_from, notes: String::new(), fit: Err(format!("our reader can't read its JSBSim file: {e}")) },
+        Err(e) => Info { name: if name.is_empty() { folder.to_string() } else { name.to_string() }, author: String::new(), description: String::new(), license, license_url, license_from, notes: String::new(), fit: Err(e) },
     }
 }
 
@@ -905,9 +948,11 @@ fn fit(j: &jsbsim::Aircraft, parts: &[(Option<Part>, Option<Part>)], folder: &st
     match &mut s.engine {
         Engine::Piston(pe) => {
             pe.power = power;
-            pe.ct0 *= p;
+            // The propeller takes p times the power at r times the speed, so
+            // it gives p / r times the thrust (the same efficiency, not r times it).
+            pe.ct0 *= p / r;
             pe.cp0 *= p;
-            pe.static_thrust *= p;
+            pe.static_thrust *= p / r;
             pe.fric0 *= p;
             pe.fric1 *= p;
             pe.prop_i *= p.sqrt();
@@ -962,9 +1007,9 @@ fn fit(j: &jsbsim::Aircraft, parts: &[(Option<Part>, Option<Part>)], folder: &st
     s.keys = Box::leak(vec![leak(key(folder))].into_boxed_slice());
     let what = if j.description.is_empty() || j.description.len() > 90 { String::new() } else { format!("{}. ", j.description.trim_end_matches('.')) };
     let drawn = if model.is_some() { "its own FlightGear 3D model".to_string() } else { format!("drawn as the {}", base.name) };
-    s.blurb = leak(format!("{what}{kind}, {:.1} t, {power_s}. JSBSim flight model fitted to ours; {drawn}.", mass_half / 1000.0));
+    s.blurb = leak(format!("{what}{kind}, {:.1} t, {power_s}. {} flight model fitted to ours; {drawn}.", mass_half / 1000.0, j.source));
     s.origin = Some(Box::leak(Box::new(Origin { license, author: j.author.clone(), body: base.name })));
-    let summary = Summary { kind, mass_kg: mass_half, span_m: span, power: power_s, stall_kt: vs / KT, vmax_kt: vmax.min(s.vne) / KT, body: base.name, own_model: model.is_some() };
+    let summary = Summary { kind, mass_kg: mass_half, span_m: span, power: power_s, stall_kt: vs / KT, vmax_kt: vmax.min(s.vne) / KT, body: base.name, own_model: model.is_some(), fdm: j.source };
     Ok((s, summary))
 }
 
@@ -1216,12 +1261,21 @@ pub fn load(dir: &Path) -> Result<&'static Spec, String> {
     let name = src["name"].as_str().unwrap_or("").to_string();
     let get = |p: &str| std::fs::read(dir.join(p)).ok();
     let set = read_set(&get, id, &folder)?;
-    if set.fdm != "jsb" {
-        return Err(format!("it flies on {}, not JSBSim", if set.fdm.is_empty() { "an unknown flight model" } else { &set.fdm }));
-    }
-    let j = jsbsim::Aircraft::load(&dir.join(format!("{}.xml", set.aero)))?;
-    let part = |n: &str| -> Option<Part> { [dir.join("Engines").join(format!("{n}.xml")), dir.join("engine").join(format!("{n}.xml"))].iter().find_map(|p| std::fs::read(p).ok()).and_then(|d| read_part(&xml_text(&d)).ok()) };
-    let parts: Vec<_> = j.engines.iter().map(|(e, t)| (part(e), t.as_deref().and_then(part))).collect();
+    let main = dir.join(format!("{}.xml", set.aero));
+    let (j, parts) = match set.fdm.as_str() {
+        "jsb" => {
+            let j = jsbsim::Aircraft::load(&main)?;
+            let part = |n: &str| -> Option<Part> { [dir.join("Engines").join(format!("{n}.xml")), dir.join("engine").join(format!("{n}.xml"))].iter().find_map(|p| std::fs::read(p).ok()).and_then(|d| read_part(&xml_text(&d)).ok()) };
+            let parts: Vec<_> = j.engines.iter().map(|(e, t)| (part(e), t.as_deref().and_then(part))).collect();
+            (j, parts)
+        }
+        "yasim" => {
+            let xml = std::fs::read(&main).map(|d| xml_text(&d)).map_err(|e| format!("{}: {e}", main.display()))?;
+            let (j, parts) = read_yasim(&xml, &set, &folder);
+            (j?, parts)
+        }
+        f => return Err(format!("it flies on {}, not JSBSim or YASim", if f.is_empty() { "an unknown flight model" } else { f })),
+    };
     let model = if set.model.is_empty() { None } else { Some(dir.join(&set.model)) }.filter(|p| p.exists());
     let fg = model.map(|m| FgFiles { dir: dir.to_path_buf(), model: m, still: still_of(dir), eye: set.eye });
     if fg.is_none() {
@@ -1313,8 +1367,8 @@ pub fn install_report(folders: &[String]) -> i32 {
     bad
 }
 
-/// `--fg-survey [TEXT]`: reads the catalogue entries whose name says JSBSim
-/// (or contains TEXT), one at a time, and prints what can be flown.
+/// `--fg-survey [TEXT]`: reads the catalogue entries (or those whose name
+/// contains TEXT), one at a time, and prints what can be flown.
 pub fn survey(filter: Option<&str>) -> i32 {
     let agent = agent();
     let entries = match list(&agent) {
@@ -1328,7 +1382,7 @@ pub fn survey(filter: Option<&str>) -> i32 {
     for e in &entries {
         let pick = match filter {
             Some(f) => e.name.to_lowercase().contains(&f.to_lowercase()) || e.folder.to_lowercase().contains(&f.to_lowercase()),
-            None => named_fdm(e) != Some(false),
+            None => true,
         };
         if !pick {
             continue;
@@ -1343,17 +1397,17 @@ pub fn survey(filter: Option<&str>) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
     let c = CAT.lock();
-    let (mut fly, mut jsb_no, mut other) = (0, 0, 0);
+    let (mut fly, mut no, mut other) = (0, 0, 0);
     for e in &c.entries {
         match &e.state {
             State::Ready(i) => match &i.fit {
                 Ok(s) => {
                     fly += 1;
-                    println!("OK  {:<16} {:<50} {:<22} {:>6.0} kg  {:>6.1} MB", e.folder, i.name.chars().take(50).collect::<String>(), s.kind, s.mass_kg, e.size as f64 / 1e6);
+                    println!("OK  {:<16} {:<50} {:<6} {:<22} {:>6.0} kg  stall {:>3.0} kt  top {:>4.0} kt  {:>6.1} MB", e.folder, i.name.chars().take(50).collect::<String>(), s.fdm, s.kind, s.mass_kg, s.stall_kt, s.vmax_kt, e.size as f64 / 1e6);
                 }
-                Err(w) if w.contains("YASim") || w.contains("flight model") => other += 1,
+                Err(w) if w.contains("flight model:") || w.contains("name no flight model") => other += 1,
                 Err(w) => {
-                    jsb_no += 1;
+                    no += 1;
                     println!("NO  {:<16} {w}", e.folder);
                 }
             },
@@ -1361,7 +1415,7 @@ pub fn survey(filter: Option<&str>) -> i32 {
             State::Pending => {}
         }
     }
-    println!("{} aircraft ({} read): {fly} can be flown, {jsb_no} JSBSim ones don't fit, {other} on other flight models", c.entries.len(), c.entries.iter().filter(|e| !matches!(e.state, State::Pending)).count());
+    println!("{} aircraft ({} read): {fly} can be flown, {no} can't, {other} on other flight models", c.entries.len(), c.entries.iter().filter(|e| !matches!(e.state, State::Pending)).count());
     0
 }
 
@@ -1372,8 +1426,17 @@ pub fn fit_report(files: &[String]) -> i32 {
         let path = Path::new(f);
         let folder = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
         let dir = path.parent().unwrap_or(Path::new("."));
-        let xml = std::fs::read_to_string(path).unwrap_or_default();
-        let j = jsbsim::Aircraft::load(path);
+        let xml = std::fs::read(path).map(|d| xml_text(&d)).unwrap_or_default();
+        if xml.contains("<airplane") {
+            let (j, parts) = read_yasim(&xml, &SetInfo::default(), folder);
+            let i = info(&xml, j, &parts, folder, "", false);
+            match &i.fit {
+                Ok(s) => println!("{folder:<18} OK   {:<28} {:<22} {:>7.0} kg {:>5.1} m  {:<34} stall {:>3.0} kt  top {:>4.0} kt  as {}  | YASim", i.name, s.kind, s.mass_kg, s.span_m, s.power, s.stall_kt, s.vmax_kt, s.body),
+                Err(e) => println!("{folder:<18} NO   {e}  | YASim"),
+            }
+            continue;
+        }
+        let j = jsbsim::Aircraft::load(path).map_err(|e| format!("our reader can't read its JSBSim file: {e}"));
         let part = |name: &str| -> Option<Part> {
             [dir.join("Engines"), dir.join("engine"), dir.join("../../engine")].iter().map(|d| d.join(format!("{name}.xml"))).find_map(|p| std::fs::read_to_string(p).ok()).and_then(|s| read_part(&s).ok())
         };

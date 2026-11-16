@@ -73,7 +73,7 @@ impl crate::Game {
             ui.painter().rect_filled(pic, 0.0, menu::PANEL);
             egui::Image::new(&tex).paint_at(ui, pic);
             if spec.origin.is_some() {
-                badge(ui.painter(), pic.left_top() + egui::vec2(12.0, 8.0), "JSBSim");
+                badge(ui.painter(), pic.left_top() + egui::vec2(12.0, 8.0), if spec.ext.is_some() { "FlightGear" } else { "JSBSim" });
             }
             if resp.hovered() {
                 ui.painter().rect_filled(pic, 0.0, Color32::from_black_alpha(90));
@@ -225,7 +225,7 @@ impl crate::Game {
                             p.line_segment([c - egui::vec2(r, 0.0), c + egui::vec2(r, 0.0)], Stroke::new(3.0, col));
                             p.line_segment([c - egui::vec2(0.0, r), c + egui::vec2(0.0, r)], Stroke::new(3.0, col));
                             p.text(rect.center() + egui::vec2(0.0, 14.0), Align2::CENTER_CENTER, t!("Download more aircraft", "Télécharger d'autres avions"), egui::FontId::proportional(15.0), if lit { Color32::WHITE } else { TEXT });
-                            p.text(rect.center() + egui::vec2(0.0, 36.0), Align2::CENTER_CENTER, t!("from the JSBSim collection", "de la collection JSBSim"), egui::FontId::proportional(12.0), DIM);
+                            p.text(rect.center() + egui::vec2(0.0, 36.0), Align2::CENTER_CENTER, t!("from FlightGear's collection", "de la collection de FlightGear"), egui::FontId::proportional(12.0), DIM);
                             if resp.clicked() {
                                 out = Some(None);
                             }
@@ -278,7 +278,7 @@ impl crate::Game {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(RichText::new(t!("Aircraft from", "Avions de")).size(12.0).color(DIM));
             link(ui, t!("FlightGear's collection (FGAddon)", "la collection de FlightGear (FGAddon)"), &hangar::repo_url());
-            ui.label(RichText::new(t!("— each with its own 3D model. The ones with a JSBSim flight model can be flown: it is fitted to ours. Each keeps the license its files state.", "— chacun avec son propre modèle 3D. Ceux qui ont un modèle de vol JSBSim peuvent voler : il est adapté au nôtre. Chacun garde la licence indiquée dans ses fichiers.")).size(12.0).color(DIM));
+            ui.label(RichText::new(t!("— each with its own 3D model. Its flight model (JSBSim or YASim) is fitted to ours. Each keeps the license its files state. They are made by FlightGear's community: some are not of high quality, and some don't fly realistically here.", "— chacun avec son propre modèle 3D. Son modèle de vol (JSBSim ou YASim) est adapté au nôtre. Chacun garde la licence indiquée dans ses fichiers. Ils sont faits par la communauté de FlightGear : certains ne sont pas de grande qualité, et certains ne volent pas de façon réaliste ici.")).size(12.0).color(DIM));
         });
         ui.add_space(8.0);
         let (status, entries) = {
@@ -326,8 +326,7 @@ impl crate::Game {
                     ui.add(egui::TextEdit::singleline(&mut self.menu.hangar_find).hint_text(t!("Search", "Rechercher")).desired_width(left_w - 120.0).margin(egui::vec2(8.0, 5.0)));
                     ui.checkbox(&mut self.menu.hangar_all, RichText::new(t!("Show all", "Tout voir")).size(12.0)).on_hover_text(t!("Also list the ones that can't be flown here (helicopters, rockets, gliders…)", "Lister aussi ceux qui ne peuvent pas voler ici (hélicoptères, fusées, planeurs…)"));
                 });
-                let n_jsb = entries.iter().filter(|e| hangar::named_fdm(e) != Some(false)).count();
-                let line = t!("{} aircraft · {} without YASim in their name · pick one to see if it flies here", "{} avions · {} sans YASim dans leur nom · choisissez-en un pour voir s'il vole ici", entries.len(), n_jsb);
+                let line = t!("{} aircraft · pick one to see if it flies here", "{} avions · choisissez-en un pour voir s'il vole ici", entries.len());
                 ui.label(RichText::new(line).size(11.5).color(DIM));
                 ui.add_space(4.0);
                 let find = self.menu.hangar_find.to_lowercase();
@@ -340,7 +339,7 @@ impl crate::Game {
                             _ => e.folder.clone(),
                         };
                         let can = flyable(e);
-                        let failed = matches!(e.state, State::Failed(_)) || matches!(&e.state, State::Ready(i) if i.fit.is_err()) || (matches!(e.state, State::Pending) && hangar::named_fdm(e) == Some(false));
+                        let failed = matches!(e.state, State::Failed(_)) || matches!(&e.state, State::Ready(i) if i.fit.is_err());
                         if failed && !self.menu.hangar_all && e.install != Install::Installed {
                             continue;
                         }
@@ -364,7 +363,7 @@ impl crate::Game {
                             },
                             State::Pending => match hangar::named_fdm(e) {
                                 Some(true) => format!("JSBSim · {}", crate::bytes(e.bytes())),
-                                Some(false) => format!("YASim · {}", t!("can't be flown here", "ne peut pas voler ici")),
+                                Some(false) => format!("YASim · {}", crate::bytes(e.bytes())),
                                 None => crate::bytes(e.bytes()),
                             },
                             State::Failed(_) => t!("couldn't be read", "illisible").to_string(),
@@ -449,12 +448,12 @@ impl crate::Game {
             let from = match i.license_from {
                 LicenseFrom::Header => t!("as stated in the aircraft file's header", "indiquée dans l'en-tête du fichier de l'avion").to_string(),
                 LicenseFrom::Comment => t!("as stated in the aircraft file's comments", "indiquée dans les commentaires du fichier de l'avion").to_string(),
-                LicenseFrom::Repository => t!("the file states no license of its own: it is covered by the JSBSim repository's license", "le fichier n'indique pas de licence propre : la licence du dépôt JSBSim s'applique").to_string(),
+                LicenseFrom::Repository => t!("the file states no license of its own: it is covered by the license of FlightGear's collection", "le fichier n'indique pas de licence propre : la licence de la collection de FlightGear s'applique").to_string(),
             };
             ui.label(RichText::new(from).size(12.0).color(DIM));
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(RichText::new(t!("JSBSim repository:", "Dépôt JSBSim :")).size(12.0).color(DIM));
+                ui.label(RichText::new(t!("FlightGear's collection:", "Collection de FlightGear :")).size(12.0).color(DIM));
                 ui.hyperlink_to(RichText::new(hangar::REPO_LICENSE).size(12.0), hangar::REPO_LICENSE_URL);
             });
             if !i.notes.is_empty() {
@@ -489,9 +488,9 @@ impl crate::Game {
                     });
                     ui.add_space(4.0);
                     let how = if s.own_model {
-                        t!("Flies with our flight model, fitted to its JSBSim lift, drag, mass and engines. Drawn with its own 3D model, on its own landing gear; instruments and sounds from the {}.", "Vole avec notre modèle de vol, ajusté à sa portance, sa traînée, sa masse et ses moteurs JSBSim. Dessiné avec son propre modèle 3D, sur son propre train ; instruments et sons du {}.", s.body)
+                        t!("Flies with our flight model, fitted to its {1} lift, drag, mass and engines. Drawn with its own 3D model, on its own landing gear; instruments and sounds from the {0}.", "Vole avec notre modèle de vol, ajusté à sa portance, sa traînée, sa masse et ses moteurs {1}. Dessiné avec son propre modèle 3D, sur son propre train ; instruments et sons du {0}.", s.body, s.fdm)
                     } else {
-                        t!("Flies with our flight model, fitted to its JSBSim lift, drag, mass and engines. Drawn as the {} (body, cockpit, gear and paint).", "Vole avec notre modèle de vol, ajusté à sa portance, sa traînée, sa masse et ses moteurs JSBSim. Dessiné comme le {} (fuselage, cockpit, train et peinture).", s.body)
+                        t!("Flies with our flight model, fitted to its {1} lift, drag, mass and engines. Drawn as the {0} (body, cockpit, gear and paint).", "Vole avec notre modèle de vol, ajusté à sa portance, sa traînée, sa masse et ses moteurs {1}. Dessiné comme le {0} (fuselage, cockpit, train et peinture).", s.body, s.fdm)
                     };
                     ui.label(RichText::new(how).size(12.0).color(DIM));
                 }

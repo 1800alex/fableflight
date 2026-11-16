@@ -111,6 +111,8 @@ impl Props {
 #[derive(Debug)]
 pub struct Aircraft {
     pub name: String,
+    /// the flight model it was read from: "JSBSim", or "YASim" for one made from a YASim file (yasim.rs)
+    pub source: &'static str,
     pub wing_area_ft2: f64,
     pub span_ft: f64,
     pub chord_ft: f64,
@@ -146,6 +148,27 @@ pub struct Aircraft {
     pub eye: Option<[f64; 3]>,
     /// the ground reactions, in file order (a 3D model's gear\[n\] is the n-th)
     pub contacts: Vec<Contact>,
+}
+
+/// A lift and drag polar for an aircraft read from another flight model
+/// (see yasim.rs), given to an `Aircraft` as its aerodynamics.
+#[derive(Clone, Debug)]
+pub struct Polar {
+    /// the clean lift curve: (angle of attack in degrees, CL), increasing in angle
+    pub lift: Vec<(f64, f64)>,
+    /// lift added by full flaps (at every angle), and their drag
+    pub flap_cl: f64,
+    pub cd_flap: f64,
+    /// parasite drag, induced drag factor (CD = cd0 + k CL²), drag of the gear down
+    pub cd0: f64,
+    pub k: f64,
+    pub cd_gear: f64,
+}
+
+impl Default for Aircraft {
+    fn default() -> Aircraft {
+        Aircraft { name: String::new(), source: "JSBSim", wing_area_ft2: 0.0, span_ft: 0.0, chord_ft: 0.0, inertia: [0.0; 3], weight_lbs: 0.0, travel: HashMap::new(), empty_lbs: 0.0, points_lbs: 0.0, fuel_lbs: 0.0, fuel_cap_lbs: 0.0, flaps_max_deg: None, engines: Vec::new(), author: String::new(), description: String::new(), license: None, notes: String::new(), functions: Vec::new(), axes: Vec::new(), cg: None, vrp: None, eye: None, contacts: Vec::new() }
+    }
 }
 
 /// A point that touches the ground (structural frame, feet; lbs/ft and lbs/ft/s).
@@ -296,7 +319,9 @@ fn parse_table(n: roxmltree::Node) -> Result<Table, String> {
             .collect()
     };
     let mut t = Table { vars, rows: Vec::new(), cols: Vec::new(), data: Vec::new(), breaks: Vec::new() };
-    for d in datas {
+    // (only a table of three variables has several; any extra after the first is left out)
+    let n_data = if nvars >= 3 { datas.len() } else { 1 };
+    for d in datas.into_iter().take(n_data) {
         let l = lines(d)?;
         if nvars <= 1 {
             // x y pairs (several to a line allowed)
@@ -362,7 +387,7 @@ impl Aircraft {
         if !root.has_tag_name("fdm_config") {
             return Err("not a JSBSim aircraft (no <fdm_config>)".into());
         }
-        let mut a = Aircraft { name: root.attribute("name").unwrap_or("?").to_string(), wing_area_ft2: 0.0, span_ft: 0.0, chord_ft: 0.0, inertia: [0.0; 3], weight_lbs: 0.0, travel: HashMap::new(), empty_lbs: 0.0, points_lbs: 0.0, fuel_lbs: 0.0, fuel_cap_lbs: 0.0, flaps_max_deg: None, engines: Vec::new(), author: String::new(), description: String::new(), license: None, notes: String::new(), functions: Vec::new(), axes: Vec::new(), cg: None, vrp: None, eye: None, contacts: Vec::new() };
+        let mut a = Aircraft { name: root.attribute("name").unwrap_or("?").to_string(), ..Default::default() };
         for sec in root.children().filter(|c| c.is_element()) {
             // (A section may live in a file of its own.)
             let other = section(dir, sec)?;
@@ -512,6 +537,24 @@ impl Aircraft {
             return Err("no <aerodynamics> axes".into());
         }
         Ok(a)
+    }
+
+    /// Gives it a polar as its aerodynamics, in place of any it had: CL is
+    /// the lift curve plus the flaps' share (`fcs/flap-pos-norm`), CD the
+    /// polar's with the flaps' and the gear's drag (`gear/gear-pos-norm`).
+    pub fn set_polar(&mut self, p: &Polar) {
+        let prop = |k: &str| Func::Prop(k.to_string(), false);
+        let curve = Table { vars: vec![("aero/alpha-deg".into(), false)], rows: p.lift.iter().map(|x| x.0).collect(), cols: Vec::new(), data: vec![p.lift.iter().map(|x| vec![x.1]).collect()], breaks: Vec::new() };
+        let cl = Func::Sum(vec![Func::Table(curve), Func::Product(vec![prop("fcs/flap-pos-norm"), Func::Value(p.flap_cl)])]);
+        let cd = Func::Sum(vec![
+            Func::Value(p.cd0),
+            Func::Product(vec![Func::Value(p.k), prop("aero/polar/cl"), prop("aero/polar/cl")]),
+            Func::Product(vec![prop("fcs/flap-pos-norm"), Func::Value(p.cd_flap)]),
+            Func::Product(vec![prop("gear/gear-pos-norm"), Func::Value(p.cd_gear)]),
+        ]);
+        let force = |c: &str| Func::Product(vec![prop("aero/qbar-psf"), prop("metrics/Sw-sqft"), prop(c)]);
+        self.functions = vec![("aero/polar/cl".into(), cl), ("aero/polar/cd".into(), cd)];
+        self.axes = vec![(Axis::Lift, vec![("aero/polar/lift".into(), force("aero/polar/cl"))]), (Axis::Drag, vec![("aero/polar/drag".into(), force("aero/polar/cd"))])];
     }
 
     // ------------------------------------------------------------ evaluating
@@ -721,7 +764,10 @@ fn eval(f: &Func, p: &mut Props) -> f64 {
 
 /// Linear interpolation in a table, held at its ends.
 fn interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
-    match xs.len() {
+    // (a table with more break points than values is read as far as both go)
+    let n = xs.len().min(ys.len());
+    let (xs, ys) = (&xs[..n], &ys[..n]);
+    match n {
         0 => 0.0,
         1 => ys[0],
         _ => {

@@ -48,6 +48,7 @@ mod trees;
 mod ocean;
 mod shore;
 mod world;
+mod yasim;
 
 #[derive(Copy, Clone, PartialEq)]
 enum Mode {
