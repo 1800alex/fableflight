@@ -774,6 +774,7 @@ struct Targets {
 }
 
 pub struct Renderer {
+    gpu_timer: Option<crate::gputime::GpuTimer>,
     ground_mats: GroundMats,
     pub device: wgpu::Device,
     /// --fps-log: seconds spent this period in the game's own update, waiting
@@ -1403,7 +1404,7 @@ impl Renderer {
         let afeat = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let ok = samples == 4 || (adapter.features().contains(afeat) && [HDR, AMB, DEPTH].iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(samples)));
         MSAA_N.store(if ok { samples } else { 4 }, std::sync::atomic::Ordering::Relaxed);
-        let required_features = if msaa() != 4 { afeat } else { wgpu::Features::empty() };
+        let required_features = if msaa() != 4 { afeat } else { wgpu::Features::empty() } | crate::gputime::GpuTimer::features(&adapter);
         log::info!("MSAA {}x", msaa());
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor { label: None, required_features, required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, max_sampled_textures_per_shader_stage: adapter.limits().max_sampled_textures_per_shader_stage.clamp(16, 32), ..Default::default() }, memory_hints: MEMORY_HINTS, ..Default::default() })
@@ -2113,6 +2114,7 @@ impl Renderer {
         Ok(Self {
             ground_mats,
             casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_rain, p_veil, p_bolt, bolt_buf, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
+            gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
             p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
@@ -2620,6 +2622,13 @@ impl Renderer {
         self.fluid.poll();
         let t = &self.targets;
         let mut enc = self.device.create_command_encoder(&Default::default());
+        let mut gt = self.gpu_timer.take();
+        let mut mark = |enc: &mut wgpu::CommandEncoder, l: &'static str| {
+            if let Some(g) = gt.as_mut() {
+                g.mark(enc, l);
+            }
+        };
+        mark(&mut enc, "start");
         match &f.fluid {
             Some(ff) => self.fluid.compute(q, &mut enc, ff),
             None => self.fluid.live = false,
@@ -2655,6 +2664,7 @@ impl Renderer {
                 }
             }
         }
+        mark(&mut enc, "compute");
         self.cshadow.draw(&mut enc, &self.bg0_pre, cs_full);
         {
             let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&self.lut_sky, true))], None));
@@ -2663,7 +2673,8 @@ impl Renderer {
             rp.draw(0..3, 0..1);
         }
         // Draws shared by the shadow cascades (c = Some) and the main view (c = None).
-        let solids = |rp: &mut wgpu::RenderPass, c: Option<usize>| {
+        // part: 1 the aircraft and objects, 2 the rest, 3 both.
+        let solids = |rp: &mut wgpu::RenderPass, c: Option<usize>, part: u8| {
             let shadow = c.is_some();
             let bit = c.map(|c| 1u8 << c).unwrap_or(0);
             // The 3D tiles zone (its radius on the ground, centre and up), where
@@ -2675,7 +2686,7 @@ impl Renderer {
             // In view, the runs nothing can cut away or dissolve go first with
             // the pipeline that has no discard (early depth testing hides the
             // facades behind them before they are shaded); the rest follow.
-            for pass in if shadow { 1..2 } else { 0..2 } {
+            for pass in if part & 2 == 0 { 0..0 } else if shadow { 1..2 } else { 0..2 } {
                 rp.set_pipeline(match (shadow, pass) {
                     (true, _) => &self.p_build_shadow,
                     (false, 0) => &self.p_build_whole,
@@ -2767,7 +2778,7 @@ impl Renderer {
                     }
                 }
             }
-            if let Some(lib) = &self.tree_lib {
+            if let Some(lib) = self.tree_lib.as_ref().filter(|_| part & 2 != 0) {
                 rp.set_vertex_buffer(0, lib.vbuf.slice(..));
                 rp.set_index_buffer(lib.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 // In view only the trees short of IMP_DIST are models (impostors follow below).
@@ -2873,7 +2884,7 @@ impl Renderer {
             if c == Some(2) {
                 return;
             }
-            if let Some(lib) = &self.inst_lib {
+            if let Some(lib) = self.inst_lib.as_ref().filter(|_| part & 2 != 0) {
                 rp.set_pipeline(if shadow { &self.p_inst_shadow } else { &self.p_inst });
                 rp.set_vertex_buffer(0, lib.vbuf.slice(..));
                 rp.set_vertex_buffer(1, self.inst_buf.slice(..));
@@ -2888,7 +2899,7 @@ impl Renderer {
                 }
             }
             let mut cur: Option<bool> = None;
-            for (i, o) in f.objs.iter().take(n_objs).enumerate() {
+            for (i, o) in f.objs.iter().take(if part & 1 == 0 { 0 } else { n_objs }).enumerate() {
                 if o.glass || if shadow { o.cast & bit == 0 } else { false } {
                     continue;
                 }
@@ -2978,12 +2989,13 @@ impl Renderer {
             }
             self.shore.compute(q, &mut enc, step, [f.g.ocean[0], f.g.ocean[1]]);
         }
+        mark(&mut enc, "prep");
         for c in 0..CASCADES {
             let mut rp = enc.begin_render_pass(&pass_desc(&[], Some(depth_att(&self.shadow[c], 1.0))));
             if f.g.csm[3] > 0.0 {
                 rp.set_bind_group(0, &self.bg0_shadow, &[]);
                 rp.set_bind_group(2, &self.bg_casc, &[c as u32 * 256]);
-                solids(&mut rp, Some(c));
+                solids(&mut rp, Some(c), 3);
                 // The 3D tiles cast their own shadows: those this cascade takes
                 // in, and that the next finer one does not wholly cover (the
                 // shaders read the finest there is, shadow_world).
@@ -3063,11 +3075,14 @@ impl Renderer {
                 }
             }
         }
+        mark(&mut enc, "shadows");
         {
             // The composite reads original samples at water/foreground boundaries.
             let att = |v, r| wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: Some(r), ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } };
             let mut rp = enc.begin_render_pass(&pass_desc(&[Some(att(&t.color_ms, &t.color)), Some(att(&t.aux_ms, &t.aux)), Some(att(&t.amb_ms, &t.amb))], Some(depth_att(&t.depth_ms, 0.0))));
             rp.set_bind_group(0, &self.bg0, &[]);
+            // the aircraft first, so early depth testing skips what the cockpit hides.
+            solids(&mut rp, None, 1);
             // The 3D tiles first: up close they hide most of what follows.
             if n_photo > 0 {
                 rp.set_pipeline(&self.p_photo);
@@ -3131,8 +3146,9 @@ impl Renderer {
                     rp.draw_indexed(0..*n, 0, 0..1);
                 }
             }
-            solids(&mut rp, None);
+            solids(&mut rp, None, 2);
         }
+        mark(&mut enc, "gbuffer");
         {
             let mut rp = enc.begin_render_pass(&pass_desc(&[], Some(depth_att(&t.depth, 0.0))));
             rp.set_pipeline(&self.p_dres);
@@ -3154,7 +3170,9 @@ impl Renderer {
             let white = wgpu::RenderPassColorAttachment { view: &t.ao, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } };
             drop(enc.begin_render_pass(&pass_desc(&[Some(white)], None)));
         }
+        mark(&mut enc, "resolve+ao");
         full(&mut enc, &t.hdr, true, &self.p_composite, &t.bg_composite);
+        mark(&mut enc, "composite");
         // Lights over the lit scene, under the clouds.
         if n_fields > 0 || n_dyn > 0 {
             let ds = wgpu::RenderPassDepthStencilAttachment { view: &t.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None };
@@ -3201,6 +3219,7 @@ impl Renderer {
                 rp.draw(0..6, 0..self.phead);
             }
         }
+        mark(&mut enc, "lights+clouds+particles");
         // The fire is drawn over the particles: sparks and leaves behind or
         // inside it are hidden by it (those in front are dimmed with them).
         if self.fluid.live {
@@ -3237,6 +3256,7 @@ impl Renderer {
                 rp.draw(0..6, 0..f.rain_drops);
             }
         }
+        mark(&mut enc, "fire");
         if f.objs.iter().take(n_objs).any(|o| o.glass) {
             // The windows bend what is seen through them, so they read the
             // scene from a copy. The depth stays read-only: it is sampled too.
@@ -3261,6 +3281,7 @@ impl Renderer {
                 rp.draw_indexed(0..m.n_idx, 0, 0..1);
             }
         }
+        mark(&mut enc, "glass");
         // The finished frame: `hdr` itself, or blended into the frames before it.
         let src = if taa {
             full(&mut enc, &t.taa[self.taa_flip], true, &self.p_taa, &t.bg_taa[self.taa_flip]);
@@ -3310,7 +3331,15 @@ impl Renderer {
         });
         let t_sub = std::time::Instant::now();
         self.stats[2] += (t_sub - t_enc).as_secs_f64();
+        mark(&mut enc, "post+ui");
+        if let Some(g) = gt.as_mut() {
+            g.resolve(&mut enc);
+        }
         self.queue.submit([enc.finish()]);
+        if let Some(g) = gt.as_mut() {
+            g.collect(&self.device);
+        }
+        self.gpu_timer = gt;
         self.fluid.after_submit();
         match frame {
             Some(frame) => self.queue.present(frame),
