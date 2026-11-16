@@ -437,7 +437,8 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     // the base instead of a square corner (a straight dark wall seen from afar).
     let foot = 1.0 - 0.1 * (1.0 - smoothstep(0.0, 700.0, hb));
     let Rt = R * 0.82 * lob * taper * foot * mix(dome, 1.0 + 1.5 * fq * sqrt(fq), mature);
-    sd = min(min(Rt - r, htop - hb), hb + 30.0);
+    // (The flat base is put on below, once, rounded into the walls.)
+    sd = min(Rt - r, htop - hb);
     if (r < R * 1.6 && hb < htop * 0.92) {
       // Five turrets around the core, each a column of its own height ending
       // in a rounded top (a capsule), slightly narrowing as it climbs.
@@ -450,7 +451,7 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
         let dk = length(vec2f(dw, cx) - vec2f(cos(th), sin(th)) * (R * (0.6 + 0.3 * hs.y)));
         let ck = max(ft - rk, 0.0);
         let sk = rk * (1.0 - 0.18 * min(hb / max(ck, 1.0), 1.0)) - length(vec2f(dk, max(hb - ck, 0.0)));
-        sd = max(sd, min(sk, hb + 30.0));
+        sd = max(sd, sk);
       }
     }
   }
@@ -459,7 +460,11 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   let fl = vec2f(-0.75, -0.66);
   let fh0 = htop * 0.56 * mix(0.6, 1.0, mature);
   let fc = vec2f(dw0 - hb * 0.1, cx);
-  if (full && hb < fh0 + 500.0 && length(fc - fl * (R * 2.05)) < R * 2.2) {
+  if (full) {
+    // (Its towers all lie inside the bound below, so outside it there are none.
+    // Taking the bound's distance there put a surface on that fat cylinder: the
+    // billows grew a straight-walled, flat-topped box of cloud round the storm.)
+    if (hb < fh0 + 500.0 && length(fc - fl * (R * 2.05)) < R * 2.2) {
     for (var k = 1; k <= 3; k++) {
       let fk = f32(k);
       let fo = fl * (R * (0.55 + 0.75 * fk)) + vec2f(sin(sp.w * 31.0 + fk * 2.1), cos(sp.w * 17.0 + fk * 1.3)) * R * 0.18;
@@ -468,10 +473,21 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
       let fh = clamp(hb / ft, 0.0, 1.2);
       let rf = length(fc - fo);
       let fd = sqrt(max(1.0 - pow(max(fh - 0.5, 0.0) / 0.5, 2.0), 0.0));
-      sd = max(sd, min(min(fr * fd - rf, ft - hb), hb + 30.0));
+      sd = max(sd, min(fr * fd - rf, ft - hb));
+    }
     }
   } else {
     sd = max(sd, min(min(R * 2.2 - length(fc - fl * (R * 2.05)), fh0 + 500.0 - hb), hb + 30.0));
+  }
+  // The flat base, 30 m under the layer's: every column (core, turrets,
+  // flanking towers) rounds off into it over its lowest few hundred metres
+  // (rounded intersection), not the square corner where a straight wall met the
+  // base, which stood as a box seen from afar. (Never above min(sd, base), so
+  // the bound holds.)
+  if (full) {
+    let rb = clamp(R * 0.25, 450.0, 1000.0);
+    let bb = hb + 30.0;
+    sd = max(rb, min(sd, bb)) - length(max(vec2f(rb - sd, rb - bb), vec2f(0.0)));
   }
   // Mature cells: anvil, overshooting top.
   if (mature > 0.0) {
@@ -510,8 +526,12 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   // its rim, its underside in rounded lumps about a km across: as a lobed drum
   // (vertical sides, flat bottom) it stood under the storm as a dark slab with
   // straight edges from every side. The bound takes the deepest lumps.
-  if (hb < 0.0) {
-    let low = mature * smoothstep(1500.0, 5000.0, R);
+  // (Only where there is one, and only round it: without the horizontal bound a
+  // cell with no wall cloud had sd = 0.8 hb under the base everywhere within
+  // its bound circle, and the billow noise grew flat sunlit scraps there that
+  // stood out as bright specks against every cloud base around a shower.)
+  let low = mature * smoothstep(1500.0, 5000.0, R);
+  if (hb < 0.0 && low > 0.0) {
     let drop = STORM_BELOW * 0.5 * low;
     let wv = vec2f(dw0 + R * 0.35, cx);
     let rw = length(wv);
@@ -525,7 +545,7 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     }
     let s2 = rw * rw / (ww * ww);
     let zb = -drop * (1.0 - s2) * (0.4 + 0.9 * lump);
-    let swc = (hb - zb) * 0.8;
+    let swc = min((hb - zb) * 0.8, ww * 1.2 - rw);
     g_wall = smoothstep(-300.0, 300.0, swc - sd);
     sd = max(sd, swc);
   }
@@ -792,7 +812,13 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // Billows: Worley fbm (cells ~2.5 km, octaves down to ~0.6 km), rounded at the
     // cell centres and creased between them (1 - (1 - w)^2), so the turrets bulge
     // out as cauliflower lobes rather than cones or smooth swells.
-    let tn = textureSampleLevel(t_noise, s_repeat, (pp + wind) / 20000.0 + vec3f(0.71, 0.33, 0.12), 0.0);
+    // Smaller towers (showers) get proportionally smaller billows, the noise
+    // scaled about the cell's centre (so it holds still as a cell grows): with
+    // billows as big as a giant's, a 4 km tower stood as a straight-walled drum.
+    let un = normalize(pp);
+    let rel = (un * 6371.0 + G.weather.xyz * 0.001 - wx.sc.xyz) * 1000.0 + un * hs;
+    let tq = (pp + wind) / 20000.0 + rel * ((1.0 / clamp(wx.sc.w / 5.0, 0.4, 1.0) - 1.0) / 20000.0);
+    let tn = textureSampleLevel(t_noise, s_repeat, tq + vec3f(0.71, 0.33, 0.12), 0.0);
     let tw = tn.g * 0.5 + tn.b * 0.3 + n.g * 0.2;
     let bl = 1.0 - (1.0 - tw) * (1.0 - tw);
     // Flat, rain-free base: the turrets only bulge out higher up.
@@ -805,10 +831,14 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // two proud of the envelope (with the weaker swell there the tower stood as
     // a straight-walled drum from afar).
     let hcf = hs / max(at * storm_top(wx.sp.x), 1.0);
-    let flank = smoothstep(0.08, 0.3, hcf) * (1.0 - smoothstep(0.6, 0.82, hcf)) * (1.0 - anvil);
+    // A young tower (a shower, towering cumulus) billows right down its walls to
+    // the flat base (not under it): with the swell faded out over the lowest
+    // 2 km it stood on a smooth, straight-walled plinth.
+    let wallq = (1.0 - smoothstep(0.4, 0.6, wx.sp.x)) * smoothstep(0.0, 400.0, hs + 30.0 - sd);
+    let flank = max(smoothstep(0.08, 0.3, hcf), wallq) * (1.0 - smoothstep(0.6, 0.82, hcf)) * (1.0 - anvil);
     // (Only outwards: deeper creases cut the turrets off into floating balls.)
     let bo = mix(bl, base * 0.6 + bl * 0.4, under) - 0.78;
-    var sdn = sd + bo * bulge * mix(1.3, 0.12, anvil) * (1.0 + 0.9 * flank * step(0.0, bo)) * select(mix(0.3, 1.0, smoothstep(0.0, 2000.0, hs)), mix(0.1, 0.25, g_wall), hs < 0.0);
+    var sdn = sd + bo * bulge * mix(1.3, 0.12, anvil) * (1.0 + 0.9 * flank * step(0.0, bo)) * select(mix(0.3, 1.0, max(smoothstep(0.0, 2000.0, hs), wallq)), mix(0.1, 0.25, g_wall), hs < 0.0);
     // Low down (the lower flanks, the base, the wall cloud) the big billows are
     // weak, and with nothing finer the outline ran straight for kilometres:
     // lumps a few hundred metres across break it up into ragged scud, fading

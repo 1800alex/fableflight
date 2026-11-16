@@ -737,6 +737,12 @@ fn depth_match(a: f32, b: f32) -> f32 {
   // Neighbourhood statistics over texels on the same surface only: across a
   // silhouette the clear texels in front would otherwise widen the clamp and let
   // the history bleed cloud onto the plane (and clear sky into the cloud).
+  // Behind cloud this texel sees as (nearly) opaque, surfaces well beyond it
+  // count as one: at the horizon the texels marching to the ground and those
+  // marching to the sky see the same cloud, but each got half a neighbourhood,
+  // a tighter clamp and less smoothing, which drew a dotted seam right across
+  // storm towers. (Not through thin cloud: what lies behind it shows.)
+  let cap = select(1e9, cd.x * 3.0, cd.x > 0.0 && cur.a < 0.15);
   var m1 = vec4f(0.0);
   var m2 = vec4f(0.0);
   var n = 0.0;
@@ -745,7 +751,7 @@ fn depth_match(a: f32, b: f32) -> f32 {
   for (var y = -1; y <= 1; y++) {
     for (var x = -1; x <= 1; x++) {
       let c = clamp(px + vec2i(x, y), vec2i(0), dims - 1);
-      if (depth_match(textureLoad(t_cdist, c, 0).g, cd.y) < 0.5) { continue; }
+      if (depth_match(min(textureLoad(t_cdist, c, 0).g, cap), min(cd.y, cap)) < 0.5) { continue; }
       let s = textureLoad(t_cur, c, 0);
       m1 += s;
       m2 += s * s;
