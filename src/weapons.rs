@@ -31,13 +31,13 @@ const LOCK_SIZE: f64 = 1_500.0;
 /// The closest a target can be and still be locked (m).
 const MIN_RANGE: f64 = 150.0;
 /// How long a missile flies before it gives up (s).
-const MISSILE_LIFE: f64 = 26.0;
+const MISSILE_LIFE: f64 = 32.0;
 /// The motor (s), its acceleration (m/s²), and the drag coefficient at speed
 /// (a = k v²).  The latter is tuned so a missile burns out around Mach 1.5 and
 /// then coasts down towards the target.
-const BOOST_TIME: f64 = 2.2;
-const BOOST_ACC: f64 = 95.0;
-const DRAG_K: f64 = 0.00011;
+const BOOST_TIME: f64 = 2.8;
+const BOOST_ACC: f64 = 170.0;
+const DRAG_K: f64 = 0.00006;
 /// The most lateral acceleration the fins can make (g), and the seeker's
 /// gimbal limit (rad).  Past the limit the lock is lost.
 const MAX_G: f64 = 32.0;
@@ -441,49 +441,7 @@ impl Missile {
             .target
             .as_ref()
             .and_then(|k| targets.iter().find(|t| &t.key == k));
-        if let Some(t) = tgt {
-            let los = t.pos - self.pos;
-            let dist = los.length();
-            let fwd = self.rot * DVec3::NEG_Z;
-            let angle = fwd.angle_between(los.normalize_or_zero());
-            if angle <= SEEKER_GIMBAL && dist > 1.0 {
-                let speed = self.vel.length();
-                let t_go = (dist / speed.max(180.0)).clamp(0.0, 12.0);
-                let aim = t.pos + t.vel * t_go;
-                let desired = (aim - self.pos).normalize_or_zero();
-                let cur = self.rot * DVec3::NEG_Z;
-                let max_rate = MAX_G * G0 / speed.max(80.0);
-                let turn = (max_rate * dt).min(cur.angle_between(desired));
-                let axis = cur.cross(desired).normalize_or_zero();
-                if axis != DVec3::ZERO && turn > 0.0 {
-                    self.rot = (DQuat::from_axis_angle(axis, turn) * self.rot).normalize();
-                }
-            } else {
-                // The target has slid out of the seeker's gimbal: the missile
-                // flies on, but it is no longer guiding. (The fuse still gets
-                // its chance this step.)
-                self.target = None;
-            }
-        }
-
-        let fwd = self.rot * DVec3::NEG_Z;
-        let speed = self.vel.length();
-        let mut acc = fwd
-            * if self.age < BOOST_TIME {
-                BOOST_ACC
-            } else {
-                0.0
-            };
-        if speed > 1.0 {
-            acc -= self.vel / speed * (DRAG_K * speed * speed);
-        }
-        acc -= self.pos.normalize() * G0;
-        self.vel += acc * dt;
-        let s = self.vel.length();
-        if s > 1_000.0 {
-            self.vel *= 1_000.0 / s;
-        }
-        self.pos += self.vel * dt;
+        self.fly(dt, tgt);
 
         if let Some(t) = tgt {
             let d = (t.pos - self.pos).length();
@@ -521,6 +479,72 @@ impl Missile {
             });
             self.alive = false;
         }
+    }
+
+    /// One step of guidance and motion, without the hit and ground checks.
+    fn fly(&mut self, dt: f64, tgt: Option<&Target>) {
+        if let Some(t) = tgt {
+            if !self.steer(dt, t) {
+                // The target has slid out of the seeker's gimbal: the missile
+                // flies on, but it is no longer guiding. (The fuse still gets
+                // its chance this step.)
+                self.target = None;
+            }
+        }
+
+        let speed = self.vel.length();
+        let mut acc = self.vel.normalize_or_zero()
+            * if self.age < BOOST_TIME {
+                BOOST_ACC
+            } else {
+                0.0
+            };
+        if speed > 1.0 {
+            acc -= self.vel / speed * (DRAG_K * speed * speed);
+        }
+        acc -= self.pos.normalize() * G0;
+        self.vel += acc * dt;
+        let s = self.vel.length();
+        if s > 1_000.0 {
+            self.vel *= 1_000.0 / s;
+        }
+        self.pos += self.vel * dt;
+        // The model follows the flight path (the missile is symmetric, so its
+        // roll does not matter).
+        if self.vel.length_squared() > 1.0 {
+            self.rot = DQuat::from_rotation_arc(DVec3::NEG_Z, self.vel.normalize());
+        }
+    }
+
+    /// Turn the flight path towards the target's lead point. The fins bend
+    /// the velocity itself, not just the model, so this works after burnout
+    /// too. Returns false when the target is outside the seeker's gimbal.
+    fn steer(&mut self, dt: f64, t: &Target) -> bool {
+        let los = t.pos - self.pos;
+        let dist = los.length();
+        let los_hat = los.normalize_or_zero();
+        let speed = self.vel.length();
+        let angle = self.vel.normalize_or_zero().angle_between(los_hat);
+        if angle > SEEKER_GIMBAL || dist <= 1.0 || speed <= 1.0 {
+            return false;
+        }
+        // Lead the target: where it will be when the missile can get there,
+        // solved a few times because the range changes too.
+        let closing = (speed + t.vel.dot(los_hat)).max(150.0);
+        let mut t_go = dist / closing;
+        for _ in 0..3 {
+            t_go = (t.pos + t.vel * t_go - self.pos).length() / closing;
+        }
+        let aim = t.pos + t.vel * t_go.clamp(0.0, 15.0);
+        let desired = (aim - self.pos).normalize_or_zero();
+        let cur = self.vel / speed;
+        let max_rate = MAX_G * G0 / speed.max(100.0);
+        let turn = (max_rate * dt).min(cur.angle_between(desired));
+        let axis = cur.cross(desired).normalize_or_zero();
+        if axis != DVec3::ZERO && turn > 0.0 {
+            self.vel = DQuat::from_axis_angle(axis, turn) * self.vel;
+        }
+        true
     }
 }
 
@@ -626,6 +650,64 @@ mod tests {
             w.try_fire(&plane, true).as_slice(),
             [Event::Refused(Refusal::NoMissiles)]
         ));
+    }
+
+    #[test]
+    fn guided_missile_closes_on_a_target() {
+        let start = geo::lla_to_pos(0.0, 0.0, 1_000.0);
+        let mut m = Missile {
+            station: 0,
+            pos: start,
+            vel: DVec3::X * 200.0,
+            rot: DQuat::from_rotation_arc(DVec3::NEG_Z, DVec3::X),
+            age: 0.0,
+            burn: 0.0,
+            target: None,
+            alive: true,
+        };
+        let mut t = Target {
+            key: TargetKey::Live("LEAD".into()),
+            pos: start + DVec3::new(2_000.0, 0.0, -1_000.0),
+            vel: DVec3::NEG_Z * 200.0,
+            size: 2,
+            label: "LEAD".into(),
+        };
+        let dt = 1.0 / 180.0;
+        let mut closest = (t.pos - m.pos).length();
+        for _ in 0..(20.0 / dt) as usize {
+            m.age += dt;
+            m.fly(dt, Some(&t));
+            t.pos += t.vel * dt;
+            closest = closest.min((t.pos - m.pos).length());
+        }
+        assert!(closest < target_radius(2) + FUSE_MARGIN, "missed by {closest:.0} m");
+    }
+
+    #[test]
+    fn guidance_turns_the_flight_path_after_burnout() {
+        let mut m = Missile {
+            station: 0,
+            pos: DVec3::ZERO,
+            vel: DVec3::X * 300.0,
+            rot: DQuat::IDENTITY,
+            age: 10.0,
+            burn: 0.0,
+            target: None,
+            alive: true,
+        };
+        let target = Target {
+            key: TargetKey::Live("TURN".into()),
+            pos: DVec3::new(1_000.0, 0.0, -1_000.0),
+            vel: DVec3::ZERO,
+            size: 2,
+            label: "TURN".into(),
+        };
+        for _ in 0..180 {
+            assert!(m.steer(1.0 / 180.0, &target));
+        }
+        // It started flying +X; a second of 32 g at 300 m/s should have bent
+        // the flight path well towards -Z.
+        assert!(m.vel.z < -100.0, "{:?}", m.vel);
     }
 
     #[test]
