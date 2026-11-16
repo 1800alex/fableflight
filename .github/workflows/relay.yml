@@ -5,7 +5,8 @@ name: Relay image
 
 on:
   push:
-    branches: [main]
+    # (multiplayer: the branch it is developed on, until it reaches main)
+    branches: [main, multiplayer]
     paths: ["relay/**", "src/mp_proto.rs", ".github/workflows/relay.yml"]
   workflow_dispatch:
 
