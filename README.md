@@ -55,6 +55,15 @@ VORs and NDBs from [OurAirports](https://ourairports.com/data/) (public domain),
 # Comparing with a JSBSim flight model
 `cargo run --release -- --jsbsim-compare path/to/c172p.xml [--aircraft 747]` reads a JSBSim aircraft file (the XML flight models JSBSim and FlightGear use; none ship with the game) and prints how its aerodynamics compare with one of ours: geometry, mass and inertia, the lift and drag curves clean and with flaps, stall, best glide, the roll rate at full aileron, and the `Spec` values that would match its curves, as a start for tuning by hand.
 
+# Multiplayer
+Turn on Multiplayer in Settings, choose a name, and you see the other players nearby and they see you. Each one carries a tag with their name, aircraft, altitude, speed and distance, and the flight panel (Tab) lists them. The game talks to a small relay server (`relay/`) over UDP port 7480. It sends your aircraft's state and the name you chose, and nothing at all while multiplayer is off.
+
+To host a relay, run the Docker image (under 1 MB, a static binary in an empty image):
+```
+cd relay && docker compose up -d      # or: docker run -d -p 7480:7480/udp ghcr.io/danux-be/fableflight-relay
+```
+Open 7480/udp in the firewall. The relay keeps nothing on disk and checks every packet. Nothing is sent to an address until it has proved it can receive at that address, so the relay cannot be used to amplify an attack. A status page on port 7481 (`/`, and `/status.json`) shows who is flying, without positions. Serve it through a reverse proxy for HTTPS. Settings are made through the environment: `FFMP_PORT`, `FFMP_HTTP_PORT` (0 turns the page off), `FFMP_MAX_PLAYERS`, `FFMP_RANGE_KM`. For testing: `--mp host[,name]`.
+
 # Live air traffic
 Real aircraft around you, as reported by ADS-B receivers (data from [adsb.lol](https://adsb.lol), ODbL), fly in the sky with tags (callsign, type, altitude, speed, distance); the flight panel (Tab) lists the nearest. It can be switched off in the pause menu's Settings.
 

@@ -18,6 +18,8 @@ mod i18n;
 mod jsbsim;
 mod live;
 mod livewx;
+mod mp;
+mod mp_proto;
 mod nav;
 mod settings;
 mod systems;
@@ -241,6 +243,8 @@ struct Args {
     photo_detail: Option<gmaps::Detail>,
     cam: Option<(f64, f64, f64)>,
     cockpit: bool,
+    /// --mp server[,name]: multiplayer on, through this relay
+    mp: Option<(String, Option<String>)>,
     /// cockpit vertical field of view (deg)
     fov: Option<f32>,
     mute: bool,
@@ -295,6 +299,7 @@ fn parse_args() -> Args {
         shots: Vec::new(),
         record: None,
         crash_at: None,
+        mp: None,
         boost_at: None,
         stage_at: None,
         engines: None,
@@ -495,6 +500,15 @@ fn parse_args() -> Args {
                     eprintln!("--lang takes en or fr");
                     std::process::exit(2)
                 }));
+            }
+            "--mp" => {
+                if let Some(s) = v.get(i + 1) {
+                    let (server, name) = match s.split_once(',') {
+                        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                        None => (s.to_string(), None),
+                    };
+                    a.mp = Some((server, name));
+                }
             }
             "--offline" => {
                 a.offline = true;
@@ -740,6 +754,13 @@ struct Game {
     /// (view-projection, position) to put labels on it
     live: live::Live,
     live_view: Option<(Mat4, DVec3)>,
+    /// multiplayer (mp.rs): switched on, the relay and our name (settings),
+    /// the connection while flying, and the other players this frame
+    mp_on: bool,
+    mp_server: String,
+    mp_name: String,
+    mp: Option<mp::Mp>,
+    mp_players: Vec<mp::Remote>,
     /// real weather (sets `wx` while `wx.live` is on)
     livewx: livewx::LiveWx,
     /// joysticks, pedals and moved keys, and what was last saved of them
@@ -882,6 +903,11 @@ impl Game {
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
             live: live::Live::new(prefs.live_traffic),
+            mp_on: prefs.multiplayer || args.mp.is_some(),
+            mp_server: args.mp.as_ref().map_or(prefs.mp_server.clone(), |m| m.0.clone()),
+            mp_name: args.mp.as_ref().and_then(|m| m.1.clone()).unwrap_or(prefs.mp_name.clone()),
+            mp: None,
+            mp_players: Vec::new(),
             live_view: None,
             livewx: livewx::LiveWx::new(),
             binds_stamp: String::new(),
@@ -1251,6 +1277,56 @@ impl Game {
         let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
         let db = airports::Db::get();
         db.near(lat.to_degrees(), lon.to_degrees(), 150_000.0).into_iter().find(|(i, _)| { let a = &db.apts[*i as usize]; a.any_paved() && a.longest() > 700.0 }).map(|x| x.0)
+    }
+
+    /// Multiplayer, once a frame: connected while flying with it switched on
+    /// (to the relay and under the name in the settings), our aircraft sent,
+    /// the others taken in.
+    fn update_mp(&mut self, in_menu: bool) {
+        let want = self.mp_on && !in_menu && !self.mp_server.trim().is_empty();
+        let stale = self.mp.as_ref().is_some_and(|m| m.server != self.mp_server.trim() || m.name != mp_proto::clean_name(&self.mp_name));
+        if !want || stale {
+            self.mp = None;
+            self.mp_players.clear();
+        }
+        if !want {
+            return;
+        }
+        let m = self.mp.get_or_insert_with(|| mp::Mp::start(&self.mp_server, &self.mp_name));
+        let p = &self.plane;
+        let q = p.rot.as_quat();
+        let byte = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let axis = |x: f64| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
+        let pw = p.sys.powered();
+        let mut flags = 0;
+        if pw {
+            flags |= mp_proto::F_NAV | mp_proto::F_STROBE | mp_proto::F_BEACON;
+        }
+        if pw && p.gear_down {
+            flags |= mp_proto::F_LANDING;
+        }
+        if p.on_ground {
+            flags |= mp_proto::F_GROUND;
+        }
+        if self.crashed {
+            flags |= mp_proto::F_CRASHED;
+        }
+        m.set_state(mp_proto::PlayerState {
+            seq: 0,
+            aircraft: self.spec.id as u8,
+            pos: p.pos.to_array(),
+            rot: [q.x, q.y, q.z, q.w],
+            vel: p.vel.as_vec3().to_array(),
+            flaps: byte(p.flaps),
+            gear: byte(p.gear),
+            throttle: byte(p.throttle),
+            canopy: 0,
+            pitch: axis(p.stick.x),
+            roll: axis(p.stick.z),
+            yaw: axis(p.stick.y),
+            flags,
+        });
+        self.mp_players = m.players();
     }
 
     fn controls(&mut self, dt: f64) -> Controls {
@@ -2601,7 +2677,7 @@ impl Game {
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
@@ -3548,6 +3624,10 @@ impl Game {
         if !in_menu {
             self.live.instances(cam, &mut insts, &mut air_lights);
         }
+        self.update_mp(in_menu);
+        if !in_menu {
+            mp::instances(&self.mp_players, cam, &mut insts, &mut air_lights);
+        }
         self.live_view = Some((vp, cam));
 
         // The globe's labels are placed in the window's pixels, not the (maybe smaller) 3D scene's.
@@ -4356,6 +4436,17 @@ impl Game {
                                 self.live.set_enabled(on);
                             }
                             ui.end_row();
+                            menu::heading(ui, t!("MULTIPLAYER", "MULTIJOUEUR"));
+                            ui.end_row();
+                            ui.label(t!("Multiplayer", "Multijoueur"));
+                            ui.checkbox(&mut self.mp_on, t!("see the other players, and be seen", "voir les autres joueurs, et être vu"));
+                            ui.end_row();
+                            ui.label(t!("Server", "Serveur"));
+                            ui.add(egui::TextEdit::singleline(&mut self.mp_server).desired_width(180.0).char_limit(100).hint_text("danux.be"));
+                            ui.end_row();
+                            ui.label(t!("Your name", "Votre nom"));
+                            ui.add(egui::TextEdit::singleline(&mut self.mp_name).desired_width(180.0).char_limit(mp_proto::NAME_MAX).hint_text(t!("shown to the others", "montré aux autres")));
+                            ui.end_row();
                         });
                         ui.add_space(6.0);
                         self.google_settings(ui);
@@ -4659,6 +4750,33 @@ impl Game {
                                     }
                                 });
                             }
+                            ui.add_space(6.0);
+                            menu::heading(ui, t!("MULTIPLAYER", "MULTIJOUEUR"));
+                            match self.mp.as_ref().map(|m| m.status()) {
+                                None => {
+                                    ui.label(RichText::new(t!("Off (pause menu, Settings).", "Désactivé (menu pause, Réglages).")).size(12.0).color(DIM));
+                                }
+                                Some(mp::Status::Error(e)) => {
+                                    ui.label(RichText::new(t!("No connection: {}", "Pas de connexion : {}", e.chars().take(60).collect::<String>())).size(12.0).color(DIM));
+                                }
+                                Some(mp::Status::Connecting) => {
+                                    ui.label(RichText::new(t!("Connecting to {}…", "Connexion à {}…", self.mp_server)).size(12.0).color(DIM));
+                                }
+                                Some(mp::Status::Connected) => {
+                                    let me = self.plane.pos;
+                                    let n = self.mp_players.len();
+                                    ui.label(RichText::new(i18n::plural(n as u64, "other pilot nearby", "other pilots nearby", "autre pilote à proximité", "autres pilotes à proximité")).size(12.0).color(DIM));
+                                    egui::Grid::new("info_mp").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
+                                        for p in self.mp_players.iter().take(8) {
+                                            ui.label(RichText::new(&p.name).monospace().size(12.5).color(TEXT));
+                                            ui.label(RichText::new(mp_proto::AIRCRAFT.get(p.aircraft as usize).copied().unwrap_or("?")).monospace().size(12.0).color(DIM));
+                                            let alt = geo::pos_to_lla(p.pos).2 * 3.28084;
+                                            ui.label(RichText::new(format!("{:.1} km · {:.0} ft", (p.pos - me).length() / 1000.0, alt)).monospace().size(12.0).color(DIM));
+                                            ui.end_row();
+                                        }
+                                    });
+                                }
+                            }
                             ui.add_space(4.0);
                             match engine_btn {
                                 Some(true) => self.plane.start_engine(),
@@ -4889,6 +5007,34 @@ impl Game {
                     for (k, (s, size)) in [(p.call.as_str(), 12.5), (line2.as_str(), 11.0)].into_iter().enumerate() {
                         let pos = at + egui::vec2(9.0, -10.0 + 14.0 * k as f32);
                         painter.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_TOP, s, FontId::proportional(size), Color32::from_black_alpha(a / 2));
+                        painter.text(pos, Align2::LEFT_TOP, s, FontId::proportional(size), col);
+                    }
+                }
+            }
+            // The other players: a tag beside each.
+            if let (true, Some((vp, cam))) = (self.show_hud && !self.mp_players.is_empty(), self.live_view) {
+                let screen = ctx.content_rect();
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let col = Color32::from_rgb(255, 205, 90);
+                for p in &self.mp_players {
+                    let rel = p.pos - cam;
+                    let d = rel.length();
+                    if d > 60_000.0 || d < 15.0 {
+                        continue;
+                    }
+                    let c = vp * rel.as_vec3().extend(1.0);
+                    if c.w <= 0.0 {
+                        continue;
+                    }
+                    let at = egui::pos2(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height());
+                    if !screen.expand(40.0).contains(at) {
+                        continue;
+                    }
+                    painter.circle_stroke(at, 6.0, egui::Stroke::new(1.5, col));
+                    let line2 = format!("{}  {:.0} ft  {:.0} kt  {:.1} km", mp_proto::AIRCRAFT.get(p.aircraft as usize).copied().unwrap_or("?"), geo::pos_to_lla(p.pos).2 * 3.28084, p.vel.length() * 1.94384, d / 1000.0);
+                    for (k, (s, size)) in [(p.name.as_str(), 13.0), (line2.as_str(), 11.0)].into_iter().enumerate() {
+                        let pos = at + egui::vec2(10.0, -10.0 + 14.0 * k as f32);
+                        painter.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_TOP, s, FontId::proportional(size), Color32::from_black_alpha(160));
                         painter.text(pos, Align2::LEFT_TOP, s, FontId::proportional(size), col);
                     }
                 }

@@ -23,11 +23,15 @@ pub struct Settings {
     pub live_weather: bool,
     /// the clock follows the real time and date
     pub real_time: bool,
+    /// multiplayer (mp.rs): on, the relay ("host" or "host:port"), our name
+    pub multiplayer: bool,
+    pub mp_server: String,
+    pub mp_name: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, taa: true, live_traffic: true, live_weather: true, real_time: true }
+        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, taa: true, live_traffic: true, live_weather: true, real_time: true, multiplayer: false, mp_server: "danux.be".into(), mp_name: String::new() }
     }
 }
 
@@ -60,6 +64,9 @@ impl Settings {
             live_traffic: b("live_traffic", d.live_traffic),
             live_weather: b("live_weather", d.live_weather),
             real_time: b("real_time", d.real_time),
+            multiplayer: b("multiplayer", d.multiplayer),
+            mp_server: j["mp_server"].as_str().map(|s| s.trim().chars().take(100).collect()).unwrap_or(d.mp_server),
+            mp_name: j["mp_name"].as_str().map(crate::mp_proto::clean_name).unwrap_or(d.mp_name),
         }
     }
 
@@ -76,6 +83,9 @@ impl Settings {
             "live_traffic": self.live_traffic,
             "live_weather": self.live_weather,
             "real_time": self.real_time,
+            "multiplayer": self.multiplayer,
+            "mp_server": self.mp_server,
+            "mp_name": self.mp_name,
         })
     }
 
@@ -99,7 +109,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let s = Settings { lang: Some(Lang::Fr), sound_on: false, volume: 0.4, cam_mode: 1, cockpit_fov: 50.0, look_sens: 1.5, show_hud: false, taa: false, live_traffic: false, live_weather: false, real_time: false };
+        let s = Settings { lang: Some(Lang::Fr), sound_on: false, volume: 0.4, cam_mode: 1, cockpit_fov: 50.0, look_sens: 1.5, show_hud: false, taa: false, live_traffic: false, live_weather: false, real_time: false, multiplayer: true, mp_server: "example.org:7000".into(), mp_name: "Dany".into() };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         // Missing or odd values fall back to the defaults.
         let j = serde_json::json!({ "volume": 7.0, "language": "xx" });
