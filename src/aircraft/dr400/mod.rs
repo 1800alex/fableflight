@@ -11,8 +11,12 @@
 //! the engine, 2 × 40 l in the wings).
 //!
 //! The paint (white, the blue and red cheat lines of the classic Robin
-//! scheme, made up, no registration) is drawn in plane.wgsl (`livery_dr400`),
-//! and so is the skin's relief: wood and fabric, no rivets.
+//! scheme, made up, no registration; black walkways on the wing roots) is
+//! drawn in plane.wgsl (`livery_dr400`), and so is the skin's relief
+//! (`relief_dr400`): wood and fabric, no rivets; rib tapes and the fabric's
+//! sag between the ribs behind the spars, the glass-fibre cowling's seams
+//! and oil door. The two round cooling inlets in the nose bowl are cut out
+//! of the skin there too (`inlet_dr400`), onto ducts built here.
 //!
 //! Body frame as everywhere: +X right, +Y up, -Z forward; the geometry is
 //! laid out in a design frame `DZ` ahead of it (see `DZ`).
@@ -364,6 +368,95 @@ pub const PROP_HUB: Vec3 = Vec3::new(0.0, -0.05, -2.46);
 /// the pilot's eye (left front seat)
 pub const EYE: Vec3 = Vec3::new(-0.27, 0.30, -0.36);
 
+/// How far outside the fuselage skin (x, y) is at station z: < 0 inside.
+fn sec_f(z: f32, x: f32, y: f32) -> f32 {
+    let s = sec(z);
+    let (h, n) = if y > s.mid { (s.top - s.mid, s.nt) } else { (s.mid - s.bot, s.nb) };
+    (x.abs() / s.w).powf(n) + ((y - s.mid).abs() / h).powf(n) - 1.0
+}
+/// Where a line along z through (x, y) first meets the skin, coming from the nose.
+fn skin_z(x: f32, y: f32, z0: f32, z1: f32) -> f32 {
+    let (mut a, mut b) = (z0, z1);
+    if sec_f(a, x, y) < 0.0 {
+        return a;
+    }
+    for _ in 0..32 {
+        let m = (a + b) * 0.5;
+        if sec_f(m, x, y) > 0.0 { a = m } else { b = m }
+    }
+    (a + b) * 0.5
+}
+
+/// The two round cooling-air inlets in the nose bowl, either side of the
+/// spinner (the right one: x, y, radius). The skin is cut away inside them
+/// (`inlet_dr400` in plane.wgsl: keep in step).
+pub const INLET: [f32; 3] = [0.225, -0.19, 0.062];
+
+fn intakes(m: &mut Mesh) {
+    let duct = mt(mat::SATIN, 0.035, 0.034, 0.033);
+    let back_z = -2.17;
+    for sx in [-1.0f32, 1.0] {
+        let c = Vec2::new(sx * INLET[0], INLET[1]);
+        let r = INLET[2];
+        let ring = |a: f32, rr: f32| c + Vec2::new(a.cos(), a.sin()) * rr;
+        // The duct: from the lip back to the cylinder baffles.
+        m.patch(&duct, 32, 6, sx < 0.0, |u, v| {
+            let a = u * TAU;
+            let q = ring(a, r + 0.002);
+            let z0 = skin_z(q.x, q.y, NOSE_Z, -2.0) - 0.004;
+            let z = z0 + (back_z - z0) * v;
+            // (Narrowing a little into the plenum.)
+            let q = ring(a, r + 0.002 - 0.008 * v);
+            (Vec3::new(q.x, q.y, z), [u * TAU * r, z], 0.0)
+        });
+        // The lip rolled round the opening, following the curve of the nose bowl.
+        let lip: Vec<Vec3> = (0..=48).map(|k| {
+            let a = k as f32 / 48.0 * TAU;
+            let q = ring(a, r + 0.004);
+            Vec3::new(q.x, q.y, skin_z(q.x, q.y, NOSE_Z, -2.0) - 0.002)
+        }).collect();
+        m.tube(&WHITE, &lip, &|_| 0.0055, 8, false);
+        // The baffle at the back and the finned cylinder head seen through it.
+        let bc = Vec3::new(c.x, c.y, back_z);
+        m.disc(&mt(mat::BLACK, 0.02, 0.02, 0.02), bc + Vec3::Z * 0.004, Vec3::NEG_Z, Vec3::Y, r, 24);
+        let fins = mt(mat::SATIN, 0.10, 0.10, 0.10);
+        for k in -4..=4 {
+            let y = k as f32 * 0.012;
+            let hw = ((r - 0.008).powi(2) - y * y).max(0.0).sqrt();
+            if hw < 0.01 {
+                continue;
+            }
+            m.rbox(&fins, bc + Vec3::new(0.0, y, -0.012), Vec3::new(hw, 0.0016, 0.012), 0.001, Quat::IDENTITY);
+        }
+    }
+}
+
+/// The cooling air leaves under the cowl just ahead of the firewall, below a
+/// flared lip.
+fn cooling_exit(m: &mut Mesh) {
+    let (z0, z1) = (-1.70, -1.535);
+    let th0 = PI - 0.62;
+    let lip = |z: f32, th: f32| -> Vec3 {
+        let k = ((z - z0) / (z1 - z0)).clamp(0.0, 1.0);
+        let fade = smoothstep(th0, th0 + 0.15, th);
+        fuse_pt(z, th) + fuse_n(z, th) * (0.003 + 0.032 * k.powf(1.6) * fade)
+    };
+    let mut half = Mesh::default();
+    half.patch(&WHITE.pat(pat::COWL), 10, 12, false, |u, v| {
+        let z = z0 + (z1 - z0) * u;
+        let th = th0 + (PI - th0) * v;
+        (lip(z, th), [z, th], 0.0)
+    });
+    // The dark gap under its trailing edge.
+    half.patch(&mt(mat::BLACK, 0.012, 0.012, 0.012), 1, 12, true, |u, v| {
+        let th = th0 + (PI - th0) * v;
+        let p = fuse_pt(z1, th).lerp(lip(z1, th), u);
+        (p, [u, v], 0.0)
+    });
+    m.append(&half.mirror_x());
+    m.append(&half);
+}
+
 fn fuselage(b: &mut Builder) {
     let mut zs = Vec::new();
     let mut z = NOSE_Z;
@@ -422,11 +515,17 @@ fn fuselage(b: &mut Builder) {
     let (rf, rt) = (row_of(FIREWALL_Z), row_of(CANOPY[1] + 0.1));
     let mut cowl = sub(0, rf, pat::COWL);
     // The engine face behind the spinner, and the two intakes either side of it.
-    cowl.disc(&mt(mat::BLACK, 0.03, 0.03, 0.03), Vec3::new(0.0, -0.05, NOSE_Z + 0.02), Vec3::NEG_Z, Vec3::Y, 0.19, 24);
-    for sx in [-1.0f32, 1.0] {
-        let c = Vec3::new(sx * 0.21, -0.20, NOSE_Z + 0.05);
-        cowl.lathe(&mt(mat::BLACK, 0.02, 0.02, 0.02), c, Vec3::NEG_Z, &[[0.075, -0.01], [0.075, 0.0], [0.0, 0.0]], 20, false);
-    }
+    // (Filling the open front of the cowl, just inside it.)
+    let s0 = sec(NOSE_Z + 0.02);
+    let face: Vec<Vec3> = (0..48).map(|k| { let p = sec_pt(&s0, -(k as f32) / 48.0 * TAU); Vec3::new(p.x * 0.97, s0.mid + (p.y - s0.mid) * 0.97, NOSE_Z + 0.02) }).collect();
+    cowl.fan(&mt(mat::BLACK, 0.03, 0.03, 0.03), Vec3::new(0.0, s0.mid, NOSE_Z + 0.02), &face, Vec3::NEG_Z);
+    intakes(&mut cowl);
+    cooling_exit(&mut cowl);
+    // The rubber boot where the nose leg leaves the bottom of the cowl.
+    let dir = (Vec3::new(0.0, -0.80, NOSE_AXLE.z) - Vec3::new(0.0, -0.52, -1.80)).normalize();
+    let s = sec(-1.82);
+    let at = Vec3::new(0.0, -0.52, -1.80) + dir * ((-0.52 - s.bot) / -dir.y - 0.025);
+    cowl.lathe(&mt(mat::RUBBER, 0.02, 0.02, 0.022), at, dir, &[[0.075, 0.0], [0.07, 0.012], [0.058, 0.024], [0.052, 0.036], [0.045, 0.05], [0.042, 0.056], [0.0, 0.056]], 20, true);
     let mut cabin = sub(rf, rt, pat::FUSE);
     let mut tailcone = sub(rt, zs.len() - 1, pat::FUSE);
     let s = sec(TAIL_Z);
@@ -454,6 +553,20 @@ fn fuselage(b: &mut Builder) {
         });
         cabin.append(&f);
     }
+    // The boarding step behind each wing root's trailing edge.
+    for sx in [-1.0f32, 1.0] {
+        let (p, n) = on_side(0.86, -0.52, sx, 0.0);
+        let foot = Vec3::new(sx * 0.66, -0.78, 0.90);
+        cabin.lathe(&PAINT_WHITE, p, n, &[[0.032, -0.004], [0.032, 0.004], [0.024, 0.008], [0.0, 0.008]], 14, false);
+        cabin.tube(&PAINT_WHITE, &[p, p + n * 0.05 + Vec3::new(0.0, -0.04, 0.0), foot], &|_| 0.011, 10, true);
+        cabin.rbox(&mt(mat::BLACK, 0.03, 0.03, 0.03).pat(pat::NONSLIP), foot + Vec3::new(sx * 0.02, 0.008, 0.0), Vec3::new(0.055, 0.007, 0.045), 0.004, Quat::IDENTITY);
+    }
+    // The tow release under the tail cone (it tows gliders).
+    let s = sec(4.0);
+    let p = Vec3::new(0.0, s.bot - 0.004, 4.0);
+    tailcone.rbox(&mt(mat::SATIN, 0.05, 0.05, 0.055), p + Vec3::new(0.0, -0.016, 0.0), Vec3::new(0.018, 0.016, 0.045), 0.005, Quat::IDENTITY);
+    let ring: Vec<Vec3> = (0..=16).map(|k| { let a = k as f32 / 16.0 * TAU; p + Vec3::new(0.0, -0.045 - 0.016 * a.cos(), 0.05 + 0.016 * a.sin()) }).collect();
+    tailcone.tube(&STEEL, &ring, &|_| 0.004, 6, false);
     // Tie-down ring under the tail, the beacon on the spine behind the canopy.
     let s = sec(3.9);
     let p = Vec3::new(0.0, s.bot - 0.005, 3.9);
@@ -559,6 +672,34 @@ fn wings(b: &mut Builder) {
         let (p, n) = foil_frame(&f, s, xc, -1.0);
         inspection_plate(&mut w, p + n * 0.0012, n, Vec3::Z, 0.05, 6);
     }
+    // Hinge brackets under the flaps and ailerons.
+    let bracket = |w: &mut Mesh, s: f32, xc: f32| {
+        let (p, n) = foil_frame(&f, s, xc, -1.0);
+        let rot = Quat::from_rotation_arc(Vec3::Y, n);
+        w.rbox(&PAINT_WHITE, p + n * 0.012, Vec3::new(0.0035, 0.016, 0.03), 0.002, rot);
+        w.bolt(&STEEL, p + n * 0.02 + rot * Vec3::X * 0.0035, rot * Vec3::X, 0.003);
+    };
+    for s in [0.80f32, 1.25, 1.75] {
+        bracket(&mut w, s, 0.75);
+    }
+    for s in [2.25f32, 3.05, 3.90] {
+        bracket(&mut w, s, 0.76);
+    }
+    // The fairing strip over the joint where the outer panel meets the centre section.
+    {
+        let strip = WHITE.pat(pat::WING);
+        let mut ring = Vec::new();
+        for k in 0..=40 {
+            let t = k as f32 / 40.0;
+            let (side, xc) = if t < 0.5 { (1.0, 0.97 * (1.0 - 2.0 * t).powi(2)) } else { (-1.0, 0.97 * (2.0 * t - 1.0).powi(2)) };
+            let (p, n) = foil_frame(&f, KINK, xc.max(0.002), side);
+            ring.push(p + n * 0.0015);
+        }
+        w.tube(&strip, &ring, &|_| 0.004, 6, true);
+    }
+    // Fuel drain under the wing tank.
+    let (p, n) = foil_frame(&f, 1.1, 0.45, -1.0);
+    w.lathe(&ALU, p, n, &[[0.008, -0.002], [0.008, 0.006], [0.004, 0.009], [0.004, 0.016], [0.0, 0.016]], 10, false);
     // Nav light and strobe on the tip.
     let (p, _) = foil_frame(&f, SPAN - 0.03, 0.06, 0.0);
     w.lathe(&mt(mat::LAMP, 0.9, 0.9, 0.9).x(lamp::STROBE), p + Vec3::new(0.0, 0.0, 0.05), Vec3::X, &[[0.015, 0.0], [0.015, 0.014], [0.011, 0.028], [0.0, 0.032]], 14, true);
@@ -567,6 +708,12 @@ fn wings(b: &mut Builder) {
     let mut left_extra = Mesh::default();
     let (p, n) = foil_frame(&f, 1.5, 0.004, 0.0);
     left_extra.disc(&mt(mat::LAMP, 0.95, 0.92, 0.85).x(lamp::LANDING), p + n * 0.002 - Vec3::Z * 0.004, Vec3::NEG_Z, Vec3::Y, 0.05, 20);
+    // The stall warning vane in the leading edge.
+    let (p, n) = foil_frame(&f, 0.95, 0.012, -1.0);
+    let fwd = (Vec3::NEG_Z - n * Vec3::NEG_Z.dot(n)).normalize();
+    let rot = Quat::from_mat3(&glam::Mat3::from_cols(Vec3::X, n, -fwd));
+    left_extra.rbox(&ALU, p + n * 0.0008, Vec3::new(0.022, 0.0008, 0.016), 0.0006, rot);
+    left_extra.rbox(&ALU, p + n * 0.003 + fwd * 0.012, Vec3::new(0.008, 0.0006, 0.009), 0.0004, rot);
     let (p, n) = foil_frame(&f, 3.2, 0.2, -1.0);
     let bend = p + n * 0.09;
     left_extra.tube(&STEEL, &[p, bend, bend - Vec3::Z * 0.17], &|t| if t > 0.9 { 0.006 } else { 0.0075 }, 10, true);
@@ -620,6 +767,9 @@ fn wings(b: &mut Builder) {
 const STAB_HALF: f32 = 1.60;
 const STAB_Y: f32 = 0.06;
 const STAB_PIVOT_Z: f32 = 3.78;
+/// The anti-servo tab's hinge line, and where it stops either side of the fuselage.
+const TAB_Z: f32 = 4.20;
+const TAB_IN: f32 = 0.12;
 
 fn tail(b: &mut Builder) {
     let stab = Foil {
@@ -646,14 +796,45 @@ fn tail(b: &mut Builder) {
     // The stabilator: the whole surface turns about its pivot, with the
     // anti-servo tab across its trailing edge.
     let mut st = Mesh::default();
-    stab.skin(&mut st, &ctrl, -STAB_HALF, STAB_HALF, 56, &|_| 0.0, &|_| 1.0, 22, false);
+    // The tab's hinge runs straight across (the trailing edge is swept forward).
+    let tab_x = |s: f32| {
+        let k = (stab.at)(s);
+        ((TAB_Z - k.le.z) / k.c).clamp(0.0, 0.95)
+    };
+    let one = |_: f32| 1.0;
+    stab.skin(&mut st, &ctrl, -STAB_HALF, -TAB_IN, 26, &|_| 0.0, &tab_x, 22, false);
+    stab.skin(&mut st, &ctrl, -TAB_IN, TAB_IN, 6, &|_| 0.0, &one, 22, false);
+    stab.skin(&mut st, &ctrl, TAB_IN, STAB_HALF, 26, &|_| 0.0, &tab_x, 22, false);
+    for (a, b) in [(-STAB_HALF + 0.12, -TAB_IN), (TAB_IN, STAB_HALF - 0.12)] {
+        stab.web(&mut st, &PRIMER, a, b, 10, &tab_x);
+    }
     for s in [-STAB_HALF, STAB_HALF] {
         stab.cap(&mut st, &ctrl, s, 0.0, 1.0, false);
+    }
+    // (Outboard of the tab the stabilator runs on to its trailing edge.)
+    stab.skin(&mut st, &ctrl, -STAB_HALF, -STAB_HALF + 0.12, 4, &tab_x, &one, 8, true);
+    stab.skin(&mut st, &ctrl, STAB_HALF - 0.12, STAB_HALF, 4, &tab_x, &one, 8, true);
+    for s in [-TAB_IN, TAB_IN] {
+        stab.cap(&mut st, &ctrl, s, tab_x(s), 1.0, false);
+    }
+    // The anti-servo tab: it moves the same way as the trailing edge, and the
+    // trim sets it.
+    let mut tab = Mesh::default();
+    let tx = |s: f32| tab_x(s) + 0.006;
+    for (a, b) in [(-STAB_HALF + 0.125, -TAB_IN - 0.005), (TAB_IN + 0.005, STAB_HALF - 0.125)] {
+        stab.skin(&mut tab, &ctrl, a, b, 18, &tx, &one, 10, true);
+        stab.cap(&mut tab, &ctrl, a, tx(a), 1.0, true);
+        stab.cap(&mut tab, &ctrl, b, tx(b), 1.0, true);
+        // Its control horn and push rod fitting, under the inboard end.
+        let s = if a < 0.0 { b - 0.06 } else { a + 0.06 };
+        let p = stab.pt(s, tx(s) + 0.03, -1.0, -1.0);
+        tab.rbox(&PAINT_WHITE, p + Vec3::new(0.0, -0.018, -0.005), Vec3::new(0.003, 0.02, 0.018), 0.002, Quat::IDENTITY);
     }
     // Its torque tube through the fuselage, and the hinge fittings.
     st.tube(&STEEL, &[Vec3::new(-0.2, STAB_Y, STAB_PIVOT_Z), Vec3::new(0.2, STAB_Y, STAB_PIVOT_Z)], &|_| 0.02, 12, true);
     let k = b.add("stabilator", G_TAIL, st, Anim::hinge2(Drive::new(Input::Elevator, -0.30), Drive::new(Input::Trim, -0.4).offset(0.02)), Vec3::new(0.0, STAB_Y, STAB_PIVOT_Z), Vec3::X, None);
     b.role(k, Role::Elevator);
+    b.add("anti-servo tab", G_TAIL, tab, Anim::hinge2(Drive::new(Input::Elevator, -0.25), Drive::new(Input::Trim, 0.35)), Vec3::new(0.0, STAB_Y, TAB_Z), Vec3::X, Some(k));
 
     // Fin, swept back, with its rudder.
     let fin = Foil {
@@ -715,9 +896,25 @@ fn engine(b: &mut Builder) {
 
     // Spinner and two blades.
     let mut sp = Mesh::default();
-    let prof: Vec<[f32; 2]> = (0..=16).map(|k| { let h = k as f32 / 16.0 * 0.26; [0.165 * (1.0 - (h / 0.26).powf(2.2)).max(0.0).sqrt(), h] }).collect();
-    sp.lathe(&WHITE, Vec3::new(0.0, PROP_HUB.y, NOSE_Z - 0.01), Vec3::NEG_Z, &prof, 36, true);
-    sp.lathe(&GREY, Vec3::new(0.0, PROP_HUB.y, NOSE_Z - 0.01), Vec3::NEG_Z, &[[0.17, -0.012], [0.17, 0.0], [0.0, 0.0]], 36, false);
+    // A long pointed spinner (a tangent ogive, the point just rounded off).
+    let (sr, sl) = (0.165f32, 0.275f32);
+    let rho = (sr * sr + sl * sl) / (2.0 * sr);
+    let mut prof: Vec<[f32; 2]> = (0..=22).map(|k| { let h = sl * (1.0 - (1.0 - k as f32 / 22.0).powf(1.4)); [((rho * rho - h * h).max(0.0).sqrt() + sr - rho).max(0.0), h] }).collect();
+    let n = prof.len();
+    prof[n - 2][0] = prof[n - 2][0].max(0.006);
+    prof[n - 1] = [0.0, sl + 0.002];
+    let base = Vec3::new(0.0, PROP_HUB.y, NOSE_Z - 0.01);
+    sp.lathe(&WHITE, base, Vec3::NEG_Z, &prof, 40, true);
+    sp.lathe(&GREY, base, Vec3::NEG_Z, &[[0.172, -0.014], [0.172, 0.0], [0.0, 0.0]], 40, false);
+    // The screws holding the dome to its back plate.
+    for k in 0..6 {
+        let a = (k as f32 + 0.5) / 6.0 * TAU;
+        let r = 0.157;
+        let h = 0.035;
+        let p = base + Vec3::new(a.cos() * r, a.sin() * r, -h);
+        let nrm = Vec3::new(a.cos(), a.sin(), -0.45).normalize();
+        sp.screw(&SCREW_PAINT, p, nrm, 0.0045, k as f32);
+    }
     let blade_m = mt(mat::PROP, 0.5, 0.5, 0.5);
     let r_tip = 0.915;
     let mut blades = Mesh::default();
@@ -783,6 +980,21 @@ fn spat(m: &mut Mesh, axle: Vec3, l: f32, w: f32, h: f32) {
     });
 }
 
+/// A streamlined fairing round a gear leg from `top` to `bot`, `c` long and
+/// `t` thick, the leg a third of the way back from its nose.
+fn leg_fairing(m: &mut Mesh, top: Vec3, bot: Vec3, c: f32, t: f32) {
+    let mat = WHITE.pat(pat::COWL);
+    m.patch(&mat, 28, 6, false, |u, v| {
+        // u round the section from the trailing edge over the outside, back by the inside.
+        let side = if u < 0.5 { 1.0 } else { -1.0 };
+        let w = if u < 0.5 { 1.0 - 2.0 * u } else { 2.0 * u - 1.0 };
+        let x = 1.0 - (w * PI * 0.5).cos();
+        let yt = 5.0 * 0.2 * (0.2969 * x.sqrt() - 0.126 * x - 0.3516 * x * x + 0.2843 * x.powi(3) - 0.1036 * x.powi(4));
+        let p = top.lerp(bot, v);
+        (p + Vec3::new(side * yt * c * (t / (0.2 * c)), 0.0, (x - 0.33) * c), [u, v], 0.0)
+    });
+}
+
 fn gear(b: &mut Builder) {
     // Main legs: a strut down from the wing to an oleo on the axle, and the fairing.
     let mut leg = Mesh::default();
@@ -790,6 +1002,11 @@ fn gear(b: &mut Builder) {
     leg.tube(&PAINT_WHITE, &[MAIN_ROOT, knee], &|t| 0.04 - 0.008 * t, 14, true);
     leg.tube(&CHROME, &[knee, MAIN_AXLE + Vec3::new(-0.08, 0.06, 0.0)], &|_| 0.026, 12, true);
     leg.rbox(&PAINT_WHITE, MAIN_AXLE + Vec3::new(-0.08, 0.03, 0.0), Vec3::new(0.018, 0.04, 0.03), 0.01, Quat::IDENTITY);
+    // The leg's streamlined fairing, from the wing down into the wheel fairing.
+    leg_fairing(&mut leg, MAIN_AXLE + Vec3::new(-0.075, 0.38, -0.02), MAIN_AXLE + Vec3::new(-0.075, 0.12, -0.02), 0.20, 0.055);
+    // The brake line down its back.
+    let bl = MAIN_AXLE + Vec3::new(-0.06, 0.0, 0.0);
+    leg.tube(&BLACK, &[MAIN_AXLE + Vec3::new(-0.075, 0.36, 0.10), MAIN_AXLE + Vec3::new(-0.075, 0.16, 0.095), bl + Vec3::new(0.0, 0.10, 0.07)], &|_| 0.0045, 6, false);
     let (ll, lr) = b.pair(["left main leg", "right main leg"], [G_GEAR, G_GEAR], leg, |s| Anim::slide(Drive::new(Input::Compress(if s < 0.0 { 1 } else { 2 }), 1.0), Vec3::Y), MAIN_AXLE, Vec3::Y, [None, None]);
     b.role(ll, Role::Gear(1)).role(lr, Role::Gear(2));
     let mut wh = Mesh::default();
