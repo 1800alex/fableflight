@@ -1521,6 +1521,9 @@ impl World {
                 close: near,
             });
         }
+        // near to far, so near buildings hide far ones before they are shaded.
+        let key = |d: &DetailDraw| Vec3::new(d.u[0], d.u[1], d.u[2]).length() - d.radius;
+        details.sort_by(|a, b| key(a).total_cmp(&key(b)));
         (tiles, details, near_inst)
     }
 }
