@@ -207,8 +207,6 @@ pub struct World {
     pub tree_dims: Vec<TreeDim>,
     tick: u32,
     pub stats: (usize, usize, usize), // drawn tiles, loading, building tiles
-    /// tiles wanted but not yet asked for (at most 28 are on their way at once)
-    pub queued: usize,
     last_update: Option<std::time::Instant>,
     uploads: VecDeque<Upload>,
     fields: HashMap<u32, FSlot>,
@@ -235,7 +233,12 @@ impl Frustum {
 impl World {
     pub fn new(loader: Loader, max_zoom: u8) -> Self {
         let photo = Some(Box::new(crate::tiles3d::Photo::new(loader.src.google.clone(), Some(loader.src.clone()))));
-        Self { photo, flat: None, loader, tiles: HashMap::new(), builds: HashMap::new(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, reach_k: 1.0, city_k: 1.0, tree_far: 3200.0, tree_imp_k: 1.0, cars: (1.0, 2200.0, 1100.0), buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), queued: 0, last_update: None, uploads: VecDeque::new(), fields: HashMap::new(), ocean: crate::ocean::Ocean::new() }
+        Self { photo, flat: None, loader, tiles: HashMap::new(), builds: HashMap::new(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, reach_k: 1.0, city_k: 1.0, tree_far: 3200.0, tree_imp_k: 1.0, cars: (1.0, 2200.0, 1100.0), buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::new(), ocean: crate::ocean::Ocean::new() }
+    }
+
+    /// Tiles wanted but not yet asked for (at most 28 are on their way at once).
+    pub fn queued(&self) -> usize {
+        self.wanted.len()
     }
 
     /// Height of the ground (or water surface) at a lat/lon: the top of the
@@ -984,12 +987,15 @@ impl World {
 
         // Dispatch the most urgent requests.
         self.wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        self.queued = self.wanted.len();
-        for (prio, id) in self.wanted.drain(..) {
+        // (What is not asked for this time stays in `wanted` until the next
+        // update clears it: `queued` counts it.)
+        let mut sent = 0;
+        for k in 0..self.wanted.len() {
             if self.in_flight >= 28 {
                 break;
             }
-            self.queued -= 1;
+            let (prio, id) = self.wanted[k];
+            sent += 1;
             self.in_flight += 1;
             if id.z & 0x80 != 0 {
                 let id = TileId::new(id.z & 0x7f, id.x, id.y);
@@ -1010,6 +1016,8 @@ impl World {
                 self.loader.submit(prio, Job::Terrain(id));
             }
         }
+
+        self.wanted.drain(..sent);
 
         // Evict what has not been needed for a while.
         if self.frame % 120 == 0 {

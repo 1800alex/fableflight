@@ -1236,7 +1236,7 @@ impl Game {
             return;
         }
         let photo = self.world.photo();
-        let n = self.world.stats.1 + self.world.queued + if photo.active { photo.stats.2 } else { 0 };
+        let n = self.world.stats.1 + self.world.queued() + if photo.active { photo.stats.2 } else { 0 };
         l.most = l.most.max(n);
         let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
         let ground = self.world.ground(lat, lon).is_some();
