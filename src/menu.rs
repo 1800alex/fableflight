@@ -328,6 +328,7 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
     ("VIEW", &[
         ("C", "chase / cockpit camera"),
         ("Mouse drag", "look around"),
+        ("Click / wheel", "cockpit: work a switch, turn a knob (Cessna)"),
         ("Mouse wheel", "camera distance / cockpit zoom"),
         ("H", "hide / show the HUD"),
         ("F12", "screenshot"),

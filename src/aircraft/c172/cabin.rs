@@ -1,6 +1,7 @@
 //! The cabin: lining and carpet, the instrument panel with its gauges, radios,
 //! switches and breakers, the moving controls, seats and belts, and the glass.
 use super::*;
+use crate::aircraft::Hotspot;
 use crate::airframe::*;
 use glam::{Mat3, Quat, Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -62,6 +63,7 @@ pub fn build(b: &mut Builder) {
     extras(&mut m);
     b.fixed("cabin", G_FUSE, m);
     controls(b);
+    switches(b);
     glass(b);
 }
 
@@ -620,14 +622,15 @@ fn panel(m: &mut Mesh) {
     // Ignition key, the rocker switch row, placards.
     let f = z + 0.0005;
     m.lathe(&CHROME, Vec3::new(-0.48, -0.15, f), Vec3::Z, &[[0.016, 0.0], [0.016, 0.004], [0.012, 0.007], [0.0, 0.007]], 24, false);
-    m.rbox(&mt(mat::STEEL, 0.6, 0.55, 0.4), Vec3::new(-0.48, -0.15, f + 0.014), Vec3::new(0.003, 0.009, 0.008), 0.0015, Quat::IDENTITY);
-    m.rbox(&BLACK, Vec3::new(-0.48, -0.15, f + 0.028), Vec3::new(0.004, 0.012, 0.009), 0.003, Quat::IDENTITY);
     for i in 0..9 {
         let x = -0.525 + i as f32 * 0.03;
         let red = i < 2;
         let col = if red { mt(mat::PLASTIC, 0.35, 0.02, 0.02) } else { mt(mat::PLASTIC, 0.03, 0.03, 0.03) };
         m.rbox(&BLACK, Vec3::new(x, -0.205, f + 0.002), Vec3::new(0.008, 0.013, 0.002), 0.0015, Quat::IDENTITY);
-        m.rbox(&col, Vec3::new(x, -0.205, f + 0.006), Vec3::new(0.0062, 0.011, 0.004), 0.002, Quat::from_rotation_x(if i % 3 == 1 { 0.18 } else { -0.18 }));
+        // (The battery master, the first, is a piece of its own: it moves, see `switches`.)
+        if i != 0 {
+            m.rbox(&col, Vec3::new(x, -0.205, f + 0.006), Vec3::new(0.0062, 0.011, 0.004), 0.002, Quat::from_rotation_x(if i % 3 == 1 { 0.18 } else { -0.18 }));
+        }
         m.rbox(&PAINT_WHITE.pat(pat::PLACARD), Vec3::new(x, -0.229, f), Vec3::new(0.011, 0.0035, 0.0004), 0.0002, Quat::IDENTITY);
     }
     for &(x, y, w, h) in &[(-0.27f32, -0.153f32, 0.06f32, 0.011f32), (0.355, 0.058, 0.03, 0.006), (-0.47, 0.135, 0.035, 0.008), (0.07, -0.155, 0.065, 0.009)] {
@@ -639,8 +642,8 @@ fn panel(m: &mut Mesh) {
         m.lathe(&CHROME, Vec3::new(*x, -0.138, f), Vec3::Z, &[[0.009, 0.0], [0.009, 0.004], [0.007, 0.006]], 16, false);
         m.dome(&col.x(*l), Vec3::new(*x, -0.138, f + 0.005), Vec3::Z, 0.0068, 0.005, 14, 0.0);
     }
-    // Push-pull engine controls: prop (blue, crenellated), mixture (red).
-    for (x, col) in [(0.048f32, mt(mat::PLASTIC, 0.02, 0.05, 0.25)), (0.094, mt(mat::PLASTIC, 0.35, 0.02, 0.02))] {
+    // Push-pull engine controls: prop (blue, crenellated); the mixture (red) moves, see `switches`.
+    for (x, col) in [(0.048f32, mt(mat::PLASTIC, 0.02, 0.05, 0.25))] {
         m.tube(&CHROME, &[Vec3::new(x, -0.195, z - 0.02), Vec3::new(x, -0.195, z + 0.02)], &|_| 0.0045, 10, false);
         m.lathe(&col.pat(pat::KNURL), Vec3::new(x, -0.195, z + 0.02), Vec3::Z, &[[0.0045, 0.0], [0.014, 0.004], [0.015, 0.018], [0.013, 0.022], [0.0, 0.023]], 18, true);
     }
@@ -839,10 +842,8 @@ fn extras(m: &mut Mesh) {
     m.rbox(&mt(mat::PLASTIC, 0.75, 0.74, 0.70).pat(pat::PLACARD), cc, Vec3::new(0.055, 0.0012, 0.08), 0.001, card);
     m.rbox(&mt(mat::PLASTIC, 0.04, 0.12, 0.35), cc + card * Vec3::new(0.0, 0.0006, -0.068), Vec3::new(0.0545, 0.0008, 0.011), 0.0006, card);
 
-    // Parking brake: a T handle under the left of the panel.
-    let pb = Vec3::new(-0.40, -0.265, PANEL_Z + 0.01);
-    m.tube(&CHROME, &[pb - Vec3::Z * 0.03, pb + Vec3::Z * 0.02], &|_| 0.0035, 8, false);
-    m.rbox(&mt(mat::PLASTIC, 0.35, 0.03, 0.02), pb + Vec3::Z * 0.026, Vec3::new(0.028, 0.007, 0.007), 0.005, Quat::IDENTITY);
+    // (The parking brake's T handle moves: see `switches`.)
+    let pb = PARK_BRAKE;
     m.rbox(&PAINT_WHITE.pat(pat::PLACARD), pb + Vec3::new(0.0, 0.016, -0.009), Vec3::new(0.02, 0.0045, 0.0004), 0.0002, Quat::IDENTITY);
     // Cowl flaps: a lever in a gated slot low on the pedestal.
     let rot = Quat::from_rotation_x(0.12);
@@ -917,6 +918,62 @@ fn controls(b: &mut Builder) {
     w.lathe(&BLACK.pat(pat::KNURL), wc - Vec3::X * 0.008, Vec3::X, &[[0.0, 0.0], [0.058, 0.0], [0.062, 0.004], [0.062, 0.012], [0.058, 0.016], [0.0, 0.016]], 40, false);
     b.add("trim wheel", G_FUSE, w, Anim::hinge(Drive::new(Input::Trim, 9.0)), wc, Vec3::X, None);
 }
+
+// ---------------------------------------------------------------- switches
+
+/// Where the ignition key, the battery master rocker, the mixture knob and
+/// the parking brake handle are (body frame); their hotspots are there too.
+const KEY: Vec3 = Vec3::new(-0.48, -0.15, PANEL_Z + 0.0005);
+const MASTER: Vec3 = Vec3::new(-0.525, -0.205, PANEL_Z + 0.0065);
+const MIXTURE: Vec3 = Vec3::new(0.094, -0.195, PANEL_Z);
+const PARK_BRAKE: Vec3 = Vec3::new(-0.40, -0.265, PANEL_Z + 0.01);
+
+/// The switches and knobs that show what they are set to, worked by the
+/// keys and by the mouse (`HOTSPOTS`).
+fn switches(b: &mut Builder) {
+    // The key turns clockwise from OFF to BOTH, and on to START while the starter runs.
+    let mut k = Mesh::default();
+    k.rbox(&mt(mat::STEEL, 0.6, 0.55, 0.4), KEY + Vec3::Z * 0.014, Vec3::new(0.003, 0.009, 0.008), 0.0015, Quat::IDENTITY);
+    k.rbox(&BLACK, KEY + Vec3::Z * 0.028, Vec3::new(0.004, 0.012, 0.009), 0.003, Quat::IDENTITY);
+    b.add("ignition key", G_FUSE, k, Anim::hinge(Drive::new(Input::Ignition, -0.8)), KEY, Vec3::Z, None);
+    // The red battery master rocker: its top pressed in when on.
+    let mut r = Mesh::default();
+    r.rbox(&mt(mat::PLASTIC, 0.35, 0.02, 0.02), MASTER, Vec3::new(0.0062, 0.011, 0.004), 0.002, Quat::IDENTITY);
+    b.add("master switch", G_FUSE, r, Anim::hinge(Drive::new(Input::Master, -0.36).offset(0.18)), MASTER - Vec3::Z * 0.004, Vec3::X, None);
+    // The mixture knob: pushed in rich, pulled out to lean and cut off.
+    let mut x = Mesh::default();
+    x.tube(&CHROME, &[MIXTURE - Vec3::Z * 0.02, MIXTURE + Vec3::Z * 0.02], &|_| 0.0045, 10, false);
+    x.lathe(&mt(mat::PLASTIC, 0.35, 0.02, 0.02).pat(pat::KNURL), MIXTURE + Vec3::Z * 0.02, Vec3::Z, &[[0.0045, 0.0], [0.014, 0.004], [0.015, 0.018], [0.013, 0.022], [0.0, 0.023]], 18, true);
+    b.add("mixture knob", G_FUSE, x, Anim::slide(Drive::new(Input::Mixture, -0.05).offset(0.05), Vec3::Z), MIXTURE, Vec3::Z, None);
+    // The parking brake: a red T handle, pulled out when set.
+    let mut p = Mesh::default();
+    p.tube(&CHROME, &[PARK_BRAKE - Vec3::Z * 0.03, PARK_BRAKE + Vec3::Z * 0.02], &|_| 0.0035, 8, false);
+    p.rbox(&mt(mat::PLASTIC, 0.35, 0.03, 0.02), PARK_BRAKE + Vec3::Z * 0.026, Vec3::new(0.028, 0.007, 0.007), 0.005, Quat::IDENTITY);
+    b.add("parking brake", G_FUSE, p, Anim::slide(Drive::new(Input::ParkingBrake, 0.04), Vec3::Z), PARK_BRAKE, Vec3::Z, None);
+}
+
+/// What the mouse can work in the cockpit (see `aircraft::Hotspot`).
+pub static HOTSPOTS: &[Hotspot] = &[
+    // Ignition: a click turns the magnetos on or off; hold it to crank.
+    Hotspot { at: [KEY.x, KEY.y, KEY.z + 0.02], r: 0.025, click: Some("ignition"), hold: Some("starter"), wheel: None },
+    Hotspot { at: [MASTER.x, MASTER.y, MASTER.z], r: 0.014, click: Some("master"), hold: None, wheel: None },
+    // (The knob travels 5 cm: the hotspot covers it in and out.)
+    Hotspot { at: [MIXTURE.x, MIXTURE.y, MIXTURE.z + 0.065], r: 0.03, click: None, hold: None, wheel: Some(("mixture_rich", "mixture_lean")) },
+    Hotspot { at: [0.0, -0.195, PANEL_Z + 0.04], r: 0.022, click: None, hold: None, wheel: Some(("throttle_up", "throttle_down")) },
+    Hotspot { at: [0.15, -0.195, PANEL_Z + 0.035], r: 0.02, click: None, hold: None, wheel: Some(("flaps_up", "flaps_down")) },
+    Hotspot { at: [-0.09, -0.19, PANEL_Z + 0.05], r: 0.02, click: Some("gear"), hold: None, wheel: None },
+    Hotspot { at: [PARK_BRAKE.x, PARK_BRAKE.y, PARK_BRAKE.z + 0.03], r: 0.025, click: Some("parking_brake"), hold: None, wheel: None },
+    // The trim wheel: rolled forward, nose down.
+    Hotspot { at: [0.0, -0.40, PANEL_Z + 0.01], r: 0.06, click: None, hold: None, wheel: Some(("trim_down", "trim_up")) },
+    // The two course deviation indicators: the wheel turns the OBS.
+    Hotspot { at: [-0.075, 0.090, PANEL_Z], r: 0.042, click: None, hold: None, wheel: Some(("obs_right", "obs_left")) },
+    Hotspot { at: [-0.075, -0.005, PANEL_Z], r: 0.042, click: None, hold: None, wheel: Some(("obs_right", "obs_left")) },
+    // Heading indicator: a click sets it to the compass; altimeter: to the QNH.
+    Hotspot { at: [-0.270, -0.005, PANEL_Z], r: 0.042, click: Some("heading_sync"), hold: None, wheel: None },
+    Hotspot { at: [-0.175, 0.090, PANEL_Z], r: 0.042, click: Some("baro_qnh"), hold: None, wheel: None },
+    // The radio stack shows or hides the navigation instruments.
+    Hotspot { at: [0.07, 0.01, PANEL_Z], r: 0.07, click: Some("nav_display"), hold: None, wheel: None },
+];
 
 // ---------------------------------------------------------------- glass
 

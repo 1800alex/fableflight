@@ -60,6 +60,7 @@ pub static SPEC: Spec = Spec {
     eye: EYE,
     eye2: None,
     sees_inside: cabin::sees_inside,
+    hotspots: cabin::HOTSPOTS,
     contacts: &[
         ([0.0, -0.035, -3.17], Part::Nose),
         ([0.0, -0.60, -2.6], Part::Nose),

@@ -87,6 +87,8 @@ pub struct Plane {
     /// a jet's starter engaged (it stays in until the engine is up to idle),
     /// and an automatic start under way (seconds it still has)
     pub starter_on: bool,
+    /// the starter is turning the engine over this instant (the key at START)
+    pub cranking: bool,
     auto_start: f64,
     /// the electrical system and the failures (systems.rs)
     pub sys: crate::systems::Systems,
@@ -123,6 +125,8 @@ pub struct Plane {
     /// gear position, 0 stowed .. 1 down and locked, and where the handle is
     pub gear: f64,
     pub gear_down: bool,
+    /// the parking brake is set (it holds the wheel brakes on)
+    pub parking_brake: bool,
     /// per landing gear leg (see `Spec::gear`): how far its oleo or spring is
     /// compressed (m), how far its wheels have turned (rad) and how fast (rad/s)
     pub compress: [f64; MAX_GEAR],
@@ -234,6 +238,7 @@ impl Plane {
             mixture: 1.0,
             running: true,
             starter_on: false,
+            cranking: false,
             auto_start: 0.0,
             sys: Default::default(),
             payload: spec.payload[0],
@@ -259,6 +264,7 @@ impl Plane {
             // Airborne starts are cleaned up: gear stowed.
             gear: 0.0,
             gear_down: false,
+            parking_brake: false,
             compress: [0.0; MAX_GEAR],
             wheel_rot: [0.0; MAX_GEAR],
             wheel_spin: [0.0; MAX_GEAR],
@@ -556,6 +562,10 @@ impl Plane {
             Input::Trim => self.trim as f32,
             Input::Reverser => self.reverser as f32,
             Input::Mach => self.mach() as f32,
+            Input::Master => self.sys.elec.master as u8 as f32,
+            Input::Ignition => if self.starter_on || self.cranking { 1.5 } else if self.ignition { 1.0 } else { 0.0 },
+            Input::Mixture => self.mixture as f32,
+            Input::ParkingBrake => self.parking_brake as u8 as f32,
         }
     }
 
@@ -1402,6 +1412,7 @@ impl Plane {
                 // starter motor's torque falls away as it spins up (it cranks at ~200 rpm).
                 // (The starter needs power from the bus; the magnetos do not.)
                 let cranking = (c.starter || self.auto_start > 0.0) && self.sys.powered();
+                self.cranking = cranking;
                 self.running = self.ignition && self.fuel > 0.0 && self.mixture > 0.08 && w > 8.0 && eng > 0.0 && !self.sys.fail.engine;
                 let mix = smooth(0.08, 0.45, self.mixture);
                 let q_eng = if self.running { Self::engine_torque(pe, self.charge, rho, c.boost, eng) * mix } else { 0.0 } + if cranking { 120.0 * (1.0 - w / 25.0).max(0.0) } else { 0.0 };

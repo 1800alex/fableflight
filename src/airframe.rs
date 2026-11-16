@@ -604,6 +604,13 @@ pub enum Input {
     Reverser,
     /// the Mach number (inlet spikes follow it)
     Mach,
+    /// cockpit switches: the battery master (0 off, 1 on), the magnetos
+    /// (0 off, 1 both, 1.5 starting), the mixture (0 cut-off .. 1 rich),
+    /// the parking brake (0 off, 1 set)
+    Master,
+    Ignition,
+    Mixture,
+    ParkingBrake,
 }
 
 /// How an input is shaped before it moves a piece.

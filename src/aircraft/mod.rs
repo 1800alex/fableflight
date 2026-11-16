@@ -19,6 +19,39 @@ pub mod starship;
 use crate::airframe::{Model, Sect};
 use glam::{DVec3, Vec3};
 
+/// A control in the cockpit that the mouse can work: a sphere in the body
+/// frame, and the actions (ids from `bind::ACTIONS`) a click and the wheel
+/// stand for. Clicking does what the action's key does; with a `hold`
+/// action, keeping the button down past a moment holds that key instead
+/// (the ignition key turned on to START); each notch of the wheel holds the "up" or
+/// "down" action for a moment (mixture, throttle, trim, OBS).
+#[derive(Clone, Copy, Debug)]
+pub struct Hotspot {
+    pub at: [f32; 3],
+    pub r: f32,
+    pub click: Option<&'static str>,
+    /// held past a moment instead of clicked (the key turned on to START)
+    pub hold: Option<&'static str>,
+    pub wheel: Option<(&'static str, &'static str)>,
+}
+
+/// The hotspot a ray from `o` along `d` (body frame, `d` unit length) meets
+/// first, if any.
+pub fn pick(hs: &[Hotspot], o: Vec3, d: Vec3) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, h) in hs.iter().enumerate() {
+        let c = Vec3::from(h.at) - o;
+        let t = c.dot(d);
+        if t <= 0.0 || c.length_squared() - t * t > h.r * h.r {
+            continue;
+        }
+        if best.is_none_or(|(_, bt)| t < bt) {
+            best = Some((i, t));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 /// Every type, in the order the menu lists them.
 pub static ALL: [&Spec; 8] = [&c172::SPEC, &b747::SPEC, &fa18::SPEC, &f4::SPEC, &f22::SPEC, &starship::SPEC, &concorde::SPEC, &sr71::SPEC];
 
@@ -344,6 +377,8 @@ pub struct Spec {
     pub eye2: Option<Vec3>,
     /// does a view from the eye along this direction see the cabin (rather than out a window)?
     pub sees_inside: fn(Vec3, Vec3) -> bool,
+    /// the cockpit's controls that can be clicked or turned with the mouse wheel
+    pub hotspots: &'static [Hotspot],
     /// points of the fuselage that can touch the ground, and of the tail cone
     pub contacts: &'static [([f64; 3], Part)],
     pub tail_pts: &'static [[f64; 3]],
@@ -469,5 +504,34 @@ impl Spec {
     }
     pub fn max_notch(&self) -> u8 {
         (self.flaps.len().max(1) - 1) as u8
+    }
+}
+
+#[cfg(test)]
+mod hotspot_tests {
+    use super::*;
+
+    #[test]
+    fn hotspots_stand_for_real_actions() {
+        let known = |id: &str| crate::bind::ACTIONS.iter().any(|a| a.id == id);
+        for s in ALL.iter() {
+            for h in s.hotspots {
+                for id in h.click.iter().chain(h.hold.iter()).chain(h.wheel.iter().flat_map(|w| [&w.0, &w.1])) {
+                    assert!(known(id), "{}: no action {id}", s.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pilot_can_point_at_every_hotspot() {
+        for s in ALL.iter() {
+            for (i, h) in s.hotspots.iter().enumerate() {
+                let d = (Vec3::from(h.at) - s.eye).normalize();
+                assert_eq!(pick(s.hotspots, s.eye, d), Some(i), "{}: hotspot {i} hidden behind another", s.name);
+            }
+            // Looking out ahead, at the horizon: nothing.
+            assert_eq!(pick(s.hotspots, s.eye, Vec3::new(0.0, 0.05, -1.0).normalize()), None, "{}", s.name);
+        }
     }
 }

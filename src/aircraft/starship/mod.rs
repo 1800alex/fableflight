@@ -186,6 +186,7 @@ pub static SPEC: Spec = Spec {
     eye: EYE,
     eye2: None,
     sees_inside,
+    hotspots: &[],
     contacts: &[([0.0, 0.0, -72.95], Part::Nose), ([0.0, -4.5, -40.0], Part::Belly), ([0.0, 4.5, -40.0], Part::Roof), ([-4.5, 0.0, 0.0], Part::Side), ([4.5, 0.0, 0.0], Part::Side)],
     tail_pts: &[[0.0, -4.5, 48.0], [0.0, 4.5, 48.0], [-4.5, 0.0, 48.0], [4.5, 0.0, 48.0]],
     wing_st: [0.5, 0.6, 0.7, 0.8, 0.9],

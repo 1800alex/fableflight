@@ -288,6 +288,7 @@ pub static SPEC: Spec = Spec {
     eye: EYE,
     eye2: None,
     sees_inside: pit::sees_inside,
+    hotspots: &[],
     contacts: &[
         ([0.0, -0.10, -9.9], Part::Nose),
         ([0.0, -0.55, -8.4], Part::Nose),

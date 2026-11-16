@@ -142,6 +142,7 @@ fn fr(en: &str) -> Option<&'static str> {
         // keys
         "Space" => "Espace",
         "Mouse drag" => "Glisser souris",
+        "Click / wheel" => "Clic / molette",
         "Mouse wheel" => "Molette",
         "Left stick" => "Stick gauche",
         "Right stick" => "Stick droit",
@@ -164,6 +165,7 @@ fn fr(en: &str) -> Option<&'static str> {
         "set the heading indicator to the compass" => "recaler le conservateur de cap sur le compas",
         "chase / cockpit camera" => "caméra extérieure / cockpit",
         "look around" => "regarder autour",
+        "cockpit: work a switch, turn a knob (Cessna)" => "cockpit : actionner un interrupteur, tourner un bouton (Cessna)",
         "camera distance / cockpit zoom" => "distance caméra / zoom cockpit",
         "hide / show the HUD" => "masquer / afficher le HUD",
         "screenshot" => "capture d'écran",
