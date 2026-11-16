@@ -1033,17 +1033,48 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       }
       hub = false;
     }
-    case 15u: { // VOR / CDI with the OBS card and a NAV flag
+    case 15u: { // VOR / ILS course deviation indicator, on NAV 1 (G.nav, main.rs `nav_globals`)
+      let nv = G.nav;
+      let flags = u32(nv.w + 0.5);
+      let live = (flags & 1u) != 0u;
+      // The OBS card turns under the index at the top: ticks every 5°, figures every 30°.
+      let obs = rad(nv.z);
       a0 = 0.0; a1 = rad(360.0); tn = 72.0; tper = 2.0;
+      q = rot2(uv, -obs);
       if (r < 0.8) { tn = 0.0; }
-      let dev = sin(G.time.x * 0.07) * 0.25;
-      ndl = (1.0 - smoothstep(0.0, px, abs(uv.x - dev) - 0.018)) * step(abs(uv.y), 0.6);
-      let k = clamp(round(uv.x / 0.13), -4.0, 4.0);
-      ink = (1.0 - smoothstep(0.022, 0.022 + px, length(uv - vec2f(k * 0.13, 0.0)))) * step(0.5, abs(k));
-      let flag = step(abs(uv.x - 0.35), 0.1) * step(abs(uv.y - 0.35), 0.06);
-      col = vec3f(0.6, 0.02, 0.01) * flag;
-      cov = flag;
-      tc = vec2f(0.0, 0.66); tcode = pack(0u, 9u, 0u, 0u, 0u, 0u); tlen = 3u; th = 0.15;
+      let k = round((ang_of(uv) + obs) / rad(30.0));
+      let a = k * rad(30.0) - obs;
+      tp = rot2(uv - vec2f(sin(a), cos(a)) * 0.68, a);
+      tc = vec2f(0.0);
+      let cc = card_code(i32(k));
+      tcode = cc.x; tlen = cc.y; th = 0.13;
+      if (r < 0.6) { tlen = 0u; }
+      let index = step(abs(uv.x), (0.99 - uv.y) * 0.35) * step(0.88, uv.y);
+      // Five dots each side of centre for the course, and for the glide slope on the right.
+      let kx = clamp(round(uv.x / 0.1), -5.0, 5.0);
+      var dots = (1.0 - smoothstep(0.016, 0.016 + px, length(uv - vec2f(kx * 0.1, 0.0)))) * step(0.5, abs(kx));
+      let gsl = (flags & 8u) != 0u;
+      let ky = clamp(round(uv.y / 0.1), -5.0, 5.0);
+      dots = max(dots, (1.0 - smoothstep(0.013, 0.013 + px, length(uv - vec2f(0.6, ky * 0.1)))) * step(0.5, abs(ky)));
+      ink = max(ink, dots);
+      // The course needle hangs from the top; full scale at the fifth dot.
+      let dev = select(0.0, clamp(nv.x, -1.0, 1.0) * 0.5, live);
+      ndl = (1.0 - smoothstep(0.0, px, abs(uv.x - dev) - 0.016)) * step(abs(uv.y), 0.62);
+      // The glide slope needle, across, while it is alive (stowed below otherwise).
+      let gy = select(-0.66, clamp(nv.y, -1.0, 1.0) * 0.5, gsl);
+      ndl = max(ndl, (1.0 - smoothstep(0.0, px, abs(uv.y - gy) - 0.014)) * step(abs(uv.x), 0.5));
+      // TO / FROM: a white triangle pointing up or down beside the centre.
+      let tri_up = step(abs(uv.x + 0.3), (0.32 - uv.y) * 0.6) * step(0.2, uv.y);
+      let tri_dn = step(abs(uv.x + 0.3), (uv.y + 0.32) * 0.6) * step(uv.y, -0.2);
+      var tf = 0.0;
+      if ((flags & 2u) != 0u) { tf = tri_up; }
+      if ((flags & 4u) != 0u) { tf = tri_dn; }
+      // The red NAV flag while the receiver hears nothing usable; the GS flag the same.
+      let flag = step(abs(uv.x - 0.3), 0.12) * step(abs(uv.y - 0.32), 0.06) * select(1.0, 0.0, live);
+      let gflag = step(abs(uv.x - 0.6), 0.06) * step(abs(uv.y - 0.6), 0.1) * select(1.0, 0.0, gsl);
+      col = vec3f(0.75, 0.35, 0.02) * index + vec3f(0.7) * tf + vec3f(0.6, 0.02, 0.01) * max(flag, gflag);
+      cov = max(max(index, tf), max(flag, gflag));
+      hub = false;
     }
     case 17u: { // magnetic compass: a card seen edge-on through a window
       let hdg = O.params[5].x % 1000.0;
