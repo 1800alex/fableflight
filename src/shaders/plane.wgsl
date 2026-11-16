@@ -130,6 +130,8 @@ fn quad(a: vec2f, b: vec2f, c: vec2f, d: vec2f) -> array<vec2f, 5> { return arra
 // Window openings (negative inside); matches c172::window / b747::window.
 fn window(p: vec3f) -> f32 {
   if (kind() == 1u) { return window747(p); }
+  // (The Robin's canopy is a glass piece of its own, all of it clear.)
+  if (kind() == 8u) { return -1.0; }
   // A fighter's canopy is blown glass: all of it is window.
   if (fighter()) { return -1.0; }
   // (Concorde's windscreen, side windows and visor are glass pieces of their own.)
@@ -148,6 +150,7 @@ fn window(p: vec3f) -> f32 {
 // Landing gear wells (only the skin has them); matches c172::well / b747::well.
 fn well(p: vec3f) -> f32 {
   if (kind() == 1u) { return well747(p); }
+  if (kind() == 8u) { return 1.0; }
   var d = 1.0;
   if (p.y < -0.40) {
     d = min(d, sd_poly(vec2f(p.z, p.x), quad(vec2f(-3.0, -0.135), vec2f(-1.915, -0.135), vec2f(-1.915, 0.135), vec2f(-3.0, 0.135)), 4) + 0.005);
@@ -159,6 +162,8 @@ fn well(p: vec3f) -> f32 {
   return d;
 }
 fn cut_here(L: vec3f, pt: u32) -> bool {
+  // Nothing is cut out of the Robin's skin: it simply stops under the canopy.
+  if (kind() == 8u) { return false; }
   // The 747's wing gear passes through the lower wing skin as well.
   let wing_well = kind() == 1u && pt == P_WING && well(L) < 0.0;
   return wing_well || ((pt == P_FUSE || pt == P_COWL || pt == P_LINING) && (window(L) < 0.0 || (pt != P_LINING && well(L) < 0.0)));
@@ -490,6 +495,7 @@ fn pack(a: u32, b: u32, c: u32, d: u32, e: u32, f: u32) -> u32 {
 
 fn livery(L: vec3f, aa: f32, pt: u32) -> vec3f {
   if (kind() == 1u) { return livery747(L, aa, pt); }
+  if (kind() == 8u) { return livery_dr400(L, aa); }
   var c = WHITE_PAINT;
   let ax = abs(L.x);
   let fin = ax < 0.15 && L.y > 0.33 && L.z > 2.8;
@@ -523,6 +529,38 @@ fn livery(L: vec3f, aa: f32, pt: u32) -> vec3f {
     let ink = text(vec2f(tx, L.y - 0.045) / 0.09, reg, 6u, 0.13, aa / 0.09 + 0.01);
     c = mix(c, NAVY, ink);
   }
+  return c;
+}
+
+// The Robin DR 400: white, a blue cheat line from the spinner to the tail
+// with a red pinstripe under it, the top of the fin blue, red wing tips and
+// spinner (a classic Robin scheme, made up; no registration).
+const ROBIN_BLUE = vec3f(0.012, 0.045, 0.20);
+const ROBIN_RED = vec3f(0.42, 0.02, 0.015);
+fn livery_dr400(Lb: vec3f, aa: f32) -> vec3f {
+  // (In dr400.rs's design frame, 0.55 m ahead of the body frame.)
+  let L = Lb - vec3f(0.0, 0.0, 0.55);
+  var c = WHITE_PAINT;
+  let ax = abs(L.x);
+  let fin = ax < 0.12 && L.y > 0.12 && L.z > 3.1;
+  if (!fin && ax < 0.6 && L.y < 0.5 && L.y > -0.5 && L.z > -2.42 && L.z < 4.4) {
+    let zz = max(L.z - 0.9, 0.0);
+    let yc = -0.07 + zz * 0.025;
+    let taper = 1.0 - 0.5 * smoothstep(1.0, 4.3, L.z);
+    let hw = 0.045 * taper;
+    let blue = smoothstep(hw + aa, hw - aa, abs(L.y - yc));
+    let red = smoothstep(0.010 + aa, 0.010 - aa, abs(L.y - (yc - hw - 0.028)));
+    c = mix(c, ROBIN_BLUE, blue);
+    c = mix(c, ROBIN_RED, red);
+  }
+  if (fin) {
+    let edge = 0.78 - (L.z - 3.6) * 0.25;
+    c = mix(c, ROBIN_BLUE, smoothstep(edge - aa, edge + aa, L.y));
+    c = mix(c, ROBIN_RED, smoothstep(aa, -aa, abs(L.y - (edge - 0.05)) - 0.012));
+  }
+  if (ax > 4.12 && L.y > -0.2) { c = ROBIN_RED; }
+  if (ax > 1.45 && L.z > 3.4 && abs(L.y - 0.06) < 0.15) { c = ROBIN_BLUE; }
+  if (L.z < -2.41) { c = ROBIN_RED; }
   return c;
 }
 
@@ -563,6 +601,8 @@ fn chord_at(s: f32) -> f32 { return select(1.65 - 0.5 * (s - 2.55) / 2.95, 1.65,
 // Height (m), seam dirt, rivet coverage, for the surface pattern.
 fn relief(pt: u32, uv: vec2f, L: vec3f, Nl: vec3f, px: f32) -> vec3f {
   if (kind() == 1u) { return relief747(pt, uv, L, Nl, px); }
+  // The Robin is wood and fabric: no rivets, no laps.
+  if (kind() == 8u) { return vec3f(0.0); }
   var h = 0.0;
   var dirt = 0.0;
   var rv = 0.0;
@@ -1455,7 +1495,7 @@ fn surface(in: VOut) -> Shaded {
   }
   let hx = dpdx(rel.x);
   let hy = dpdy(rel.x);
-  let cuts = pt == P_FUSE || pt == P_COWL || pt == P_LINING;
+  let cuts = (pt == P_FUSE || pt == P_COWL || pt == P_LINING) && kind() != 8u;
   var wd = 1.0;
   var wl = 1.0;
   if (cuts) { wd = window(in.L); }
@@ -1951,6 +1991,7 @@ fn surface(in: VOut) -> Shaded {
   if (kind() == 3u) { inside = step(abs(L.x), F4_TUB.x) * step(F4_TUB.z, L.z) * step(L.z, F4_TUB.w) * step(F4_TUB.y, L.y) * select(0.0, 1.0, pt != P_HORNET); }
   if (kind() == 4u) { inside = step(abs(L.x), F22_TUB.x) * step(F22_TUB.z, L.z) * step(L.z, F22_TUB.w) * step(F22_TUB.y, L.y) * select(0.0, 1.0, pt != P_HORNET); }
   if (kind() == 6u) { inside = step(abs(L.x), CONCORDE_TUB.x) * step(CONCORDE_TUB.z, L.z) * step(L.z, CONCORDE_TUB.w) * step(CONCORDE_TUB.y, L.y) * select(0.0, 1.0, pt != P_HORNET); }
+  if (kind() == 8u) { inside = step(abs(L.x), 0.56) * step(-0.62, L.z) * step(L.z, 1.66) * step(L.y, 0.62) * select(0.0, 1.0, id != M_LIVERY && pt != P_FUSE && pt != P_COWL); }
   if (kind() == 7u) { inside = step(abs(L.x), SR71_TUB.x) * step(SR71_TUB.z, L.z) * step(L.z, SR71_TUB.w) * step(SR71_TUB.y, L.y) * select(0.0, 1.0, pt != P_HORNET); }
   // (The baked occlusion already counts only the sky seen through the
   // windows; the eye adapts to the dimmer cabin, main.rs / cockpit.rs.)
@@ -2066,6 +2107,7 @@ const GS_Z = -1.30; // cabin::PANEL_Z
   if (kind() == 3u) { in_cabin = from_inside && abs(eye_l.x) < F4_CABIN[0] && eye_l.y > F4_CABIN[1] && eye_l.y < F4_CABIN[2] && eye_l.z > F4_CABIN[3] && eye_l.z < F4_CABIN[4]; }
   if (kind() == 4u) { in_cabin = from_inside && abs(eye_l.x) < F22_CABIN[0] && eye_l.y > F22_CABIN[1] && eye_l.y < F22_CABIN[2] && eye_l.z > F22_CABIN[3] && eye_l.z < F22_CABIN[4]; }
   if (kind() == 6u) { in_cabin = from_inside && abs(eye_l.x) < CONCORDE_CABIN[0] && eye_l.y > CONCORDE_CABIN[1] && eye_l.y < CONCORDE_CABIN[2] && eye_l.z > CONCORDE_CABIN[3] && eye_l.z < CONCORDE_CABIN[4]; }
+  if (kind() == 8u) { in_cabin = from_inside && abs(eye_l.x) < 0.56 && eye_l.y > -0.52 && eye_l.y < 0.62 && eye_l.z > -0.62 && eye_l.z < 1.66; }
   if (kind() == 7u) { in_cabin = from_inside && abs(eye_l.x) < SR71_CABIN[0] && eye_l.y > SR71_CABIN[1] && eye_l.y < SR71_CABIN[2] && eye_l.z > SR71_CABIN[3] && eye_l.z < SR71_CABIN[4]; }
   let wind = abs(in.Nl.x) < 0.5;
   let tb = select(vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 0.0), wind);
