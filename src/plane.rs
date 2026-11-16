@@ -89,6 +89,8 @@ pub struct Plane {
     pub starter_on: bool,
     /// the starter is turning the engine over this instant (the key at START)
     pub cranking: bool,
+    /// the parking brake is set (it holds the wheel brakes on)
+    pub parking_brake: bool,
     auto_start: f64,
     /// the electrical system and the failures (systems.rs)
     pub sys: crate::systems::Systems,
@@ -125,8 +127,6 @@ pub struct Plane {
     /// gear position, 0 stowed .. 1 down and locked, and where the handle is
     pub gear: f64,
     pub gear_down: bool,
-    /// the parking brake is set (it holds the wheel brakes on)
-    pub parking_brake: bool,
     /// per landing gear leg (see `Spec::gear`): how far its oleo or spring is
     /// compressed (m), how far its wheels have turned (rad) and how fast (rad/s)
     pub compress: [f64; MAX_GEAR],
@@ -239,6 +239,7 @@ impl Plane {
             running: true,
             starter_on: false,
             cranking: false,
+            parking_brake: false,
             auto_start: 0.0,
             sys: Default::default(),
             payload: spec.payload[0],
@@ -264,7 +265,6 @@ impl Plane {
             // Airborne starts are cleaned up: gear stowed.
             gear: 0.0,
             gear_down: false,
-            parking_brake: false,
             compress: [0.0; MAX_GEAR],
             wheel_rot: [0.0; MAX_GEAR],
             wheel_spin: [0.0; MAX_GEAR],
@@ -560,12 +560,12 @@ impl Plane {
             Input::Prop => (self.prop % std::f64::consts::TAU) as f32,
             Input::Throttle => self.throttle as f32,
             Input::Trim => self.trim as f32,
-            Input::Reverser => self.reverser as f32,
-            Input::Mach => self.mach() as f32,
             Input::Master => self.sys.elec.master as u8 as f32,
             Input::Ignition => if self.starter_on || self.cranking { 1.5 } else if self.ignition { 1.0 } else { 0.0 },
             Input::Mixture => self.mixture as f32,
             Input::ParkingBrake => self.parking_brake as u8 as f32,
+            Input::Reverser => self.reverser as f32,
+            Input::Mach => self.mach() as f32,
         }
     }
 

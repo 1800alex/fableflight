@@ -600,10 +600,6 @@ pub enum Input {
     Throttle,
     /// the angle of attack the trim holds (rad)
     Trim,
-    /// thrust reversers, 0 stowed .. 1 deployed
-    Reverser,
-    /// the Mach number (inlet spikes follow it)
-    Mach,
     /// cockpit switches: the battery master (0 off, 1 on), the magnetos
     /// (0 off, 1 both, 1.5 starting), the mixture (0 cut-off .. 1 rich),
     /// the parking brake (0 off, 1 set)
@@ -611,6 +607,10 @@ pub enum Input {
     Ignition,
     Mixture,
     ParkingBrake,
+    /// thrust reversers, 0 stowed .. 1 deployed
+    Reverser,
+    /// the Mach number (inlet spikes follow it)
+    Mach,
 }
 
 /// How an input is shaped before it moves a piece.
