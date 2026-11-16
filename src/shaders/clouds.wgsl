@@ -444,7 +444,11 @@ fn depth_match(a: f32, b: f32) -> f32 {
       let dt0 = clamp(t * select(0.016, 0.03, ufree), 40.0, 2500.0) * qs;
       ufree = false;
       var dt = dt0 * (1.0 + clear);
-      if (smask != 0u) { dt = min(dt, max(sclear, dt0)); }
+      // Near a storm the stride is held to the air sure to be clear, in whole base
+      // steps. (Cut to that distance exactly, the steps ended where a lookup made
+      // at the last jittered sample said, so the jitter cancelled out and the
+      // march's banding stood on the towers' sunlit faces as contour-line rings.)
+      if (smask != 0u) { dt = min(dt, dt0 * max(floor(sclear / dt0), 1.0)); }
       if (i >= n_max * 11 / 20 && clear > 0.0) { dt = max(dt, (tb - t) / f32(max(n_max - 4 - i, 4))); }
       let ts = t + dt * jit;
       t += dt;
@@ -482,7 +486,7 @@ fn depth_match(a: f32, b: f32) -> f32 {
         slook = max(-wx.sd - max(storm_bulge(wx.sc), 2600.0), 0.0) * 0.8;
       }
       // Stride faster through the empty storm-only air above the ordinary layer.
-      if (d <= 0.002) { pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, min(sclear, h - base - G.cloud.z + dt0) / dt0 - 1.0); }
+      if (d <= 0.002) { pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, floor(min(sclear, h - base - G.cloud.z + dt0) / dt0) - 1.0); }
         // Under a storm's base the clear air between the scud takes longer
         // steps (grazing rays cross kilometres of it).
         ufree = h < base && smask != 0u;
@@ -507,10 +511,15 @@ fn depth_match(a: f32, b: f32) -> f32 {
         var hi = ts;
         // Far off the strides are km long: two more halvings, or the light is taken
         // a few hundred metres inside and distant towers go grey.
-        for (var k = 0; k < select(4, 6, dt > 600.0); k++) {
+        // The surface found is that of the cloud as sampled (eroded, with the
+        // close-up octave): the smooth, uneroded one lies further out, so the
+        // light was taken in the clear air between the billows and they came out
+        // flat. (One halving fewer pays for the eroded lookups; the jitter
+        // averages out what is left.)
+        for (var k = 0; k < select(3, 5, dt > 600.0); k++) {
           let tm = 0.5 * (lo + hi);
           let pm = oc + rd * tm;
-          if (cloud_shape(pm, length(pm) - rg, wx, false) > 0.002) { hi = tm; } else { lo = tm; }
+          if (cloud_shape_f(pm, length(pm) - rg, wx, true, fine) > 0.002) { hi = tm; } else { lo = tm; }
         }
         pl = oc + rd * min(hi + 40.0, ts);
         hl = length(pl) - rg;
