@@ -34,6 +34,7 @@ mod pave;
 mod photonight;
 mod relight;
 mod weather;
+mod weapons;
 mod mvt;
 mod plane;
 mod render;
@@ -577,6 +578,8 @@ struct Game {
     /// aircraft models being built on a background thread (menu selection)
     building: Vec<(&'static aircraft::Spec, std::sync::mpsc::Receiver<airframe::Model>)>,
     plane: Plane,
+    /// the F/A-18's missiles: master arm, seeker and the two wingtip shots
+    weapons: weapons::Weapons,
     crashed: bool,
     crash: Option<Crash>,
     crash_real: f64,
@@ -862,6 +865,7 @@ impl Game {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let doy = (secs / 86400.0) % 365.25;
         let cam_pos = plane.pos - plane.forward() * spec.cam_dist;
+        let weapons = weapons::Weapons::new(spec, &model.pieces);
         // What the anti-aliasing takes to be flying along with the camera:
         // everything within the aircraft's bounds, and a little around them
         // for the gear, flaps and control surfaces as they move.
@@ -877,7 +881,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane,
+            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -956,6 +960,7 @@ impl Game {
         self.hangar.push(old);
         self.r.set_paint(spec.paint.as_ref());
         self.spec = spec;
+        self.weapons.reset(spec, &self.model.pieces);
         self.cam_dist = spec.cam_dist;
         self.menu.aircraft = aircraft::ALL.iter().position(|s| std::ptr::eq(*s, spec)).unwrap_or(0);
     }
@@ -1162,6 +1167,7 @@ impl Game {
         self.warn_t = [-10.0; 4];
         (self.g_slow, self.was_ground, self.prev_vs, self.prev_gear, self.prev_flaps) = (1.0, false, 0.0, self.plane.gear, self.plane.flaps);
         self.gauges = gauges::Gauges::new(&self.plane, self.frame ^ 0x9e37);
+        self.weapons.reset(self.spec, &self.model.pieces);
     }
 
     /// On the ground, at rest, waiting for the terrain under it to load.
@@ -2114,6 +2120,31 @@ impl Game {
             }
             KeyCode::Backspace if !self.crashed => self.plane.stage_sep(),
             KeyCode::Digit2 if !self.crashed => self.plane.toggle_autoland(),
+            KeyCode::Digit3 if !self.crashed => {
+                if !self.weapons.has_weapons() {
+                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                } else {
+                    let on = self.weapons.toggle_arm();
+                    self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
+                }
+                self.status_until = self.real + 3.0;
+            }
+            KeyCode::Digit4 if !self.crashed => {
+                if !self.weapons.has_weapons() {
+                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                } else {
+                    self.weapons.request_cycle();
+                }
+                self.status_until = self.real + 3.0;
+            }
+            KeyCode::Digit5 if !self.crashed => {
+                if !self.weapons.has_weapons() {
+                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                } else {
+                    self.weapons.request_fire();
+                }
+                self.status_until = self.real + 3.0;
+            }
             KeyCode::KeyG => {
                 self.goto_open = true;
                 self.goto_text.clear();
@@ -2354,6 +2385,109 @@ impl Game {
         }
     }
 
+    /// A weapon-system event: status messages, the launch sound, and a
+    /// missile's detonation in the particle system.
+    fn weapon_event(&mut self, ev: weapons::Event, femit: &mut Vec<(DVec3, render::Particle)>) {
+        use weapons::Refusal;
+        match ev {
+            weapons::Event::Locked => {
+                self.status = t!("Target locked", "Cible verrouillée").into();
+                self.status_until = self.real + 2.0;
+            }
+            weapons::Event::Lost => {}
+            weapons::Event::Fired { station } => {
+                if let Some(a) = &self.audio {
+                    a.event(audio::Event::Missile(1.0));
+                }
+                let name = self.weapons.station(station).map_or("AIM-9", |s| s.spec.name);
+                self.flash.push((t!("MISSILE AWAY  {}", "MISSILE LANCÉ  {}", name), self.real));
+            }
+            weapons::Event::Refused(why) => {
+                let msg = match why {
+                    Refusal::NotArmed => t!("MASTER ARM OFF", "ARMEMENT MAÎTRE SUR OFF"),
+                    Refusal::NoPower => t!("WEAPONS: NO POWER", "ARMES : PAS D'ALIMENTATION"),
+                    Refusal::NoLock => t!("NO LOCK", "PAS DE VERROUILLAGE"),
+                    Refusal::NoMissiles => t!("NO MISSILES", "PLUS DE MISSILES"),
+                    Refusal::NoWeapons => t!("NO WEAPONS ON THIS AIRCRAFT", "PAS D'ARMES SUR CET AVION"),
+                    Refusal::NoTarget => t!("NO TARGET", "PAS DE CIBLE"),
+                };
+                self.flash.push((msg.into(), self.real));
+            }
+            weapons::Event::Blast { pos, power, size, target } => {
+                let near = 1.0 / (1.0 + ((self.cam_pos - pos).length() as f32 / 500.0).powi(2));
+                if let Some(a) = &self.audio {
+                    a.boom(power * (0.2 + 0.8 * near));
+                }
+                self.blast_fx(pos, power, size, femit);
+                if let Some(key) = target {
+                    let label = self.weapons.target_view.as_ref().map(|v| v.label.clone()).unwrap_or_default();
+                    let hit = match &key {
+                        weapons::TargetKey::Live(hex) => self.live.down(hex),
+                        weapons::TargetKey::Airport { .. } => self.world.down_air_target(&key),
+                    };
+                    if hit {
+                        let msg = if label.is_empty() { t!("SPLASH", "ABATTU").to_string() } else { t!("SPLASH  {}", "ABATTU  {}", label) };
+                        self.flash.push((msg, self.real));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fireball and smoke of a missile going off (or a target being hit).
+    fn blast_fx(&mut self, at: DVec3, power: f32, size: f32, femit: &mut Vec<(DVec3, render::Particle)>) {
+        let up = at.normalize();
+        let p = power.max(0.3);
+        let k = (0.7 + 0.15 * size).min(1.5);
+        let r = &mut self.rng;
+        femit.push((at, render::Particle { life: 0.22, size0: 9.0 * p * k, size1: 28.0 * p * k, kind: crash::FLASH, alpha: 1.7 * p, ..Default::default() }));
+        for _ in 0..18 {
+            let d = r.dir();
+            femit.push((at, render::Particle {
+                vel: (d * r.range(14.0, 45.0) * p.sqrt() + up.as_vec3() * r.range(2.0, 9.0)).into(),
+                life: r.range(1.2, 2.8),
+                size0: r.range(1.4, 3.0) * p * k,
+                size1: r.range(6.0, 12.0) * p * k,
+                temp: r.range(1.6, 2.8),
+                kind: crash::GAS,
+                drag: r.range(1.4, 2.2),
+                buoy: r.range(5.0, 10.0),
+                seed: r.f(),
+                alpha: r.range(0.7, 0.95),
+                ..Default::default()
+            }));
+        }
+        for _ in 0..20 {
+            let d = (r.dir() + up.as_vec3() * 0.6).normalize_or_zero();
+            femit.push((at, render::Particle {
+                vel: (d * r.range(20.0, 70.0) * p.sqrt()).into(),
+                life: r.range(0.5, 1.8),
+                size0: r.range(0.06, 0.14),
+                size1: 0.03,
+                kind: crash::SPARK,
+                drag: r.range(0.3, 0.9),
+                seed: r.f(),
+                alpha: r.range(0.5, 1.0),
+                ..Default::default()
+            }));
+        }
+        for _ in 0..8 {
+            let d = r.dir();
+            femit.push((at, render::Particle {
+                vel: (d * r.range(3.0, 12.0) * p.sqrt() + up.as_vec3() * r.range(1.0, 5.0)).into(),
+                life: r.range(3.0, 6.0),
+                size0: r.range(2.5, 4.5) * p * k,
+                size1: r.range(8.0, 16.0) * p * k,
+                kind: crash::GAS,
+                drag: r.range(0.8, 1.4),
+                buoy: r.range(2.0, 5.0),
+                seed: r.f(),
+                alpha: r.range(0.3, 0.55),
+                ..Default::default()
+            }));
+        }
+    }
+
     /// Knock a building down, with any parts standing on it.
     /// `hit`: the aircraft itself went in (the wall shows its outline).
     /// `energy`: kinetic energy (J) of what hit it. A building only comes down
@@ -2520,6 +2654,9 @@ impl Game {
     fn update_audio(&mut self, cam: DVec3, fire: f32, in_menu: bool, c: &Controls, dt: f64, scrape: f32) {
         self.warn = if dt > 0.0 { self.warnings() } else { audio::Warn::default() };
         let live = !self.crashed && !in_menu && dt > 0.0;
+        if live {
+            self.warn.seeker = self.weapons.seeker_tone;
+        }
         let p = &self.plane;
         let up = p.pos.normalize();
         let vs = p.vel.dot(up);
@@ -2780,11 +2917,22 @@ impl Game {
         let mut femit: Vec<(DVec3, render::Particle)> = Vec::new();
         let (mut scrape_n, mut steps) = (0usize, 0usize);
         if !self.crashed && !in_menu {
+            let weapon_targets = if !self.weapons.has_weapons() {
+                Vec::new()
+            } else {
+                let mut t = self.live.targets();
+                t.extend(self.world.air_targets(self.plane.pos));
+                t
+            };
             self.acc += dt;
             let h = 1.0 / 180.0;
             while self.acc >= h {
                 self.acc -= h;
                 let imp = self.plane.step(h, &c, &self.world);
+                let powered = self.plane.sys.powered();
+                for ev in self.weapons.step(h, &self.plane, &weapon_targets, &self.world, powered) {
+                    self.weapon_event(ev, &mut femit);
+                }
                 self.gauges.update(h, &self.plane, self.time);
                 steps += 1;
                 scrape_n += self.plane.sparks.len();
@@ -3045,6 +3193,34 @@ impl Game {
         }
         if !emit.is_empty() {
             self.r.emit(&emit);
+        }
+        // Missiles leave a trail of smoke (and a little flame on the boost).
+        if !in_menu && !self.weapons.missiles.is_empty() {
+            let mut trail = Vec::new();
+            for m in &self.weapons.missiles {
+                let pos = (m.pos - self.fx_anchor).as_vec3();
+                let back = (m.rot * DVec3::Z).as_vec3();
+                let n = if m.burn > 0.0 { 2 } else { 1 };
+                for _ in 0..n {
+                    let r = &mut self.rng;
+                    let drift = r.dir() * r.range(0.4, 1.6);
+                    trail.push(render::Particle {
+                        pos: pos.into(),
+                        vel: (back * r.range(3.0, 8.0) + drift).into(),
+                        life: r.range(1.2, 3.0),
+                        size0: if m.burn > 0.0 { 0.18 } else { 0.28 },
+                        size1: r.range(1.2, 3.2),
+                        temp: if m.burn > 0.0 { 0.15 } else { 0.0 },
+                        kind: crash::MIST,
+                        drag: 1.0,
+                        buoy: 0.4,
+                        seed: r.f(),
+                        alpha: 0.4,
+                        ..Default::default()
+                    });
+                }
+            }
+            self.r.emit(&trail);
         }
 
         // ---- camera
@@ -3462,7 +3638,7 @@ impl Game {
                     airframe::Vis::FastProp => blur <= 0.0,
                     airframe::Vis::Chute => self.plane.spoilers < 0.02,
                 };
-                if hide || dm.hidden(p) {
+                if hide || dm.hidden(p) || self.weapons.hides_piece(p.name) {
                     continue;
                 }
                 let tears = dm.tears_for(p);
@@ -3510,6 +3686,14 @@ impl Game {
                     });
                 }
             }
+            // Missiles in flight: the same wingtip piece, now on its own.
+            for m in &self.weapons.missiles {
+                let Some(st) = self.weapons.station(m.station) else { continue };
+                let Some(pi) = st.piece else { continue };
+                let local = self.model.pieces[pi].pivot.as_dvec3();
+                let model = Mat4::from_rotation_translation(m.rot.as_quat(), (m.pos - cam).as_vec3()) * Mat4::from_translation((-local).as_vec3());
+                objs.push(DrawObj { mesh: self.piece_mesh[pi], model, tint: [0.0; 4], glow: [0.0, kind, 0.0, 0.0], params, cast: 0, ..DrawObj::DEFAULT });
+            }
             self.own_lights(&base, &pose, params[5], &mut g, &mut own_lights);
         }
         if !in_menu {
@@ -3538,6 +3722,19 @@ impl Game {
             self.world.photo_beacons(cam, &mut air_lights);
         }
         self.live.step(&self.src, (!in_menu).then_some(self.plane.pos));
+        if !in_menu {
+            // A downed aircraft that has reached the ground is gone.
+            let mut gone = Vec::new();
+            for p in self.live.planes.iter().filter(|p| p.downed > 0.0) {
+                let (la, lo, h) = geo::pos_to_lla(p.pos);
+                if h < 0.0 || self.world.ground(la, lo).is_some_and(|g| h < g.h + 2.0) {
+                    gone.push(p.hex.clone());
+                }
+            }
+            for hex in gone {
+                self.live.remove(&hex);
+            }
+        }
         let wx_at = if in_menu {
             self.menu.pick
         } else {
@@ -4812,6 +5009,33 @@ impl Game {
                             let flaps = match &p.spec.lever { Some(l) => l.notches.get(p.flap_set as usize).map_or("", |n| n[0]).to_string(), None => format!("FLAPS {:>2.0}°", p.flap_notch_deg()) };
                             shadow(ui, format!("{flaps}   GEAR {}{sb}", gear), 14.0, if p.gear > 0.0 && p.gear < 1.0 { Color32::from_rgb(255, 190, 60) } else { dim });
                         }
+                        if self.weapons.has_weapons() {
+                            let armed = self.weapons.armed;
+                            let power = p.sys.powered();
+                            let arm_col = if !armed { dim } else if power { Color32::from_rgb(120, 230, 140) } else { Color32::from_rgb(255, 180, 50) };
+                            shadow(ui, format!("MASTER ARM {}", if armed { "ON" } else { "OFF" }), 14.0, arm_col);
+                            let (mut left, mut right) = (0u8, 0u8);
+                            for (i, st) in self.weapons.stations.iter().enumerate() {
+                                if self.weapons.loaded(i) {
+                                    if st.spec.side == 0 { left += 1 } else { right += 1 }
+                                }
+                            }
+                            shadow(ui, format!("AIM-9  L {left}  R {right}"), 14.0, dim);
+                            let (line, col) = if !armed {
+                                (t!("SEEKER  SAFE", "CHERCHEUR  SÉCURISÉ").to_string(), dim)
+                            } else if !power {
+                                (t!("SEEKER  NO POWER", "CHERCHEUR  PAS D'ALIMENTATION").to_string(), Color32::from_rgb(255, 180, 50))
+                            } else if let Some(v) = &self.weapons.target_view {
+                                if self.weapons.lock >= 1.0 {
+                                    (t!("SEEKER  LOCK  {:.1} km", "CHERCHEUR  VERROUILLÉ  {:.1} km", v.range / 1000.0), Color32::from_rgb(120, 230, 140))
+                                } else {
+                                    (t!("SEEKER  TRACK  {:.1} km", "CHERCHEUR  POURSUITE  {:.1} km", v.range / 1000.0), Color32::from_rgb(255, 180, 50))
+                                }
+                            } else {
+                                (t!("SEEKER  SEARCH", "CHERCHEUR  RECHERCHE").to_string(), dim)
+                            };
+                            shadow(ui, line, 14.0, col);
+                        }
                         if p.gear < 1.0 && agl < 150.0 && p.throttle < 0.35 && !self.crashed {
                             if pad {
                                 ui.horizontal(|ui| {
@@ -4869,6 +5093,9 @@ impl Game {
                 let screen = ctx.content_rect();
                 let painter = ctx.layer_painter(egui::LayerId::background());
                 for p in &self.live.planes {
+                    if p.downed > 0.0 {
+                        continue;
+                    }
                     let rel = p.pos - cam;
                     let d = rel.length();
                     if d > 40_000.0 || d < 30.0 {
@@ -4890,6 +5117,31 @@ impl Game {
                         let pos = at + egui::vec2(9.0, -10.0 + 14.0 * k as f32);
                         painter.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_TOP, s, FontId::proportional(size), Color32::from_black_alpha(a / 2));
                         painter.text(pos, Align2::LEFT_TOP, s, FontId::proportional(size), col);
+                    }
+                }
+            }
+            // The seeker's target: a diamond on the aircraft, and its range.
+            if let (true, Some((vp, cam))) = (self.show_hud, self.live_view) {
+                if let Some(t) = &self.weapons.target_view {
+                    let screen = ctx.content_rect();
+                    let c = vp * (t.pos - cam).as_vec3().extend(1.0);
+                    if c.w > 0.0 {
+                        let at = egui::pos2(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height());
+                        if screen.expand(100.0).contains(at) {
+                            let painter = ctx.layer_painter(egui::LayerId::background());
+                            let locked = self.weapons.lock >= 1.0;
+                            let col = if locked { Color32::from_rgb(120, 230, 140) } else { Color32::from_rgb(255, 180, 50) };
+                            let st = egui::Stroke::new(1.6, col);
+                            let r = if locked { 16.0 } else { 12.0 };
+                            painter.circle_stroke(at, r + 5.0, egui::Stroke::new(1.0, col));
+                            for (a, b) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                                painter.line_segment([at + egui::vec2(a * r, b * r), at + egui::vec2(a * (r + 8.0), b * (r + 8.0))], st);
+                            }
+                            let line = format!("{}  {}  {:.1} km  {:+.0} m/s", if locked { "LOCK" } else { "TRACK" }, t.label, t.range / 1000.0, t.closure);
+                            let pos = at + egui::vec2(0.0, r + 22.0);
+                            painter.text(pos + egui::vec2(1.0, 1.0), Align2::CENTER_TOP, &line, FontId::monospace(12.0), Color32::from_black_alpha(180));
+                            painter.text(pos, Align2::CENTER_TOP, &line, FontId::monospace(12.0), col);
+                        }
                     }
                 }
             }

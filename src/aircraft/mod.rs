@@ -289,6 +289,16 @@ pub enum Sound {
     Rocket,
 }
 
+/// A heat-seeking missile on a hardpoint: the model piece that is the loaded
+/// missile (the game hides it when fired and draws it as the projectile), the
+/// wing it hangs from (0 left, 1 right), and what the HUD calls it.
+#[derive(Clone, Copy, Debug)]
+pub struct MissileStation {
+    pub piece: &'static str,
+    pub side: usize,
+    pub name: &'static str,
+}
+
 /// A painted skin: pictures of the aircraft seen from straight above, from
 /// below and from its left side (and from its right, if `views` is 4;
 /// otherwise the left one serves both sides, mirrored), side by side in one
@@ -453,6 +463,12 @@ impl std::fmt::Debug for Spec {
 }
 
 impl Spec {
+    /// The heat-seeking missiles it carries, if any. (Only the Hornet has
+    /// them modelled; other types get an empty list.)
+    pub fn missiles(&self) -> &'static [MissileStation] {
+        if self.keys.contains(&"fa18") { &fa18::MISSILES } else { &[] }
+    }
+
     pub fn is_jet(&self) -> bool {
         matches!(self.engine, Engine::Fan(_))
     }
