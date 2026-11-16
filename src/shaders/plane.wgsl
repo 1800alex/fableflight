@@ -1747,7 +1747,9 @@ fn surface(in: VOut) -> Shaded {
   let duv = max(length(duvx), length(duvy));
   let dLx = dpdx(in.L);
   let dLy = dpdy(in.L);
-  var rel = relief(pt, in.uv, in.L, in.Nl, px);
+  // low preset skips panel lines and rivets, G.quality.x is 1.8 there.
+  var rel = vec3f(0.0);
+  if (G.quality.x <= 1.5) { rel = relief(pt, in.uv, in.L, in.Nl, px); }
   // The Hornet's paint; its panel lines and rivets, darker than the skin
   // round them, are taken to lie a little below it.
   var paint = vec4f(0.0);
@@ -1821,9 +1823,11 @@ fn surface(in: VOut) -> Shaded {
       // Each skin panel's paint aged a little differently.
       albedo *= 0.985 + 0.03 * fine.a * select(0.4, 1.0, id == 1u);
       if (id == 1u || pt == P_FUSE) {
-        let w = weather(L, in.Nl, albedo);
-        albedo = w.rgb;
-        rough += w.a;
+        if (G.quality.x <= 1.5) {
+          let w = weather(L, in.Nl, albedo);
+          albedo = w.rgb;
+          rough += w.a;
+        }
         // Chipped paint where things get knocked: leading edges, around fasteners.
         let chip = smoothstep(0.80, 0.83, nz(L * 7.0).b + in.wear * 0.07) * sat(in.wear * 1.5);
         albedo = mix(albedo, vec3f(0.55, 0.56, 0.58), chip);
