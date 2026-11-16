@@ -888,7 +888,7 @@ impl Game {
         }
         wx.open = args.weather_panel;
         // Real weather, unless the command line sets the weather itself.
-        let scripted = std::env::args().any(|a| matches!(a.as_str(), "--clouds" | "--storms" | "--alto" | "--wind" | "--haze"));
+        let scripted = std::env::args().any(|a| matches!(a.as_str(), "--clouds" | "--rain" | "--storms" | "--alto" | "--wind" | "--haze"));
         wx.live = prefs.live_weather && !scripted;
         let set_time = std::env::args().any(|a| matches!(a.as_str(), "--time" | "--day" | "--time-rate"));
         wx.real_time = prefs.real_time && !set_time;
