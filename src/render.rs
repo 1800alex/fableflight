@@ -3108,6 +3108,9 @@ impl Renderer {
                     rp.draw(0..sk.n, 0..1);
                 }
             }
+            // scenery before the ground, so terrain under buildings and trees is never shaded.
+            solids(&mut rp, None, 2);
+            rp.set_bind_group(0, &self.bg0, &[]);
             rp.set_pipeline(&self.p_terrain);
             rp.set_index_buffer(self.tile_ibuf.slice(..), wgpu::IndexFormat::Uint16);
             let tess = |u: &[f32; 12]| u[10] >= 1.0 && u[11] >= 1.0;
@@ -3149,7 +3152,6 @@ impl Renderer {
                     rp.draw_indexed(0..*n, 0, 0..1);
                 }
             }
-            solids(&mut rp, None, 2);
         }
         mark(&mut enc, "gbuffer");
         {
