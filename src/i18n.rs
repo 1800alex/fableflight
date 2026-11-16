@@ -95,6 +95,23 @@ pub fn tr_owned(en: &str) -> String {
     if is_fr() { fr(en).unwrap_or(en).to_string() } else { en.to_string() }
 }
 
+/// French "de" before a place name, as it is written: "d'Amsterdam",
+/// "du Havre", "des Sables-d'Olonne", "de la Rochelle", "de Paris".
+/// (No elision before an H: "de Hambourg"; it depends on the word.)
+pub fn de_place(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("Le ") {
+        return format!("du {rest}");
+    }
+    if let Some(rest) = name.strip_prefix("Les ") {
+        return format!("des {rest}");
+    }
+    if let Some(rest) = name.strip_prefix("La ") {
+        return format!("de la {rest}");
+    }
+    let vowel = name.chars().next().is_some_and(|c| "AEIOUYÀÂÄÉÈÊËÎÏÔÖÙÛÜaeiouyàâäéèêëîïôöùûü".contains(c));
+    if vowel { format!("d'{name}") } else { format!("de {name}") }
+}
+
 /// "{n} request(s)" and the like.
 pub fn plural(n: u64, en_one: &str, en_many: &str, fr_one: &str, fr_many: &str) -> String {
     let w = match (is_fr(), n) {
@@ -163,6 +180,15 @@ fn fr(en: &str) -> Option<&'static str> {
         "thrust reversers, on the ground (hold)" => "inverseurs de poussée, au sol (maintenir)",
         "set the heading indicator to the compass" => "recaler le conservateur de cap sur le compas",
         "chase / cockpit camera" => "caméra extérieure / cockpit",
+        "C switches between the chase view and the cockpit; drag the mouse to look around." => "C passe de la vue extérieure au cockpit ; glissez la souris pour regarder autour.",
+        "F4 starts or stops the engine; for a start by hand: Ins battery, Page Up mixture, I magnetos, hold O." => "F4 démarre ou coupe le moteur ; pour un démarrage à la main : Inser batterie, Page ↑ mélange, I magnétos, maintenir O.",
+        "J shows the radio navigation instruments; the Radio page of the panel (Tab) tunes VORs and ILSs." => "J affiche les instruments de radionavigation ; la page Radios du panneau (Tab) règle VOR et ILS.",
+        "X sets the altimeter to the QNH before take-off and on the way down." => "X cale l'altimètre au QNH avant le décollage et en descente.",
+        "F and V move the flaps a notch; L the landing gear; B the wheel brakes." => "F et V sortent ou rentrent les volets d'un cran ; L le train ; B les freins.",
+        "Tab opens the flight panel: instruments, places, weather, fuel and balance." => "Tab ouvre le panneau de vol : instruments, lieux, météo, carburant et centrage.",
+        "R starts again in the air over where you are; G goes to any place or address." => "R repart en vol au-dessus de votre position ; G va à n'importe quel lieu ou adresse.",
+        "The weather and the traffic are real: METAR at the airports, live aircraft around you." => "La météo et le trafic sont réels : METAR des aéroports, avions en vol autour de vous.",
+        "F1 lists every key; joysticks and pedals are set up in Settings, Bindings." => "F1 liste toutes les touches ; joysticks et palonniers se règlent dans Réglages, Assignations.",
         "look around" => "regarder autour",
         "camera distance / cockpit zoom" => "distance caméra / zoom cockpit",
         "hide / show the HUD" => "masquer / afficher le HUD",
@@ -402,6 +428,17 @@ const CAUSES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn de_before_place_names() {
+        assert_eq!(de_place("Amsterdam"), "d'Amsterdam");
+        assert_eq!(de_place("Évreux"), "d'Évreux");
+        assert_eq!(de_place("Paris"), "de Paris");
+        assert_eq!(de_place("Le Havre"), "du Havre");
+        assert_eq!(de_place("Les Mureaux"), "des Mureaux");
+        assert_eq!(de_place("La Rochelle"), "de la Rochelle");
+        assert_eq!(de_place("Hambourg"), "de Hambourg");
+    }
+
     use super::*;
 
     // One test touches the global language, so the others cannot race it.
