@@ -551,6 +551,42 @@ fn ground_elev(src: &sources::Sources, lat: f64, lon: f64) -> f64 {
     src.elev(id).map(|e| e.sample(u, v) as f64).unwrap_or(0.0).max(0.0)
 }
 
+/// The loading screen between the start screen and the flight: when it
+/// began, the most tiles seen loading at once, how far along it is, since
+/// when hardly anything has been loading, when it was done (it then fades),
+/// and which tip it shows.
+#[derive(Clone, Debug)]
+struct Loading {
+    t0: f64,
+    most: usize,
+    frac: f64,
+    quiet_since: Option<f64>,
+    done: Option<f64>,
+    tip: usize,
+}
+impl Loading {
+    /// shown at least this long, at most this long (s), fading out over FADE
+    const MIN: f64 = 1.2;
+    const MAX: f64 = 25.0;
+    const FADE: f64 = 0.6;
+    fn new(now: f64) -> Self {
+        Loading { t0: now, most: 0, frac: 0.0, quiet_since: None, done: None, tip: (now * 1000.0) as usize }
+    }
+}
+
+/// Shown on the loading screen, one at a time (translated in i18n.rs).
+const LOADING_TIPS: &[&str] = &[
+    "C switches between the chase view and the cockpit; drag the mouse to look around.",
+    "F4 starts or stops the engine; for a start by hand: Ins battery, Page Up mixture, I magnetos, hold O.",
+    "J shows the radio navigation instruments; the Radio page of the panel (Tab) tunes VORs and ILSs.",
+    "X sets the altimeter to the QNH before take-off and on the way down.",
+    "F and V move the flaps a notch; L the landing gear; B the wheel brakes.",
+    "Tab opens the flight panel: instruments, places, weather, fuel and balance.",
+    "R starts again in the air over where you are; G goes to any place or address.",
+    "The weather and the traffic are real: METAR at the airports, live aircraft around you.",
+    "F1 lists every key; joysticks and pedals are set up in Settings, Bindings.",
+];
+
 struct Game {
     window: Arc<Window>,
     r: Renderer,
@@ -730,6 +766,8 @@ struct Game {
     wreck_t: f64,
     wreck_seen: f64,
     start_rx: Option<std::sync::mpsc::Receiver<(f64, f64, f64)>>,
+    /// the loading screen, from the start screen into the air (see `Loading`)
+    loading: Option<Loading>,
     name_rx: Option<std::sync::mpsc::Receiver<String>>,
     last_click: f64,
     n_cars: usize,
@@ -887,7 +925,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), weapon_flash: None, damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane, weapons,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -1200,6 +1238,98 @@ impl Game {
     /// Start at an airport: its layout is put together in the background
     /// (see `airport_rx`), then the aircraft appears lined up on the runway
     /// in use, or on a final approach to it.
+    /// The loading screen: done once the ground under the aircraft is there and
+    /// the tiles it needs have come in (or after `Loading::MAX` seconds).
+    fn update_loading(&mut self) {
+        let Some(l) = self.loading.as_mut() else { return };
+        if let Some(done) = l.done {
+            if self.real - done > Loading::FADE {
+                self.loading = None;
+            }
+            return;
+        }
+        let photo = self.world.photo();
+        let n = self.world.stats.1 + self.world.queued() + if photo.active { photo.stats.2 } else { 0 };
+        l.most = l.most.max(n);
+        let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
+        let ground = self.world.ground(lat, lon).is_some();
+        let t = self.real - l.t0;
+        // How far along: the tiles come in, and time passes (never going back).
+        let tiles = if l.most > 0 { 1.0 - n as f64 / l.most as f64 } else { 0.0 };
+        l.frac = l.frac.max((0.92 * tiles + 0.08 * (t / Loading::MAX)).min(if ground { 1.0 } else { 0.9 }));
+        // (A few tiles far off are always on their way: "nearly none" is enough.)
+        let quiet = ground && n <= 3;
+        l.quiet_since = if quiet { Some(l.quiet_since.unwrap_or(self.real)) } else { None };
+        if (t > Loading::MIN && l.quiet_since.is_some_and(|q| self.real - q > 0.6)) || t > Loading::MAX {
+            self.finish_loading();
+        }
+    }
+    fn finish_loading(&mut self) {
+        if let Some(l) = self.loading.as_mut() {
+            l.frac = 1.0;
+            l.done.get_or_insert(self.real);
+        }
+    }
+    /// The loading screen over the scene (which goes on loading under it):
+    /// the aircraft, where it is going and the weather there, a progress bar
+    /// and a tip, fading out once done.
+    fn loading_overlay(&mut self, ctx: &egui::Context) {
+        use egui::{Align2, Color32, FontId};
+        let Some(l) = self.loading.clone() else { return };
+        let a = match l.done {
+            Some(d) => (1.0 - (self.real - d) / Loading::FADE).clamp(0.0, 1.0) as f32,
+            None => 1.0,
+        };
+        let screen = ctx.content_rect();
+        let k = aircraft::ALL.iter().position(|s| std::ptr::eq(*s, self.spec)).unwrap_or(0);
+        let spec = self.spec;
+        let tex = self.stills[k]
+            .get_or_insert_with(|| {
+                let img = image::load_from_memory(spec.still).expect("aircraft still").to_rgba8();
+                let size = [img.width() as usize, img.height() as usize];
+                ctx.load_texture(format!("aircraft {k}"), egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
+            })
+            .clone();
+        let fade = |c: Color32| c.gamma_multiply(a);
+        egui::Area::new(egui::Id::unique("loading")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            let p = ui.painter();
+            p.rect_filled(screen, 0.0, fade(Color32::from_rgb(8, 11, 16)));
+            let c = screen.center();
+            // The aircraft, as on the start screen.
+            let w = (screen.width() * 0.5).min(680.0);
+            let pic = egui::Rect::from_center_size(c - egui::vec2(0.0, w * 0.30), egui::vec2(w, w * 392.0 / 680.0));
+            egui::Image::new(&tex).tint(Color32::WHITE.gamma_multiply(a)).paint_at(ui, pic);
+            let mut y = pic.bottom() + 18.0;
+            let mut line = |s: &str, size: f32, col: Color32| {
+                p.text(egui::pos2(c.x, y), Align2::CENTER_TOP, s, FontId::proportional(size), fade(col));
+                y += size + 10.0;
+            };
+            line(spec.name, 26.0, Color32::WHITE);
+            if !self.status.is_empty() {
+                line(&self.status, 15.0, menu::ACCENT);
+            }
+            let wx = t!("Wind {:03.0}° / {:.0} kt  ·  QNH {:.0} hPa", "Vent {:03.0}° / {:.0} kt  ·  QNH {:.0} hPa", self.wx.wind_from.rem_euclid(360.0), self.wx.wind * 1.94384, self.wx.qnh);
+            line(&wx, 14.0, Color32::from_gray(170));
+            // Progress.
+            let bar = egui::Rect::from_center_size(egui::pos2(c.x, y + 16.0), egui::vec2(w.min(460.0), 6.0));
+            p.rect_filled(bar, 3.0, fade(Color32::from_gray(45)));
+            let mut done = bar;
+            done.set_width(bar.width() * l.frac as f32);
+            p.rect_filled(done, 3.0, fade(menu::ACCENT));
+            y = bar.bottom() + 12.0;
+            let what = if l.done.is_some() { t!("Ready", "Prêt").to_string() } else { t!("Loading the scenery…", "Chargement du décor…").to_string() };
+            p.text(egui::pos2(c.x, y), Align2::CENTER_TOP, what, FontId::proportional(13.0), fade(Color32::from_gray(150)));
+            // A tip, and how to skip.
+            let tip = tr(LOADING_TIPS[l.tip % LOADING_TIPS.len()]);
+            p.text(egui::pos2(c.x, screen.bottom() - 70.0), Align2::CENTER_TOP, tip, FontId::proportional(14.0), fade(Color32::from_gray(200)));
+            p.text(egui::pos2(c.x, screen.bottom() - 40.0), Align2::CENTER_TOP, t!("Enter or click: skip", "Entrée ou clic : passer"), FontId::proportional(12.0), fade(Color32::from_gray(110)));
+        });
+        // A click skips it too.
+        if l.done.is_none() && ctx.input(|i| i.pointer.any_click()) {
+            self.finish_loading();
+        }
+    }
+
     fn start_airport(&mut self, idx: u32, runway: Option<String>, approach: bool, keep_local: bool) {
         let a = &airports::Db::get().apts[idx as usize];
         self.status = t!("Preparing {} {}…", "Préparation de {} {}…", a.code(), a.name);
@@ -1218,6 +1348,9 @@ impl Game {
         let a = &airports::Db::get().apts[idx as usize];
         let local = if keep_local { (self.utc + geo::pos_to_lla(self.plane.pos).1.to_degrees() / 15.0).rem_euclid(24.0) } else { self.menu.hour };
         self.utc = (local - a.lon / 15.0).rem_euclid(24.0);
+        if self.mode == Mode::Menu {
+            self.loading = Some(Loading::new(self.real));
+        }
         self.mode = Mode::Fly;
         self.menu.starting = false;
         self.status_until = self.real + 12.0;
@@ -1754,6 +1887,28 @@ impl Game {
         ui.label(dim(t!("The altimeter reads {:.0} ft (true altitude {:.0} ft).", "L'altimètre indique {:.0} ft (altitude vraie {:.0} ft).", true_ft + self.radios.alt_error_ft(qnh), true_ft)));
     }
 
+    /// NAV 1 as the cockpit's course deviation indicators show it (Globals::nav).
+    fn nav_globals(&self) -> [f32; 4] {
+        let obs = self.radios.obs as f32;
+        let Some(st) = self.radios.nav.as_ref().filter(|_| self.plane.sys.powered()) else {
+            return [0.0, 0.0, obs, 0.0];
+        };
+        let r = nav::nav_reading(st, self.radios.obs, self.plane.pos);
+        if !r.live {
+            return [0.0, 0.0, obs, 0.0];
+        }
+        let mut flags = 1.0;
+        match r.to {
+            Some(true) => flags += 2.0,
+            Some(false) => flags += 4.0,
+            None => {}
+        }
+        if r.gs.is_some() {
+            flags += 8.0;
+        }
+        [r.cdi as f32, r.gs.unwrap_or(0.0) as f32, obs, flags]
+    }
+
     /// The navigation instruments over the game: a course deviation
     /// indicator for NAV 1 (with the glide slope on an ILS) and an ADF dial.
     fn nav_overlay(&self, ctx: &egui::Context, hdg: f64) {
@@ -2134,6 +2289,13 @@ impl Game {
             }
             return;
         }
+        // Enter, Space or Esc skip the loading screen (the scenery goes on loading).
+        if self.loading.as_ref().is_some_and(|l| l.done.is_none()) {
+            if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::Escape) {
+                self.finish_loading();
+            }
+            return;
+        }
         if self.pause_open {
             // The pause menu has the keyboard (and the game is stopped) until it closes.
             match code {
@@ -2155,6 +2317,11 @@ impl Game {
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
             KeyCode::KeyL if !self.crashed => self.plane.toggle_gear(),
             KeyCode::Slash if !self.crashed => self.plane.toggle_speedbrake(),
+            KeyCode::Digit6 if !self.crashed && self.model.pieces.iter().any(|p| p.anim.uses(airframe::Input::Canopy)) => {
+                self.plane.toggle_canopy();
+                self.status = if self.plane.canopy_open { t!("Canopy open", "Verrière ouverte") } else { t!("Canopy shut", "Verrière fermée") }.into();
+                self.status_until = self.real + 3.0;
+            }
             KeyCode::Digit1 if !self.crashed => {
                 self.plane.next_engines();
                 if let Some((name, lit, _)) = self.plane.engines() {
@@ -2370,7 +2537,7 @@ impl Game {
         self.menu.runway = None;
         self.menu.pick_name = match menu::Menu::near_city(lat, lon) {
             Some((name, d)) if d < 40_000.0 => tr(name).to_string(),
-            Some((name, d)) if d < 400_000.0 => t!("{:.0} km from {}", "À {:.0} km de {}", d / 1000.0, tr(name)),
+            Some((name, d)) if d < 400_000.0 => t!("{:.0} km from {}", "À {:.0} km {}", d / 1000.0, if crate::i18n::is_fr() { crate::i18n::de_place(tr(name)) } else { tr(name).to_string() }),
             _ => String::new(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2894,6 +3061,7 @@ impl Game {
                 self.respawn(lat.to_radians(), lon.to_radians(), elev + self.menu.start_agl, self.heading);
                 self.status = self.menu.pick_name.clone();
                 self.status_until = self.real + 10.0;
+                self.loading = Some(Loading::new(self.real));
                 self.mode = Mode::Fly;
                 self.menu.starting = false;
             }
@@ -2940,7 +3108,11 @@ impl Game {
                 self.pause_at = None;
             }
         }
-        let scale = if self.paused || in_menu || self.pause_open || self.real < self.hold { 0.0 } else { 1.0 };
+        if !in_menu {
+            self.update_loading();
+        }
+        let loading = self.loading.as_ref().is_some_and(|l| l.done.is_none());
+        let scale = if self.paused || in_menu || self.pause_open || self.real < self.hold || loading { 0.0 } else { 1.0 };
         let dt = dt_real * scale;
         self.time += dt;
         if !in_menu {
@@ -3583,6 +3755,7 @@ impl Game {
             glow_e: glow[1],
             glow_n: glow[2],
             spot: [[0.0; 4]; 3],
+            nav: self.nav_globals(),
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -5209,6 +5382,8 @@ impl Game {
                     }
                 }
             }
+            // The loading screen, over everything else.
+            self.loading_overlay(ctx);
             // Google's imagery has to carry its credit, HUD or not.
             if self.show_hud || self.google_shown() {
                 self.credits(ctx);

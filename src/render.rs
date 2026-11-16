@@ -164,6 +164,11 @@ pub struct Globals {
     /// lamps, each camera-relative position + intensity (0 = off); then the
     /// beam's direction + cosine of its half-angle
     pub spot: [[f32; 4]; 3],
+    /// the flown aircraft's NAV 1 receiver, for the course deviation
+    /// indicators in its cockpit (plane.wgsl, gauge 15): course needle -1..1
+    /// (+ fly right), glide slope needle -1..1 (+ fly up), OBS (degrees),
+    /// flags (1 alive, 2 TO, 4 FROM, 8 glide slope alive)
+    pub nav: [f32; 4],
 }
 
 /// The cloud shadow map: the sun's view of the cloud layer (common.wgsl

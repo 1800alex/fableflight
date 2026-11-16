@@ -40,6 +40,9 @@ The interface is in English or French. It follows the system language, can be ch
 # Joysticks, pedals and key bindings
 Any joystick, throttle, rudder pedals or wheel can be used: in Bindings (pause menu, or Settings on the start screen), bind each axis by moving it the way that means "more" (nose up, right roll, right rudder, full throttle, brake pressed) and each button to any action. Each axis has an Invert switch and a dead zone. Presets set a device up in one click; the Turtle Beach VelocityOne Flightstick and rudder pedals get theirs on their own the first time they are plugged in. Keyboard keys can be moved too. Everything is kept in `bindings.json` in the config folder.
 
+# Aircraft
+The Cessna 172RG, the Robin DR 400/180 Régent, the 747, the F/A-18, the F-4, the F-22, Concorde, the SR-71 and Starship. The Robin is the French wooden four-seater and glider tug: bubble canopy, the cranked Jodel wing, an all-moving tailplane, fixed gear and 60° flaps (`--aircraft dr400`); 6 slides its canopy open and shut. Like the Cessna it is built in code (`src/aircraft/dr400`), in a made-up classic Robin livery.
+
 # Fuel and engine start
 The engines burn fuel as they work (the Cessna some 30 l/h at 75% power, the 747 about 10 t/h in the cruise) and the fuel weighs: full tanks fly heavier than empty ones. Choose how much to take on the start screen (Flight); the HUD, the flight panel (fuel, flow, endurance) and the cockpit gauges show what is left, with LOW FUEL / NO FUEL warnings, and a dry engine stops. Start on a runway with the engine off ("cold start", or `--cold`) and start it by hand (I magnetos, Page Up mixture, hold O for the starter; on the jets I is the fuel controls and O engages the starters) or with F4, which also shuts it down. A windmilling engine with fuel and ignition catches again in the air; shut down on the ground, compression stops it within seconds.
 

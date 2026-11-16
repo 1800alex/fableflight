@@ -10,6 +10,7 @@
 pub mod b747;
 pub mod c172;
 pub mod concorde;
+pub mod dr400;
 pub mod f22;
 pub mod f4;
 pub mod fa18;
@@ -20,7 +21,7 @@ use crate::airframe::{Model, Sect};
 use glam::{DVec3, Vec3};
 
 /// Every type, in the order the menu lists them.
-pub static ALL: [&Spec; 8] = [&c172::SPEC, &b747::SPEC, &fa18::SPEC, &f4::SPEC, &f22::SPEC, &starship::SPEC, &concorde::SPEC, &sr71::SPEC];
+pub static ALL: [&Spec; 9] = [&c172::SPEC, &dr400::SPEC, &b747::SPEC, &fa18::SPEC, &f4::SPEC, &f22::SPEC, &starship::SPEC, &concorde::SPEC, &sr71::SPEC];
 
 /// A type by its short name (`c172`, `747`, ...), as typed on the command line.
 pub fn by_key(key: &str) -> Option<&'static Spec> {
@@ -421,6 +422,7 @@ pub struct Spec {
     pub slats_at: u8,
     /// what the flap lever works, when that is not flaps (None: flaps)
     pub lever: Option<Lever>,
+    /// how fast the gear goes up or down (fraction per second; 0: fixed gear)
     pub gear_rate: f64,
     /// never-exceed speed (m/s indicated) and Mach limit (0: none); flutter sets in at `flutter_v`
     pub vne: f64,
@@ -469,6 +471,10 @@ impl Spec {
         if self.keys.contains(&"fa18") { &fa18::MISSILES } else { &[] }
     }
 
+    /// Gear that never retracts (no fold rate): always down, the gear key does nothing.
+    pub fn fixed_gear(&self) -> bool {
+        self.gear_rate == 0.0 && self.rocket().is_none()
+    }
     pub fn is_jet(&self) -> bool {
         matches!(self.engine, Engine::Fan(_))
     }
