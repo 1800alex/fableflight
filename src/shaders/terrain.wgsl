@@ -762,8 +762,10 @@ fn city_glow(gq: vec2f, dens: f32, dcx: vec2f, dcy: vec2f, upn: vec3f) -> vec3f 
   let upn = normalize(in.P - G.planet.xyz);
   var wc = wc0;
   let fw = max(length(dx), length(dy));
-  if (dist < DET_FAR) {
-    let fade = 1.0 - smoothstep(DET_FAR * 0.45, DET_FAR, dist);
+  // low preset keeps the ground detail materials to half the distance.
+  let det_far = DET_FAR * select(1.0, 0.5, G.quality.x > 1.5);
+  if (dist < det_far) {
+    let fade = 1.0 - smoothstep(det_far * 0.45, det_far, dist);
     let g = ground(in.uv, wc0, img, 1.0 - dot(N, upn), dx, dy, V);
     // Tangent frame along east / north, laid onto the surface.
     let t = normalize(G.east.xyz - N * dot(G.east.xyz, N));
