@@ -931,6 +931,7 @@ fn fit(j: &jsbsim::Aircraft, parts: &[(Option<Part>, Option<Part>)], folder: &st
     let (base_power, power) = match &base.engine {
         Engine::Piston(p) => (p.power, hp * 745.7),
         Engine::Fan(f) => (f.thrust * f.n as f64, mil),
+        Engine::Rocket(_) => unreachable!("a rocket is never a downloaded type's body"),
     };
     let vmax = top_speed(prop, power, area, a.cd0);
     let vmax_base = top_speed(prop, base_power, base.wing_area, base.cd0);
@@ -964,6 +965,7 @@ fn fit(j: &jsbsim::Aircraft, parts: &[(Option<Part>, Option<Part>)], folder: &st
             f.thrust = mil / f.n as f64;
             f.boost = if augmented { wet / mil } else { 1.0 };
         }
+        Engine::Rocket(_) => unreachable!("a rocket is never a downloaded type's body"),
     }
     s.fuel_flow = [base.fuel_flow[0] * p, base.fuel_flow[1] * p, if augmented { base.fuel_flow[1] * p * (1.0 + 2.5 * (wet / mil - 1.0)) } else { base.fuel_flow[1] * p }];
 

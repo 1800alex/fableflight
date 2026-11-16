@@ -31,6 +31,18 @@ pub mod gauge {
     pub const CHT: f32 = 18.0;
     pub const FUEL_SEL: f32 = 19.0;
     pub const OAT: f32 = 20.0;
+    /// (21 is the Hornet's brake accumulator pressure.) A jet fighter's engine
+    /// instruments (the Phantom's): engine speed in percent, exhaust gas
+    /// temperature, fuel flow, nozzle position, fuel on board, Mach number.
+    pub const JET_RPM: f32 = 22.0;
+    pub const JET_EGT: f32 = 23.0;
+    pub const JET_FF: f32 = 24.0;
+    pub const NOZZLE: f32 = 25.0;
+    pub const JET_FUEL: f32 = 26.0;
+    pub const MACH: f32 = 27.0;
+    /// The Blackbird's: an inlet spike's position, the compressor inlet temperature.
+    pub const SPIKE: f32 = 28.0;
+    pub const CIT: f32 = 29.0;
 }
 
 const PANEL_COL: Mat = mt(mat::PLASTIC, 0.035, 0.036, 0.038);
@@ -54,7 +66,7 @@ pub fn build(b: &mut Builder) {
 }
 
 /// Quad with a [-1, 1] local frame, facing ax x ay.
-fn rect(m: &mut Mesh, mm: &Mat, c: Vec3, ax: Vec3, ay: Vec3, hx: f32, hy: f32) {
+pub fn rect(m: &mut Mesh, mm: &Mat, c: Vec3, ax: Vec3, ay: Vec3, hx: f32, hy: f32) {
     let n = ax.cross(ay).normalize();
     let base = m.v.len() as u32;
     for (u, v) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
@@ -66,7 +78,7 @@ fn circle(c: Vec2, r: f32, n: usize) -> Vec<Vec2> {
     (0..n).map(|k| { let a = -(k as f32) / n as f32 * TAU; c + Vec2::new(a.cos(), a.sin()) * r }).collect()
 }
 /// Strap or bar between two points, `w` wide, lying flat against `n`.
-fn strap(m: &mut Mesh, mm: &Mat, a: Vec3, c: Vec3, n: Vec3, w: f32, t: f32) {
+pub fn strap(m: &mut Mesh, mm: &Mat, a: Vec3, c: Vec3, n: Vec3, w: f32, t: f32) {
     let d = (c - a).normalize();
     let x = n.cross(d).normalize();
     let rot = Quat::from_mat3(&Mat3::from_cols(x, d, x.cross(d)));

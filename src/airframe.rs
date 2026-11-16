@@ -602,6 +602,10 @@ pub enum Input {
     Trim,
     /// thrust reversers, 0 stowed .. 1 deployed
     Reverser,
+    /// the Mach number (inlet spikes follow it)
+    Mach,
+    /// a sliding canopy, 0 shut .. 1 fully open
+    Canopy,
 }
 
 /// How an input is shaped before it moves a piece.
@@ -693,6 +697,13 @@ impl Anim {
     pub const fn turn_slide(t: Drive, s: Drive, dir: Vec3) -> Self {
         Anim::Move(Motion { turn: [t, Drive::NONE], slide: s, dir })
     }
+    /// Whether any of its drives follows `i`.
+    pub fn uses(&self, i: Input) -> bool {
+        match self {
+            Anim::Move(m) => m.turn.iter().chain(std::iter::once(&m.slide)).any(|d| d.gain != 0.0 && d.input == i),
+            _ => false,
+        }
+    }
 }
 
 /// What a piece is to the damage model (see damage.rs): which part goes
@@ -726,6 +737,8 @@ pub enum Vis {
     SlowProp,
     /// the blur of a propeller turning too fast to see
     FastProp,
+    /// a braking parachute, while it is out (no part of the airframe's bounds or wreckage)
+    Chute,
 }
 
 pub struct Piece {
@@ -792,13 +805,47 @@ pub struct Model {
     pub tex: Option<std::sync::Arc<crate::fgmodel::TexSet>>,
 }
 
+/// One of the outside lights, found from its lens: the glow sprites and the
+/// landing lights' beam (main.rs) sit where the lenses are modelled.
+#[derive(Clone, Copy, Debug)]
+pub struct Lamp {
+    pub piece: usize,
+    /// the lens's middle, body frame at rest
+    pub at: Vec3,
+    /// which light (`lamp::*`)
+    pub id: u32,
+}
+
 impl Model {
+    /// The outside lights (navigation, tail, strobes, beacons, landing): the
+    /// lens vertices of each, gathered into one lamp per lens.
+    pub fn lamps(&self) -> Vec<Lamp> {
+        let mut acc: Vec<(Lamp, Vec3, f32)> = Vec::new();
+        for (pi, p) in self.pieces.iter().enumerate() {
+            for v in &p.mesh.v {
+                if v.mat[0] != mat::LAMP || v.mat[3] > lamp::LANDING + 0.5 {
+                    continue;
+                }
+                let id = v.mat[3].round() as u32;
+                let at = Vec3::from(v.pos);
+                match acc.iter_mut().find(|(l, s, n)| l.piece == pi && l.id == id && (*s / *n).distance(at) < 0.6) {
+                    Some((_, s, n)) => {
+                        *s += at;
+                        *n += 1.0;
+                    }
+                    None => acc.push((Lamp { piece: pi, at, id }, at, 1.0)),
+                }
+            }
+        }
+        acc.into_iter().map(|(l, s, n)| Lamp { at: s / n, ..l }).collect()
+    }
+
     /// Finish a model: split the cut pieces and merge the groups.
     pub fn finish(mut pieces: Vec<Piece>) -> Model {
         split_cut(&mut pieces);
         let mut groups = vec![Mesh::default(); N_GROUPS];
         for p in &pieces {
-            if !p.glass {
+            if !p.glass && p.vis != Vis::Chute {
                 groups[p.group].append(&p.mesh);
             }
         }
@@ -806,7 +853,7 @@ impl Model {
     }
     /// Centre and half size of everything solid in it (body frame, at rest).
     pub fn bounds(&self) -> (Vec3, Vec3) {
-        let (lo, hi) = self.pieces.iter().filter(|p| !p.glass).flat_map(|p| p.mesh.v.iter()).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), v| (lo.min(v.pos.into()), hi.max(v.pos.into())));
+        let (lo, hi) = self.pieces.iter().filter(|p| !p.glass && p.vis != Vis::Chute).flat_map(|p| p.mesh.v.iter()).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), v| (lo.min(v.pos.into()), hi.max(v.pos.into())));
         ((lo + hi) * 0.5, (hi - lo) * 0.5)
     }
 }

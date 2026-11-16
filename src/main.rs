@@ -47,6 +47,7 @@ mod traffic;
 mod trees;
 mod ocean;
 mod shore;
+mod skyglow;
 mod world;
 mod yasim;
 
@@ -124,8 +125,8 @@ fn attribution_default() -> &'static str {
 }
 fn attribution_rest() -> &'static str {
     t!(
-        "Elevation: Mapzen / AWS Terrain Tiles  ·  Buildings, roads, land cover & water © OpenStreetMap contributors, OpenFreeMap",
-        "Relief : Mapzen / AWS Terrain Tiles  ·  Bâtiments, routes, occupation du sol et eau © contributeurs OpenStreetMap, OpenFreeMap"
+        "Elevation: Mapzen / AWS Terrain Tiles  ·  Buildings, roads, land cover & water © OpenStreetMap contributors, OpenFreeMap  ·  Night lights: NASA Black Marble",
+        "Relief : Mapzen / AWS Terrain Tiles  ·  Bâtiments, routes, occupation du sol et eau © contributeurs OpenStreetMap, OpenFreeMap  ·  Lumières nocturnes : NASA Black Marble"
     )
 }
 
@@ -147,6 +148,8 @@ struct Loaded {
     /// everything within the aircraft's bounds, and a little around them for
     /// the gear, flaps and control surfaces as they move
     plane_box: [[f32; 4]; 2],
+    /// its outside lights (glow sprites, landing-light beam)
+    lamps: Vec<airframe::Lamp>,
 }
 
 impl Loaded {
@@ -194,7 +197,8 @@ impl Loaded {
             .collect();
         let (c, h) = model.bounds();
         let plane_box = [c.extend(0.0).to_array(), (h + Vec3::splat(0.25 * spec.span / 5.5)).extend(0.0).to_array()];
-        Loaded { spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, plane_box }
+        let lamps = model.lamps();
+        Loaded { spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, plane_box, lamps }
     }
 }
 
@@ -236,6 +240,11 @@ struct Args {
     crash_at: Option<f64>,
     /// from this many seconds on, full throttle with the boost key held (the afterburners), for scripted screenshots and recordings
     boost_at: Option<f64>,
+    /// a rocket drops its booster after this many seconds, likewise
+    stage_at: Option<f64>,
+    /// a rocket burns this engine group (0 all) once it is let go, or starts as the ship alone coming back
+    engines: Option<usize>,
+    ship: bool,
     /// game time stands still for this many wall-clock seconds at the start (tiles stream in)
     hold: f64,
     size: (u32, u32),
@@ -307,6 +316,9 @@ fn parse_args() -> Args {
         record: None,
         crash_at: None,
         boost_at: None,
+        stage_at: None,
+        engines: None,
+        ship: false,
         hold: 0.0,
         size: (1600, 900),
         imagery: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}".into(),
@@ -417,6 +429,12 @@ fn parse_args() -> Args {
             "--imagery" => a.imagery = v.get(i + 1).cloned().unwrap_or(a.imagery.clone()),
             "--crash-at" => a.crash_at = num(&v, i),
             "--boost-at" => a.boost_at = num(&v, i),
+            "--stage-at" => a.stage_at = num(&v, i),
+            "--engines" => a.engines = num(&v, i).map(|k| k as usize),
+            "--ship" => {
+                a.ship = true;
+                used = 1;
+            }
             "--hold" => a.hold = num(&v, i).unwrap_or(0.0),
             "--damage" => a.damage = v.get(i + 1).cloned(),
             "--pause-menu" => {
@@ -527,7 +545,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -558,6 +576,42 @@ fn ground_elev(src: &sources::Sources, lat: f64, lon: f64) -> f64 {
     let (u, v) = id.frac(lat.to_radians(), lon.to_radians());
     src.elev(id).map(|e| e.sample(u, v) as f64).unwrap_or(0.0).max(0.0)
 }
+
+/// The loading screen between the start screen and the flight: when it
+/// began, the most tiles seen loading at once, how far along it is, since
+/// when hardly anything has been loading, when it was done (it then fades),
+/// and which tip it shows.
+#[derive(Clone, Debug)]
+struct Loading {
+    t0: f64,
+    most: usize,
+    frac: f64,
+    quiet_since: Option<f64>,
+    done: Option<f64>,
+    tip: usize,
+}
+impl Loading {
+    /// shown at least this long, at most this long (s), fading out over FADE
+    const MIN: f64 = 1.2;
+    const MAX: f64 = 25.0;
+    const FADE: f64 = 0.6;
+    fn new(now: f64) -> Self {
+        Loading { t0: now, most: 0, frac: 0.0, quiet_since: None, done: None, tip: (now * 1000.0) as usize }
+    }
+}
+
+/// Shown on the loading screen, one at a time (translated in i18n.rs).
+const LOADING_TIPS: &[&str] = &[
+    "C switches between the chase view and the cockpit; drag the mouse to look around.",
+    "F4 starts or stops the engine; for a start by hand: Ins battery, Page Up mixture, I magnetos, hold O.",
+    "J shows the radio navigation instruments; the Radio page of the panel (Tab) tunes VORs and ILSs.",
+    "X sets the altimeter to the QNH before take-off and on the way down.",
+    "F and V move the flaps a notch; L the landing gear; B the wheel brakes.",
+    "Tab opens the flight panel: instruments, places, weather, fuel and balance.",
+    "R starts again in the air over where you are; G goes to any place or address.",
+    "The weather and the traffic are real: METAR at the airports, live aircraft around you.",
+    "F1 lists every key; joysticks and pedals are set up in Settings, Bindings.",
+];
 
 struct Game {
     window: Arc<Window>,
@@ -632,6 +686,8 @@ struct Game {
     prev_plane: Mat4,
     /// centre and half size of the aircraft in its body frame
     plane_box: [[f32; 4]; 2],
+    /// the outside lights of the aircraft being flown
+    lamps: Vec<airframe::Lamp>,
     frame: u64,
     fps: f64,
     /// --fps-log: on, start of this second, frames in it, its slowest frame
@@ -647,6 +703,8 @@ struct Game {
     shots: Vec<(f64, PathBuf, Option<(f64, f64, f64)>)>,
     crash_at: Option<f64>,
     boost_at: Option<f64>,
+    stage_at: Option<f64>,
+    engines: Option<usize>,
     hold: f64,
     gilrs: Option<gilrs::Gilrs>,
     pad: Controls,
@@ -726,11 +784,14 @@ struct Game {
     wreck_t: f64,
     wreck_seen: f64,
     start_rx: Option<std::sync::mpsc::Receiver<(f64, f64, f64)>>,
+    /// the loading screen, from the start screen into the air (see `Loading`)
+    loading: Option<Loading>,
     name_rx: Option<std::sync::mpsc::Receiver<String>>,
     last_click: f64,
     n_cars: usize,
     /// how much city is around (0..1), for the orange skyglow at night
     city_glow: f32,
+    skyglow: skyglow::SkyGlow,
     /// an airport start being prepared: (airport, the airfield if it could be put together, runway, on approach, keep the local time)
     airport_rx: Option<std::sync::mpsc::Receiver<(u32, Option<Arc<airports::Geo>>, Option<String>, bool, bool)>>,
     /// an airport start asked for on the command line
@@ -804,12 +865,16 @@ impl Game {
         let alt = args.alt.unwrap_or_else(|| ground_elev(&src, lat, lon) + args.agl.unwrap_or(450.0));
         let spec = args.aircraft.as_deref().and_then(aircraft::by_key).unwrap_or(aircraft::BUILTIN[0]);
         let mut plane = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt, args.heading.to_radians(), spec.cruise);
+        if args.ship {
+            plane.rocket_return();
+        }
         if let Some(spec) = &args.damage {
             plane.dmg.apply_spec(spec);
         }
         let mut world = world::World::new(sources::Loader::new(src.clone(), 14), args.max_zoom);
         let mut r = r;
-        let Loaded { spec: _, model, piece_mesh, group_mesh, piece_cut, group_pivots, plane_box } = Loaded::build(spec, &mut r);
+        r.set_paint(spec.paint.as_ref());
+        let Loaded { spec: _, model, piece_mesh, group_mesh, piece_cut, group_pivots, plane_box, lamps } = Loaded::build(spec, &mut r);
         let tm = trees::build_meshes();
         r.set_tree_meshes(&tm.meshes);
         world.tree_dims = tm.dims;
@@ -876,15 +941,15 @@ impl Game {
         let mut g = Self {
             gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: std::collections::HashMap::new(), window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
-            utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box,
+            utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
-            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
+            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -919,10 +984,21 @@ impl Game {
 
     /// Fly another aircraft from the next spawn on: its model is built (once
     /// a session) and swapped in.
+    /// The next view: outside, the cockpit, and the other cockpit of a type that has two.
+    fn next_view(&mut self) {
+        if self.cam_mode == 1 && !self.head.rear && self.spec.eye2.is_some() {
+            self.head.rear = true;
+        } else {
+            self.head.rear = false;
+            self.cam_mode = (self.cam_mode + 1) % 2;
+        }
+    }
+
     fn set_aircraft(&mut self, spec: &'static aircraft::Spec) {
         if std::ptr::eq(spec, self.spec) {
             return;
         }
+        self.head.rear = false;
         self.restore_wreck_meshes();
         self.sheds.items.clear();
         let next = match self.hangar.iter().position(|l| std::ptr::eq(l.spec, spec)) {
@@ -947,8 +1023,10 @@ impl Game {
             piece_cut: std::mem::replace(&mut self.piece_cut, next.piece_cut),
             group_pivots: std::mem::replace(&mut self.group_pivots, next.group_pivots),
             plane_box: std::mem::replace(&mut self.plane_box, next.plane_box),
+            lamps: std::mem::replace(&mut self.lamps, next.lamps),
         };
         self.hangar.push(old);
+        self.r.set_paint(spec.paint.as_ref());
         self.spec = spec;
         self.cam_dist = spec.cam_dist;
         self.menu.aircraft = aircraft::index_of(spec);
@@ -1005,11 +1083,15 @@ impl Game {
             let tat = oat + (oat + 273.15) * 0.2 * mach * mach;
             let x = ((p.n1 - 0.2) / 0.82).clamp(0.0, 1.2);
             let running = if p.running { (p.n1 / 0.15).clamp(0.0, 1.0) } else { 0.0 };
-            // (The Hornet's two F404s: hotter and thirstier for their size, 4.9 t of fuel inside.)
-            let hornet = self.spec.id == 2;
-            let egt = if hornet { oat + (400.0 - oat + 380.0 * x.powf(1.4)) * running } else { oat + (440.0 - oat + 200.0 * x.powf(1.4)) * running };
+            // (The Hornet's two F404s: hotter and thirstier for their size, 4.9 t of fuel inside.
+            // The Phantom's J79 turbojets: about 250 C idling, 650 C at military power.
+            // The Raptor's F119s are taken to run like the Hornet's.
+            // Concorde's Olympus 593 turbojets: about 350 C idling, 750 C flat out.
+            // The Blackbird's J58s: about 400 C idling, 795 C at military power and in afterburner.)
+            let (idle_t, rise) = match self.spec.id { 2 | 4 => (400.0, 380.0), 3 => (250.0, 330.0), 6 => (350.0, 400.0), 7 => (80.0, 740.0), _ => (440.0, 200.0) };
+            let egt = oat + (idle_t - oat + rise * x.powf(1.4)) * running;
             // Fuel flow per engine (kg/h) and the fuel on board (kg), from the engines' burn.
-            let n_eng = if hornet { 2.0 } else { 4.0 };
+            let n_eng = match &self.spec.engine { aircraft::Engine::Fan(f) => f.n as f64, _ => 1.0 };
             let ff = p.fuel_flow * 3600.0 / n_eng;
             let fuel = p.fuel;
             let _ = x;
@@ -1033,6 +1115,74 @@ impl Game {
             [g[4][0], local as f32, p.gear as f32, p.flap_deg() as f32],
             [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if p.gear_down { 1.0 } else { 0.0 }],
         ]
+    }
+
+    /// The flown aircraft's outside lights: a glow sprite on each lens
+    /// (lights.wgsl, as the traffic has), and the landing lights' beams
+    /// (Globals `spot`, common.wgsl `spot_light`). `p5` is the lights' state
+    /// (instruments row 5: nav on, strobe, beacon, landing).
+    fn own_lights(&self, base: &Mat4, pose: &[Mat4], p5: [f32; 4], g: &mut render::Globals, out: &mut Vec<airfield::Light>) {
+        use airfield::{L_GREEN, L_RED, L_STROBE, L_WHITE};
+        use airframe::lamp;
+        let dm = &self.plane.dmg;
+        let big = self.spec.span > 30.0;
+        let nav = if p5[0] >= 999.0 { 1.0 } else { 0.0 };
+        let mut beam: [(Vec3, f32); 2] = [(Vec3::ZERO, 0.0); 2];
+        let mut beam_dir = Vec3::ZERO;
+        let mid = {
+            let xs: Vec<f32> = self.lamps.iter().filter(|l| l.id == lamp::LANDING as u32 && l.at.x.abs() > 0.5).map(|l| l.at.x).collect();
+            xs.iter().sum::<f32>() / xs.len().max(1) as f32
+        };
+        for l in &self.lamps {
+            let p = &self.model.pieces[l.piece];
+            if dm.hidden(p) || !dm.tears_for(p).iter().all(|t| t.keeps(l.at)) {
+                continue;
+            }
+            let m = *base * pose[l.piece];
+            let at = m.transform_point3(l.at);
+            let fwd = m.transform_vector3(Vec3::NEG_Z).normalize();
+            let right = m.transform_vector3(Vec3::X).normalize();
+            // The navigation lights show only in their sectors: red ahead and
+            // out to the left, green to the right, white behind; each fades
+            // out a little past 90 degrees from the middle of its sector, so
+            // all show from above and below (lights.wgsl).
+            let (inten, col, dir, spread) = match l.id as f32 {
+                lamp::NAV_RED => (40.0 * nav, L_RED, (fwd - right).normalize(), -0.35),
+                lamp::NAV_GREEN => (40.0 * nav, L_GREEN, (fwd + right).normalize(), -0.35),
+                lamp::TAIL => (25.0 * nav, L_WHITE, -fwd, -0.35),
+                lamp::STROBE => (1600.0 * p5[1], L_STROBE, Vec3::ZERO, 0.0),
+                lamp::BEACON => (160.0 * p5[2], L_RED, Vec3::ZERO, 0.0),
+                _ => (if big { 6000.0 } else { 3000.0 } * p5[3], L_WHITE, fwd, 0.86),
+            };
+            if l.id == lamp::LANDING as u32 && p5[3] > 0.0 && l.at.x.abs() > 0.5 {
+                let k = (l.at.x > mid) as usize;
+                beam[k].0 += at;
+                beam[k].1 += 1.0;
+                beam_dir = fwd;
+            }
+            if inten > 0.0 && out.len() < render::MAX_DYN_LIGHTS {
+                out.push(airfield::Light { pos: at.into(), inten, dir: dir.into(), spread, col: [col[0], col[1], col[2], 3], fx: [0, 0, 255, 1] });
+            }
+        }
+        // The beams: aimed a little below the aircraft's axis, as they are
+        // set to light the runway ahead in the flare; per side about 3e5 cd
+        // on an airliner, 1e5 on a light aircraft (Globals units: cd / 1e4 /
+        // pi), times 60: MOON_E is far brighter than the real moon, and the
+        // beams graze the runway, so true-to-life ones would hardly show
+        // against moonlit pavement.
+        if beam_dir != Vec3::ZERO {
+            let up = (*base * pose[0]).transform_vector3(Vec3::Y).normalize();
+            let dir = (beam_dir - up * 0.11).normalize();
+            let per_side = if big { 3.0e5 } else { 1.0e5 } / 1.0e4 / std::f32::consts::PI * 60.0;
+            let n = beam.iter().filter(|b| b.1 > 0.0).count() as f32;
+            for (i, b) in beam.iter().enumerate() {
+                if b.1 > 0.0 {
+                    let at = b.0 / b.1;
+                    g.spot[i] = [at.x, at.y, at.z, per_side * 2.0 / n];
+                }
+            }
+            g.spot[2] = [dir.x, dir.y, dir.z, 14f32.to_radians().cos()];
+        }
     }
 
     fn sun_dir(&self) -> DVec3 {
@@ -1109,6 +1259,91 @@ impl Game {
     /// Start at an airport: its layout is put together in the background
     /// (see `airport_rx`), then the aircraft appears lined up on the runway
     /// in use, or on a final approach to it.
+    /// The loading screen: done once the ground under the aircraft is there and
+    /// the tiles it needs have come in (or after `Loading::MAX` seconds).
+    fn update_loading(&mut self) {
+        let Some(l) = self.loading.as_mut() else { return };
+        if let Some(done) = l.done {
+            if self.real - done > Loading::FADE {
+                self.loading = None;
+            }
+            return;
+        }
+        let photo = self.world.photo();
+        let n = self.world.stats.1 + self.world.queued() + if photo.active { photo.stats.2 } else { 0 };
+        l.most = l.most.max(n);
+        let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
+        let ground = self.world.ground(lat, lon).is_some();
+        let t = self.real - l.t0;
+        // How far along: the tiles come in, and time passes (never going back).
+        let tiles = if l.most > 0 { 1.0 - n as f64 / l.most as f64 } else { 0.0 };
+        l.frac = l.frac.max((0.92 * tiles + 0.08 * (t / Loading::MAX)).min(if ground { 1.0 } else { 0.9 }));
+        // (A few tiles far off are always on their way: "nearly none" is enough.)
+        let quiet = ground && n <= 3;
+        l.quiet_since = if quiet { Some(l.quiet_since.unwrap_or(self.real)) } else { None };
+        if (t > Loading::MIN && l.quiet_since.is_some_and(|q| self.real - q > 0.6)) || t > Loading::MAX {
+            self.finish_loading();
+        }
+    }
+    fn finish_loading(&mut self) {
+        if let Some(l) = self.loading.as_mut() {
+            l.frac = 1.0;
+            l.done.get_or_insert(self.real);
+        }
+    }
+    /// The loading screen over the scene (which goes on loading under it):
+    /// the aircraft, where it is going and the weather there, a progress bar
+    /// and a tip, fading out once done.
+    fn loading_overlay(&mut self, ctx: &egui::Context) {
+        use egui::{Align2, Color32, FontId};
+        let Some(l) = self.loading.clone() else { return };
+        let a = match l.done {
+            Some(d) => (1.0 - (self.real - d) / Loading::FADE).clamp(0.0, 1.0) as f32,
+            None => 1.0,
+        };
+        let screen = ctx.content_rect();
+        let spec = self.spec;
+        let tex = self.still(ctx, spec);
+        let fade = |c: Color32| c.gamma_multiply(a);
+        egui::Area::new(egui::Id::unique("loading")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            let p = ui.painter();
+            p.rect_filled(screen, 0.0, fade(Color32::from_rgb(8, 11, 16)));
+            let c = screen.center();
+            // The aircraft, as on the start screen.
+            let w = (screen.width() * 0.5).min(680.0);
+            let pic = egui::Rect::from_center_size(c - egui::vec2(0.0, w * 0.30), egui::vec2(w, w * 392.0 / 680.0));
+            egui::Image::new(&tex).tint(Color32::WHITE.gamma_multiply(a)).paint_at(ui, pic);
+            let mut y = pic.bottom() + 18.0;
+            let mut line = |s: &str, size: f32, col: Color32| {
+                p.text(egui::pos2(c.x, y), Align2::CENTER_TOP, s, FontId::proportional(size), fade(col));
+                y += size + 10.0;
+            };
+            line(spec.name, 26.0, Color32::WHITE);
+            if !self.status.is_empty() {
+                line(&self.status, 15.0, menu::ACCENT);
+            }
+            let wx = t!("Wind {:03.0}° / {:.0} kt  ·  QNH {:.0} hPa", "Vent {:03.0}° / {:.0} kt  ·  QNH {:.0} hPa", self.wx.wind_from.rem_euclid(360.0), self.wx.wind * 1.94384, self.wx.qnh);
+            line(&wx, 14.0, Color32::from_gray(170));
+            // Progress.
+            let bar = egui::Rect::from_center_size(egui::pos2(c.x, y + 16.0), egui::vec2(w.min(460.0), 6.0));
+            p.rect_filled(bar, 3.0, fade(Color32::from_gray(45)));
+            let mut done = bar;
+            done.set_width(bar.width() * l.frac as f32);
+            p.rect_filled(done, 3.0, fade(menu::ACCENT));
+            y = bar.bottom() + 12.0;
+            let what = if l.done.is_some() { t!("Ready", "Prêt").to_string() } else { t!("Loading the scenery…", "Chargement du décor…").to_string() };
+            p.text(egui::pos2(c.x, y), Align2::CENTER_TOP, what, FontId::proportional(13.0), fade(Color32::from_gray(150)));
+            // A tip, and how to skip.
+            let tip = tr(LOADING_TIPS[l.tip % LOADING_TIPS.len()]);
+            p.text(egui::pos2(c.x, screen.bottom() - 70.0), Align2::CENTER_TOP, tip, FontId::proportional(14.0), fade(Color32::from_gray(200)));
+            p.text(egui::pos2(c.x, screen.bottom() - 40.0), Align2::CENTER_TOP, t!("Enter or click: skip", "Entrée ou clic : passer"), FontId::proportional(12.0), fade(Color32::from_gray(110)));
+        });
+        // A click skips it too.
+        if l.done.is_none() && ctx.input(|i| i.pointer.any_click()) {
+            self.finish_loading();
+        }
+    }
+
     fn start_airport(&mut self, idx: u32, runway: Option<String>, approach: bool, keep_local: bool) {
         let a = &airports::Db::get().apts[idx as usize];
         self.status = t!("Preparing {} {}…", "Préparation de {} {}…", a.code(), a.name);
@@ -1127,6 +1362,9 @@ impl Game {
         let a = &airports::Db::get().apts[idx as usize];
         let local = if keep_local { (self.utc + geo::pos_to_lla(self.plane.pos).1.to_degrees() / 15.0).rem_euclid(24.0) } else { self.menu.hour };
         self.utc = (local - a.lon / 15.0).rem_euclid(24.0);
+        if self.mode == Mode::Menu {
+            self.loading = Some(Loading::new(self.real));
+        }
         self.mode = Mode::Fly;
         self.menu.starting = false;
         self.status_until = self.real + 12.0;
@@ -1213,6 +1451,13 @@ impl Game {
         if self.boost_at.is_some_and(|t| self.real > t) {
             c.throttle = 1.0;
             c.boost = true;
+        }
+        if !self.plane.hold && self.engines.is_some() {
+            self.plane.lit = self.engines.take().unwrap_or(0);
+        }
+        if self.stage_at.is_some_and(|t| self.real > t) {
+            self.stage_at = None;
+            self.plane.stage_sep();
         }
         c
     }
@@ -1637,6 +1882,28 @@ impl Game {
         ui.label(dim(t!("The altimeter reads {:.0} ft (true altitude {:.0} ft).", "L'altimètre indique {:.0} ft (altitude vraie {:.0} ft).", true_ft + self.radios.alt_error_ft(qnh), true_ft)));
     }
 
+    /// NAV 1 as the cockpit's course deviation indicators show it (Globals::nav).
+    fn nav_globals(&self) -> [f32; 4] {
+        let obs = self.radios.obs as f32;
+        let Some(st) = self.radios.nav.as_ref().filter(|_| self.plane.sys.powered()) else {
+            return [0.0, 0.0, obs, 0.0];
+        };
+        let r = nav::nav_reading(st, self.radios.obs, self.plane.pos);
+        if !r.live {
+            return [0.0, 0.0, obs, 0.0];
+        }
+        let mut flags = 1.0;
+        match r.to {
+            Some(true) => flags += 2.0,
+            Some(false) => flags += 4.0,
+            None => {}
+        }
+        if r.gs.is_some() {
+            flags += 8.0;
+        }
+        [r.cdi as f32, r.gs.unwrap_or(0.0) as f32, obs, flags]
+    }
+
     /// The navigation instruments over the game: a course deviation
     /// indicator for NAV 1 (with the glide slope on an ILS) and an ADF dial.
     fn nav_overlay(&self, ctx: &egui::Context, hdg: f64) {
@@ -1921,7 +2188,7 @@ impl Game {
                 self.info_open = true;
                 self.pad_home = true;
             }
-            (_, Button::Select) => self.cam_mode = (self.cam_mode + 1) % 2,
+            (_, Button::Select) => self.next_view(),
             (_, Button::RightThumb) => {
                 (self.cam_yaw, self.cam_pitch) = self.cam_home;
                 self.head.zoom = 1.0;
@@ -2002,6 +2269,13 @@ impl Game {
             }
             return;
         }
+        // Enter, Space or Esc skip the loading screen (the scenery goes on loading).
+        if self.loading.as_ref().is_some_and(|l| l.done.is_none()) {
+            if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::Escape) {
+                self.finish_loading();
+            }
+            return;
+        }
         if self.pause_open {
             // The pause menu has the keyboard (and the game is stopped) until it closes.
             match code {
@@ -2018,11 +2292,25 @@ impl Game {
             KeyCode::Escape if self.wx.open => self.wx.open = false,
             KeyCode::Escape => self.set_pause_menu(true),
             KeyCode::KeyR => self.respawn_here(),
-            KeyCode::KeyC => self.cam_mode = (self.cam_mode + 1) % 2,
+            KeyCode::KeyC => self.next_view(),
             KeyCode::KeyF if !self.crashed => self.plane.set_flaps(1),
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
             KeyCode::KeyL if !self.crashed => self.plane.toggle_gear(),
             KeyCode::Slash if !self.crashed => self.plane.toggle_speedbrake(),
+            KeyCode::Digit3 if !self.crashed && self.model.pieces.iter().any(|p| p.anim.uses(airframe::Input::Canopy)) => {
+                self.plane.toggle_canopy();
+                self.status = if self.plane.canopy_open { t!("Canopy open", "Verrière ouverte") } else { t!("Canopy shut", "Verrière fermée") }.into();
+                self.status_until = self.real + 3.0;
+            }
+            KeyCode::Digit1 if !self.crashed => {
+                self.plane.next_engines();
+                if let Some((name, lit, _)) = self.plane.engines() {
+                    self.status = t!("Engines: {} ({} burning)", "Moteurs : {} ({} allumés)", name, lit);
+                    self.status_until = self.real + 3.0;
+                }
+            }
+            KeyCode::Backspace if !self.crashed => self.plane.stage_sep(),
+            KeyCode::Digit2 if !self.crashed => self.plane.toggle_autoland(),
             KeyCode::KeyG => {
                 self.goto_open = true;
                 self.goto_text.clear();
@@ -2204,7 +2492,7 @@ impl Game {
         self.menu.runway = None;
         self.menu.pick_name = match menu::Menu::near_city(lat, lon) {
             Some((name, d)) if d < 40_000.0 => tr(name).to_string(),
-            Some((name, d)) if d < 400_000.0 => t!("{:.0} km from {}", "À {:.0} km de {}", d / 1000.0, tr(name)),
+            Some((name, d)) if d < 400_000.0 => t!("{:.0} km from {}", "À {:.0} km {}", d / 1000.0, if crate::i18n::is_fr() { crate::i18n::de_place(tr(name)) } else { tr(name).to_string() }),
             _ => String::new(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2265,7 +2553,19 @@ impl Game {
 
     /// Knock a building down, with any parts standing on it.
     /// `hit`: the aircraft itself went in (the wall shows its outline).
-    fn bring_down(&mut self, tile: geo::TileId, idx: usize, at: DVec3, vel: DVec3, hit: Option<destruct::Hitter>, femit: &mut Vec<(DVec3, render::Particle)>) {
+    /// `energy`: kinetic energy (J) of what hit it. A building only comes down
+    /// as a whole when that is enough for its size (see `destruct::resistance`);
+    /// less breaks out the part round the impact, and a mere fraction of it
+    /// (a blast from the next lot, a lump of rubble) leaves a building alone.
+    fn bring_down(&mut self, tile: geo::TileId, idx: usize, at: DVec3, vel: DVec3, energy: f64, hit: Option<destruct::Hitter>, femit: &mut Vec<(DVec3, render::Particle)>) {
+        if hit.is_none() {
+            if let Some((base, top, area)) = self.world.footprint(tile, idx) {
+                let h = (top - base).max(3.0);
+                if energy < 0.03 * destruct::resistance(h as f32, (area.max(25.0) as f64 * h) as f32) {
+                    return;
+                }
+            }
+        }
         let above = self.world.structure_of(tile, idx);
         let mut parts = Vec::new();
         for (t, i) in std::iter::once((tile, idx)).chain(above) {
@@ -2292,7 +2592,7 @@ impl Game {
             }
             log::info!("3D tiles: building cut out, {} tiles, {} triangles", src.tiles.len(), src.tiles.iter().map(|t| t.tris.len()).sum::<usize>());
         }
-        self.destr.collapse(&parts, at, vel, hit, photo.as_ref(), femit);
+        self.destr.collapse(&parts, at, vel, energy, hit, photo.as_ref(), femit);
     }
 
     /// The wreck is made of what was left of the aircraft: every group's mesh
@@ -2349,7 +2649,8 @@ impl Game {
     fn warnings(&mut self) -> audio::Warn {
         let p = &self.plane;
         let mut w = audio::Warn::default();
-        if self.crashed || self.mode == Mode::Menu || p.on_ground {
+        // (Nobody is aboard a rocket to be warned.)
+        if self.crashed || self.mode == Mode::Menu || p.on_ground || p.spec.rocket().is_some() {
             return w;
         }
         let up = p.pos.normalize();
@@ -2449,7 +2750,7 @@ impl Game {
         let sa = p.stall_alpha();
         let ground_speed = (p.vel - up * vs).length();
         // The sound was tuned on the light single: a jet's airflow is scaled to match.
-        let jet = !matches!(p.spec.sound, aircraft::Sound::Piston);
+        let jet = !matches!(p.spec.sound, aircraft::Sound::Piston | aircraft::Sound::Rocket);
         let sk = if jet { 0.45 } else { 1.0 };
         let params = audio::Params {
             live: if live { 1.0 } else { 0.0 },
@@ -2463,8 +2764,11 @@ impl Game {
             vne: (p.spec.vne * sk) as f32,
             jet: if jet { 1.0 } else { 0.0 },
             n1: p.n1 as f32,
-            fighter: if matches!(p.spec.sound, aircraft::Sound::Fighter) { 1.0 } else { 0.0 },
+            fighter: match p.spec.sound { aircraft::Sound::Fighter => 1.0, aircraft::Sound::Turbojet => 2.0, _ => 0.0 },
             burner: p.burner as f32,
+            four: if matches!(&p.spec.engine, aircraft::Engine::Fan(f) if f.n >= 4) { 1.0 } else { 0.0 },
+            rocket: if matches!(p.spec.sound, aircraft::Sound::Rocket) { p.n1 as f32 } else { 0.0 },
+            air: (plane::density(geo::pos_to_lla(p.pos).2) / plane::RHO0) as f32,
             g_load: p.g_load as f32,
             rough: p.air.sigma_w as f32,
             jolt: jolt as f32,
@@ -2596,6 +2900,7 @@ impl Game {
                 self.respawn(lat.to_radians(), lon.to_radians(), elev + self.menu.start_agl, self.heading);
                 self.status = self.menu.pick_name.clone();
                 self.status_until = self.real + 10.0;
+                self.loading = Some(Loading::new(self.real));
                 self.mode = Mode::Fly;
                 self.menu.starting = false;
             }
@@ -2615,7 +2920,7 @@ impl Game {
             if (fine && self.real > until - 28.0) || self.real > until {
                 if let Some(gr) = self.world.ground(lat, lon) {
                     let up = self.plane.pos.normalize();
-                    self.plane.pos = up * (geo::R + gr.h + self.plane.wheel_height() * self.plane.up().dot(up));
+                    self.plane.pos = up * (geo::R + gr.h + self.plane.stand_height());
                 }
                 self.plane.hold = false;
                 self.plane.t = 2.0;
@@ -2642,7 +2947,11 @@ impl Game {
                 self.pause_at = None;
             }
         }
-        let scale = if self.paused || in_menu || self.pause_open || self.real < self.hold { 0.0 } else { 1.0 };
+        if !in_menu {
+            self.update_loading();
+        }
+        let loading = self.loading.as_ref().is_some_and(|l| l.done.is_none());
+        let scale = if self.paused || in_menu || self.pause_open || self.real < self.hold || loading { 0.0 } else { 1.0 };
         let dt = dt_real * scale;
         self.time += dt;
         if !in_menu {
@@ -2698,7 +3007,7 @@ impl Game {
                     let pose = self.plane.pose(&self.model.pieces);
                     let reqs: Vec<_> = self.plane.shed.drain(..).collect();
                     for req in &reqs {
-                        self.sheds.spawn(req, &self.plane.dmg_prev, &self.model.pieces, &self.piece_mesh, &self.piece_cut, &pose, self.plane.pos, self.plane.rot, self.plane.vel, &mut self.rng, &mut femit);
+                        self.sheds.spawn(req, &self.plane.dmg_prev, &self.model.pieces, &self.piece_mesh, &self.piece_cut, &pose, self.plane.model_pos(), self.plane.rot, self.plane.vel, &mut self.rng, &mut femit);
                     }
                 }
                 for n in self.plane.notes.drain(..) {
@@ -2754,6 +3063,8 @@ impl Game {
                     // it and on, slowed about as much as the house weighs.
                     let size = (self.spec.span / 5.5).max(1.0);
                     let heavy = size > 2.0;
+                    // What it brings to a building: its kinetic energy.
+                    let e_hit = 0.5 * self.spec.mass * imp.vel.length_squared();
                     let mut through = 0.0f32;
                     if let Some((tile, idx)) = imp.building.filter(|_| heavy) {
                         if let Some((base, top, area)) = self.world.footprint(tile, idx) {
@@ -2783,9 +3094,10 @@ impl Game {
                         }
                         let d = &self.plane.dmg;
                         let hit = destruct::Hitter { right: self.plane.right(), up: self.plane.up(), span: d.wing, shape: &self.spec.hole, full: self.spec.span, stab: d.stab, fin: d.fin };
-                        self.bring_down(tile, idx, imp.pos, imp.vel, Some(hit), &mut femit);
+                        self.bring_down(tile, idx, imp.pos, imp.vel, e_hit, Some(hit), &mut femit);
+                        // (next door only gets the blast and the flying pieces: a hundredth of it)
                         for (t, i) in self.world.buildings_near(site, 9.0 * (power * reach) as f64, if heavy { 700.0 } else { 160.0 }) {
-                            self.bring_down(t, i, imp.pos, imp.vel * 0.3, None, &mut femit);
+                            self.bring_down(t, i, imp.pos, imp.vel * 0.3, e_hit * 0.01, None, &mut femit);
                         }
                     } else if !imp.water {
                         // Open ground: a bite is taken out of it (a big one
@@ -2796,7 +3108,7 @@ impl Game {
                         self.destr.eject(site, r, imp.vel, &mut femit);
                         gone = r as f64;
                         for (t, i) in self.world.buildings_near(site, r as f64 + 4.0 * reach as f64, if heavy { 900.0 } else { 400.0 }) {
-                            self.bring_down(t, i, imp.pos, imp.vel * 0.3, None, &mut femit);
+                            self.bring_down(t, i, imp.pos, imp.vel * 0.3, e_hit * 0.01, None, &mut femit);
                         }
                     }
                     if !imp.water {
@@ -2818,8 +3130,8 @@ impl Game {
             self.destr.update(dt as f32, &self.world, &mut femit);
             // Buildings next door that heavy falling pieces went through.
             let hits: Vec<_> = self.destr.crush.drain(..).collect();
-            for (t, i, p, v) in hits {
-                self.bring_down(t, i, p, v * 0.4, None, &mut femit);
+            for (t, i, p, v, e) in hits {
+                self.bring_down(t, i, p, v * 0.4, e, None, &mut femit);
                 self.destr.booms.push(0.5);
             }
             self.sheds.update(dt as f32, &self.world);
@@ -2869,8 +3181,8 @@ impl Game {
         }
         // What the wreckage ploughed through on its way comes down.
         let crushed: Vec<_> = self.crash.as_mut().map(|cr| cr.crush.drain(..).collect()).unwrap_or_default();
-        for (t, i, p, v) in crushed {
-            self.bring_down(t, i, p, v * 0.5, None, &mut femit);
+        for (t, i, p, v, e) in crushed {
+            self.bring_down(t, i, p, v * 0.5, e, None, &mut femit);
             self.destr.booms.push(0.6);
             if let Some(a) = &self.audio {
                 a.event(audio::Event::Crunch(1.4));
@@ -3055,13 +3367,15 @@ impl Game {
             let shake = DVec3::new(jit() * 0.006, jit() * 0.006, 0.0);
             let wob = DQuat::from_rotation_y(jit() * 0.004) * DQuat::from_rotation_x(jit() * 0.004);
             let r = self.plane.rot * wob * view.rot;
-            cam = self.plane.pos + self.plane.rot * (view.eye + shake);
+            cam = self.plane.model_pos() + self.plane.rot * (view.eye + shake);
             dir = r * DVec3::NEG_Z;
             upv = r * DVec3::Y;
             self.cam_pos = cam;
         } else {
             let u = self.plane.pos.normalize();
-            let back = -self.plane.forward();
+            // (A rocket points at the sky: its chase camera stays level with it, on the side its back is to, and closes in on the ship once that flies alone.)
+            let rocket = self.spec.rocket().is_some();
+            let back = if rocket { self.plane.right().cross(u).normalize_or_zero() } else { -self.plane.forward() };
             self.cam_dir = (self.cam_dir + (back - self.cam_dir) * (dt_real * 3.5).min(1.0)).normalize();
             let flat = (self.cam_dir - u * self.cam_dir.dot(u)).normalize_or_zero();
             let tilt = self.cam_dir.dot(u).asin() * 0.6 + self.cam_pitch;
@@ -3069,9 +3383,11 @@ impl Game {
             let vibe = self.plane.dmg.vibe.min(2.0) as f64;
             // (Offsets scale with the aircraft: the camera sits as far back for its size.)
             let sz = self.spec.cam_dist / 16.0;
-            cam = self.plane.pos + d * self.cam_dist + u * (1.5 * sz) + (self.plane.right() * self.rng.range(-1.0, 1.0) as f64 + u * self.rng.range(-1.0, 1.0) as f64) * (vibe * 0.03);
-            dir = (self.plane.pos + u * (1.2 * sz) + self.plane.forward() * (6.0 * sz) - cam).normalize();
-            upv = (u + self.plane.up() * 0.25).normalize();
+            let at = self.plane.centre();
+            let dist = self.cam_dist * if self.plane.stage > 0 { 0.5 } else { 1.0 };
+            cam = at + d * dist + u * (1.5 * sz) + (self.plane.right() * self.rng.range(-1.0, 1.0) as f64 + u * self.rng.range(-1.0, 1.0) as f64) * (vibe * 0.03);
+            dir = if rocket { (at - cam).normalize() } else { (self.plane.pos + u * (1.2 * sz) + self.plane.forward() * (6.0 * sz) - cam).normalize() };
+            upv = if rocket { u } else { (u + self.plane.up() * 0.25).normalize() };
             self.cam_pos = cam;
             self.cam_look = self.plane.pos;
         }
@@ -3137,6 +3453,14 @@ impl Game {
         // Detail building tiles in range stand in for "how much city is around".
         let city = if in_menu { 0.0 } else { (self.world.stats.2 as f32 / 45.0).min(1.0) };
         self.city_glow += (city - self.city_glow) * (dt_real as f32 * 0.5).min(1.0);
+        // City light in the air: the lights come on as the sun sets.
+        let glow_px = if in_menu { None } else { self.skyglow.update(cam) };
+        let glow = {
+            let (la, lo, _) = geo::pos_to_lla(cam);
+            let gh = self.world.ground(la, lo).map(|g| g.h).unwrap_or(0.0);
+            let on = 1.0 - ((up.dot(sun) as f32 + 0.2) / 0.25).clamp(0.0, 1.0);
+            if in_menu { [[0.0; 4]; 3] } else { self.skyglow.globals(cam, gh, on * on * (3.0 - 2.0 * on)) }
+        };
         let mu = up.dot(sun) as f32;
         let day = ((mu + 0.2) / 0.4).clamp(0.0, 1.0);
         let day = day * day * (3.0 - 2.0 * day);
@@ -3170,7 +3494,7 @@ impl Game {
             // The aircraft's own shadow map: a few metres across, deep enough
             // to reach the ground below it.
             let centre = (self.plane.pos - cam).as_vec3();
-            let (pr, pb) = (self.spec.shadow_r, PSHADOW_BACK * self.spec.shadow_r / PSHADOW_R);
+            let (pr, pb) = (self.plane.shadow_r(), PSHADOW_BACK * self.plane.shadow_r() / PSHADOW_R);
             let lview = look_to(centre + sun.as_vec3() * pb, -sun.as_vec3(), upl.as_vec3());
             casc_vp[3] = (ortho(-pr, pr, -pr, pr, 0.0, PSHADOW_DEPTH) * lview).to_cols_array_2d();
         }
@@ -3203,7 +3527,7 @@ impl Game {
             vol_e: [0.0; 4],
             vol_n: [0.0; 4],
             pshadow_vp: casc_vp[3],
-            pshadow: [self.spec.shadow_r * 2.0 / pres, 0.0012 / PSHADOW_DEPTH, pres / sres, if shadow_on && !self.crashed { 1.0 } else { 0.0 }],
+            pshadow: [self.plane.shadow_r() * 2.0 / pres, 0.0012 / PSHADOW_DEPTH, pres / sres, if shadow_on && !self.crashed { 1.0 } else { 0.0 }],
             taa: [jitter.x * 0.5, -jitter.y * 0.5, if self.gfx.taa { 1.0 } else { 0.0 }, 0.0],
             plane_inv: [[0.0; 4]; 4],
             plane_prev: [[0.0; 4]; 4],
@@ -3227,6 +3551,11 @@ impl Game {
             start: [if in_menu { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
             quality: [0.0; 4],
             detail: [self.gfx.city_k(), self.gfx.tree_imp_k(), self.gfx.tree_far(), 0.0],
+            glow_c: glow[0],
+            glow_e: glow[1],
+            glow_n: glow[2],
+            spot: [[0.0; 4]; 3],
+            nav: self.nav_globals(),
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -3242,7 +3571,7 @@ impl Game {
             // The aircraft keeps pace with the camera, so its pixels are found
             // in last frame's image through where it was then, not through
             // where the ground under them was.
-            let base = Mat4::from_rotation_translation(self.plane.rot.as_quat(), (self.plane.pos - cam).as_vec3());
+            let base = Mat4::from_rotation_translation(self.plane.rot.as_quat(), (self.plane.model_pos() - cam).as_vec3());
             g.taa[3] = 1.0;
             g.plane_inv = base.inverse().to_cols_array_2d();
             g.plane_prev = (Mat4::from_cols_array_2d(&self.prev_vp) * self.prev_plane).to_cols_array_2d();
@@ -3303,8 +3632,9 @@ impl Game {
             }
         }
         let params = self.instruments(agl);
+        let mut own_lights = Vec::new();
         if !self.crashed && !in_menu {
-            let base = Mat4::from_rotation_translation(self.plane.rot.as_quat(), (self.plane.pos - cam).as_vec3());
+            let base = Mat4::from_rotation_translation(self.plane.rot.as_quat(), (self.plane.model_pos() - cam).as_vec3());
             let pose = self.plane.pose(&self.model.pieces);
             // Blades while they can be followed by eye, a blur once they cannot.
             let blur = ((self.plane.prop_rate - 30.0) / 25.0).clamp(0.0, 1.0) as f32;
@@ -3312,14 +3642,20 @@ impl Game {
             let kind = self.spec.id as f32;
             // What the exhaust shows (plane.wgsl, the plume and the nozzles): how far the
             // afterburners are lit, and how hard the engines are running dry (0 idle .. 1).
-            let (burner, dry) = match &self.spec.engine {
-                aircraft::Engine::Fan(fe) => (self.plane.burner as f32, (((self.plane.n1 - fe.idle) / (1.0 - fe.idle)).clamp(0.0, 1.0) * if dm.engine > 0.0 { 1.0 } else { 0.0 }) as f32),
-                _ => (0.0, 0.0),
+            let (burner, dry, nozzle_z) = match &self.spec.engine {
+                aircraft::Engine::Fan(fe) => (self.plane.burner as f32, (((self.plane.n1 - fe.idle) / (1.0 - fe.idle)).clamp(0.0, 1.0) * if dm.engine > 0.0 { 1.0 } else { 0.0 }) as f32, fe.nozzle_z),
+                // (A rocket: how hard the lit engines burn, and which stage's they are with how many of them, see plane.wgsl `rocket_plume`.)
+                aircraft::Engine::Rocket(rk) => (self.plane.burner as f32, self.plane.plume_code(), rk.stages[self.plane.stage].z[1]),
+                _ => (0.0, 0.0, 0.0),
             };
+            // (A rocket's plume also wants to know how thin the air is: 0 at the sea, a half by 20 km, 1 in space; and its tiles how hot.)
+            let rocket = self.spec.rocket().is_some();
+            let thin = if rocket { 1.0 - (plane::density(geo::pos_to_lla(self.plane.pos).2) / plane::RHO0).min(1.0).powf(0.25) as f32 } else { 0.0 };
+            let heat = if rocket { self.plane.heat() } else { 0.0 };
             if burner > 0.01 && self.crash.is_none() {
                 // The flames light the tail from behind (turned down at night, as they are, for the eye that has opened up).
                 let k = burner * (0.12 + 0.88 * day) * 2.2;
-                g.light_pos = v4(self.plane.pos + self.plane.rot * DVec3::new(0.0, 0.0, 10.0) - cam, 1.3);
+                g.light_pos = v4(self.plane.model_pos() + self.plane.rot * DVec3::new(0.0, 0.0, nozzle_z + 2.0) - cam, 1.3);
                 g.light_col = [k, 0.5 * k, 0.2 * k, 0.0];
             }
             for (i, p) in self.model.pieces.iter().enumerate() {
@@ -3327,6 +3663,7 @@ impl Game {
                     airframe::Vis::Always => false,
                     airframe::Vis::SlowProp => blur >= 1.0,
                     airframe::Vis::FastProp => blur <= 0.0,
+                    airframe::Vis::Chute => self.plane.spoilers < 0.02,
                 };
                 if hide || dm.hidden(p) {
                     continue;
@@ -3336,8 +3673,8 @@ impl Game {
                 objs.push(DrawObj {
                     mesh: self.piece_mesh[i],
                     model: base * pose[i],
-                    tint: [blur, burner, dry, 0.0],
-                    glow: [0.0, kind, 0.0, 0.0],
+                    tint: [blur, burner, dry, thin],
+                    glow: [0.0, kind, heat, 0.0],
                     params,
                     cast: 1 << render::PLANE_LAYER,
                     glass: p.glass,
@@ -3376,13 +3713,22 @@ impl Game {
                     });
                 }
             }
+            self.own_lights(&base, &pose, params[5], &mut g, &mut own_lights);
         }
         if !in_menu {
             self.sheds.draw(cam, params, &mut objs);
+            // A booster just let go: its centre engines' flame dying away behind it.
+            let ix = |n: &str| self.model.pieces.iter().position(|p| p.name == n);
+            if let (true, Some(body), Some(plume)) = (self.plane.stage > 0, ix("booster body"), ix("booster plume")) {
+                if let Some((model, age)) = self.sheds.find(self.piece_mesh[body], cam).filter(|s| s.1 < 2.5) {
+                    let thin = 1.0 - (plane::density(geo::pos_to_lla(self.plane.pos).2) / plane::RHO0).min(1.0).powf(0.25) as f32;
+                    objs.push(DrawObj { mesh: self.piece_mesh[plume], model, tint: [0.0, 0.7 * (1.0 - age / 2.5), 0.9 * 3.0 / 33.0, thin], glow: [0.0, self.spec.id as f32, 0.0, 0.0], params, glass: true, ..DrawObj::DEFAULT });
+                }
+            }
         }
         let mut insts = Vec::new();
         let mut fall = Vec::new();
-        let mut air_lights = Vec::new();
+        let mut air_lights = own_lights;
         if !in_menu {
             let local = (self.utc + clon.to_degrees() / 15.0).rem_euclid(24.0);
             let sun_up = geo::enu(cam).2.dot(self.sun_dir());
@@ -3436,6 +3782,7 @@ impl Game {
         g.cut_v = pf.cut_v;
         casc_vp[render::MASK_SLOT] = g.photo_vp;
         let (tiles, details, near) = self.world.draw_lists(cam, focus_abs, CASC);
+        let cover = self.world.light_cover(cam);
         // The shore distance field: a step of its rebuild this frame.
         let sf = self.shore.frame(cam);
         casc_vp[render::SHORE_SLOT] = sf.build_vp;
@@ -3478,7 +3825,7 @@ impl Game {
         let had_shots = shot.is_some() && self.shots.is_empty();
         let (skin_slots, skins) = if in_menu { (Vec::new(), Vec::new()) } else { self.destr.skin_draws() };
         self.r.stats[0] += now.elapsed().as_secs_f64();
-        self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && self.menu.hangar.is_none()).then(|| self.window.scale_factor() as f32) });
+        self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && self.menu.hangar.is_none()).then(|| self.window.scale_factor() as f32), cover, glow: glow_px });
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
         }
@@ -4368,12 +4715,22 @@ impl Game {
                             menu::heading(ui, t!("AIRCRAFT", "AVION"));
                             egui::Grid::new("info_ac").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
                                 row(ui, t!("Aircraft", "Avion"), p.spec.name.into(), TEXT);
-                                if jet {
+                                if let Some((name, lit, n)) = p.engines() {
+                                    row(ui, t!("Stage", "Étage"), p.stage_name().unwrap_or("").into(), TEXT);
+                                    row(ui, t!("Engines", "Moteurs"), t!("{}  ·  {} of {} lit", "{}  ·  {} sur {} allumés", name, lit, n), TEXT);
+                                    row(ui, t!("Thrust", "Poussée"), format!("{:.0}%  ·  {:.1} MN", p.throttle * 100.0, p.thrust_now() / 1.0e6), TEXT);
+                                } else if jet {
                                     row(ui, t!("Thrust", "Poussée"), format!("{:.0}%  ·  N1 {:.0}%{}", p.throttle * 100.0, p.n1 * 100.0, if p.reverser > 0.0 { "  · REV" } else { "" }), TEXT);
                                 } else {
                                     row(ui, t!("Throttle", "Gaz"), format!("{:.0}%  ·  {:.0} rpm", p.throttle * 100.0, rpm), if rpm > 2710.0 { Color32::from_rgb(255, 180, 50) } else { TEXT });
                                 }
-                                row(ui, t!("Flaps", "Volets"), format!("{:.0}°", p.flap_notch_deg()), TEXT);
+                                match &p.spec.lever {
+                                    Some(l) => row(ui, l.name[i18n::is_fr() as usize], l.notch(p.flap_set).into(), TEXT),
+                                    None => row(ui, t!("Flaps", "Volets"), format!("{:.0}°", p.flap_notch_deg()), TEXT),
+                                }
+                                if p.spec.chute.is_some() {
+                                    row(ui, t!("Drag chute", "Parachute-frein"), if p.spoilers > 0.0 { t!("out", "sorti") } else if p.chute_spent { t!("gone", "largué") } else { t!("packed", "plié") }.into(), TEXT);
+                                }
                                 if p.spec.spoiler_cd > 0.0 {
                                     row(ui, t!("Speedbrake", "Aérofreins"), if p.spoilers > 0.6 { t!("ground spoilers", "spoilers sol").into() } else if p.speedbrake > 0.0 { t!("flight detent", "cran vol").into() } else { t!("down", "rentrés").to_string() }, TEXT);
                                 }
@@ -4545,6 +4902,8 @@ impl Game {
         let tas = self.plane.airspeed().length();
         let gs = self.plane.vel.length();
         let vs = self.plane.vel.dot(u);
+        // (A rocket's height is its engines' above the ground.)
+        let base_up = self.world.ground(lat, lon).map_or(alt, |g| alt - g.h) - self.plane.wheel_height();
         let wind_kt = self.wx.wind * 1.94384;
         let local = (self.utc + lon.to_degrees() / 15.0).rem_euclid(24.0);
         let mut go: Option<String> = None;
@@ -4587,16 +4946,27 @@ impl Game {
                             shadow(ui, format!("TAS {:>4.0} kt", tas * 1.94384), 14.0, dim);
                         }
                         let p = &self.plane;
-                        if p.spec.is_jet() {
+                        if let Some((name, _, _)) = p.engines() {
+                            shadow(ui, format!("{}   ENGINES {name}{}", p.stage_name().unwrap_or(""), if p.auto { "   AUTOLAND" } else { "" }), 14.0, white);
+                            shadow(ui, format!("THR {:>3.0}%   {:>2.0} MN   G {:>4.1}   {:.0} t", p.throttle * 100.0, p.thrust_now() / 1.0e6, p.g_load, p.mass() / 1000.0), 14.0, dim);
+                            // What a rocket is flown by: how fast it climbs, how far it has gone, and how high it will coast.
+                            let apo = p.apogee().map_or("ESCAPE".into(), |a| format!("{:.0} km", a.max(0.0) / 1000.0));
+                            let high = if base_up < 3000.0 { format!("{:.0} m up", base_up.max(0.0)) } else { format!("{:.1} km up", base_up / 1000.0) };
+                            shadow(ui, format!("{:>+6.0} m/s   {:>5.0} m/s   {high}", vs, p.vel.length()), 14.0, white);
+                            shadow(ui, format!("APOGEE {apo}   DOWNRANGE {:.0} km{}", p.downrange() / 1000.0, p.burnout().map_or(String::new(), |t| format!("   BURNOUT {}:{:02}", t as u32 / 60, t as u32 % 60))), 14.0, dim);
+                        } else if p.spec.is_jet() {
                             let rev = if p.reverser > 0.95 { "   REV" } else if p.reverser > 0.0 { "   rev" } else { "" };
                             shadow(ui, format!("THR {:>3.0}%   N1 {:>3.0}%   G {:>4.1}{rev}", p.throttle * 100.0, p.n1 * 100.0, p.g_load), 14.0, dim);
                         } else {
                             shadow(ui, format!("THR {:>3.0}%   {:>4.0} rpm   G {:>4.1}", p.throttle * 100.0, p.prop_rate * 60.0 / std::f64::consts::TAU, p.g_load), 14.0, if p.prop_rate * 60.0 / std::f64::consts::TAU > 2710.0 { Color32::from_rgb(255, 190, 60) } else { dim });
                         }
                         let gear = if p.gear >= 1.0 { "DOWN".to_string() } else if p.gear <= 0.0 { "UP".to_string() } else { "transit".to_string() };
-                        let sb = if p.spoilers > 0.05 { "   SPDBRK" } else { "" };
+                        let sb = if p.spoilers <= 0.05 { "" } else if p.spec.chute.is_some() { "   CHUTE" } else { "   SPDBRK" };
                         shadow(ui, format!("FUEL {:>3.0}%   {:.0} kg{}", p.fuel_frac() * 100.0, p.fuel, if p.running { "" } else { "   ENG OFF" }), 14.0, if p.fuel_frac() < 0.1 || !p.running { Color32::from_rgb(255, 190, 60) } else { dim });
-                        shadow(ui, format!("FLAPS {:>2.0}°   GEAR {}{sb}", p.flap_notch_deg(), gear), 14.0, if p.gear > 0.0 && p.gear < 1.0 { Color32::from_rgb(255, 190, 60) } else { dim });
+                        if p.spec.rocket().is_none() {
+                            let flaps = match &p.spec.lever { Some(l) => l.notches.get(p.flap_set as usize).map_or("", |n| n[0]).to_string(), None => format!("FLAPS {:>2.0}°", p.flap_notch_deg()) };
+                            shadow(ui, format!("{flaps}   GEAR {}{sb}", gear), 14.0, if p.gear > 0.0 && p.gear < 1.0 { Color32::from_rgb(255, 190, 60) } else { dim });
+                        }
                         if p.gear < 1.0 && agl < 150.0 && p.throttle < 0.35 && !self.crashed {
                             if pad {
                                 ui.horizontal(|ui| {
@@ -4678,6 +5048,8 @@ impl Game {
                     }
                 }
             }
+            // The loading screen, over everything else.
+            self.loading_overlay(ctx);
             // Google's imagery has to carry its credit, HUD or not.
             if self.show_hud || self.google_shown() {
                 self.credits(ctx);
@@ -4706,7 +5078,7 @@ impl Game {
                     warn.push(("OVERSPEED", amber));
                 }
                 if p.flaps > 0.25 && speed > p.vfe() {
-                    warn.push(("FLAPS OVERSPEED", if p.dmg.flap_stress > 0.5 { red } else { amber }));
+                    warn.push((if p.spec.lever.is_some() { "NOSE OVERSPEED" } else { "FLAPS OVERSPEED" }, if p.dmg.flap_stress > 0.5 { red } else { amber }));
                 }
                 if p.g_load.abs() > 5.0 {
                     warn.push(("OVER G", if p.dmg.fatigue > 1.2 { red } else { amber }));
