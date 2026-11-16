@@ -19,6 +19,8 @@ struct Tile {
     water: Vec<bool>,
     /// how much of the ocean's long waves the water shows (sources.rs TileData::sea)
     sea: Vec<f32>,
+    /// any water on the tile, so the ocean fft can idle without it.
+    wet: bool,
     last_used: u64,
     /// imagery source it was made with; a different one gets it made again
     generation: u32,
@@ -857,7 +859,7 @@ impl World {
                     let slot = match res {
                         Ok(td) => {
                             bytes += crate::render::tile_bytes(&td);
-                            Slot::Ready(Box::new(Tile { center: td.center, radius: td.radius, gpu: r.upload_tile(&td), heights: td.heights, water: td.water, sea: td.sea, last_used: self.frame, generation: td.imagery_gen, refreshing: false }))
+                            Slot::Ready(Box::new(Tile { center: td.center, radius: td.radius, gpu: r.upload_tile(&td), heights: td.heights, wet: td.water.iter().any(|w| *w), water: td.water, sea: td.sea, last_used: self.frame, generation: td.imagery_gen, refreshing: false }))
                         }
                         Err(e) => {
                             log::debug!("tile {id:?} failed: {e}");
@@ -1074,6 +1076,11 @@ impl World {
             self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall })));
         }
         bytes
+    }
+
+    /// whether any drawn terrain tile has water on it.
+    pub fn water_in_view(&self) -> bool {
+        self.draw.iter().any(|id| matches!(self.tiles.get(id), Some(Slot::Ready(t)) if t.wet))
     }
 
     /// Zoom of the most detailed terrain tile loaded at a spot.

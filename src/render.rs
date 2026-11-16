@@ -712,7 +712,7 @@ pub struct Frame<'a> {
     /// the crash's fire simulation, while there is one
     pub fluid: Option<crate::fluid::FluidFrame>,
     /// this frame's ocean spectrum (ocean.rs)
-    pub ocean: crate::ocean::OceanU,
+    pub ocean: Option<crate::ocean::OceanU>,
     pub egui: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     pub shot: Option<std::path::PathBuf>,
     /// the start screen's title, drawn at this UI scale (None: not shown)
@@ -2633,7 +2633,10 @@ impl Renderer {
             Some(ff) => self.fluid.compute(q, &mut enc, ff),
             None => self.fluid.live = false,
         }
-        self.ocean.compute(q, &mut enc, &f.ocean);
+        // the wave fft only runs while some water is drawn.
+        if let Some(o) = &f.ocean {
+            self.ocean.compute(q, &mut enc, o);
+        }
         if f.g.weather[3] != self.lut_haze {
             self.lut_haze = f.g.weather[3];
             self.lut_bake.draw(&mut enc);
