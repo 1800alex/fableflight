@@ -125,6 +125,7 @@ pub struct Wreck {
     pub base: f64,
     pub top: f64,
     pub col: [u8; 3],
+    #[allow(dead_code)]
     pub tile: TileId,
     /// how its walls were drawn (see `Footprint`)
     pub sty: [u8; 4],
@@ -789,7 +790,7 @@ impl World {
     /// moving ones that the 3D tiles hide (`photo_car_light`).
     pub fn car_instances(&self, cam: DVec3, activity: f32, sun: f64, out: &mut Vec<(u32, Inst)>, lights: &mut Vec<crate::airfield::Light>) {
         let fr = self.frustum.as_ref();
-        let mut push = |pos: DVec3, fwd: glam::Vec3, up: glam::Vec3, model: u8, col: [f32; 3], out: &mut Vec<(u32, Inst)>| {
+        let push = |pos: DVec3, fwd: glam::Vec3, up: glam::Vec3, model: u8, col: [f32; 3], out: &mut Vec<(u32, Inst)>| {
             let o = (pos - cam).as_vec3();
             if fr.map(|f| f.sphere(pos - cam, 8.0)).unwrap_or(true) {
                 let right = fwd.cross(up).normalize_or_zero();
@@ -1085,6 +1086,7 @@ impl World {
     pub fn airfield_near(&self, p: DVec3, r: f64) -> Option<&Field> {
         self.fields.values().filter_map(|s| if let FSlot::Ready(f) = s { Some(f.as_ref()) } else { None }).filter(|f| (f.geo.center - p).length() < r + f.geo.radius as f64).min_by(|a, b| (a.geo.center - p).length().total_cmp(&(b.geo.center - p).length()))
     }
+    #[allow(dead_code)]
     pub fn airfield(&self, idx: u32) -> Option<&Field> {
         match self.fields.get(&idx) {
             Some(FSlot::Ready(f)) => Some(f),

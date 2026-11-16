@@ -1601,6 +1601,7 @@ impl Game {
     }
 
     /// The nearest airport worth landing at.
+    #[allow(dead_code)]
     fn nearest_airport(&self) -> Option<u32> {
         let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
         let db = airports::Db::get();
