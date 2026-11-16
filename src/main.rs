@@ -721,6 +721,8 @@ struct Game {
     smoke_acc: f32,
     /// things that just broke, to flash on the HUD: text, when
     flash: Vec<(String, f64)>,
+    /// a weapon's fireball for the renderer's light: position, power, when
+    weapon_flash: Option<(DVec3, f32, f64)>,
     damage_spec: Option<String>,
     /// group wreck meshes have been cut down and need restoring on respawn
     wreck_dirty: bool,
@@ -884,7 +886,7 @@ impl Game {
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
-            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
+            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), weapon_flash: None, damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
             start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
@@ -1172,6 +1174,7 @@ impl Game {
         (self.g_slow, self.was_ground, self.prev_vs, self.prev_gear, self.prev_flaps) = (1.0, false, 0.0, self.plane.gear, self.plane.flaps);
         self.gauges = gauges::Gauges::new(&self.plane, self.frame ^ 0x9e37);
         self.weapons.reset(self.spec, &self.model.pieces);
+        self.weapon_flash = None;
     }
 
     /// On the ground, at rest, waiting for the terrain under it to load.
@@ -2459,6 +2462,13 @@ impl Game {
                 if let Some(a) = &self.audio {
                     a.boom(power * (0.2 + 0.8 * near));
                 }
+                // The flash lights the aircraft for a moment and, if the hit
+                // is close, gives the airframe a jolt.
+                self.weapon_flash = Some((pos, power, self.real));
+                if (self.cam_pos - pos).length() < 800.0 {
+                    self.plane.dmg.vibe = self.plane.dmg.vibe.max(power * 1.5);
+                }
+                self.anchor_fx(pos);
                 self.blast_fx(pos, power, size, femit);
                 if let Some(key) = target {
                     let label = self.weapons.target_view.as_ref().map(|v| v.label.clone()).unwrap_or_default();
@@ -2481,49 +2491,52 @@ impl Game {
         let p = power.max(0.3);
         let k = (0.7 + 0.15 * size).min(1.5);
         let r = &mut self.rng;
-        femit.push((at, render::Particle { life: 0.22, size0: 9.0 * p * k, size1: 28.0 * p * k, kind: crash::FLASH, alpha: 1.7 * p, ..Default::default() }));
-        for _ in 0..18 {
+        femit.push((at, render::Particle { life: 0.3, size0: 12.0 * p * k, size1: 52.0 * p * k, kind: crash::FLASH, alpha: 2.0 * p, ..Default::default() }));
+        // The fireball: overlapping hot blobs, thrown on with the wreckage.
+        for _ in 0..30 {
             let d = r.dir();
             femit.push((at, render::Particle {
-                vel: (d * r.range(14.0, 45.0) * p.sqrt() + up.as_vec3() * r.range(2.0, 9.0)).into(),
-                life: r.range(1.2, 2.8),
-                size0: r.range(1.4, 3.0) * p * k,
-                size1: r.range(6.0, 12.0) * p * k,
-                temp: r.range(1.6, 2.8),
+                vel: (d * r.range(14.0, 50.0) * p.sqrt() + up.as_vec3() * r.range(2.0, 11.0)).into(),
+                life: r.range(1.8, 4.0),
+                size0: r.range(2.5, 5.5) * p * k,
+                size1: r.range(10.0, 24.0) * p * k,
+                temp: r.range(2.2, 3.2),
                 kind: crash::GAS,
-                drag: r.range(1.4, 2.2),
-                buoy: r.range(5.0, 10.0),
+                drag: r.range(1.2, 2.0),
+                buoy: r.range(6.0, 12.0),
                 seed: r.f(),
-                alpha: r.range(0.7, 0.95),
+                alpha: r.range(0.75, 1.0),
                 ..Default::default()
             }));
         }
-        for _ in 0..20 {
+        // Burning fragments and sparks tearing out through the fireball.
+        for _ in 0..40 {
             let d = (r.dir() + up.as_vec3() * 0.6).normalize_or_zero();
             femit.push((at, render::Particle {
-                vel: (d * r.range(20.0, 70.0) * p.sqrt()).into(),
-                life: r.range(0.5, 1.8),
-                size0: r.range(0.06, 0.14),
+                vel: (d * r.range(20.0, 85.0) * p.sqrt()).into(),
+                life: r.range(0.6, 2.2),
+                size0: r.range(0.06, 0.16),
                 size1: 0.03,
                 kind: crash::SPARK,
                 drag: r.range(0.3, 0.9),
                 seed: r.f(),
-                alpha: r.range(0.5, 1.0),
+                alpha: r.range(0.6, 1.0),
                 ..Default::default()
             }));
         }
-        for _ in 0..8 {
+        // The smoke column left behind, and the fire under it, lingering.
+        for _ in 0..20 {
             let d = r.dir();
             femit.push((at, render::Particle {
-                vel: (d * r.range(3.0, 12.0) * p.sqrt() + up.as_vec3() * r.range(1.0, 5.0)).into(),
-                life: r.range(3.0, 6.0),
-                size0: r.range(2.5, 4.5) * p * k,
-                size1: r.range(8.0, 16.0) * p * k,
+                vel: (d * r.range(3.0, 14.0) * p.sqrt() + up.as_vec3() * r.range(1.0, 6.0)).into(),
+                life: r.range(6.0, 12.0),
+                size0: r.range(3.0, 6.0) * p * k,
+                size1: r.range(14.0, 32.0) * p * k,
                 kind: crash::GAS,
-                drag: r.range(0.8, 1.4),
-                buoy: r.range(2.0, 5.0),
+                drag: r.range(0.7, 1.3),
+                buoy: r.range(2.0, 6.0),
                 seed: r.f(),
-                alpha: r.range(0.3, 0.55),
+                alpha: r.range(0.35, 0.6),
                 ..Default::default()
             }));
         }
@@ -3671,6 +3684,16 @@ impl Game {
                 let k = burner * (0.12 + 0.88 * day) * 2.2;
                 g.light_pos = v4(self.plane.model_pos() + self.plane.rot * DVec3::new(0.0, 0.0, nozzle_z + 2.0) - cam, 1.3);
                 g.light_col = [k, 0.5 * k, 0.2 * k, 0.0];
+            }
+            if let Some((at, power, t0)) = self.weapon_flash {
+                let age = self.real - t0;
+                if age < 0.45 {
+                    let k = (1.0 - age / 0.45) as f32 * power * (0.25 + 0.75 * day);
+                    g.light_pos = v4(at - cam, (6.0 * power as f64).max(2.0));
+                    g.light_col = [2.8 * k, 1.1 * k, 0.35 * k, 0.0];
+                } else {
+                    self.weapon_flash = None;
+                }
             }
             for (i, p) in self.model.pieces.iter().enumerate() {
                 let hide = match p.vis {
