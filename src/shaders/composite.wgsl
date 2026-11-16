@@ -593,8 +593,11 @@ fn composite_sample(in: FsIn, z: f32, c0: vec4f, a0: vec4f, amb: f32) -> vec3f {
     let t0 = max(top.x, 0.0);
     let t1 = min(dist, top.y);
     if (t1 > t0) {
-      let sc = atm_march(oc, rd, t0, t1, 12, fract(jit + G.time.w * 0.618034));
-      col = col * sc.T + sc.L + glow_march(rd, t1, 8, fract(jit + G.time.w * 0.381966));
+      // Fewer steps on the lighter presets (G.quality.x: 1.8 Low, 1.35 Medium,
+      // 1.0 High); the jitter and TAA hide the coarser march.
+      let q = max(G.quality.x, 1.0);
+      let sc = atm_march(oc, rd, t0, t1, max(6, i32(12.0 / q)), fract(jit + G.time.w * 0.618034));
+      col = col * sc.T + sc.L + glow_march(rd, t1, max(4, i32(8.0 / q)), fract(jit + G.time.w * 0.381966));
     }
   }
   if (cov < 0.996) { col = mix(sky_color(rd, jit), col, cov); }
