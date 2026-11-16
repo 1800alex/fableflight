@@ -38,6 +38,7 @@ const K_WELCOME: u8 = 2;
 const K_STATE: u8 = 3;
 const K_PEERS: u8 = 4;
 const K_BYE: u8 = 5;
+const K_FED: u8 = 6;
 
 /// One player's aircraft at one instant. Positions are in the game's world
 /// frame (metres from the planet's centre), the attitude a unit quaternion
@@ -82,6 +83,11 @@ pub enum Msg {
     State { cookie: u64, state: PlayerState },
     Peers { peers: Vec<(u32, String, PlayerState)> },
     Bye { cookie: u64 },
+    /// Relay → relay (federation, the game never sees one): the sending
+    /// relay's own players. `relay` is that relay's id for this run, `ts`
+    /// its clock (unix seconds), `seq` counts up; `tag` signs everything
+    /// before it with the network's shared secret (see `fed_tag`).
+    Fed { relay: u32, relay_name: String, ts: u64, seq: u32, players: Vec<(u32, String, PlayerState)>, tag: u64 },
 }
 
 /// A name as it may be shown: printable characters only, trimmed, at most
@@ -235,6 +241,22 @@ impl Msg {
                 w.u64(*cookie);
                 w.0
             }
+            Msg::Fed { relay, relay_name, ts, seq, players, tag } => {
+                let mut w = W::new(K_FED);
+                w.u32(*relay);
+                w.name(relay_name);
+                w.u64(*ts);
+                w.u32(*seq);
+                let n = players.len().min(PEERS_PER_PACKET);
+                w.u8(n as u8);
+                for (id, name, s) in &players[..n] {
+                    w.u32(*id);
+                    w.name(name);
+                    w.state(s);
+                }
+                w.u64(*tag);
+                w.0
+            }
         }
     }
 
@@ -266,10 +288,37 @@ impl Msg {
                 Msg::Peers { peers }
             }
             K_BYE => Msg::Bye { cookie: r.u64()? },
+            K_FED => {
+                let (relay, relay_name, ts, seq) = (r.u32()?, r.name()?, r.u64()?, r.u32()?);
+                let n = r.u8()? as usize;
+                if n > PEERS_PER_PACKET {
+                    return None;
+                }
+                let mut players = Vec::with_capacity(n);
+                for _ in 0..n {
+                    players.push((r.u32()?, r.name()?, r.state()?));
+                }
+                Msg::Fed { relay, relay_name, ts, seq, players, tag: r.u64()? }
+            }
             _ => return None,
         };
         Some(m)
     }
+}
+
+/// The signature of a federation datagram: SipHash-2-4 (a keyed hash made
+/// for this) of everything before the tag, keyed by the shared secret.
+#[allow(dead_code, deprecated)] // (only the relay signs; SipHasher is std's own)
+pub fn fed_tag(secret: &str, signed: &[u8]) -> u64 {
+    use std::hash::{Hasher, SipHasher};
+    let key = |salt: u64| {
+        let mut h = SipHasher::new_with_keys(salt, !salt);
+        h.write(secret.as_bytes());
+        h.finish()
+    };
+    let mut h = SipHasher::new_with_keys(key(0x6666_6d70_6665_6431), key(0x6666_6d70_6665_6432));
+    h.write(signed);
+    h.finish()
 }
 
 #[cfg(test)]
@@ -288,6 +337,7 @@ mod tests {
             Msg::State { cookie: 99, state: state() },
             Msg::Peers { peers: vec![(1, "Dany".into(), state()), (2, "Roland".into(), state())] },
             Msg::Bye { cookie: 5 },
+            Msg::Fed { relay: 77, relay_name: "danux.be".into(), ts: 1_800_000_000, seq: 4, players: vec![(1, "Dany".into(), state())], tag: 9 },
         ] {
             let b = m.encode();
             assert_eq!(Msg::decode(&b), Some(m.clone()), "{m:?}");
