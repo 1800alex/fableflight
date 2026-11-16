@@ -16,6 +16,7 @@ mod fetch;
 mod frame_pacer;
 mod fgmodel;
 mod fluid;
+mod gputime;
 mod geo;
 mod hangar;
 mod hangar_ui;
