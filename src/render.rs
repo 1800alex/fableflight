@@ -359,7 +359,9 @@ impl CloudShadow {
         }
         // What lookups read this frame, from the maps as they were before this
         // frame's slice (the back map's slot is neither of them).
-        for (k, p) in self.p_mix.iter().enumerate() {
+        // on integrated gpus the fade moves 1/64 a frame, so the blend is redrawn every other frame.
+        let skip_mix = !full && self.slices > CS_SLICES && self.slice % 2 == 1;
+        for (k, p) in self.p_mix.iter().enumerate().filter(|_| !skip_mix) {
             let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&self.mix_layers[k], false))], None));
             rp.set_pipeline(p);
             rp.set_bind_group(0, &self.bg_mix, &[]);
