@@ -5276,14 +5276,19 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let Some(g) = self.game.as_mut() else { return };
         let consumed = g.egui_state.on_window_event(&g.window, &event).consumed;
         match event {
             WindowEvent::CloseRequested => {
                 g.keep_settings(true);
                 g.src.google.save();
-                el.exit()
+                // Dropped here, while the event loop (and with it the Wayland
+                // connection) is still alive: egui's clipboard thread tears
+                // down its Wayland objects on drop, and if the game outlived
+                // `run_app` that would be on an already freed display.
+                self.game = None;
+                std::process::exit(0);
             }
             WindowEvent::Resized(s) => g.r.resize(s.width, s.height),
             WindowEvent::RedrawRequested => {
