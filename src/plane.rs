@@ -3846,7 +3846,7 @@ mod tests {
     #[test]
     fn a_rocket_lights_the_engines_it_is_told_to() {
         let w = flat_world();
-        let mut burn = |lit: usize| {
+        let burn = |lit: usize| {
             let mut p = on_the_pad();
             p.lit = lit;
             run(&mut p, &w, 4.0, Controls { throttle_set: Some(1.0), ..Default::default() });

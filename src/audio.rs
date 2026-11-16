@@ -1900,7 +1900,7 @@ mod tests {
         *shared.params.lock() = f18(1.0, 1.0, 0.0, 0.0);
         let mut s = Synth::new(shared.clone());
         s.p = f18(1.0, 1.0, 0.0, 0.0);
-        let mut take = |s: &mut Synth, secs: f32| -> Vec<[f32; 2]> { (0..(secs * RATE as f32) as usize).map(|_| [s.next().unwrap(), s.next().unwrap()]).collect() };
+        let take = |s: &mut Synth, secs: f32| -> Vec<[f32; 2]> { (0..(secs * RATE as f32) as usize).map(|_| [s.next().unwrap(), s.next().unwrap()]).collect() };
         take(&mut s, 1.0);
         *shared.params.lock() = f18(1.0, 1.8, 1.0, 0.0);
         let x = take(&mut s, 2.5);
