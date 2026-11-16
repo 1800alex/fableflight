@@ -174,8 +174,9 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
-            // (An ICMP "port unreachable" from a relay that is down.)
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            // (An ICMP "port unreachable" from a relay that is down: refused
+            // on Linux, reset — WSAECONNRESET — on Windows.)
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset) => {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
