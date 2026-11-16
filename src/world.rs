@@ -1521,7 +1521,8 @@ impl World {
                 close: near,
             });
         }
-        // near to far, so near buildings hide far ones before they are shaded.
+        // near to far, so nearer geometry hides what is behind it before it is shaded.
+        tiles.sort_by(|a, b| Vec3::new(a.1[0], a.1[1], a.1[2]).length_squared().total_cmp(&Vec3::new(b.1[0], b.1[1], b.1[2]).length_squared()));
         let key = |d: &DetailDraw| Vec3::new(d.u[0], d.u[1], d.u[2]).length() - d.radius;
         details.sort_by(|a, b| key(a).total_cmp(&key(b)));
         (tiles, details, near_inst)
