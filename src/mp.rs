@@ -213,9 +213,11 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
     Ok(())
 }
 
-/// Where the list of the network's servers is read from (the main relay's
-/// `/servers.json`, see relay/).
-pub const DIRECTORY_URL: &str = "https://fableflight.danux.be/servers.json";
+/// Where the list of the network's servers is read from, tried in turn (a
+/// relay's `/servers.json`, see relay/; any relay serves the whole network's).
+/// When none answers, the last list received (kept on disk) stands in, and
+/// its servers are asked directly.
+pub const DIRECTORY_URLS: &[&str] = &["https://fableflight.danux.be/servers.json"];
 
 /// A server of the network, as the list gives it and as we hear it.
 #[derive(Clone, Debug, PartialEq)]
@@ -232,6 +234,8 @@ pub struct ServerEntry {
 struct DirShared {
     servers: Mutex<Vec<ServerEntry>>,
     error: Mutex<Option<String>>,
+    /// the list is the last one received, no list server answering
+    stale: AtomicBool,
     now: AtomicBool,
     stop: AtomicBool,
 }
@@ -243,9 +247,11 @@ pub struct Directory {
 }
 
 impl Directory {
-    pub fn start(src: Arc<crate::sources::Sources>, url: &str) -> Self {
-        let shared = Arc::new(DirShared { servers: Mutex::new(Vec::new()), error: Mutex::new(None), now: AtomicBool::new(true), stop: AtomicBool::new(false) });
-        let (sh, url) = (shared.clone(), url.to_string());
+    /// Reads the list from `urls` (the first that answers), keeping a copy
+    /// in `cache` for when none does.
+    pub fn start(src: Arc<crate::sources::Sources>, urls: Vec<String>, cache: Option<std::path::PathBuf>) -> Self {
+        let shared = Arc::new(DirShared { servers: Mutex::new(Vec::new()), error: Mutex::new(None), stale: AtomicBool::new(false), now: AtomicBool::new(true), stop: AtomicBool::new(false) });
+        let sh = shared.clone();
         std::thread::Builder::new()
             .name("server list".into())
             .spawn(move || {
@@ -253,22 +259,22 @@ impl Directory {
                 while !sh.stop.load(Ordering::Relaxed) {
                     if sh.now.swap(false, Ordering::Relaxed) || last.elapsed() > Duration::from_secs(30) {
                         last = Instant::now();
-                        match src.fetch.get(&url).map_err(|e| e.to_string()).and_then(|d| parse_servers(&d, &url).ok_or_else(|| "unreadable list".to_string())) {
-                            Ok(mut list) => {
-                                for s in list.iter_mut().filter(|s| s.up) {
-                                    s.ping_ms = ping(&s.address);
-                                }
-                                *sh.servers.lock().unwrap() = list;
-                                *sh.error.lock().unwrap() = None;
-                            }
-                            Err(e) => *sh.error.lock().unwrap() = Some(e),
+                        let (list, error) = read_list(&urls, |u| src.fetch.get(u).map_err(|e| e.to_string()), cache.as_deref());
+                        sh.stale.store(list.as_ref().is_some_and(|l| l.1), Ordering::Relaxed);
+                        if let Some((list, _)) = list {
+                            *sh.servers.lock().unwrap() = list;
                         }
+                        *sh.error.lock().unwrap() = error;
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
             })
             .ok();
         Directory { shared }
+    }
+    /// The list is the last one received (no list server answers now).
+    pub fn stale(&self) -> bool {
+        self.shared.stale.load(Ordering::Relaxed)
     }
     pub fn servers(&self) -> Vec<ServerEntry> {
         self.shared.servers.lock().unwrap().clone()
@@ -290,6 +296,47 @@ impl Drop for Directory {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// One reading of the list: from the first of `urls` that answers (then kept
+/// in `cache`), else from `cache` (then every server is asked directly, as
+/// the list cannot say which are up). Each server that is up is pinged.
+/// Returns the list and whether it came from the cache, and the error when
+/// no list server answered.
+fn read_list(urls: &[String], get: impl Fn(&str) -> Result<Vec<u8>, String>, cache: Option<&std::path::Path>) -> (Option<(Vec<ServerEntry>, bool)>, Option<String>) {
+    let mut error = None;
+    for u in urls {
+        match get(u).and_then(|d| parse_servers(&d, u).ok_or_else(|| "unreadable list".to_string())) {
+            Ok(mut list) => {
+                if let Some(c) = cache {
+                    let _ = std::fs::write(c, cache_json(&list));
+                }
+                for s in list.iter_mut().filter(|s| s.up) {
+                    s.ping_ms = ping(&s.address);
+                }
+                return (Some((list, false)), None);
+            }
+            Err(e) => error = Some(e),
+        }
+    }
+    let cached = cache.and_then(|c| std::fs::read(c).ok()).and_then(|d| parse_servers(&d, "https://cache/"));
+    match cached {
+        Some(mut list) if !list.is_empty() => {
+            for s in list.iter_mut() {
+                s.ping_ms = ping(&s.address);
+                (s.up, s.flying) = (s.ping_ms.is_some(), 0);
+            }
+            (Some((list, true)), error)
+        }
+        _ => (None, error.or_else(|| Some("no server list".into()))),
+    }
+}
+
+/// The list as kept on disk (the same shape as `/servers.json`, every address given).
+fn cache_json(list: &[ServerEntry]) -> String {
+    let esc = |s: &str| serde_json::Value::String(s.to_string()).to_string();
+    let rows: Vec<String> = list.iter().map(|s| format!("{{\"name\":{},\"address\":{},\"up\":true,\"flying\":0}}", esc(&s.name), esc(&s.address))).collect();
+    format!("{{\"servers\":[{}]}}", rows.join(","))
 }
 
 /// "host:port", the default port added when there is none.
@@ -429,7 +476,89 @@ mod tests {
         assert_eq!((l[0].name.as_str(), l[0].address.as_str(), l[0].flying), ("France · danux.be", "fableflight.danux.be:7480", 3));
         assert_eq!((l[1].address.as_str(), l[1].up), ("203.0.113.9:7480", false));
         assert_eq!(l[2].address, "asia.example.com:7480");
-        assert!(parse_servers(b"nonsense", DIRECTORY_URL).is_none());
+        assert!(parse_servers(b"nonsense", DIRECTORY_URLS[0]).is_none());
+    }
+
+    /// A minimal relay on `port` until `stop`: Welcome to a Hello, and each
+    /// State answered with an empty Peers (it is up).
+    fn tiny_relay(port: u16, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        let sock = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !stop.load(Ordering::Relaxed) {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+                match Msg::decode(&buf[..n]) {
+                    Some(Msg::Hello { .. }) => {
+                        let _ = sock.send_to(&Msg::Welcome { id: 1, cookie: 7 }.encode(), from);
+                    }
+                    Some(Msg::State { .. }) => {
+                        let _ = sock.send_to(&Msg::Peers { peers: Vec::new() }.encode(), from);
+                    }
+                    _ => {}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_client_comes_back_after_its_relay_restarts() {
+        let port = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let wait = |c: &Mp, want: Status, secs: u64| {
+            let t0 = Instant::now();
+            while c.status() != want && t0.elapsed() < Duration::from_secs(secs) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            c.status() == want
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = tiny_relay(port, stop.clone());
+        let c = Mp::start(&format!("127.0.0.1:{port}"), "A");
+        c.set_state(PlayerState { pos: [6_372_000.0, 0.0, 0.0], rot: [0.0, 0.0, 0.0, 1.0], ..Default::default() });
+        assert!(wait(&c, Status::Connected, 5), "connects");
+        // The relay goes down: the client notices within LOST and starts over.
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert!(wait(&c, Status::Connecting, 8), "notices the relay is gone");
+        // It comes back (a new run, new cookies): the client is in again by itself.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _h = tiny_relay(port, stop.clone());
+        assert!(wait(&c, Status::Connected, 6), "back without anyone doing anything");
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn without_a_list_server_the_last_list_stands_in() {
+        // A relay that answers Hello, and a list that names it and one that is gone.
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = relay.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            while let Ok((n, from)) = relay.recv_from(&mut buf) {
+                if let Some(Msg::Hello { .. }) = Msg::decode(&buf[..n]) {
+                    let _ = relay.send_to(&Msg::Welcome { id: 1, cookie: 2 }.encode(), from);
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("ff-mp-cache-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cache = dir.join("servers.json");
+        let list = format!(r#"{{"servers":[{{"name":"EU","address":"127.0.0.1:{port}","up":true,"flying":4}},{{"name":"Gone","address":"127.0.0.1:9","up":true,"flying":0}}]}}"#);
+        let urls = vec!["https://down.example/servers.json".to_string(), "https://up.example/servers.json".to_string()];
+        // The first list server is down, the second answers: its list is used and kept.
+        let (got, err) = read_list(&urls, |u| if u.contains("up.") { Ok(list.clone().into_bytes()) } else { Err("down".into()) }, Some(&cache));
+        let (l, stale) = got.unwrap();
+        assert!(!stale && err.is_none() && l.len() == 2 && l[0].ping_ms.is_some() && l[0].flying == 4);
+        // Now none answers: the kept list stands in, its servers asked directly.
+        let (got, err) = read_list(&urls, |_| Err("down".into()), Some(&cache));
+        let (l, stale) = got.unwrap();
+        assert!(stale && err.is_some());
+        assert!(l[0].up && l[0].ping_ms.is_some(), "the live relay answers");
+        assert!(!l[1].up && l[1].ping_ms.is_none(), "the gone one does not");
+        // Nothing kept and nothing answering: no list.
+        let _ = std::fs::remove_file(&cache);
+        assert!(read_list(&urls, |_| Err("down".into()), Some(&cache)).0.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

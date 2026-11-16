@@ -815,8 +815,8 @@ struct Game {
     mp_dir: Option<mp::Directory>,
     /// the server is typed in (not picked from the list)
     mp_custom: bool,
-    /// where the server list is read from
-    mp_list: String,
+    /// where the server list is read from, in turn (--mp-list first)
+    mp_list: Vec<String>,
     /// the near ones' stand-in aircraft, for posing their models (by player id)
     mp_puppets: std::collections::HashMap<u32, Plane>,
     /// --mp-mirror (see Args)
@@ -970,7 +970,7 @@ impl Game {
             mp_players: Vec::new(),
             mp_dir: None,
             mp_custom: false,
-            mp_list: args.mp_list.clone().unwrap_or_else(|| mp::DIRECTORY_URL.to_string()),
+            mp_list: args.mp_list.iter().cloned().chain(mp::DIRECTORY_URLS.iter().map(|u| u.to_string())).collect(),
             mp_puppets: std::collections::HashMap::new(),
             mp_mirror: args.mp_mirror,
             live_view: None,
@@ -1626,7 +1626,7 @@ impl Game {
     fn mp_server_picker(&mut self, ui: &mut egui::Ui) {
         use egui::RichText;
         let dir = self.mp_directory();
-        let (servers, err) = (dir.servers(), dir.error());
+        let (servers, err, stale) = (dir.servers(), dir.error(), dir.stale());
         let best = dir.best();
         let auto = self.mp_auto();
         let current = mp::with_port(&self.mp_server);
@@ -1683,6 +1683,7 @@ impl Game {
         }
         ui.horizontal(|ui| {
             let note = match (&err, servers.is_empty()) {
+                (Some(_), false) if stale => t!("Last known list (the list server is not answering)", "Dernière liste connue (le serveur de liste ne répond pas)").to_string(),
                 (Some(e), _) => t!("Server list unavailable: {}", "Liste des serveurs indisponible : {}", e.chars().take(50).collect::<String>()),
                 (None, true) => t!("Reading the server list…", "Lecture de la liste des serveurs…").to_string(),
                 (None, false) => i18n::plural(servers.iter().filter(|s| s.up).count() as u64, "server online", "servers online", "serveur en ligne", "serveurs en ligne"),
@@ -1700,7 +1701,10 @@ impl Game {
     /// The network's server list (read in the background from the first call on).
     fn mp_directory(&mut self) -> &mp::Directory {
         let (src, url) = (self.src.clone(), self.mp_list.clone());
-        self.mp_dir.get_or_insert_with(|| mp::Directory::start(src, &url))
+        let cache = dirs::config_dir().map(|d| d.join("fablegame")).inspect(|d| {
+            let _ = std::fs::create_dir_all(d);
+        }).map(|d| d.join("mp_servers.json"));
+        self.mp_dir.get_or_insert_with(|| mp::Directory::start(src, url, cache))
     }
     /// A server's name in the list, by its address (else the address itself).
     fn mp_server_name(&self, address: &str) -> String {
