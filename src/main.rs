@@ -2435,7 +2435,7 @@ impl Game {
         self.menu.runway = None;
         self.menu.pick_name = match menu::Menu::near_city(lat, lon) {
             Some((name, d)) if d < 40_000.0 => tr(name).to_string(),
-            Some((name, d)) if d < 400_000.0 => t!("{:.0} km from {}", "À {:.0} km de {}", d / 1000.0, tr(name)),
+            Some((name, d)) if d < 400_000.0 => t!("{:.0} km from {}", "À {:.0} km {}", d / 1000.0, if crate::i18n::is_fr() { crate::i18n::de_place(tr(name)) } else { tr(name).to_string() }),
             _ => String::new(),
         };
         let (tx, rx) = std::sync::mpsc::channel();

@@ -95,6 +95,23 @@ pub fn tr_owned(en: &str) -> String {
     if is_fr() { fr(en).unwrap_or(en).to_string() } else { en.to_string() }
 }
 
+/// French "de" before a place name, as it is written: "d'Amsterdam",
+/// "du Havre", "des Sables-d'Olonne", "de la Rochelle", "de Paris".
+/// (No elision before an H: "de Hambourg"; it depends on the word.)
+pub fn de_place(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("Le ") {
+        return format!("du {rest}");
+    }
+    if let Some(rest) = name.strip_prefix("Les ") {
+        return format!("des {rest}");
+    }
+    if let Some(rest) = name.strip_prefix("La ") {
+        return format!("de la {rest}");
+    }
+    let vowel = name.chars().next().is_some_and(|c| "AEIOUYÀÂÄÉÈÊËÎÏÔÖÙÛÜaeiouyàâäéèêëîïôöùûü".contains(c));
+    if vowel { format!("d'{name}") } else { format!("de {name}") }
+}
+
 /// "{n} request(s)" and the like.
 pub fn plural(n: u64, en_one: &str, en_many: &str, fr_one: &str, fr_many: &str) -> String {
     let w = match (is_fr(), n) {
@@ -411,6 +428,17 @@ const CAUSES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn de_before_place_names() {
+        assert_eq!(de_place("Amsterdam"), "d'Amsterdam");
+        assert_eq!(de_place("Évreux"), "d'Évreux");
+        assert_eq!(de_place("Paris"), "de Paris");
+        assert_eq!(de_place("Le Havre"), "du Havre");
+        assert_eq!(de_place("Les Mureaux"), "des Mureaux");
+        assert_eq!(de_place("La Rochelle"), "de la Rochelle");
+        assert_eq!(de_place("Hambourg"), "de Hambourg");
+    }
+
     use super::*;
 
     // One test touches the global language, so the others cannot race it.
