@@ -2381,6 +2381,7 @@ impl Game {
             KeyCode::F3 => self.wx.open = !self.wx.open,
             KeyCode::KeyP => self.paused = !self.paused,
             KeyCode::KeyH => self.show_hud = !self.show_hud,
+            KeyCode::Backquote => self.minimap.visible = !self.minimap.visible,
             KeyCode::KeyJ => self.radios.show = !self.radios.show,
             KeyCode::Insert => {
                 let m = &mut self.plane.sys.elec.master;
@@ -4804,12 +4805,11 @@ impl Game {
                             ui.label(t!("Landing guidance", "Aide à l’atterrissage"));
                             ui.checkbox(&mut self.minimap.landing_guidance, t!("Approach arrows and tunnel", "Flèches et tunnel d’approche"));
                             ui.end_row();
-                            ui.label(t!("Minimap width", "Largeur de la mini-carte"));
-                            ui.add(egui::Slider::new(&mut self.minimap.size.x, 240.0..=640.0).step_by(10.0).suffix(" px"))
-                                .on_hover_text(t!("The map fits the window and keeps this size when you resume flight.", "La carte s’adapte à la fenêtre et conserve cette taille à la reprise du vol."));
-                            ui.end_row();
-                            ui.label(t!("Minimap height", "Hauteur de la mini-carte"));
-                            ui.add(egui::Slider::new(&mut self.minimap.size.y, 240.0..=640.0).step_by(10.0).suffix(" px"));
+                            ui.label(t!("Minimap size", "Taille de la mini-carte"));
+                            if ui.add(egui::Slider::new(&mut self.minimap.size.x, 240.0..=640.0).step_by(10.0).suffix(" px"))
+                                .on_hover_text(t!("The map fits the window and keeps this size when you resume flight.", "La carte s’adapte à la fenêtre et conserve cette taille à la reprise du vol.")).changed() {
+                                self.minimap.size.y = self.minimap.size.x;
+                            }
                             ui.end_row();
                             menu::heading(ui, t!("TRAFFIC", "TRAFIC"));
                             ui.end_row();
@@ -5249,7 +5249,7 @@ impl Game {
                 self.info_panel(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local, speed, alt, agl, hdg);
             }
             if self.show_hud {
-                egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
+                let hud = egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
                     panel.show(ui, |ui| {
                         shadow(ui, format!("IAS {:>4.0} kt", speed * 1.94384), 20.0, white);
                         shadow(ui, format!("ALT {:>5.0} ft", alt * 3.28084), 20.0, white);
@@ -5324,6 +5324,7 @@ impl Game {
                         }
                     });
                 });
+                self.minimap.top = hud.response.rect.bottom();
                 if let Some(lines) = &airport_hud {
                     egui::Area::new(egui::Id::unique("airport")).anchor(Align2::CENTER_TOP, [0.0, 14.0]).show(ctx, |ui| {
                         panel.show(ui, |ui| {
@@ -5334,7 +5335,7 @@ impl Game {
                         });
                     });
                 }
-                egui::Area::new(egui::Id::unique("info")).anchor(Align2::LEFT_BOTTOM, [14.0, -14.0]).show(ctx, |ui| {
+                let info = egui::Area::new(egui::Id::unique("info")).anchor(Align2::LEFT_BOTTOM, [14.0, -14.0]).show(ctx, |ui| {
                     panel.show(ui, |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         if self.real < self.status_until && !self.status.is_empty() {
@@ -5357,6 +5358,8 @@ impl Game {
                         }
                     });
                 });
+                // The minimap (or its button) stacks just above this panel, whatever its height.
+                self.minimap.bottom = ctx.content_rect().bottom() - info.response.rect.top() + 8.0;
             }
             if self.show_hud && self.radios.show {
                 self.nav_overlay(ctx, hdg);
@@ -5541,8 +5544,8 @@ impl Game {
                     let horizontal = f.dot(e).hypot(f.dot(n));
                     self.minimap.show(ctx, &self.src, lat, lon, (horizontal > 1e-5).then_some(hdg.to_radians()), self.info_open, landing_guide.as_ref(), &self.world);
                 } else {
-                    egui::Area::new(egui::Id::unique("show_minimap")).anchor(Align2::LEFT_BOTTOM, [14.0, -65.0]).show(ctx, |ui| {
-                        if ui.button(t!("Map", "Carte")).clicked() { self.minimap.visible = true; }
+                    egui::Area::new(egui::Id::unique("show_minimap")).anchor(Align2::LEFT_BOTTOM, [14.0, -self.minimap.bottom]).show(ctx, |ui| {
+                        if ui.button(t!("Map", "Carte")).on_hover_text(t!("Show the minimap (`)", "Afficher la mini-carte (`)")).clicked() { self.minimap.visible = true; }
                     });
                 }
             }

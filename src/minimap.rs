@@ -25,7 +25,11 @@ pub struct Minimap {
     pub zoom: u8,
     pub plan: bool,
     pub size: Vec2,
-    resize_start: Vec2,
+    /// Distance from the window's bottom edge, kept clear of the info panel below.
+    pub bottom: f32,
+    /// Lowest point of the HUD panel above, which the map must not reach.
+    pub top: f32,
+    resize_start: f32,
     maps: HashMap<TileId, MapTile>,
     map_pending: Option<(TileId, mpsc::Receiver<Option<data::Data>>)>,
     heading: f64,
@@ -41,6 +45,105 @@ pub struct Minimap {
 fn rotate(v: Vec2, angle: f64) -> Vec2 {
     let (s, c) = (angle as f32).sin_cos();
     Vec2::new(c * v.x - s * v.y, s * v.x + c * v.y)
+}
+
+/// Whether `r` lies wholly inside the disc.
+fn in_disc(r: egui::Rect, center: Pos2, radius: f32) -> bool {
+    [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()].iter().all(|p| p.distance(center) <= radius)
+}
+
+/// Spots labels must leave free: the aircraft, the north mark and the scale bar.
+fn reserved(rect: egui::Rect, angle: f64) -> Vec<egui::Rect> {
+    let (center, radius) = (rect.center(), rect.width() * 0.5);
+    let north = center + rotate(Vec2::new(0.0, -(radius - 14.0)), angle);
+    vec![
+        egui::Rect::from_center_size(center, Vec2::splat(38.0)),
+        egui::Rect::from_center_size(north, Vec2::splat(26.0)),
+        egui::Rect::from_center_size(Pos2::new(center.x, rect.bottom() - 32.0), Vec2::new(72.0, 30.0)),
+    ]
+}
+
+const DISC_SIDES: usize = 96;
+
+fn lerp_vertex(a: &egui::epaint::Vertex, b: &egui::epaint::Vertex, t: f32) -> egui::epaint::Vertex {
+    let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::epaint::Vertex {
+        pos: a.pos + (b.pos - a.pos) * t,
+        uv: a.uv + (b.uv - a.uv) * t,
+        color: Color32::from_rgba_premultiplied(c(a.color.r(), b.color.r()), c(a.color.g(), b.color.g()), c(a.color.b(), b.color.b()), c(a.color.a(), b.color.a())),
+    }
+}
+
+/// Cuts a mesh down to a disc (a fine regular polygon), interpolating uv and colour.
+fn clip_mesh(mesh: &egui::Mesh, center: Pos2, radius: f32) -> egui::Mesh {
+    let inner = radius * (std::f32::consts::PI / DISC_SIDES as f32).cos();
+    let mut out = egui::Mesh::with_texture(mesh.texture_id);
+    for tri in mesh.indices.chunks_exact(3) {
+        let v = [tri[0], tri[1], tri[2]].map(|i| mesh.vertices[i as usize]);
+        if v.iter().all(|v| v.pos.distance(center) <= inner) {
+            let base = out.vertices.len() as u32;
+            out.vertices.extend(v);
+            out.indices.extend([base, base + 1, base + 2]);
+            continue;
+        }
+        let bounds = egui::Rect::from_points(&v.map(|v| v.pos));
+        if bounds.distance_to_pos(center) > radius { continue; }
+        let mut poly = v.to_vec();
+        for k in 0..DISC_SIDES {
+            let a = k as f32 / DISC_SIDES as f32 * std::f32::consts::TAU;
+            let normal = Vec2::new(a.cos(), a.sin());
+            let side = |p: Pos2| inner - (p - center).dot(normal);
+            let mut next = Vec::with_capacity(poly.len() + 1);
+            for i in 0..poly.len() {
+                let (p, q) = (&poly[i], &poly[(i + 1) % poly.len()]);
+                let (sp, sq) = (side(p.pos), side(q.pos));
+                if sp >= 0.0 { next.push(*p); }
+                if (sp >= 0.0) != (sq >= 0.0) { next.push(lerp_vertex(p, q, sp / (sp - sq))); }
+            }
+            poly = next;
+            if poly.len() < 3 { break; }
+        }
+        if poly.len() < 3 { continue; }
+        let base = out.vertices.len() as u32;
+        for i in 1..poly.len() as u32 - 1 { out.indices.extend([base, base + i, base + i + 1]); }
+        out.vertices.extend(poly);
+    }
+    out
+}
+
+fn clip_shape(tessellator: &mut egui::epaint::Tessellator, shape: egui::Shape, center: Pos2, radius: f32, out: &mut Vec<egui::Shape>) {
+    let mesh = match shape {
+        egui::Shape::Noop => return,
+        egui::Shape::Vec(shapes) => {
+            for s in shapes { clip_shape(tessellator, s, center, radius, out); }
+            return;
+        }
+        egui::Shape::Mesh(mesh) => clip_mesh(&mesh, center, radius),
+        other => {
+            let mut mesh = egui::Mesh::default();
+            tessellator.tessellate_shape(other, &mut mesh);
+            clip_mesh(&mesh, center, radius)
+        }
+    };
+    if !mesh.is_empty() { out.push(egui::Shape::mesh(mesh)); }
+}
+
+/// Replaces the shapes painted on `layer` since `start` with copies cut to the disc.
+fn clip_to_disc(ctx: &egui::Context, layer: egui::LayerId, start: egui::layers::ShapeIdx, center: Pos2, radius: f32) {
+    let font_size = ctx.fonts(|f| f.font_image_size());
+    let mut tessellator = egui::epaint::Tessellator::new(ctx.pixels_per_point(), ctx.tessellation_options(|o| *o), font_size, Vec::new());
+    ctx.graphics_mut(|g| {
+        let list = g.entry(layer);
+        let end = list.next_idx().0;
+        for i in start.0..end {
+            list.mutate_shape(egui::layers::ShapeIdx(i), |clipped| {
+                let shape = std::mem::replace(&mut clipped.shape, egui::Shape::Noop);
+                let mut meshes = Vec::new();
+                clip_shape(&mut tessellator, shape, center, radius, &mut meshes);
+                clipped.shape = egui::Shape::Vec(meshes);
+            });
+        }
+    });
 }
 
 fn tile_offset(x: f64, center: f64, n: f64) -> f64 {
@@ -68,11 +171,7 @@ impl Minimap {
             rect.center() + rotate(Vec2::new((tile_offset(x, cx, n) * 256.0) as f32, ((y - cy) * 256.0) as f32), angle)
         };
         let color = Color32::from_rgb(95, 235, 255);
-        let mut occupied = vec![
-            egui::Rect::from_center_size(rect.center(), Vec2::splat(38.0)),
-            egui::Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + 43.0)),
-            egui::Rect::from_min_max(rect.left_bottom() - Vec2::new(0.0, 40.0), rect.left_bottom() + Vec2::new(90.0, 0.0)),
-        ];
+        let mut occupied = reserved(rect, angle);
         for &id in &self.runway_airports {
             let airport = &db.apts[id as usize];
             // Prefer the exact geometry used by the 3D airfield and approach guide.
@@ -110,7 +209,7 @@ impl Minimap {
                 let midpoint = ends[0] + (ends[1] - ends[0]) * 0.5;
                 let Some(label) = [-1.0, 1.0].into_iter().map(|sign| {
                     egui::Rect::from_center_size(midpoint + Vec2::new(0.0, sign * (galley.size().y * 0.5 + 8.0)), galley.size() + Vec2::new(6.0, 4.0))
-                }).find(|r| rect.shrink(3.0).contains_rect(*r) && !occupied.iter().any(|other| other.intersects(*r))) else { continue; };
+                }).find(|r| in_disc(*r, rect.center(), rect.width() * 0.5 - 6.0) && !occupied.iter().any(|other| other.intersects(*r))) else { continue; };
                 painter.rect_filled(label, 3.0, Color32::from_black_alpha(225));
                 painter.galley(label.min + Vec2::new(3.0, 2.0), galley, color);
                 occupied.push(label);
@@ -161,10 +260,7 @@ impl Minimap {
         let mut labels: Vec<_> = visible.iter().filter_map(|id| self.maps.get(id)).flat_map(|tile| &tile.places)
             .filter(|p| self.zoom >= p.min_zoom).collect();
         labels.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)).then(a.xy[0].total_cmp(&b.xy[0])));
-        let north = rect.center() + rotate(Vec2::new(0.0, -rect.width().min(rect.height()) * 0.5 + 54.0), angle);
-        let mut occupied = vec![egui::Rect::from_center_size(rect.center(), Vec2::splat(38.0)), egui::Rect::from_center_size(north, Vec2::splat(26.0)),
-            egui::Rect::from_min_max(rect.left_bottom() + Vec2::new(0.0, -37.0), rect.left_bottom() + Vec2::new(90.0, 0.0))];
-        occupied.push(egui::Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + 43.0)));
+        let mut occupied = reserved(rect, angle);
         let mut names = std::collections::HashSet::new();
         for place in labels {
             let name = place.label(crate::i18n::lang());
@@ -175,7 +271,7 @@ impl Minimap {
             let galley = painter.layout_no_wrap(name.to_owned(), font, Color32::WHITE);
             // Try above and below so a town underneath the aircraft can still be named.
             let Some(label_rect) = [-1.0, 1.0].into_iter().map(|side| egui::Rect::from_center_size(point + Vec2::new(0.0, side * (galley.size().y * 0.5 + 6.0)), galley.size() + Vec2::new(6.0, 2.0)))
-                .find(|r| rect.shrink(3.0).contains_rect(*r) && !occupied.iter().any(|other| other.intersects(r.expand(3.0)))) else { continue };
+                .find(|r| in_disc(*r, rect.center(), rect.width() * 0.5 - 6.0) && !occupied.iter().any(|other| other.intersects(r.expand(3.0)))) else { continue };
             painter.circle_filled(point, 2.5, Color32::WHITE);
             painter.circle_stroke(point, 2.5, Stroke::new(1.0, Color32::from_gray(40)));
             painter.rect_filled(label_rect, 3.0, Color32::from_black_alpha(185));
@@ -189,7 +285,7 @@ impl Minimap {
 
     pub fn new(prefs: &crate::settings::Settings) -> Self {
         Self { visible: prefs.minimap, landing_guidance: prefs.landing_guidance, heading_up: prefs.minimap_heading_up, zoom: prefs.minimap_zoom,
-            size: Vec2::new(prefs.minimap_size, prefs.minimap_height), resize_start: Vec2::ZERO, plan: prefs.minimap_plan, maps: HashMap::new(), map_pending: None, heading: 0.0, scroll: 0.0, tiles: HashMap::new(), pending: None, generation: 0, frame: 0, runway_airports: Vec::new(), runway_center: None }
+            size: Vec2::splat(prefs.minimap_size), bottom: 65.0, top: 0.0, resize_start: 0.0, plan: prefs.minimap_plan, maps: HashMap::new(), map_pending: None, heading: 0.0, scroll: 0.0, tiles: HashMap::new(), pending: None, generation: 0, frame: 0, runway_airports: Vec::new(), runway_center: None }
     }
 
     fn poll(&mut self, ctx: &egui::Context, generation: u32) {
@@ -243,16 +339,16 @@ impl Minimap {
         self.poll(ctx, src.google.generation());
         if let Some(h) = heading { self.heading = h; }
         let reserved_width = if info_open { 426.0 } else { 44.0 };
-        let limit = Vec2::new(
-            (ctx.content_rect().width() - reserved_width).clamp(120.0, 640.0),
-            (ctx.content_rect().height() - 100.0).clamp(120.0, 640.0),
-        );
-        let size = self.size.clamp(Vec2::splat(240.0), Vec2::splat(640.0)).min(limit);
-        egui::Area::new(egui::Id::unique("minimap")).anchor(egui::Align2::LEFT_BOTTOM, [14.0, -65.0]).show(ctx, |ui| {
-            egui::Frame::new().fill(crate::menu::GLASS).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
-                ui.set_width(size.x);
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                if response.hovered() {
+        let limit = (ctx.content_rect().width() - reserved_width).min(ctx.content_rect().bottom() - self.bottom - 44.0 - self.top - 8.0).clamp(120.0, 640.0);
+        let diameter = self.size.x.clamp(240.0, 640.0).min(limit);
+        egui::Area::new(egui::Id::unique("minimap")).anchor(egui::Align2::LEFT_BOTTOM, [14.0, -self.bottom]).show(ctx, |ui| {
+            ui.set_width(diameter);
+            ui.vertical_centered(|ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), egui::Sense::click_and_drag());
+                let (center, radius) = (rect.center(), diameter * 0.5);
+                let over_disc = response.hover_pos().is_some_and(|p| p.distance(center) <= radius);
+                if over_disc {
                     let scroll = ui.input_mut(|i| {
                         let s = i.smooth_scroll_delta.y;
                         i.smooth_scroll_delta = Vec2::ZERO;
@@ -266,7 +362,9 @@ impl Minimap {
                     self.scroll = 0.0;
                 }
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 0.0, Color32::from_rgb(22, 32, 42));
+                // Everything painted from here to the bezel is cut to the disc afterwards.
+                let first_shape = ctx.graphics_mut(|g| g.entry(painter.layer_id()).next_idx());
+                painter.circle_filled(center, radius, Color32::from_rgb(22, 32, 42));
                 let angle = if self.heading_up { -self.heading } else { 0.0 };
                 let n = (1u32 << self.zoom) as f64;
                 let cx = geo::lon_to_merc_x(lon).rem_euclid(1.0) * n;
@@ -336,49 +434,49 @@ impl Minimap {
                 let arrow = [Vec2::new(0.0, -13.0), Vec2::new(9.0, 10.0), Vec2::new(-9.0, 10.0)];
                 let points: Vec<_> = arrow.into_iter().map(|v| rect.center() + rotate(v, self.heading + angle)).collect();
                 painter.add(egui::Shape::convex_polygon(points, Color32::from_rgb(255, 210, 70), Stroke::new(2.0, Color32::BLACK)));
-                let north = rect.center() + rotate(Vec2::new(0.0, -size.x.min(size.y) * 0.5 + 54.0), angle);
-                painter.circle_filled(north, 10.0, Color32::from_black_alpha(190));
-                painter.text(north, egui::Align2::CENTER_CENTER, "N", egui::FontId::proportional(13.0), Color32::WHITE);
                 let meters = 2.0 * std::f64::consts::PI * geo::R * lat.cos() / (n * 256.0) * 60.0;
-                let a = rect.left_bottom() + Vec2::new(10.0, -10.0);
+                let a = Pos2::new(center.x - 30.0, rect.bottom() - 26.0);
                 painter.line_segment([a, a + Vec2::new(60.0, 0.0)], Stroke::new(4.0, Color32::BLACK));
                 painter.line_segment([a, a + Vec2::new(60.0, 0.0)], Stroke::new(2.0, Color32::WHITE));
-                let label = distance_label(meters, crate::i18n::lang());
-                let label_rect = egui::Rect::from_min_size(a + Vec2::new(-3.0, -23.0), Vec2::new(76.0, 20.0));
+                let label_rect = egui::Rect::from_center_size(a + Vec2::new(30.0, -13.0), Vec2::new(64.0, 18.0));
                 painter.rect_filled(label_rect, 3.0, Color32::from_black_alpha(190));
-                painter.text(label_rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), Color32::WHITE);
-                // Controls float over the map instead of adding rows to its height.
-                let toolbar_rect = egui::Rect::from_min_max(rect.min + Vec2::new(22.0, 6.0), Pos2::new(rect.right() - 5.0, rect.top() + 38.0));
-                let mut toolbar = ui.new_child(egui::UiBuilder::new().max_rect(toolbar_rect));
-                egui::Frame::new().fill(Color32::from_black_alpha(210)).corner_radius(5.0).inner_margin(3.0).show(&mut toolbar, |ui| {
+                painter.text(label_rect.center(), egui::Align2::CENTER_CENTER, distance_label(meters, crate::i18n::lang()), egui::FontId::proportional(12.0), Color32::WHITE);
+                clip_to_disc(ctx, painter.layer_id(), first_shape, center, radius);
+                // Bezel, with the north mark riding on it.
+                painter.circle_stroke(center, radius - 1.5, Stroke::new(3.0, Color32::from_black_alpha(200)));
+                painter.circle_stroke(center, radius - 3.5, Stroke::new(1.0, Color32::from_white_alpha(70)));
+                let north = center + rotate(Vec2::new(0.0, -(radius - 14.0)), angle);
+                painter.circle_filled(north, 10.0, Color32::from_black_alpha(200));
+                painter.text(north, egui::Align2::CENTER_CENTER, "N", egui::FontId::proportional(13.0), Color32::WHITE);
+                // Resize handle on the rim, upper right; the lower-left stays anchored.
+                let knob = center + Vec2::new(1.0, -1.0) * (radius * std::f32::consts::FRAC_1_SQRT_2);
+                let resize = ui.interact(egui::Rect::from_center_size(knob, Vec2::splat(18.0)), egui::Id::unique("minimap_resize"), egui::Sense::drag())
+                    .on_hover_cursor(egui::CursorIcon::ResizeNeSw)
+                    .on_hover_text(crate::t!("Drag to resize the map", "Glisser pour redimensionner la carte"));
+                if resize.drag_started() { self.resize_start = diameter; }
+                if resize.dragged() {
+                    let d = resize.total_drag_delta().unwrap_or_default();
+                    let size = (self.resize_start + (d.x - d.y) * 0.5).clamp(240.0f32.min(limit), limit);
+                    self.size = Vec2::splat(size);
+                }
+                let hot = resize.hovered() || resize.dragged();
+                painter.circle_filled(knob, 7.0, Color32::from_black_alpha(220));
+                painter.circle_stroke(knob, 7.0, Stroke::new(1.5, if hot { Color32::from_rgb(255, 210, 70) } else { Color32::WHITE }));
+                // Controls sit under the disc.
+                egui::Frame::new().fill(Color32::from_black_alpha(210)).corner_radius(14.0).inner_margin(3.0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     ui.spacing_mut().button_padding = Vec2::new(5.0, 4.0);
                     ui.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
                     ui.horizontal(|ui| {
                         let button = egui::Button::selectable(self.heading_up, if self.heading_up { crate::t!("Heading", "Cap") } else { crate::t!("North", "Nord") });
-                        if ui.add_sized([48.0, 26.0], button).on_hover_text(crate::t!("Toggle north up / heading up", "Basculer nord en haut / cap en haut")).clicked() { self.heading_up = !self.heading_up; }
+                        if ui.add_sized([48.0, 24.0], button).on_hover_text(crate::t!("Toggle north up / heading up", "Basculer nord en haut / cap en haut")).clicked() { self.heading_up = !self.heading_up; }
                         let button = egui::Button::selectable(self.plan, if self.plan { crate::t!("Map", "Plan") } else { "Satellite" });
-                        if ui.add_sized([62.0, 26.0], button).on_hover_text(crate::t!("Toggle satellite / map", "Basculer satellite / plan")).clicked() { self.plan = !self.plan; }
-                        if ui.add_enabled(self.zoom > 3, egui::Button::new("-").min_size(Vec2::splat(26.0))).on_hover_text(crate::t!("Zoom out", "D\u{00e9}zoomer")).clicked() { self.zoom -= 1; }
-                        if ui.add_enabled(self.zoom < 17, egui::Button::new("+").min_size(Vec2::splat(26.0))).on_hover_text(crate::t!("Zoom in", "Zoomer")).clicked() { self.zoom += 1; }
-                        if ui.add_sized([26.0, 26.0], egui::Button::new("x")).on_hover_text(crate::t!("Hide map", "Masquer la carte")).clicked() { self.visible = false; }
+                        if ui.add_sized([62.0, 24.0], button).on_hover_text(crate::t!("Toggle satellite / map", "Basculer satellite / plan")).clicked() { self.plan = !self.plan; }
+                        if ui.add_enabled(self.zoom > 3, egui::Button::new("-").min_size(Vec2::splat(24.0))).on_hover_text(crate::t!("Zoom out", "D\u{00e9}zoomer")).clicked() { self.zoom -= 1; }
+                        if ui.add_enabled(self.zoom < 17, egui::Button::new("+").min_size(Vec2::splat(24.0))).on_hover_text(crate::t!("Zoom in", "Zoomer")).clicked() { self.zoom += 1; }
+                        if ui.add_sized([24.0, 24.0], egui::Button::new("x")).on_hover_text(crate::t!("Hide map (`)", "Masquer la carte (`)")).clicked() { self.visible = false; }
                     });
                 });
-                // Pull the top corner opposite the anchored bottom corner.
-                let corner = rect.right_top();
-                let grip = egui::Rect::from_min_size(corner - Vec2::new(20.0, 0.0), Vec2::splat(20.0));
-                let resize = ui.interact(grip, egui::Id::unique("minimap_resize"), egui::Sense::drag())
-                    .on_hover_cursor(egui::CursorIcon::ResizeNeSw)
-                    .on_hover_text(crate::t!("Drag to resize the map", "Glisser pour redimensionner la carte"));
-                if resize.drag_started() { self.resize_start = size; }
-                if resize.dragged() {
-                    let d = resize.total_drag_delta().unwrap_or_default();
-                    self.size = (self.resize_start + Vec2::new(d.x, -d.y)).clamp(Vec2::splat(240.0).min(limit), limit);
-                }
-                painter.rect_filled(grip, 3.0, Color32::from_black_alpha(210));
-                for inset in [5.0, 10.0, 15.0] {
-                    painter.line_segment([corner + Vec2::new(-3.0, inset), corner + Vec2::new(-inset, 3.0)], Stroke::new(1.5, Color32::WHITE));
-                }
             });
         });
     }
