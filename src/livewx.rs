@@ -4,8 +4,15 @@
 //! cloud layers, thunderstorms and rain; away from any airport, Open-Meteo's model
 //! stands in. A background thread looks again every ten minutes or after a
 //! move of 30 km, and the sky eases into each new report.
+//!
+//! Where a weather radar sees (RainViewer's composite, radar.rs), the storm
+//! cells stand where it shows the convective cores and the rain deck over its
+//! widespread rain, refreshed every five minutes or after 40 km, growing in
+//! and dying away as the picture changes. Beyond radar coverage (or with no
+//! radar picture) the report's storms and rain are spread round as before.
 
 use crate::geo;
+use crate::radar::{self, Radar};
 use crate::sources::Sources;
 use crate::weather::Weather;
 use parking_lot::Mutex;
@@ -17,6 +24,13 @@ const REFRESH: f64 = 600.0;
 const MOVE_KM: f64 = 30.0;
 /// The nearest METAR station is used up to this far away (km).
 const STATION_KM: f64 = 60.0;
+/// How often to look for a new radar picture (s; RainViewer makes one every
+/// ten minutes), and how far the player may move before it is read again round
+/// them (km).
+const RADAR_REFRESH: f64 = 300.0;
+const RADAR_MOVE_KM: f64 = 40.0;
+/// A radar picture older than this is no longer the weather now (s).
+const RADAR_STALE: i64 = 2700;
 
 /// The weather sliders a report comes to.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +60,8 @@ struct Shared {
     want: Option<(f64, f64)>,
     got: Option<(Instant, Target)>,
     error: String,
+    /// the latest radar picture read round the player (None: none to be had)
+    radar: Option<(Instant, Arc<Radar>)>,
 }
 
 pub struct LiveWx {
@@ -57,11 +73,16 @@ pub struct LiveWx {
     settled: bool,
     /// the Rain slider (`rain_set`) is ours: handed back when live weather goes off
     owns_rain: bool,
+    radar_thread: bool,
+    /// the radar picture in use (when it came; where the player was)
+    radar_got: Option<Instant>,
+    radar: Option<Arc<Radar>>,
+    radar_at: Option<(f64, f64)>,
 }
 
 impl LiveWx {
     pub fn new() -> Self {
-        Self { shared: Arc::default(), thread: false, last_got: None, target: None, settled: false, owns_rain: false }
+        Self { shared: Arc::default(), thread: false, last_got: None, target: None, settled: false, owns_rain: false, radar_thread: false, radar_got: None, radar: None, radar_at: None }
     }
 
     pub fn error(&self) -> String {
@@ -76,17 +97,41 @@ impl LiveWx {
             if self.owns_rain {
                 self.owns_rain = false;
                 wx.rain_set = None;
+                wx.live_cells.clear();
+                (wx.radar_cover, wx.deck_goal, wx.deck_tau) = (None, None, 6.0);
+                (self.radar, self.radar_got, self.radar_at) = (None, None, None);
             }
             return;
         }
-        let got = {
+        let (got, radar) = {
             let mut s = self.shared.lock();
             s.want = at;
-            s.got.as_ref().filter(|(t, _)| Some(*t) != self.last_got).cloned()
+            let r = match &s.radar {
+                Some((t, r)) if Some(*t) != self.radar_got => Some((Some(*t), Some(r.clone()))),
+                None if self.radar_got.is_some() => Some((None, None)),
+                _ => None,
+            };
+            (s.got.as_ref().filter(|(t, _)| Some(*t) != self.last_got).cloned(), r)
         };
         if !self.thread && at.is_some() {
             self.thread = true;
             spawn(src.clone(), self.shared.clone());
+        }
+        if !self.radar_thread && at.is_some() {
+            self.radar_thread = true;
+            spawn_radar(src.clone(), self.shared.clone());
+        }
+        if let Some((t, r)) = radar {
+            self.radar_got = t;
+            self.apply_radar(wx, r, at, dt);
+        }
+        wx.step_live(dt);
+        // Where there is radar, the rain deck stands over its rain (weather.rs
+        // `step_deck` eases it in and out).
+        let radar_here = self.radar.as_ref().is_some_and(|r| r.here);
+        if let Some(r) = self.radar.as_ref().filter(|r| r.here) {
+            wx.rain_set = r.deck.as_ref().map(|d| d.amount);
+            wx.deck_tau = 25.0;
         }
         if let Some((t, target)) = got {
             self.last_got = Some(t);
@@ -113,8 +158,12 @@ impl LiveWx {
         wx.alto = mix(wx.alto, t.alto);
         wx.storms = mix(wx.storms, t.storms);
         wx.haze = mix(wx.haze, t.haze);
-        // The rain deck eases in and out by itself (weather.rs `step_deck`).
-        wx.rain_set = (t.rain > 0.0).then_some(t.rain);
+        // Beyond the radar, a rain deck round the aircraft as heavy as the
+        // report says.
+        if !radar_here {
+            wx.rain_set = (t.rain > 0.0).then_some(t.rain);
+            (wx.deck_goal, wx.deck_tau) = (None, 6.0);
+        }
         self.owns_rain = true;
         wx.wind += (t.wind - wx.wind) * k;
         wx.gusts += (t.gusts - wx.gusts) * k;
@@ -123,6 +172,202 @@ impl LiveWx {
             wx.wind_from = (wx.wind_from + d * k).rem_euclid(360.0);
         }
     }
+}
+
+impl LiveWx {
+    /// A new radar picture (None: there is none now): its cells into cloud
+    /// space where they stand now, and the rain deck's place.
+    fn apply_radar(&mut self, wx: &mut Weather, r: Option<Arc<Radar>>, at: Option<(f64, f64)>, dt: f64) {
+        self.owns_rain = true;
+        let Some(r) = r else {
+            // Lost it: the radar's cells die away, the report takes over.
+            wx.set_live_cells(&[], false);
+            (wx.radar_cover, wx.deck_goal) = (None, None);
+            (self.radar, self.radar_at) = (None, None);
+            return;
+        };
+        // A fresh start (the first picture, or the player put down far away):
+        // show it as it is rather than growing it all in.
+        let jump = dt <= 0.0 || self.radar_at.zip(at).is_none_or(|(a, b)| dist_km(a, b) > 150.0);
+        self.radar_at = at;
+        // The cloud field drifts with the wind (Weather::advance): where the
+        // radar saw a cell is where it stood when the picture was taken.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(r.time);
+        let age = (now - r.time).clamp(0, RADAR_STALE) as f64;
+        let cloud = |lat: f64, lon: f64| {
+            let p = geo::lla_to_pos(lat.to_radians(), lon.to_radians(), 0.0);
+            let drift = wx.steady(p, 2000.0) * 1.6 * age;
+            (p.normalize() * 6371.0 + (wx.cloud_off + drift) / 1000.0).normalize() * 6371.0
+        };
+        let cells: Vec<_> = r.cells.iter().map(|c| (cloud(c.lat, c.lon), c.rad, c.age)).collect();
+        let deck = r.deck.as_ref().filter(|_| r.here).map(|d| cloud(d.lat, d.lon));
+        wx.set_live_cells(&cells, jump);
+        wx.deck_goal = deck;
+        wx.radar_cover = Some(r.cover.clone());
+        if let Some(a) = at {
+            let near: Vec<String> = r
+                .cells
+                .iter()
+                .take(6)
+                .map(|c| format!("{:.0} km {:03.0}° r{:.1} age{:.2} {:.0}dBZ", radar::dist_km(a, (c.lat, c.lon)), bearing(a, (c.lat, c.lon)), c.rad, c.age, c.peak))
+                .collect();
+            let deck = r.deck.as_ref().map(|d| format!("{:.0} km {:03.0}° rain {:.2} ({:.0}% wet)", radar::dist_km(a, (d.lat, d.lon)), bearing(a, (d.lat, d.lon)), d.amount, d.frac * 100.0));
+            log::info!("radar ({} min old): {} cells{}, deck {:?}; nearest: {}", age as i64 / 60, r.cells.len(), if r.here { "" } else { " (no radar here)" }, deck, near.join(", "));
+        }
+        self.radar = Some(r);
+    }
+}
+
+/// Compass bearing from a to b, degrees.
+fn bearing(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (la1, la2, dl) = (a.0.to_radians(), b.0.to_radians(), (b.1 - a.1).to_radians());
+    let y = dl.sin() * la2.cos();
+    let x = la1.cos() * la2.sin() - la1.sin() * la2.cos() * dl.cos();
+    y.atan2(x).to_degrees().rem_euclid(360.0)
+}
+
+/// The radar thread: a new picture every five minutes (if RainViewer has
+/// one), read round the player again after a move of 40 km. The tiles of the
+/// picture in use stay in memory; the coverage tiles (which hardly change) on
+/// disk.
+fn spawn_radar(src: Arc<Sources>, shared: Arc<Mutex<Shared>>) {
+    std::thread::spawn(move || {
+        let mut frame: Option<(Instant, Frame)> = None;
+        let mut done: Option<(String, (f64, f64))> = None;
+        let mut tiles: std::collections::HashMap<(i64, i64), Arc<Vec<f32>>> = Default::default();
+        let mut retry: Option<Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(p) = shared.lock().want else { continue };
+            if retry.is_some_and(|t| t.elapsed().as_secs() < 120) {
+                continue;
+            }
+            retry = None;
+            if frame.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs_f64() > RADAR_REFRESH) {
+                match radar_frame(&src) {
+                    Ok(f) => {
+                        if frame.as_ref().is_none_or(|(_, o)| o.path != f.path) {
+                            tiles.clear();
+                        }
+                        frame = Some((Instant::now(), f));
+                    }
+                    Err(e) => {
+                        radar_failed(&shared, &e, &mut retry);
+                        continue;
+                    }
+                }
+            }
+            let Some((_, f)) = &frame else { continue };
+            if done.as_ref().is_some_and(|(path, q)| *path == f.path && dist_km(p, *q) < RADAR_MOVE_KM) {
+                continue;
+            }
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            if now - f.time > RADAR_STALE {
+                radar_failed(&shared, "the radar picture is old", &mut retry);
+                continue;
+            }
+            match radar_echo(&src, f, p, &mut tiles) {
+                Ok(e) => {
+                    let mut r = radar::analyse(&e, p);
+                    r.time = f.time;
+                    let mut s = shared.lock();
+                    s.radar = Some((Instant::now(), Arc::new(r)));
+                    done = Some((f.path.clone(), p));
+                }
+                Err(e) => radar_failed(&shared, &e, &mut retry),
+            }
+        }
+    });
+}
+
+fn radar_failed(shared: &Mutex<Shared>, e: &str, retry: &mut Option<Instant>) {
+    if e != "offline" {
+        log::warn!("weather radar: {e}");
+    }
+    let mut s = shared.lock();
+    // An older picture will still do for a while.
+    if s.radar.as_ref().is_some_and(|(t, _)| t.elapsed().as_secs() > 1800) {
+        s.radar = None;
+    }
+    *retry = Some(Instant::now());
+}
+
+/// RainViewer's newest radar picture.
+struct Frame {
+    host: String,
+    path: String,
+    /// Unix seconds
+    time: i64,
+}
+
+fn radar_frame(src: &Sources) -> Result<Frame, String> {
+    let j = get_json(src, "https://api.rainviewer.com/public/weather-maps.json")?;
+    let last = j["radar"]["past"].as_array().and_then(|a| a.last()).ok_or("no radar pictures")?;
+    Ok(Frame {
+        host: j["host"].as_str().unwrap_or("https://tilecache.rainviewer.com").to_string(),
+        path: last["path"].as_str().ok_or("no radar path")?.to_string(),
+        time: last["time"].as_i64().ok_or("no radar time")?,
+    })
+}
+
+/// The strongest storms anywhere a radar sees right now (lat, lon, dBZ), a
+/// few hundred km apart, strongest first: places to fly to see live storms
+/// (`--find-storms`). Reads the whole world at zoom 2 (16 tiles).
+pub fn find_storms(fetch: &crate::fetch::Fetcher) -> Result<Vec<(f64, f64, f32)>, String> {
+    let j: serde_json::Value = serde_json::from_slice(&fetch.get("https://api.rainviewer.com/public/weather-maps.json").map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let host = j["host"].as_str().unwrap_or("https://tilecache.rainviewer.com");
+    let path = j["radar"]["past"].as_array().and_then(|a| a.last()).and_then(|f| f["path"].as_str()).ok_or("no radar pictures")?;
+    let mut hits: Vec<(f32, f64, f64)> = Vec::new();
+    for y in 0..4i64 {
+        for x in 0..4i64 {
+            let d = radar::decode_tile(&fetch.get(&format!("{host}{path}/256/2/{x}/{y}/2/0_0.png")).map_err(|e| e.to_string())?)?;
+            for (k, &z) in d.iter().enumerate() {
+                if z >= 45.0 {
+                    let (gx, gy) = ((x * 256 + (k % 256) as i64) as f64 + 0.5, (y * 256 + (k / 256) as i64) as f64 + 0.5);
+                    hits.push((z, geo::merc_y_to_lat(gy / 1024.0).to_degrees(), gx / 1024.0 * 360.0 - 180.0));
+                }
+            }
+        }
+    }
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut out: Vec<(f64, f64, f32)> = Vec::new();
+    for (z, lat, lon) in hits {
+        if out.len() < 12 && out.iter().all(|o| radar::dist_km((o.0, o.1), (lat, lon)) > 300.0) {
+            out.push((lat, lon, z));
+        }
+    }
+    Ok(out)
+}
+
+/// The block of radar and coverage tiles round p, as one grid.
+fn radar_echo(src: &Sources, f: &Frame, (lat, lon): (f64, f64), tiles: &mut std::collections::HashMap<(i64, i64), Arc<Vec<f32>>>) -> Result<radar::Echo, String> {
+    let (z, tx0, ty0, n) = radar::Echo::block(lat, lon);
+    let s = 256 * n as usize;
+    let mut e = radar::Echo { z, gx0: tx0 * 256, gy0: ty0 * 256, w: s, h: s, dbz: vec![f32::NAN; s * s], cover: vec![false; s * s] };
+    let wrap = 1i64 << z;
+    for ty in 0..n {
+        for tx in 0..n {
+            let (x, y) = ((tx0 + tx).rem_euclid(wrap), ty0 + ty);
+            let d = match tiles.get(&(x, y)) {
+                Some(d) => d.clone(),
+                None => {
+                    // (smooth 0: the pixels as measured; snow 0: one palette)
+                    let url = format!("{}{}/256/{z}/{x}/{y}/2/0_0.png", f.host, f.path);
+                    let d = Arc::new(radar::decode_tile(&src.fetch.get(&url).map_err(|e| e.to_string())?)?);
+                    tiles.insert((x, y), d.clone());
+                    d
+                }
+            };
+            let url = format!("{}/v2/coverage/0/256/{z}/{x}/{y}/0/0_0.png", f.host);
+            let c = radar::decode_cover(&src.fetch.get_cached(&format!("radar/coverage/{z}/{x}/{y}.png"), &url).map_err(|e| e.to_string())?)?;
+            for j in 0..256 {
+                let row = (ty as usize * 256 + j) * s + tx as usize * 256;
+                e.dbz[row..row + 256].copy_from_slice(&d[j * 256..j * 256 + 256]);
+                e.cover[row..row + 256].copy_from_slice(&c[j * 256..j * 256 + 256]);
+            }
+        }
+    }
+    Ok(e)
 }
 
 fn spawn(src: Arc<Sources>, shared: Arc<Mutex<Shared>>) {

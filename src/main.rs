@@ -16,6 +16,7 @@ mod geo;
 mod bind;
 mod i18n;
 mod live;
+mod radar;
 mod livewx;
 mod settings;
 mod gauges;
@@ -203,6 +204,10 @@ struct Args {
     haze: Option<f32>,
     day: Option<f64>,
     weather_panel: bool,
+    /// real weather on for this run (else the saved setting, off when the command line sets the weather)
+    live_weather: bool,
+    /// print where it is storming now (weather radar) and quit
+    find_storms: bool,
     vsync: bool,
     taa: bool,
     /// graphics preset and render resolution for this run (not saved; the
@@ -287,6 +292,8 @@ fn parse_args() -> Args {
         haze: None,
         day: None,
         weather_panel: false,
+        live_weather: false,
+        find_storms: false,
         vsync: true,
         taa: true,
         graphics: None,
@@ -490,6 +497,14 @@ fn parse_args() -> Args {
             "--render-scale" => a.render_scale = num(&v, i).map(|s| (s as f32).clamp(graphics::SCALE_MIN, graphics::SCALE_MAX)),
             "--headless" => {
                 a.headless = true;
+                used = 1;
+            }
+            "--live-weather" => {
+                a.live_weather = true;
+                used = 1;
+            }
+            "--find-storms" => {
+                a.find_storms = true;
                 used = 1;
             }
             "--fps-log" => {
@@ -889,7 +904,7 @@ impl Game {
         wx.open = args.weather_panel;
         // Real weather, unless the command line sets the weather itself.
         let scripted = std::env::args().any(|a| matches!(a.as_str(), "--clouds" | "--rain" | "--storms" | "--alto" | "--wind" | "--haze"));
-        wx.live = prefs.live_weather && !scripted;
+        wx.live = (prefs.live_weather && !scripted) || args.live_weather;
         let set_time = std::env::args().any(|a| matches!(a.as_str(), "--time" | "--day" | "--time-rate"));
         wx.real_time = prefs.real_time && !set_time;
         // The spawn speed is through the air: start out moving with the wind,
@@ -3645,7 +3660,10 @@ impl Game {
         let g = &self.src.google;
         let p = self.world.photo();
         let photo = if p.zone_r > 0.0 && p.stats.0 > 0 { format!("3D: {}  ·  ", if p.credits.is_empty() { "Google" } else { &p.credits }) } else { String::new() };
-        let live = if self.live.enabled() && !self.live.planes.is_empty() { format!("  ·  {}", t!("Traffic: adsb.lol (ODbL)", "Trafic : adsb.lol (ODbL)")) } else { String::new() };
+        let mut live = if self.live.enabled() && !self.live.planes.is_empty() { format!("  ·  {}", t!("Traffic: adsb.lol (ODbL)", "Trafic : adsb.lol (ODbL)")) } else { String::new() };
+        if self.wx.live && (!self.wx.live_cells.is_empty() || self.wx.deck_goal.is_some()) {
+            live += t!("  ·  Weather radar: RainViewer", "  ·  Radar météo : RainViewer");
+        }
         photo + &if g.enabled() {
             let c = g.attribution.lock();
             let c = if c.is_empty() { t!("Imagery © Google", "Imagerie © Google").to_string() } else { c.clone() };
@@ -4795,6 +4813,20 @@ fn ortho(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,fablegame=info")).init();
     let args = parse_args();
+    if args.find_storms {
+        let cache = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame");
+        match livewx::find_storms(&fetch::Fetcher::new(cache, false)) {
+            Ok(s) if s.is_empty() => println!("no strong storms on radar right now"),
+            Ok(s) => {
+                println!("strongest radar echoes now (fly there with --lat --lon --live-weather):");
+                for (lat, lon, z) in s {
+                    println!("  --lat {lat:.2} --lon {lon:.2}   {z:.0} dBZ");
+                }
+            }
+            Err(e) => println!("weather radar: {e}"),
+        }
+        return Ok(());
+    }
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);

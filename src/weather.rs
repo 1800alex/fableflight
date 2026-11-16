@@ -53,6 +53,16 @@ pub struct Weather {
     pub cells: Vec<[[f32; 4]; 2]>,
     /// storm cells placed by hand (`--storm-at`), in cloud space; always handed on first
     pub placed: Vec<[[f32; 4]; 2]>,
+    /// storm cells where the weather radar sees them (live weather, see
+    /// livewx.rs and radar.rs), fading in and out as the radar updates
+    pub live_cells: Vec<LiveCell>,
+    /// where some radar sees (made-up storm cells give way to the real ones there)
+    pub radar_cover: Option<crate::radar::Cover>,
+    /// live weather: where the rain deck should stand (cloud space, km), over
+    /// the real rain; None = round the aircraft
+    pub deck_goal: Option<DVec3>,
+    /// how quickly the rain deck follows the Rain slider (time constant, s)
+    pub deck_tau: f64,
     /// real weather (see livewx.rs) sets the sliders: where its report came
     /// from ("EBBR", "Open-Meteo") and the report itself
     pub live: bool,
@@ -76,6 +86,31 @@ pub struct Air {
     /// a storm's outflow along the ground (the gust front), planet frame m/s
     pub gust: DVec3,
 }
+
+/// A storm cell from the weather radar, easing towards what the latest
+/// radar picture says (so nothing pops as it updates).
+#[derive(Clone, Debug)]
+pub struct LiveCell {
+    /// centre now and where the radar puts it (cloud space, km on the sphere)
+    pub at: DVec3,
+    pub goal: DVec3,
+    /// tower radius (km) and maturity 0..1, now and wanted
+    pub rad: f64,
+    pub rad_goal: f64,
+    pub age: f64,
+    pub age_goal: f64,
+    /// how far it has grown in, 0..1, and whether it is growing (or dying away)
+    pub on: f64,
+    pub alive: bool,
+    /// turret layout seed and anvil height
+    pub seed: f32,
+    pub top: f32,
+}
+
+/// Live storm cells grow in or die away over about this long (time constant, s).
+const LIVE_FADE: f64 = 35.0;
+/// ...and glide to their new place and size over this (s).
+const LIVE_GLIDE: f64 = 50.0;
 
 impl Default for Air {
     fn default() -> Self {
@@ -156,7 +191,7 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live: false, live_station: String::new(), live_raw: String::new(), real_time: false }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false }
     }
 
     /// The rain deck's mean base and top, metres above sea level: the heavier
@@ -244,7 +279,16 @@ impl Weather {
     /// slider is moved outside it. `ground` = the terrain height under the
     /// aircraft, when known (the deck's base is set above it).
     pub fn step_deck(&mut self, dt: f64, pos: DVec3, ground: Option<f64>) {
-        let target = self.rain_set.unwrap_or(0.0);
+        let mut target = self.rain_set.unwrap_or(0.0);
+        // Live weather puts the deck over the real rain: a small shift glides
+        // it there, a big one fades it out and back in at the new place.
+        if let (Some(g), Some(at)) = (self.deck_goal, self.deck_at) {
+            if g.distance(at) > 35.0 {
+                target = 0.0;
+            } else {
+                self.deck_at = Some(at + (g - at) * (dt / LIVE_GLIDE).min(1.0));
+            }
+        }
         if let Some(g) = ground {
             self.deck_ground = Some(match self.deck_ground {
                 Some(o) => o + (g - o) * (dt / 90.0).min(1.0),
@@ -253,7 +297,16 @@ impl Weather {
         }
         let moved = self.deck_prev != self.rain_set;
         self.deck_prev = self.rain_set;
-        if target > 0.0 && (self.deck_at.is_none() || (moved && self.deck_area(pos) < 0.5)) {
+        if target > 0.0 && (self.deck_at.is_none() || (moved && self.deck_goal.is_none() && self.deck_area(pos) < 0.5)) {
+            if let Some(g) = self.deck_goal {
+                self.deck_at = Some(g);
+                // (at once only on a fresh start; otherwise it closes in)
+                if self.deck <= 0.0 && dt <= 0.0 {
+                    self.deck = target;
+                }
+                self.deck += (target - self.deck) * (dt / self.deck_tau).min(1.0) as f32;
+                return;
+            }
             let p = match self.deck_place.take() {
                 Some((km, bearing)) => {
                     let (e, n, up) = geo::enu(pos);
@@ -268,7 +321,7 @@ impl Weather {
                 self.deck = target;
             }
         }
-        self.deck += (target - self.deck) * (dt as f32 / 6.0).min(1.0);
+        self.deck += (target - self.deck) * (dt / self.deck_tau).min(1.0) as f32;
         if target <= 0.0 && self.deck < 0.003 {
             (self.deck, self.deck_at) = (0.0, None);
         }
@@ -296,7 +349,63 @@ impl Weather {
     /// Top of the cloud layer including any storm towers, metres.
     pub fn cloud_ceiling(&self) -> f32 {
         let top = self.base() + self.depth();
-        if self.storms > 0.0 || !self.placed.is_empty() { top.max(STORM_TOP + 700.0 + STORM_OVERSHOOT + 300.0).max(top + 1500.0) } else { top }
+        if self.storms > 0.0 || !self.placed.is_empty() || !self.live_cells.is_empty() { top.max(STORM_TOP + 700.0 + STORM_OVERSHOOT + 300.0).max(top + 1500.0) } else { top }
+    }
+
+    /// The weather radar's latest storm cells: (centre in cloud space km,
+    /// tower radius km, maturity 0..1). Each is matched to a cell already
+    /// standing near there, which glides to it; cells no longer seen die away
+    /// and new ones grow in. `jump`: a fresh start, show them as they are.
+    pub fn set_live_cells(&mut self, cells: &[(DVec3, f64, f64)], jump: bool) {
+        if jump {
+            self.live_cells.clear();
+        }
+        let mut used = vec![false; self.live_cells.len()];
+        // Biggest first, so a big cell keeps its old self rather than a small neighbour taking it.
+        let mut order: Vec<usize> = (0..cells.len()).collect();
+        order.sort_by(|&a, &b| cells[b].1.total_cmp(&cells[a].1));
+        let mut fresh = Vec::new();
+        for &k in &order {
+            let (p, rad, age) = cells[k];
+            let near = self
+                .live_cells
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| !used[*i] && c.alive)
+                .map(|(i, c)| (i, c.goal.distance(p)))
+                .filter(|&(i, d)| d < (1.3 * (rad + self.live_cells[i].rad_goal)).max(10.0))
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            match near {
+                Some((i, _)) => {
+                    used[i] = true;
+                    let c = &mut self.live_cells[i];
+                    (c.goal, c.rad_goal, c.age_goal) = (p, rad, age);
+                }
+                None => {
+                    let h = shash((p.x * 37.0) as i32 as u32 ^ ((p.y * 41.0) as i32 as u32).wrapping_mul(19349663) ^ ((p.z * 43.0) as i32 as u32).wrapping_mul(83492791));
+                    let on = if jump { 1.0 } else { 0.0 };
+                    fresh.push(LiveCell { at: p, goal: p, rad, rad_goal: rad, age, age_goal: age, on, alive: true, seed: unit(h) as f32, top: STORM_TOP + 700.0 * (unit(h >> 16) as f32 * 2.0 - 1.0) });
+                }
+            }
+        }
+        for (c, u) in self.live_cells.iter_mut().zip(used) {
+            c.alive &= u;
+        }
+        self.live_cells.extend(fresh);
+    }
+
+    /// Let the radar's cells grow, die away and glide (dt s; 0 = at once).
+    pub fn step_live(&mut self, dt: f64) {
+        let (kf, kg) = if dt <= 0.0 { (1.0, 1.0) } else { (1.0 - (-dt / LIVE_FADE).exp(), 1.0 - (-dt / LIVE_GLIDE).exp()) };
+        for c in &mut self.live_cells {
+            let to = if c.alive { 1.0 } else { 0.0 };
+            // (a smooth start and a clean end: never quite reaching 0 otherwise)
+            c.on = (c.on + (to - c.on) * kf + (to * 2.0 - 1.0) * 0.002 * dt.max(0.0)).clamp(0.0, 1.0);
+            c.at += (c.goal - c.at) * kg;
+            c.rad += (c.rad_goal - c.rad) * kg;
+            c.age += (c.age_goal - c.age) * kg;
+        }
+        self.live_cells.retain(|c| c.alive || c.on > 0.0);
     }
 
     /// Put a mature cumulonimbus `dist_km` from `pos` (planet frame) towards
@@ -344,11 +453,23 @@ impl Weather {
     /// age, and a coarse noise makes them cluster.
     pub fn storm_cells(&self, cam: DVec3) -> Vec<[[f32; 4]; 2]> {
         let mut out: Vec<(f64, [[f32; 4]; 2])> = Vec::new();
+        let q = cam.normalize() * 6371.0 + self.cloud_off / 1000.0;
+        // The weather radar's cells, where it sees them.
+        for c in &self.live_cells {
+            let dist = c.at.distance(q);
+            if c.on <= 0.0 || dist > STORM_RANGE {
+                continue;
+            }
+            let rad = c.rad * (0.6 + 0.4 * c.on);
+            let age = c.age * c.on;
+            let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
+            out.push((dist, [[c.at.x as f32, c.at.y as f32, c.at.z as f32, rad as f32], [age as f32, c.top, over, c.seed]]));
+        }
         let prob_amount = self.storms as f64 * 0.5 * smoothstep(0.12, 0.45, self.clouds as f64);
         if prob_amount <= 0.0 {
-            return self.placed.iter().take(MAX_STORMS).copied().collect();
+            out.sort_by(|a, b| a.0.total_cmp(&b.0));
+            return self.placed.iter().copied().chain(out.into_iter().map(|c| c.1)).take(MAX_STORMS).collect();
         }
-        let q = cam.normalize() * 6371.0 + self.cloud_off / 1000.0;
         let reach = (STORM_RANGE / STORM_GRID).ceil() as i32 + 1;
         for face in 0..6u32 {
             let n = [DVec3::X, -DVec3::X, DVec3::Y, -DVec3::Y, DVec3::Z, -DVec3::Z][face as usize];
@@ -377,7 +498,13 @@ impl Weather {
                     let prob = prob_amount * smoothstep(0.2, 0.6, region + self.storms as f64 * 0.25);
                     // Fades in rather than pops as the slider or the region changes.
                     let r0 = unit(h0);
-                    let on = smoothstep(r0 - 0.04, r0 + 0.04, prob);
+                    // Where a weather radar sees, its cells stand instead (fading
+                    // across the edge of its coverage as the cloud drifts).
+                    let seen = self.radar_cover.as_ref().map_or(0.0, |cv| {
+                        let (la, lo, _) = geo::pos_to_lla(cen - self.cloud_off / 1000.0);
+                        cv.at(la.to_degrees(), lo.to_degrees())
+                    });
+                    let on = smoothstep(r0 - 0.04, r0 + 0.04, prob) * (1.0 - seen);
                     if on <= 0.0 {
                         continue;
                     }
@@ -587,7 +714,7 @@ impl Weather {
 
     /// The real-weather switch, and where the report comes from.
     fn live_switch(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.live, t!("Real weather (METAR, else Open-Meteo)", "Météo réelle (METAR, sinon Open-Meteo)"));
+        ui.checkbox(&mut self.live, t!("Real weather (METAR, else Open-Meteo; radar)", "Météo réelle (METAR, sinon Open-Meteo ; radar)"));
         if self.live {
             let text = if self.live_station.is_empty() {
                 if self.live_raw.is_empty() { t!("Waiting for a report…", "En attente d'un bulletin…").to_string() } else { self.live_raw.clone() }
@@ -864,6 +991,55 @@ mod tests {
         assert!((v.dot(e) - 10.0).abs() < 1e-6, "{v:?}");
         assert!(w.steady(p, 300.0).length() > 10.0);
         assert!((w.visibility_km() - 3.912 / (13.558e-6 + 8.396e-6) / 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn radar_cells_grow_in_and_die_away() {
+        let mut w = Weather::new(0.5);
+        w.storms = 0.0;
+        let cam = geo::lla_to_pos(0.6, -2.1, 1000.0);
+        let (e, n, _) = geo::enu(cam);
+        let q = cam.normalize() * 6371.0;
+        let a = (q + e * 40.0).normalize() * 6371.0;
+        let b = (q + n * 80.0).normalize() * 6371.0;
+        // A fresh start shows the radar's cells as they are.
+        w.set_live_cells(&[(a, 7.0, 0.95), (b, 2.5, 0.3)], true);
+        assert_eq!(w.storm_cells(cam).len(), 2);
+        assert!(w.live_cells.iter().all(|c| c.on == 1.0));
+        let seed = w.live_cells[0].seed;
+        // The next picture: the big cell has moved 5 km and grown, the shower is
+        // gone and a new one has popped up.
+        let a2 = (a + e * 5.0).normalize() * 6371.0;
+        let c = (q - n * 60.0).normalize() * 6371.0;
+        w.set_live_cells(&[(a2, 8.0, 1.0), (c, 3.0, 0.4)], false);
+        assert_eq!(w.live_cells.len(), 3);
+        assert_eq!(w.live_cells[0].seed, seed, "the big cell is the same cell");
+        w.step_live(1.0);
+        let big = &w.live_cells[0];
+        assert!(big.at.distance(a) < 1.0 && big.rad < 7.3, "it glides, not jumps: {big:?}");
+        let fresh = w.live_cells.iter().find(|x| x.goal == c).unwrap();
+        assert!(fresh.on > 0.0 && fresh.on < 0.1, "it grows in: {fresh:?}");
+        for _ in 0..600 {
+            w.step_live(1.0);
+        }
+        assert_eq!(w.live_cells.len(), 2, "the shower has died away");
+        assert!(w.live_cells.iter().all(|c| c.on == 1.0));
+        assert!(w.live_cells[0].at.distance(a2) < 0.01 && (w.live_cells[0].rad - 8.0).abs() < 0.01);
+        assert!(w.cloud_ceiling() > STORM_TOP);
+        // Where radar sees, the made-up cells give way to the real ones.
+        w.storms = 1.0;
+        w.live_cells.clear();
+        let made_up = w.storm_cells(cam).len();
+        assert!(made_up > 0);
+        let (la, lo, _) = geo::pos_to_lla(cam);
+        let mut e = crate::radar::Echo { z: 0, gx0: 0, gy0: 0, w: 0, h: 0, dbz: vec![], cover: vec![] };
+        let (z, tx, ty, nt) = crate::radar::Echo::block(la.to_degrees(), lo.to_degrees());
+        let sz = 256 * nt as usize;
+        (e.z, e.gx0, e.gy0, e.w, e.h) = (z, tx * 256, ty * 256, sz, sz);
+        (e.dbz, e.cover) = (vec![f32::NAN; sz * sz], vec![true; sz * sz]);
+        w.radar_cover = Some(crate::radar::analyse(&e, (la.to_degrees(), lo.to_degrees())).cover);
+        let near = w.storm_cells(cam).iter().filter(|s| DVec3::new(s[0][0] as f64, s[0][1] as f64, s[0][2] as f64).distance(q) < 150.0).count();
+        assert_eq!(near, 0);
     }
 
     #[test]
