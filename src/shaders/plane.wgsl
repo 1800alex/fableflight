@@ -2619,7 +2619,9 @@ fn tex_glass(in: VOut) -> vec4f {
   var env = l.amb * 0.035;
   if (!from_inside) { env = env_reflect(in.P, R, l.upn, true); }
   // A sheet has two faces, and from inside both mirror the cabin.
-  if (in_cabin) {
+  // low preset skips the cabin reflection, rain spots and scratches.
+  let lowq = G.quality.x > 1.5;
+  if (in_cabin && !lowq) {
     env = select(cabin_mirror(in.L, ml * R, l, ml * Ls), deck_mirror(in.L, ml * R, l, ml * Ls), kind() == 1u) * 2.0 / (1.0 + F);
     if (fighter()) { env = pit_mirror(in.L, ml * R, l, ml * Ls) * 2.0 / (1.0 + F); }
   }
@@ -2636,7 +2638,7 @@ fn tex_glass(in: VOut) -> vec4f {
   // Dried rain: rings of grime left where drops evaporated, in clusters.
   var spots = 0.0;
   let spot_cs = 0.016;
-  let fine = 1.0 - smoothstep(spot_cs * 0.06, spot_cs * 0.25, px);
+  let fine = select(1.0 - smoothstep(spot_cs * 0.06, spot_cs * 0.25, px), 0.0, lowq);
   if (fine > 0.0) {
     let cl = smoothstep(0.5, 0.78, nz(L * 1.6 + vec3f(0.4, 0.0, 0.2)).g);
     if (cl > 0.0) {
@@ -2674,7 +2676,7 @@ fn tex_glass(in: VOut) -> vec4f {
   // scatters sunlight only when it lies across the line to the sun, so the
   // lit ones ring the sun and slide round as the head moves.
   let face = dot(V, Ls);
-  if (face > 0.2) {
+  if (face > 0.2 && !lowq) {
     let dv = V - Ls;
     let d2 = vec2f(dot(dv, normalize((O.model * vec4f(tb, 0.0)).xyz)), dot(dv, normalize((O.model * vec4f(bb, 0.0)).xyz)));
     let dn = d2 / max(length(d2), 1e-5);
