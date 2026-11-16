@@ -82,6 +82,11 @@ struct Globals {
   // Graphics settings: building level-of-detail distance factor, tree
   // impostor distance factor, how far out trees are drawn (m). 0 = High.
   detail: vec4f,
+  // The rain deck (nimbostratus, weather.rs deck_globals): centre of its area
+  // (cloud space, km on the sphere) + amount 0..1 (0 = none); tangent axis +
+  // mean base (m); the other axis + top (m); how dark it is under it, -, how
+  // far its ragged scud hangs below the base (m), the area's radius (km).
+  nimbo: array<vec4f, 4>,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -310,8 +315,51 @@ const CIRRUS_H = 8800.0;
 // overshoots the anvil (m), seed.
 // cell: stratocumulus cell pattern, 1 at the heart of a cell, low between cells.
 // sd: signed distance (m) to that cell's smooth envelope, + inside (-1e6 = none).
-struct Weather { cov: f32, typ: f32, top: f32, cb: f32, sc: vec4f, sp: vec4f, cell: f32, sd: f32 };
-fn no_weather() -> Weather { return Weather(0.0, 0.0, 0.0, 0.0, vec4f(0.0), vec4f(0.0), 0.0, -1e6); }
+// ns: how far into the rain deck's area the column is (nimbostratus), 0..1.
+struct Weather { cov: f32, typ: f32, top: f32, cb: f32, sc: vec4f, sp: vec4f, cell: f32, sd: f32, ns: f32 };
+fn no_weather() -> Weather { return Weather(0.0, 0.0, 0.0, 0.0, vec4f(0.0), vec4f(0.0), 0.0, -1e6, 0.0); }
+
+// The rain deck: where rain is set (weather.rs rain_set) the layer closes into
+// a deep grey nimbostratus over a lobed area ~90 km across around where it was
+// set, drifting with the wind. How far into that area a point is, 0..1 (soft
+// edge NIMBO_EDGE km). Must match weather.rs `deck_area`. (Callers check
+// G.nimbo[0].w > 0 first.)
+const NIMBO_EDGE = 10.0;
+fn nimbo_area(pp: vec3f) -> f32 {
+  let d = normalize(pp) * 6371.0 + G.weather.xyz * 0.001 - G.nimbo[0].xyz;
+  let x = dot(d, G.nimbo[1].xyz);
+  let y = dot(d, G.nimbo[2].xyz);
+  let wob = 9.0 * sin(0.083 * x + 1.7 * sin(0.051 * y)) + 6.0 * sin(0.13 * y + 0.9 + 0.8 * sin(0.07 * x));
+  let R = G.nimbo[3].w;
+  return smoothstep(R, R - NIMBO_EDGE, length(vec2f(x, y)) + wob);
+}
+// How far under (or deep in) the deck a point (planet-centred) is, 0..1: there
+// only the dull light diffusing through it reaches. Times G.nimbo[3].x, this
+// is weather.rs `deck_shade`.
+fn nimbo_under(pp: vec3f) -> f32 {
+  if (G.nimbo[0].w <= 0.0) { return 0.0; }
+  let h = length(pp) - G.planet.w;
+  let b = G.nimbo[1].w;
+  let t = G.nimbo[2].w;
+  return nimbo_area(pp) * (1.0 - smoothstep(b, t - 0.15 * (t - b), h));
+}
+// The deck's extinction (cloud_shape_f's stratus density x clouds.wgsl SIGMA), 1/m.
+const NIMBO_SIGMA = 0.0275;
+// The light under the deck (or in it at height h): sun and sky on its top,
+// diffused down through all of it (two-stream, g ~ 0.85: 1 / (1 + 0.75 (1 - g)
+// tau), a little lower for the rain in it). A radiance: what its base sends
+// down, and what a white surface under it sends back. A cool, flat grey.
+// (nimbo_top: the light on its top, as a radiance; nimbo_down: what is left of
+// it at height h. The cloud march takes the top once per pixel.)
+fn nimbo_top(upn: vec3f) -> vec3f {
+  let mu = dot(upn, G.sun_dir.xyz);
+  let e = luma(sun_trans(G.nimbo[2].w, mu)) * G.sun_dir.w * (max(mu, 0.0) + 0.12 * smoothstep(-0.12, 0.1, mu));
+  return vec3f(0.9, 0.95, 1.0) * (e / PI);
+}
+fn nimbo_down(top: vec3f, h: f32) -> vec3f {
+  return top / (1.0 + 0.15 * NIMBO_SIGMA * max(G.nimbo[2].w - max(h, G.nimbo[1].w), 0.0));
+}
+fn nimbo_light(upn: vec3f, h: f32) -> vec3f { return nimbo_down(nimbo_top(upn), h); }
 // The wall cloud under a big storm hangs down to this far below the cloud base, m.
 const STORM_BELOW = 800.0;
 
@@ -573,7 +621,11 @@ fn cloud_weather_m(pp: vec3f, mask: u32) -> Weather {
   var st = no_weather();
   if (mask != 0u && G.storm.w > 0.0) { st = storm_find(pp, hs, mask); }
   // Above the ordinary layer (or under its base) only storm cells reach.
-  if (hs >= G.cloud.z || hs < 0.0) { return Weather(0.0, 0.0, 0.0, st.cb, st.sc, st.sp, 0.0, st.sd); }
+  if (hs >= G.cloud.z || hs < 0.0) { return Weather(0.0, 0.0, 0.0, st.cb, st.sc, st.sp, 0.0, st.sd, 0.0); }
+  // The rain deck closes the sky over its area (its edge breaks up as the
+  // cover there allows).
+  var ns = 0.0;
+  if (G.nimbo[0].w > 0.0) { ns = nimbo_area(pp); }
   let big = textureSampleLevel(t_noise, s_repeat, q / 1700.0 + vec3f(0.13, 0.71, 0.37), 0.0);
   let mid = textureSampleLevel(t_noise, s_repeat, (q + w) / 173.0, 0.0);
   let cell = textureSampleLevel(t_noise, s_repeat, (q + w) / 29.0 + vec3f(0.53, 0.21, 0.87), 0.0);
@@ -582,20 +634,22 @@ fn cloud_weather_m(pp: vec3f, mask: u32) -> Weather {
   // Storm towers take over their surroundings (and the air around them sinks):
   // no ordinary cumulus inside or against them, which used to show as a
   // straight-walled block on the tower's face with a seam at the layer top.
-  let cov = clamp(c, 0.0, 1.0) * (1.0 - st.cb);
+  let cov = clamp(mix(c, 1.1, ns), 0.0, 1.0) * (1.0 - st.cb);
   // Broken skies grow cumulus; as it closes in the cloud flattens into stratocumulus, then stratus.
-  let typ = clamp(1.0 - smoothstep(0.68, 0.98, cov) + (big.g - 0.62) * 0.6, 0.0, 1.0);
+  let typ = clamp(1.0 - smoothstep(0.68, 0.98, cov) + (big.g - 0.62) * 0.6, 0.0, 1.0) * (1.0 - ns);
   // How tall the cumulus in this area grow: mostly fair-weather puffs, some towers.
   // Towers need broken sky around them; a closed deck caps the convection (storm
   // cells are separate and still punch through).
   let tower = smoothstep(0.25, 0.95, cov * 0.75 + cell.r * 0.55 - 0.1) * (1.0 - 0.75 * smoothstep(0.7, 0.92, cov));
   let cu_top = 0.28 + 0.72 * tower * tower;
-  let top = mix(mix(0.1, 0.22, smoothstep(0.0, 0.5, typ)), cu_top, smoothstep(0.4, 1.0, typ));
+  var top = mix(mix(0.1, 0.22, smoothstep(0.0, 0.5, typ)), cu_top, smoothstep(0.4, 1.0, typ));
+  // The deck reaches up to its own top.
+  if (ns > 0.0) { top = mix(top, clamp((G.nimbo[2].w - G.cloud.y) / G.cloud.z, 0.05, 1.0), ns); }
   // Stratocumulus decks are a mosaic of cells 1-2 km across (Worley, columnar so each
   // cell is one lump). Looked up per column, so light probes reuse it.
   var cellv = 0.0;
   if (typ < 0.9) { cellv = textureSampleLevel(t_noise, s_repeat, (pp + G.weather.xyz - normalize(pp) * (hb * 0.85)) / 16000.0 + vec3f(0.41, 0.77, 0.19), 0.0).g; }
-  return Weather(cov, typ, top, st.cb, st.sc, st.sp, cellv, st.sd);
+  return Weather(cov, typ, top, st.cb, st.sc, st.sp, cellv, st.sd, ns);
 }
 // Height of a column's cloud above the base, metres: storm cores reach their anvil.
 fn column_top(wx: Weather) -> f32 {
@@ -607,8 +661,12 @@ fn column_top(wx: Weather) -> f32 {
 // cells a few pixels across aliased into worm-like ridges on distant towers).
 var<private> g_erode: f32 = 1.0;
 fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32 {
-  let hb = h - G.cloud.y;
-  if (hb <= -STORM_BELOW || h >= G.cloud.w) { return 0.0; }
+  // (hs: above the layer's base, for the storms; hb: above this column's base.
+  // Under the rain deck the layer reaches down to its scud; elsewhere the
+  // ordinary cloud keeps to the base set for it.)
+  let hs = h - G.cloud.y;
+  if (hs <= -STORM_BELOW || h >= G.cloud.w) { return 0.0; }
+  let hb = hs - (1.0 - wx.ns) * G.nimbo[3].y;
   let hn = hb / (G.cloud.z * wx.top);  // 0 at the base, 1 at the top of this column
   // The storm envelope is re-evaluated here, not taken from the column: towers are
   // only a few km across, so light probes leave them quickly. Skip the noise where
@@ -617,9 +675,9 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
   var sd = -1e6;
   var bulge = 0.0;
   if (wx.sc.w > 0.0) {
-    sd = storm_sd(pp, hb, wx.sc, wx.sp, true);
+    sd = storm_sd(pp, hs, wx.sc, wx.sp, true);
     bulge = storm_bulge(wx.sc);
-    storm = sd > -storm_reach(wx.sc, hb);
+    storm = sd > -storm_reach(wx.sc, hs);
   }
   let cumulus = hb > 0.0 && hn < 1.0 && wx.cov > 0.02;
   if (!storm && !cumulus) { return 0.0; }
@@ -654,11 +712,24 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // Stratocumulus: each cell of the deck is thickest (darkest from below) in the
     // middle and thins towards its edges, where gaps open as the cover drops.
     let stw = 1.0 - smoothstep(0.45, 0.9, wx.typ);
-    let tl = mix(1.0, mix(0.55, 1.0, smoothstep(0.25, 0.8, wx.cell)), stw);
-    let bv = mix(base, base * 0.5 + wx.cell * 0.55 + 0.05, stw);
-    let bottom = smoothstep(0.0, mix(150.0, 70.0, wx.typ), hb);
+    var tl = mix(1.0, mix(0.55, 1.0, smoothstep(0.25, 0.8, wx.cell)), stw);
+    var bv = mix(base, base * 0.5 + wx.cell * 0.55 + 0.05, stw);
+    var bottom = smoothstep(0.0, mix(150.0, 70.0, wx.typ), hb);
+    var tf = tl * 0.7;
+    if (wx.ns > 0.0) {
+      // Nimbostratus: one deep, dense sheet with a gently lumpy top, and a
+      // ragged base that hangs down in tatters of scud as far as G.nimbo[3].z
+      // below its mean height wherever the noise says.
+      tl = mix(tl, 0.9 + 0.1 * wx.cell, wx.ns);
+      tf = mix(tf, tl - 0.12, wx.ns);
+      let rag = G.nimbo[3].z;
+      let hr = h - (G.nimbo[1].w - rag);
+      let rb = rag * clamp(0.6 + (0.5 - base) * 1.4 - (wv.x * 0.7 + wv.y * 0.3) * 1.8 + (0.5 - wx.cell) * 0.5, 0.0, 1.0);
+      bottom = mix(bottom, smoothstep(rb, rb + 260.0, hr), wx.ns);
+      bv = mix(bv, 0.6 + 0.4 * bv, wx.ns);
+    }
     let dome = 1.0 - pow(hn, mix(3.0, 1.6, wx.typ));
-    let prof = bottom * mix(smoothstep(tl, tl * 0.7, hn), dome, wx.typ);
+    let prof = bottom * mix(smoothstep(tl, tf, hn), dome, wx.typ);
     let cv = mix(min(wx.cov * 1.15, 1.0), wx.cov, wx.typ);
     d = remap(bv, min(1.0 - cv * prof, 0.999), 1.0, 0.0, 1.0) * (1.0 - cuw);
   }
@@ -703,13 +774,13 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // and a soft edge, or it hangs as a box with straight walls. (Not more bulge:
     // everything under the base sits within ~30 m of the envelope there, and
     // stronger noise filled the whole band under it with cloud.)
-    let under = 1.0 - smoothstep(-200.0, 0.0, hb);
-    var sdn = sd + (mix(bl, base * 0.6 + bl * 0.4, under) - 0.78) * bulge * mix(1.3, 0.12, anvil) * select(mix(0.3, 1.0, smoothstep(0.0, 2000.0, hb)), mix(0.1, 0.25, g_wall), hb < 0.0);
+    let under = 1.0 - smoothstep(-200.0, 0.0, hs);
+    var sdn = sd + (mix(bl, base * 0.6 + bl * 0.4, under) - 0.78) * bulge * mix(1.3, 0.12, anvil) * select(mix(0.3, 1.0, smoothstep(0.0, 2000.0, hs)), mix(0.1, 0.25, g_wall), hs < 0.0);
     // Low down (the lower flanks, the base, the wall cloud) the big billows are
     // weak, and with nothing finer the outline ran straight for kilometres:
     // lumps a few hundred metres across break it up into ragged scud, fading
     // out towards the bottom of the band under the base.
-    let lowz = (1.0 - smoothstep(0.0, 1500.0, hb)) * smoothstep(-STORM_BELOW, -STORM_BELOW + 250.0, hb);
+    let lowz = (1.0 - smoothstep(0.0, 1500.0, hs)) * smoothstep(-STORM_BELOW, -STORM_BELOW + 250.0, hs);
     sdn += (wv.x * 0.7 + wv.y * 0.3 + 0.08) * 650.0 * lowz * (1.0 - anvil);
     // The anvil's underside is a soft, sagging veil, not a crisp wall.
     let env = smoothstep(0.0, mix(mix(220.0, 500.0, anvil), 700.0, under), sdn);
@@ -739,7 +810,7 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // Worley is brightest at cell centres. Eroding by its inverse keeps round
     // bulges (cauliflower billows); eroding by it directly leaves ragged, wispy
     // strands, which suits the undersides and the anvil's fibrous ice.
-    let low = select(1.0 - smoothstep(0.02, 0.13, hn), 1.0 - smoothstep(-STORM_BELOW, 300.0, hb), storm);
+    let low = select(1.0 - smoothstep(0.02, 0.13, hn), 1.0 - smoothstep(-STORM_BELOW, 300.0, hs), storm);
     let wisp = max(low * 0.8, anvil);
     let ed = mix(1.0 - ef, ef, wisp);
     d = remap(d, ed * mix(mix(0.5, 0.62, tyc), 0.6, cuw) * mix(1.0, 0.35, anvil) * mix(0.35, 1.0, g_erode), 1.0, 0.0, 1.0);
@@ -1322,6 +1393,13 @@ fn light_at_nv(P: vec3f) -> Light {
   amb += vec3f(0.30, 0.45, 0.85) * 0.16 * smoothstep(-0.1, 0.35, mum) * G.moon.w * mix(1.0, 0.7, G.cloud.x);
   amb += (vec3f(0.0016, 0.0024, 0.0048) + SKYGLOW * 0.0022 * G.misc.y * (0.6 + 0.6 * G.cloud.x)) * night;
   var sun_s = sun;
+  if (G.nimbo[0].w > 0.0) {
+    // Under the rain deck: only the flat grey light diffusing through it (the
+    // shadow map takes the sun, which can still slant in under its edge), and
+    // the city's glow off its base at night.
+    let nd = nimbo_under(pp);
+    amb = mix(amb, nimbo_light(upn, h) + SKYGLOW * 0.003 * G.misc.y * night, nd);
+  }
   if (G.stormfx.x > 0.0) {
     // (The sun can still slant in under the edge of an anvil, not under the core.)
     let dark = storm_shade(pp);

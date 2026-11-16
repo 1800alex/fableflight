@@ -185,6 +185,8 @@ struct VeilOut {
   o.clip = vec4f(uv * 2.0 - 1.0, 0.9999, 1.0);
   let inten = G.rain[0].w;
   o.col = vec4f(rain_light(-G.up.xyz, 1.0), VEIL_MAX * pow(inten, 0.8));
+  // Under the rain deck the cloud pass draws its rain as a veil already (clouds.wgsl nimbo_rain).
+  if (G.nimbo[0].w > 0.0) { o.col.a *= 1.0 - 0.5 * nimbo_area(-G.planet.xyz); }
   o.dv = mix(3000.0, 700.0, inten);
   return o;
 }

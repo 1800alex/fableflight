@@ -17,11 +17,21 @@ pub struct Weather {
     /// aerosol haze, as a multiple of a clear day's
     pub haze: f32,
     /// rain falling where the aircraft is, 0..1 (wets the windows, rain.rs;
-    /// falling streaks, precip.wgsl): from the storm cells (storm.rs `local`)
-    /// unless set by hand
+    /// falling streaks, precip.wgsl): from the rain deck (`deck_rain`) and the
+    /// storm cells (storm.rs `local`), only ever under or in their cloud
     pub rain: f32,
-    /// rain set by hand (`--rain`, the slider) instead of following the storms
+    /// rain set by hand (`--rain`, the slider): it brings a rain deck
+    /// (nimbostratus) that heavy over the area around the aircraft
     pub rain_set: Option<f32>,
+    /// the rain deck now, 0..1 (eases towards `rain_set`; 0 = none)
+    pub deck: f32,
+    /// centre of the rain deck's area, cloud space (km on the sphere, drifting
+    /// with the wind like the storm cells), and the ground height it sits over (m)
+    pub deck_at: Option<DVec3>,
+    pub deck_ground: Option<f64>,
+    /// where to put the rain area's centre next time (`--rain-at KM,BEARING`)
+    pub deck_place: Option<(f64, f64)>,
+    deck_prev: Option<f32>,
     /// wind 10 m above the ground, m/s, and the compass direction it blows from
     pub wind: f64,
     pub wind_from: f64,
@@ -90,6 +100,12 @@ pub const STORM_TOP: f32 = 11500.0;
 pub const STORM_OVERSHOOT: f32 = 1800.0;
 /// Most storm cells handed to the shaders at once (nearest first).
 pub const MAX_STORMS: usize = 16;
+/// The rain deck's area: radius (km, its lobed edge wanders by ~15 km either
+/// way) and how soft its edge is (km). Must match common.wgsl `nimbo_area`.
+pub const DECK_R: f64 = 45.0;
+const DECK_EDGE: f64 = 10.0;
+/// How far below its mean base the rain deck's ragged scud hangs, m.
+pub const DECK_RAG: f32 = 320.0;
 /// Spacing of candidate storm sites, km.
 const STORM_GRID: f64 = 40.0;
 /// Storm cells are found out to this distance from the camera, km.
@@ -140,12 +156,146 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live: false, live_station: String::new(), live_raw: String::new(), real_time: false }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live: false, live_station: String::new(), live_raw: String::new(), real_time: false }
+    }
+
+    /// The rain deck's mean base and top, metres above sea level: the heavier
+    /// the rain, the lower and thicker (darker) the deck.
+    pub fn deck_layer(&self) -> Option<(f32, f32)> {
+        if self.deck <= 0.0 || self.deck_at.is_none() {
+            return None;
+        }
+        let r = self.deck;
+        let base = self.deck_ground.unwrap_or(0.0) as f32 + 1100.0 + (450.0 - 1100.0) * r;
+        Some((base, base + 1800.0 + 1600.0 * r))
+    }
+
+    /// The cloud layer the shaders draw, metres: base (the lowest any cloud
+    /// reaches) and thickness, taking in the rain deck.
+    pub fn base(&self) -> f32 {
+        match self.deck_layer() {
+            Some((b, _)) => self.cloud_base.min(b - DECK_RAG),
+            None => self.cloud_base,
+        }
+    }
+    pub fn depth(&self) -> f32 {
+        let top = self.cloud_base + self.cloud_depth;
+        match self.deck_layer() {
+            Some((_, t)) => top.max(t + 100.0) - self.base(),
+            None => top - self.base(),
+        }
+    }
+
+    /// The rain deck's tangent axes at its centre (Globals.nimbo).
+    fn deck_axes(c: DVec3) -> (DVec3, DVec3) {
+        let cn = c.normalize();
+        let a = if cn.z.abs() > 0.9 { DVec3::X } else { DVec3::Z };
+        let ax = cn.cross(a).normalize();
+        (ax, cn.cross(ax))
+    }
+
+    /// How far into the rain deck's area a point (planet frame) is, 0..1: a
+    /// lobed patch some 90 km across, soft at the edge. Must match common.wgsl
+    /// `nimbo_area`.
+    pub fn deck_area(&self, pos: DVec3) -> f64 {
+        let Some(c) = self.deck_at else { return 0.0 };
+        if self.deck <= 0.0 {
+            return 0.0;
+        }
+        let d = pos.normalize() * 6371.0 + self.cloud_off / 1000.0 - c;
+        let (ax, ay) = Self::deck_axes(c);
+        let (x, y) = (d.dot(ax), d.dot(ay));
+        let wob = 9.0 * (0.083 * x + 1.7 * (0.051 * y).sin()).sin() + 6.0 * (0.13 * y + 0.9 + 0.8 * (0.07 * x).sin()).sin();
+        smoothstep(DECK_R, DECK_R - DECK_EDGE, x.hypot(y) + wob)
+    }
+
+    /// Rain from the deck at a point, 0..1: under it and in it (thinning out
+    /// higher up, where it is snow and ice), none above its top or outside it.
+    pub fn deck_rain(&self, pos: DVec3) -> f64 {
+        let Some((base, top)) = self.deck_layer() else { return 0.0 };
+        let a = self.deck_area(pos);
+        if a <= 0.0 {
+            return 0.0;
+        }
+        let (base, top) = (base as f64, top as f64);
+        let d = top - base;
+        let alt = pos.length() - geo::R;
+        let v = (1.0 - 0.5 * smoothstep(base, top, alt)) * (1.0 - smoothstep(top - 0.25 * d, top - 0.12 * d, alt));
+        self.deck as f64 * smoothstep(0.3, 0.8, a) * v
+    }
+
+    /// How deep in the rain deck's gloom a point is, 0..1 (the ground and
+    /// air under it get only the dull light that diffuses through). Must match
+    /// common.wgsl `nimbo_shade`.
+    pub fn deck_shade(&self, pos: DVec3) -> f64 {
+        let Some((base, top)) = self.deck_layer() else { return 0.0 };
+        let alt = pos.length() - geo::R;
+        let (base, top) = (base as f64, top as f64);
+        (0.6 + 0.4 * self.deck as f64) * self.deck_area(pos) * (1.0 - smoothstep(base, top - 0.15 * (top - base), alt))
+    }
+
+    /// Rain at a point from any cloud above it: the deck or a storm cell.
+    pub fn rain_at(&self, pos: DVec3, agl: f64, t: f64) -> f64 {
+        self.deck_rain(pos).max(crate::storm::local(self, pos, agl, t).rain).min(1.0)
+    }
+
+    /// The rain deck follows the slider (over a few seconds); its area is
+    /// centred on `pos` (planet frame) when it first comes, or when the
+    /// slider is moved outside it. `ground` = the terrain height under the
+    /// aircraft, when known (the deck's base is set above it).
+    pub fn step_deck(&mut self, dt: f64, pos: DVec3, ground: Option<f64>) {
+        let target = self.rain_set.unwrap_or(0.0);
+        if let Some(g) = ground {
+            self.deck_ground = Some(match self.deck_ground {
+                Some(o) => o + (g - o) * (dt / 90.0).min(1.0),
+                None => g,
+            });
+        }
+        let moved = self.deck_prev != self.rain_set;
+        self.deck_prev = self.rain_set;
+        if target > 0.0 && (self.deck_at.is_none() || (moved && self.deck_area(pos) < 0.5)) {
+            let p = match self.deck_place.take() {
+                Some((km, bearing)) => {
+                    let (e, n, up) = geo::enu(pos);
+                    let b = bearing.to_radians();
+                    let a = km / 6371.0;
+                    up * a.cos() + (e * b.sin() + n * b.cos()) * a.sin()
+                }
+                None => pos.normalize(),
+            };
+            self.deck_at = Some(p * 6371.0 + self.cloud_off / 1000.0);
+            if self.deck <= 0.0 {
+                self.deck = target;
+            }
+        }
+        self.deck += (target - self.deck) * (dt as f32 / 6.0).min(1.0);
+        if target <= 0.0 && self.deck < 0.003 {
+            (self.deck, self.deck_at) = (0.0, None);
+        }
+    }
+
+    /// The aircraft was put down somewhere new: a rain deck set by hand
+    /// moves there if it was left behind (and learns the new ground height).
+    pub fn deck_moved(&mut self, pos: DVec3) {
+        if self.deck_at.is_some() && self.deck_area(pos) < 0.5 {
+            (self.deck_at, self.deck_ground) = (None, None);
+        }
+    }
+
+    /// The rain deck for the shaders (Globals.nimbo): centre (cloud space, km)
+    /// + amount (0 = none); east-ish axis + mean base (m); north-ish axis +
+    /// top (m); how dark it is under it, how far below the ordinary cloud's base
+    /// the layer now starts (m), how far its scud hangs (m), area radius (km).
+    pub fn deck_globals(&self) -> [[f32; 4]; 4] {
+        let (Some(c), Some((base, top))) = (self.deck_at, self.deck_layer()) else { return [[0.0; 4]; 4] };
+        let (ax, ay) = Self::deck_axes(c);
+        let v = |v: DVec3, w: f32| [v.x as f32, v.y as f32, v.z as f32, w];
+        [v(c, self.deck), v(ax, base), v(ay, top), [0.6 + 0.4 * self.deck, (self.cloud_base - self.base()).max(0.0), DECK_RAG, DECK_R as f32]]
     }
 
     /// Top of the cloud layer including any storm towers, metres.
     pub fn cloud_ceiling(&self) -> f32 {
-        let top = self.cloud_base + self.cloud_depth;
+        let top = self.base() + self.depth();
         if self.storms > 0.0 || !self.placed.is_empty() { top.max(STORM_TOP + 700.0 + STORM_OVERSHOOT + 300.0).max(top + 1500.0) } else { top }
     }
 
@@ -367,7 +517,7 @@ impl Weather {
         let convt = 1.1 * conv * (1.0 - smoothstep(0.85 * top, 1.15 * top, agl)) * smoothstep(0.0, 60.0, agl).max(0.3);
         // In the cloud layer itself (strongest where it is cumulus-like rather than a flat deck).
         let (_, _, alt) = geo::pos_to_lla(pos);
-        let (base, ctop) = (self.cloud_base as f64, (self.cloud_base + self.cloud_depth) as f64);
+        let (base, ctop) = (self.base() as f64, (self.base() + self.depth()) as f64);
         let inside = smoothstep(base - 150.0, base + 100.0, alt) * (1.0 - smoothstep(ctop - 100.0, ctop + 200.0, alt));
         let cloud = inside * self.clouds as f64 * (0.7 + 0.8 * self.convection() + 0.6 * self.storms as f64);
         // A light background chop everywhere, as there always is a little.
@@ -536,11 +686,12 @@ impl Weather {
             ui.end_row();
             ui.label(t!("Rain", "Pluie"));
             ui.horizontal(|ui| {
-                let mut r = self.rain;
+                let mut r = self.rain_set.unwrap_or(self.rain);
                 if add(ui, Slider::new(&mut r, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0))).changed() {
                     self.rain_set = Some(r);
                 }
-                // Unset, the rain is wherever the storm cells drop it.
+                // Set, a rain deck (nimbostratus) that heavy closes in overhead;
+                // unset, the rain is wherever the storm cells drop it.
                 let mut auto = self.rain_set.is_none();
                 if ui.checkbox(&mut auto, "auto").changed() {
                     self.rain_set = if auto { None } else { Some(self.rain) };

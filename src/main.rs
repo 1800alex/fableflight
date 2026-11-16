@@ -194,6 +194,8 @@ struct Args {
     storms: Option<f32>,
     /// storm cells placed by hand: distance (km), compass bearing (deg), tower radius (km)
     storm_at: Vec<(f64, f64, f64)>,
+    /// km,bearing: where the rain deck's area is centred, from the spawn
+    rain_at: Option<(f64, f64)>,
     time_rate: Option<f64>,
     alto: Option<f32>,
     /// wind in knots and the direction it blows from, haze, day of year; open the F3 panel
@@ -278,6 +280,7 @@ fn parse_args() -> Args {
         clouds: 0.5,
         storms: None,
         storm_at: Vec::new(),
+        rain_at: None,
         time_rate: None,
         alto: None,
         wind: None,
@@ -394,6 +397,13 @@ fn parse_args() -> Args {
                 let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
                 if p.len() >= 2 {
                     a.storm_at.push((p[0], p[1], p.get(2).copied().unwrap_or(6.0)));
+                }
+            }
+            "--rain-at" => {
+                // km,bearing: centre the rain deck's area (--rain) that far from the spawn
+                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if p.len() >= 2 {
+                    a.rain_at = Some((p[0], p[1]));
                 }
             }
             "--time-rate" => a.time_rate = num(&v, i),
@@ -532,7 +542,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -853,6 +863,11 @@ impl Game {
         }
         wx.rain = args.rain.unwrap_or(0.0).clamp(0.0, 1.0);
         wx.rain_set = args.rain.map(|r| r.clamp(0.0, 1.0));
+        wx.deck_place = args.rain_at;
+        // The rain deck closes in from the start; the windows start as wet as
+        // the rain where the aircraft is (none above the deck).
+        wx.step_deck(0.0, plane.pos, None);
+        wx.rain = wx.deck_rain(plane.pos) as f32;
         let mut lightning = storm::Lightning::new();
         lightning.forced = args.strikes.clone();
         let mut glass = rain::Glass::new(wx.rain);
@@ -1074,6 +1089,8 @@ impl Game {
         self.hold_spot = None;
         self.parking_brake = false;
         self.plane = Plane::spawn(self.spec, lat, lon, alt, heading, speed);
+        // Rain set by hand comes along to a new place (its deck closes in there).
+        self.wx.deck_moved(self.plane.pos);
         // The spawn speed is through the air, not over the ground.
         self.plane.wind = self.wx.steady(self.plane.pos, 300.0);
         self.plane.vel += self.plane.wind;
@@ -2311,15 +2328,18 @@ impl Game {
             // The air the aircraft flies through, gusts and all.
             let (la, lo, h) = geo::pos_to_lla(self.plane.pos);
             let g = self.world.ground(la, lo);
-            let agl = h - g.as_ref().map(|g| g.h).unwrap_or(0.0);
+            let gh = g.as_ref().map(|g| g.h);
+            let agl = h - gh.unwrap_or(0.0);
             let water = g.map(|g| g.water).unwrap_or(false);
             self.wx.sun = self.sun_dir().dot(self.plane.pos.normalize());
             // Turbulence, thermals and storm drafts ride on top of the gusting wind.
             let air = self.wx.air(self.plane.pos, agl, self.time, water);
             self.plane.air = air;
             self.plane.wind = self.wx.at(self.plane.pos, agl, self.time) + self.plane.pos.normalize() * air.draft + air.gust;
-            // The rain on the windows: from the storm cells, unless set by hand.
-            self.wx.rain = self.wx.rain_set.unwrap_or_else(|| storm::local(&self.wx, self.plane.pos, agl, self.time).rain as f32);
+            // The rain on the windows: only under (or in) a cloud that rains, the
+            // rain deck the slider sets or a storm cell.
+            self.wx.step_deck(dt, self.plane.pos, gh);
+            self.wx.rain = self.wx.rain_at(self.plane.pos, agl, self.time) as f32;
             self.wx.advance(dt, self.plane.pos);
             self.glass.step(dt, self.wx.rain, self.plane.ias() * 1.94384);
         }
@@ -2745,7 +2765,7 @@ impl Game {
         if in_menu {
             self.cam_rain = 0.0;
         } else {
-            self.cam_rain = self.wx.rain_set.unwrap_or_else(|| storm::local(&self.wx, cam, agl, self.time).rain as f32);
+            self.cam_rain = self.wx.rain_at(cam, agl, self.time) as f32;
             let world = &self.world;
             let gnd = |p: DVec3| {
                 let (la, lo, _) = geo::pos_to_lla(p);
@@ -2815,7 +2835,7 @@ impl Game {
         // far too early, washing the city out while the sky still glows).
         // Night stays a night photograph: dark walls, bright windows.
         // Under a storm (in daylight) the eye opens up a stop or so to the gloom.
-        let shade = if in_menu { 0.0 } else { storm::shade(&self.wx, cam) as f32 };
+        let shade = if in_menu { 0.0 } else { storm::shade(&self.wx, cam).max(self.wx.deck_shade(cam)) as f32 };
         self.storm_adapt += (shade * day - self.storm_adapt) * (dt_real as f32 * 0.4).min(1.0);
         let exposure = (6.0f32.ln() + (0.5f32.ln() - 6.0f32.ln()) * day).exp() * if self.cam_mode == 1 && !self.crashed && !in_menu { 2f32.powf(self.head.adapt) } else { 1.0 } * 2f32.powf(1.3 * self.storm_adapt);
         let v4 = |v: DVec3, w: f64| [v.x as f32, v.y as f32, v.z as f32, w as f32];
@@ -2866,7 +2886,7 @@ impl Game {
             up: v4(up, calt),
             screen: [rw, rh, 1.0 / rw, 1.0 / rh],
             time: [self.time as f32, dt as f32, exposure, self.frame as f32],
-            cloud: [if in_menu { 0.0 } else { self.wx.clouds }, self.wx.cloud_base, self.wx.cloud_depth, self.wx.cloud_ceiling()],
+            cloud: [if in_menu { 0.0 } else { self.wx.clouds }, self.wx.base(), self.wx.depth(), self.wx.cloud_ceiling()],
             light_pos: [0.0; 4],
             light_col: [0.0; 4],
             vol_o: [0.0; 4],
@@ -2898,7 +2918,7 @@ impl Game {
             cut: [[0.0; 4]; 3 * tiles3d::MAX_CUTS],
             cut_v: [[0.0; 4]; tiles3d::MAX_CUT_V / 2],
             cs: [[0.0; 4]; 2 * render::CS_MAP],
-            alto: [if in_menu { 0.0 } else { self.wx.alto }, 4800f32.max(self.wx.cloud_base + 0.4 * self.wx.cloud_depth + 800.0), 0.0, 0.0],
+            alto: [if in_menu { 0.0 } else { self.wx.alto }, 4800f32.max(self.wx.base() + 0.4 * self.wx.depth() + 800.0), 0.0, 0.0],
             ocean: self.world.ocean.globals(),
             shore_vp: [[0.0; 4]; 4],
             shore: [0.0; 4],
@@ -2910,6 +2930,7 @@ impl Game {
             rain: [[0.0; 4]; 2],
             quality: [0.0; 4],
             detail: [self.gfx.city_k(), self.gfx.tree_imp_k(), self.gfx.tree_far(), 0.0],
+            nimbo: if in_menu { [[0.0; 4]; 4] } else { self.wx.deck_globals() },
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);

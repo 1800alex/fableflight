@@ -79,8 +79,8 @@ fn cell_at(wx: &Weather, c: &[[f32; 4]; 2], pos: DVec3, w: DVec3) -> At {
     let dv = (un * 6371.0 + wx.cloud_off / 1000.0 - cen) * 1000.0;
     let alt = pos.length() - geo::R;
     let age = c[1][0] as f64;
-    let at = c[1][1] as f64 - wx.cloud_base as f64;
-    At { dw0: dv.dot(w), cx: dv.dot(x), hb: alt - wx.cloud_base as f64, r: c[0][3] as f64 * 1000.0, age, htop: at * storm_top(age), w, x }
+    let at = c[1][1] as f64 - wx.base() as f64;
+    At { dw0: dv.dot(w), cx: dv.dot(x), hb: alt - wx.base() as f64, r: c[0][3] as f64 * 1000.0, age, htop: at * storm_top(age), w, x }
 }
 
 /// How much rain a cell's shaft carries (clouds.wgsl `storm_rain`: mature, big enough).
@@ -193,7 +193,7 @@ pub fn shade(wx: &Weather, pos: DVec3) -> f64 {
         dark = dark.max(core.max(lid));
     }
     let alt = pos.length() - geo::R;
-    dark * (1.0 - smoothstep(wx.cloud_base as f64, wx.cloud_base as f64 + 3000.0, alt))
+    dark * (1.0 - smoothstep(wx.base() as f64, wx.base() as f64 + 3000.0, alt))
 }
 
 /// Lightning that stays in the cloud, or comes down to the ground.
@@ -433,7 +433,7 @@ impl Lightning {
             f.age += dt;
         }
         self.flashes.retain(|f| f.age < f.end);
-        let base = wx.cloud_base as f64;
+        let base = wx.base() as f64;
         // Forced strikes begin their leader just ahead of the stroke time.
         let mut i = 0;
         while i < self.forced.len() {
@@ -666,7 +666,7 @@ mod tests {
         let l = local(&wx, far, 600.0, 0.0);
         assert!(l.rain == 0.0 && l.sigma < 0.1, "{l:?}");
         // In the tower's heart: cloud, updraft.
-        let core = (p - e * 1000.0).normalize() * (geo::R + wx.cloud_base as f64 + 3000.0);
+        let core = (p - e * 1000.0).normalize() * (geo::R + wx.base() as f64 + 3000.0);
         let l = local(&wx, core, 4000.0, 0.0);
         assert!(l.cloud > 0.9 && l.draft > 5.0, "{l:?}");
         let _ = u;

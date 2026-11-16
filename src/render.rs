@@ -162,6 +162,10 @@ pub struct Globals {
     /// graphics settings (graphics.rs): building LOD distance factor, tree
     /// impostor distance factor, how far out trees are drawn (m); 0 = High
     pub detail: [f32; 4],
+    /// the rain deck (nimbostratus, weather.rs `deck_globals`): centre of its
+    /// area (cloud space, km) + amount (0 = none); axis + mean base (m); axis +
+    /// top (m); darkness under it, -, how far its scud hangs (m), area radius (km)
+    pub nimbo: [[f32; 4]; 4],
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).

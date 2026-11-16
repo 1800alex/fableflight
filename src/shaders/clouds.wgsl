@@ -231,6 +231,64 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
   return o;
 }
 
+// ------------------------------------------------------ the rain deck's rain
+// Under the rain deck (nimbostratus) rain fills the air from its ragged base to
+// the ground: a grey veil (heavy rain cuts the view to a few km) in broad sheets
+// drifting with the wind, ending where the deck does. Integrated in a few
+// samples, closer together near the camera, along the stretch of the ray under
+// the deck's base; col = the dull light in it, about what the base sends down.
+const NIMBO_E = 0.0008;  // extinction of the heaviest rain, 1/m
+const NIMBO_RAIN_K = 0.9;
+fn nimbo_rain(oc: vec3f, rd: vec3f, tmax: f32, jit: f32, col: vec3f) -> Rain {
+  var o = Rain(vec3f(0.0), 1.0, 0.0);
+  let rg = G.planet.w;
+  let top = G.nimbo[1].w - 0.5 * G.nimbo[3].z;
+  let sb = ray_sphere(oc, rd, rg + top);
+  var t0 = 0.0;
+  var t1 = min(tmax, 90000.0);
+  if (G.up.w < top) {
+    t1 = min(t1, sb.y);
+  } else {
+    if (sb.x <= 0.0) { return o; }
+    t0 = sb.x;
+    t1 = min(t1, sb.y);
+  }
+  if (t1 <= t0) { return o; }
+  let ext = NIMBO_E * pow(G.nimbo[0].w, 1.2);
+  let len = t1 - t0;
+  var tp = t0;
+  var wsum = 0.0;
+  let n = 6;
+  for (var k = 0; k < n; k++) {
+    let f = f32(k + 1) / f32(n);
+    let tn = t0 + len * f * f;
+    let dt = tn - tp;
+    let ts = mix(tp, tn, jit);
+    tp = tn;
+    let p = oc + rd * ts;
+    let a = nimbo_area(p);
+    if (a <= 0.0) { continue; }
+    let r = length(p);
+    let h = r - rg;
+    let up = p / r;
+    // Sheets of heavier and lighter rain: noise squashed flat along the vertical.
+    let q = p + G.weather.xyz;
+    let qc = q - up * dot(q, up) * 0.93;
+    let sn = textureSampleLevel(t_noise, s_repeat, qc / 7000.0 + vec3f(0.31, 0.77, 0.12), 0.0);
+    let sheet = mix(0.45, 1.3, smoothstep(0.3, 0.75, sn.g * 0.6 + sn.b * 0.4));
+    let e = ext * smoothstep(0.3, 0.8, a) * sheet * smoothstep(top, top - 250.0, h);
+    if (e <= 1e-8) { continue; }
+    let st = exp(-e * dt);
+    o.L += o.T * col * (1.0 - st);
+    let w = o.T * (1.0 - st);
+    o.t += ts * w;
+    wsum += w;
+    o.T *= st;
+  }
+  if (wsum > 0.0) { o.t /= wsum; }
+  return o;
+}
+
 // dist.x: distance (km) to the clouds this texel sees; dist.y: distance (km) to the
 // scene surface the march stopped at, for the depth-aware passes below.
 struct CloudOut { @location(0) col: vec4f, @location(1) dist: vec2f };
@@ -331,7 +389,23 @@ fn depth_match(a: f32, b: f32) -> f32 {
   // Rain shafts under the storms: in front of the cloud seen from under the base,
   // behind it seen from above.
   var rain = Rain(vec3f(0.0), 1.0, 0.0);
+  // The light on the rain deck's top (the same over the whole view, near enough).
+  var nim_top = vec3f(0.0);
+  if (G.nimbo[0].w > 0.0) { nim_top = nimbo_top(G.up.xyz); }
   if (smask != 0u) { rain = storm_rain(oc, rd, min(tscene, 320000.0), smask, jit, sky_amb, gnd_amb); }
+  // The rain deck's rain: lit by what diffuses down through the deck (as its
+  // base is, see the march), so the view into the rain fades into the base.
+  if (G.nimbo[0].w > 0.0) {
+    let ncol = (nimbo_down(nim_top, G.nimbo[1].w) + gnd_amb * 0.3) * NIMBO_RAIN_K;
+    let nr = nimbo_rain(oc, rd, min(tscene, 320000.0), jit, ncol);
+    if (nr.T < 1.0) {
+      let w0 = 1.0 - rain.T;
+      let w1 = rain.T * (1.0 - nr.T);
+      rain.t = (rain.t * w0 + nr.t * w1) / (w0 + w1);
+      rain.L += rain.T * nr.L;
+      rain.T *= nr.T;
+    }
+  }
   let rain_front = alt < base;
   if (rain_front && rain.T < 1.0) {
     L += rain.L;
@@ -441,7 +515,7 @@ fn depth_match(a: f32, b: f32) -> f32 {
       pts = ts;
       let upn = pl / length(pl);
       let ctop = column_top(wx);
-      let hn = clamp((hl - base) / ctop, 0.0, 1.0);
+      let hn = clamp((hl - base - (1.0 - wx.ns) * G.nimbo[3].y) / ctop, 0.0, 1.0);
       // Optical depth towards the sun; the column's weather is reused along the way.
       // Tall columns take one more, long step (out to ~3 km) so towers shade their neighbours.
       var od = 0.0;
@@ -473,6 +547,14 @@ fn depth_match(a: f32, b: f32) -> f32 {
         let pu2 = pl + upn * (2500.0 * (0.6 + 0.8 * jit2));
         let od2 = cloud_shape(pu2, hl + 2500.0, wx, false) * 3000.0 * SIGMA;
         occ *= mix(1.0 / (1.0 + 0.06 * od2), 1.0, 0.3);
+      }
+      // The rain deck is kilometres deep, and the light march stops ~1.5 km in:
+      // its base came out as bright as a thin stratus's. Light gets down by
+      // diffusing through all of the deck above, and the sky above it is hidden.
+      if (wx.ns > 0.0) {
+        let tau = SIGMA * 0.55 * max(G.nimbo[2].w - hl, 0.0) * wx.ns;
+        od = max(od, tau / max(dot(upn, sun), 0.3));
+        occ = min(occ, 0.1 + 0.9 / (1.0 + 0.1 * tau));
       }
       // Multiple scattering as a sum of ever dimmer, softer, more isotropic octaves.
       var ms = 0.0;
@@ -508,6 +590,13 @@ fn depth_match(a: f32, b: f32) -> f32 {
       let amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn * (1.0 - 0.7 * anv)) * (1.0 - 0.7 * wx.cb)) * mix(0.5, 1.0, powder);
       let moonc = moon_light(upn, hl);
       var S = ((sunc + moonc) * ms * MS_GAIN * powder + amb) * d * SIGMA;
+      // Deep in the rain deck (and on its base) the light is what diffuses down
+      // through it, a little lighter and darker where the deck is thinner and thicker.
+      // The ragged scud hanging below it is darker (dense and in its shadow).
+      if (wx.ns > 0.0) {
+        let scud = 1.0 - smoothstep(0.0, G.nimbo[3].z * 1.3, hl - G.nimbo[1].w + G.nimbo[3].z);
+        S = max(S, nimbo_down(nim_top, hl) * (mix(0.75, 1.2, wx.cell) * mix(0.55, 1.0, powder) * mix(1.0, 0.5, scud) * wx.ns * d * SIGMA));
+      }
       // Lightning: the cloud lit from inside (diffuse, so an even phase). Per
       // sample: added once per ray at the cloud's mean distance it lit the whole
       // tower as one flat veil.
