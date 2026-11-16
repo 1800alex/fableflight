@@ -15,6 +15,9 @@
 //!
 //! - `FFMP_NAME`: this relay's name, as the other relays and the status page
 //!   show it (say its host name);
+//! - `FFMP_PUBLIC`: where players reach this relay (`host[:port]`), as the
+//!   server list gives it (`/servers.json`: every relay of the network, its
+//!   address, up or not, its pilots; the game reads it for its server list);
 //! - `FFMP_PEER_SECRET`: the network's shared secret (16 characters at
 //!   least, the same on every relay): without it, no federation;
 //! - `FFMP_HUB`: the network's main relay (`host[:port]`). A relay with the
@@ -65,6 +68,8 @@ struct Config {
     /// this relay's name, and the network's secret (None: no federation)
     name: String,
     secret: Option<String>,
+    /// where players reach this relay ("host[:port]"), for the server list
+    public: Option<String>,
 }
 
 /// Another relay of the network.
@@ -403,6 +408,23 @@ impl Relay {
         )
     }
 
+    /// The network's relays for the game's server list: name, the address to
+    /// connect to, up or not, how many fly on it.
+    fn servers_json(&self) -> String {
+        let here = self.players.values().filter(|p| p.state.is_some()).count();
+        let addr = |a: Option<String>| a.map_or("null".to_string(), |a| json_str(&a));
+        let mut list = vec![format!("{{\"name\":{},\"address\":{},\"up\":true,\"flying\":{}}}", json_str(&self.cfg.name), addr(self.cfg.public.clone()), here)];
+        list.extend(self.peers.iter().map(|p| {
+            let up = p.heard.is_some_and(|t| t.elapsed() < Duration::from_secs(5));
+            let n = self.remote.keys().filter(|(rel, _)| *rel == p.relay).count();
+            // (A configured relay by its host name; one that came in by itself at the address it came from.)
+            let a = if p.found.is_none() { Some(p.host.clone()) } else { p.addrs.first().map(|a| a.to_string()) };
+            let name = if p.name.is_empty() { p.host.as_str() } else { p.name.as_str() };
+            format!("{{\"name\":{},\"address\":{},\"up\":{},\"flying\":{}}}", json_str(name), addr(a), up, if up { n } else { 0 })
+        }));
+        format!("{{\"servers\":[{}]}}", list.join(","))
+    }
+
     /// Forgets the players gone quiet, and old Hellos.
     fn expire(&mut self, now: Instant) {
         let gone: Vec<SocketAddr> = self.players.iter().filter(|(_, p)| now.saturating_duration_since(p.last) > IDLE).map(|(a, _)| *a).collect();
@@ -446,7 +468,7 @@ const PAGE: &str = include_str!("status.html");
 
 /// The HTTP side: GET / and GET /status.json, nothing else. Each connection
 /// gets two seconds and 2 KB of request.
-fn serve_http(listener: TcpListener, status: Arc<Mutex<String>>) {
+fn serve_http(listener: TcpListener, status: Arc<Mutex<(String, String)>>) {
     for conn in listener.incoming() {
         let Ok(mut c) = conn else { continue };
         let status = status.clone();
@@ -455,7 +477,7 @@ fn serve_http(listener: TcpListener, status: Arc<Mutex<String>>) {
         });
     }
 }
-fn answer(c: &mut TcpStream, status: &Mutex<String>) -> std::io::Result<()> {
+fn answer(c: &mut TcpStream, status: &Mutex<(String, String)>) -> std::io::Result<()> {
     c.set_read_timeout(Some(Duration::from_secs(2)))?;
     c.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut buf = [0u8; 2048];
@@ -464,7 +486,8 @@ fn answer(c: &mut TcpStream, status: &Mutex<String>) -> std::io::Result<()> {
     let path = req.lines().next().and_then(|l| l.strip_prefix("GET ")).and_then(|l| l.split_whitespace().next()).unwrap_or("");
     let (code, kind, body) = match path.split('?').next().unwrap_or("") {
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", PAGE.to_string()),
-        "/status.json" => ("200 OK", "application/json", status.lock().map(|s| s.clone()).unwrap_or_default()),
+        "/status.json" => ("200 OK", "application/json", status.lock().map(|s| s.0.clone()).unwrap_or_default()),
+        "/servers.json" => ("200 OK", "application/json", status.lock().map(|s| s.1.clone()).unwrap_or_default()),
         _ => ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string()),
     };
     let head = format!("HTTP/1.1 {code}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'\r\nConnection: close\r\n\r\n", body.len());
@@ -489,7 +512,7 @@ fn main() -> std::io::Result<()> {
         eprintln!("FFMP_HUB and FFMP_PEERS need FFMP_PEER_SECRET (16 characters at least, the same on every relay): no federation");
         secret = None;
     }
-    let cfg = Config { max_players: env("FFMP_MAX_PLAYERS", 64usize).clamp(1, 10_000), range_m: env("FFMP_RANGE_KM", 150.0f64).clamp(1.0, 20_000.0) * 1000.0, name, secret };
+    let cfg = Config { max_players: env("FFMP_MAX_PLAYERS", 64usize).clamp(1, 10_000), range_m: env("FFMP_RANGE_KM", 150.0f64).clamp(1.0, 20_000.0) * 1000.0, name, secret, public: std::env::var("FFMP_PUBLIC").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) };
     let sock = UdpSocket::bind(("0.0.0.0", port))?;
     sock.set_read_timeout(Some(Duration::from_millis(20)))?;
     println!("fableflight-relay {} on udp/{port}: up to {} players, {} km", env!("CARGO_PKG_VERSION"), cfg.max_players, cfg.range_m / 1000.0);
@@ -506,7 +529,7 @@ fn main() -> std::io::Result<()> {
     }
     let started = Instant::now();
     let mut packets: u64 = 0;
-    let status = Arc::new(Mutex::new(relay.status_json(started, 0)));
+    let status = Arc::new(Mutex::new((relay.status_json(started, 0), relay.servers_json())));
     let http_port: u16 = env("FFMP_HTTP_PORT", 7481);
     if http_port != 0 {
         let listener = TcpListener::bind(("0.0.0.0", http_port))?;
@@ -551,7 +574,7 @@ fn main() -> std::io::Result<()> {
                 relay.resolve_peers();
             }
             if let Ok(mut s) = status.lock() {
-                *s = relay.status_json(started, packets);
+                *s = (relay.status_json(started, packets), relay.servers_json());
             }
         }
     }
@@ -565,13 +588,13 @@ mod tests {
         PlayerState { seq, aircraft: 0, pos: [6_371_000.0 + 1000.0, x, 0.0], rot: [0.0, 0.0, 0.0, 1.0], ..Default::default() }
     }
     fn relay() -> Relay {
-        Relay::new(Config { max_players: 3, range_m: 150_000.0, name: "here".into(), secret: None })
+        Relay::new(Config { max_players: 3, range_m: 150_000.0, name: "here".into(), secret: None, public: Some("here.example:7480".into()) })
     }
     const SECRET: &str = "a secret for the tests";
     const T: u64 = 1_800_000_000;
     /// Relay `name` at 10.0.0.<ip>, federated with the relays at the other ips.
     fn fed_relay(name: &str, peers: &[u8]) -> Relay {
-        let mut r = Relay::new(Config { max_players: 10, range_m: 150_000.0, name: name.into(), secret: Some(SECRET.into()) });
+        let mut r = Relay::new(Config { max_players: 10, range_m: 150_000.0, name: name.into(), secret: Some(SECRET.into()), public: None });
         r.peers = peers.iter().map(|ip| PeerRelay { host: format!("10.0.0.{ip}:7480"), addrs: vec![SocketAddr::from(([10, 0, 0, *ip], 7480))], name: String::new(), relay: 0, last_seq: 0, heard: None, found: None }).collect();
         r
     }
@@ -633,6 +656,7 @@ mod tests {
         assert!(j.contains("\"flying\":1") && j.contains("\"aircraft\":\"Cessna 172RG\"") && j.contains("\"relay\":\"here\""), "{j}");
         assert!(j.contains(r#""name":"Dany \"<b>\\""#), "{j}");
         assert_eq!(json_str("a\nb"), "\"a\\u000ab\"");
+        assert_eq!(r.servers_json(), r#"{"servers":[{"name":"here","address":"here.example:7480","up":true,"flying":1}]}"#);
     }
 
     #[test]
@@ -696,8 +720,11 @@ mod tests {
             }
         }
         assert_eq!(peers_of(&b.broadcast(), addr(2)), vec!["Marc"]);
+        // B's server list: itself, the hub by its configured name, C where it came from.
+        let j = b.servers_json();
+        assert!(j.contains(r#""address":"10.0.0.1:7480""#) && j.contains(r#"{"name":"C","address":"10.0.0.3:7480","up":true,"flying":1}"#), "{j}");
         // Without the secret, nobody joins.
-        let mut stranger = Relay::new(Config { max_players: 3, range_m: 150_000.0, name: "X".into(), secret: Some("not the network's secret".into()) });
+        let mut stranger = Relay::new(Config { max_players: 3, range_m: 150_000.0, name: "X".into(), secret: Some("not the network's secret".into()), public: None });
         stranger.peers = vec![PeerRelay { host: "hub".into(), addrs: vec![from(1)], name: String::new(), relay: 0, last_seq: 0, heard: None, found: None }];
         for (_, d) in stranger.fed_packets(T) {
             hub.receive(from(9), &d, now, T);

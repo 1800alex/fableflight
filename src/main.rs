@@ -245,6 +245,8 @@ struct Args {
     cockpit: bool,
     /// --mp server[,name]: multiplayer on, through this relay
     mp: Option<(String, Option<String>)>,
+    /// --mp-list URL: read the server list from there (testing a relay)
+    mp_list: Option<String>,
     /// --mp-mirror: a copy of our own aircraft flies 25 m off the left wing as
     /// another player would be drawn (to check the drawing, no network)
     mp_mirror: bool,
@@ -304,6 +306,7 @@ fn parse_args() -> Args {
         crash_at: None,
         mp: None,
         mp_mirror: false,
+        mp_list: None,
         boost_at: None,
         stage_at: None,
         engines: None,
@@ -514,6 +517,7 @@ fn parse_args() -> Args {
                     a.mp = Some((server, name));
                 }
             }
+            "--mp-list" => a.mp_list = v.get(i + 1).cloned(),
             "--mp-mirror" => {
                 a.mp_mirror = true;
                 used = 1;
@@ -769,6 +773,12 @@ struct Game {
     mp_name: String,
     mp: Option<mp::Mp>,
     mp_players: Vec<mp::Remote>,
+    /// the network's servers (started when first wanted: settings, or "auto")
+    mp_dir: Option<mp::Directory>,
+    /// the server is typed in (not picked from the list)
+    mp_custom: bool,
+    /// where the server list is read from
+    mp_list: String,
     /// the near ones' stand-in aircraft, for posing their models (by player id)
     mp_puppets: std::collections::HashMap<u32, Plane>,
     /// --mp-mirror (see Args)
@@ -920,6 +930,9 @@ impl Game {
             mp_name: args.mp.as_ref().and_then(|m| m.1.clone()).unwrap_or(prefs.mp_name.clone()),
             mp: None,
             mp_players: Vec::new(),
+            mp_dir: None,
+            mp_custom: false,
+            mp_list: args.mp_list.clone().unwrap_or_else(|| mp::DIRECTORY_URL.to_string()),
             mp_puppets: std::collections::HashMap::new(),
             mp_mirror: args.mp_mirror,
             live_view: None,
@@ -1301,16 +1314,30 @@ impl Game {
             self.mp_players = if in_menu { Vec::new() } else { vec![self.mirror_player()] };
             return;
         }
-        let want = self.mp_on && !in_menu && !self.mp_server.trim().is_empty();
-        let stale = self.mp.as_ref().is_some_and(|m| m.server != self.mp_server.trim() || m.name != mp_proto::clean_name(&self.mp_name));
-        if !want || stale {
+        // "auto": the server that answers fastest, kept for the flight once chosen.
+        let auto = self.mp_auto();
+        let target = if !self.mp_on || in_menu {
+            None
+        } else if auto {
+            match &self.mp {
+                Some(m) if m.auto => Some(m.server.clone()),
+                _ => self.mp_directory().best().map(|s| s.address),
+            }
+        } else {
+            Some(self.mp_server.trim().to_string()).filter(|s| !s.is_empty())
+        };
+        let stale = self.mp.as_ref().is_some_and(|m| Some(&m.server) != target.as_ref() || m.auto != auto || m.name != mp_proto::clean_name(&self.mp_name));
+        if target.is_none() || stale {
             self.mp = None;
             self.mp_players.clear();
         }
-        if !want {
-            return;
-        }
-        let m = self.mp.get_or_insert_with(|| mp::Mp::start(&self.mp_server, &self.mp_name));
+        let Some(target) = target else { return };
+        let name = self.mp_name.clone();
+        let m = self.mp.get_or_insert_with(|| {
+            let mut m = mp::Mp::start(&target, &name);
+            m.auto = auto;
+            m
+        });
         let p = &self.plane;
         let q = p.rot.as_quat();
         let byte = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -1459,6 +1486,93 @@ impl Game {
         }
         self.mp_players = players;
         full
+    }
+
+    /// Settings, Multiplayer, Server: the network's servers with their pilots
+    /// and ping, "automatic" (the fastest), or an address typed in.
+    fn mp_server_picker(&mut self, ui: &mut egui::Ui) {
+        use egui::RichText;
+        let dir = self.mp_directory();
+        let (servers, err) = (dir.servers(), dir.error());
+        let best = dir.best();
+        let auto = self.mp_auto();
+        let current = mp::with_port(&self.mp_server);
+        let listed = servers.iter().any(|s| s.address == current);
+        let label = |s: &mp::ServerEntry| {
+            let state = match (s.up, s.ping_ms) {
+                (false, _) => t!("offline", "hors ligne").to_string(),
+                (true, Some(ms)) => format!("{ms} ms"),
+                (true, None) => t!("no answer", "pas de réponse").to_string(),
+            };
+            format!("{}  ·  {}  ·  {}", s.name, i18n::plural(s.flying as u64, "pilot", "pilots", "pilote", "pilotes"), state)
+        };
+        let selected = if auto {
+            match &best {
+                Some(b) => t!("Automatic ({})", "Automatique ({})", b.name),
+                None => t!("Automatic: the fastest", "Automatique : le plus rapide").to_string(),
+            }
+        } else if let Some(s) = servers.iter().find(|s| s.address == current) {
+            label(s)
+        } else {
+            t!("Other: {}", "Autre : {}", self.mp_server.trim())
+        };
+        let mut pick: Option<String> = None;
+        egui::ComboBox::from_id_salt("mp_server").selected_text(selected).width(280.0).show_ui(ui, |ui| {
+            if ui.selectable_label(auto, t!("Automatic: the fastest", "Automatique : le plus rapide")).clicked() {
+                pick = Some("auto".into());
+            }
+            for s in &servers {
+                ui.add_enabled_ui(s.up, |ui| {
+                    if ui.selectable_label(!auto && s.address == current, label(s)).clicked() {
+                        pick = Some(s.address.clone());
+                    }
+                });
+            }
+            if ui.selectable_label(!auto && !listed, t!("Other address…", "Autre adresse…")).clicked() {
+                pick = Some(String::new());
+            }
+        });
+        match pick.as_deref() {
+            Some("") => {
+                self.mp_custom = true;
+                if auto || listed {
+                    self.mp_server.clear();
+                }
+            }
+            Some(a) => {
+                self.mp_custom = false;
+                self.mp_server = a.to_string();
+            }
+            None => {}
+        }
+        if self.mp_custom || (!auto && !listed) {
+            ui.add(egui::TextEdit::singleline(&mut self.mp_server).desired_width(260.0).char_limit(100).hint_text("host[:port]"));
+        }
+        ui.horizontal(|ui| {
+            let note = match (&err, servers.is_empty()) {
+                (Some(e), _) => t!("Server list unavailable: {}", "Liste des serveurs indisponible : {}", e.chars().take(50).collect::<String>()),
+                (None, true) => t!("Reading the server list…", "Lecture de la liste des serveurs…").to_string(),
+                (None, false) => i18n::plural(servers.iter().filter(|s| s.up).count() as u64, "server online", "servers online", "serveur en ligne", "serveurs en ligne"),
+            };
+            ui.label(RichText::new(note).size(11.5).color(menu::DIM));
+            if ui.small_button(t!("Refresh", "Actualiser")).clicked() {
+                self.mp_directory().refresh();
+            }
+        });
+    }
+
+    fn mp_auto(&self) -> bool {
+        self.mp_server.trim().is_empty() || self.mp_server.trim().eq_ignore_ascii_case("auto")
+    }
+    /// The network's server list (read in the background from the first call on).
+    fn mp_directory(&mut self) -> &mp::Directory {
+        let (src, url) = (self.src.clone(), self.mp_list.clone());
+        self.mp_dir.get_or_insert_with(|| mp::Directory::start(src, &url))
+    }
+    /// A server's name in the list, by its address (else the address itself).
+    fn mp_server_name(&self, address: &str) -> String {
+        let a = mp::with_port(address);
+        self.mp_dir.as_ref().and_then(|d| d.servers().into_iter().find(|s| s.address == a).map(|s| s.name)).unwrap_or_else(|| address.to_string())
     }
 
     fn controls(&mut self, dt: f64) -> Controls {
@@ -4575,7 +4689,7 @@ impl Game {
                             ui.checkbox(&mut self.mp_on, t!("see the other players, and be seen", "voir les autres joueurs, et être vu"));
                             ui.end_row();
                             ui.label(t!("Server", "Serveur"));
-                            ui.add(egui::TextEdit::singleline(&mut self.mp_server).desired_width(180.0).char_limit(100).hint_text("danux.be"));
+                            ui.vertical(|ui| self.mp_server_picker(ui));
                             ui.end_row();
                             ui.label(t!("Your name", "Votre nom"));
                             ui.add(egui::TextEdit::singleline(&mut self.mp_name).desired_width(180.0).char_limit(mp_proto::NAME_MAX).hint_text(t!("shown to the others", "montré aux autres")));
@@ -4886,6 +5000,9 @@ impl Game {
                             ui.add_space(6.0);
                             menu::heading(ui, t!("MULTIPLAYER", "MULTIJOUEUR"));
                             match self.mp.as_ref().map(|m| m.status()) {
+                                None if self.mp_on => {
+                                    ui.label(RichText::new(t!("Looking for the fastest server…", "Recherche du serveur le plus rapide…")).size(12.0).color(DIM));
+                                }
                                 None => {
                                     ui.label(RichText::new(t!("Off (pause menu, Settings).", "Désactivé (menu pause, Réglages).")).size(12.0).color(DIM));
                                 }
@@ -4893,11 +5010,14 @@ impl Game {
                                     ui.label(RichText::new(t!("No connection: {}", "Pas de connexion : {}", e.chars().take(60).collect::<String>())).size(12.0).color(DIM));
                                 }
                                 Some(mp::Status::Connecting) => {
-                                    ui.label(RichText::new(t!("Connecting to {}…", "Connexion à {}…", self.mp_server)).size(12.0).color(DIM));
+                                    let to = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
+                                    ui.label(RichText::new(t!("Connecting to {}…", "Connexion à {}…", to)).size(12.0).color(DIM));
                                 }
                                 Some(mp::Status::Connected) => {
                                     let me = self.plane.pos;
                                     let n = self.mp_players.len();
+                                    let on = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
+                                    ui.label(RichText::new(t!("Server: {}", "Serveur : {}", on)).size(12.0).color(TEXT));
                                     ui.label(RichText::new(i18n::plural(n as u64, "other pilot nearby", "other pilots nearby", "autre pilote à proximité", "autres pilotes à proximité")).size(12.0).color(DIM));
                                     egui::Grid::new("info_mp").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
                                         for p in self.mp_players.iter().take(8) {

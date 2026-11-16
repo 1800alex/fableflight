@@ -31,7 +31,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, taa: true, live_traffic: true, live_weather: true, real_time: true, multiplayer: false, mp_server: "danux.be".into(), mp_name: String::new() }
+        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, taa: true, live_traffic: true, live_weather: true, real_time: true, multiplayer: false, mp_server: "auto".into(), mp_name: String::new() }
     }
 }
 

@@ -66,6 +66,8 @@ pub struct Remote {
 pub struct Mp {
     pub server: String,
     pub name: String,
+    /// picked by the server list ("auto"), not typed in
+    pub auto: bool,
     shared: Arc<Shared>,
 }
 
@@ -83,7 +85,7 @@ impl Mp {
                 }
             })
             .ok();
-        Mp { server: server.trim().to_string(), name: proto::clean_name(name), shared }
+        Mp { server: server.trim().to_string(), name: proto::clean_name(name), auto: false, shared }
     }
 
     /// What to send next: our aircraft now.
@@ -211,6 +213,133 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the list of the network's servers is read from (the main relay's
+/// `/servers.json`, see relay/).
+pub const DIRECTORY_URL: &str = "https://fableflight.danux.be/servers.json";
+
+/// A server of the network, as the list gives it and as we hear it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerEntry {
+    pub name: String,
+    /// "host:port" to connect to
+    pub address: String,
+    pub up: bool,
+    pub flying: u32,
+    /// how long it takes to answer us (ms), when it does
+    pub ping_ms: Option<u32>,
+}
+
+struct DirShared {
+    servers: Mutex<Vec<ServerEntry>>,
+    error: Mutex<Option<String>>,
+    now: AtomicBool,
+    stop: AtomicBool,
+}
+
+/// The network's servers, read every 30 seconds from the main relay and
+/// pinged (a Hello and the time to its Welcome), in a background thread.
+pub struct Directory {
+    shared: Arc<DirShared>,
+}
+
+impl Directory {
+    pub fn start(src: Arc<crate::sources::Sources>, url: &str) -> Self {
+        let shared = Arc::new(DirShared { servers: Mutex::new(Vec::new()), error: Mutex::new(None), now: AtomicBool::new(true), stop: AtomicBool::new(false) });
+        let (sh, url) = (shared.clone(), url.to_string());
+        std::thread::Builder::new()
+            .name("server list".into())
+            .spawn(move || {
+                let mut last = Instant::now() - Duration::from_secs(3600);
+                while !sh.stop.load(Ordering::Relaxed) {
+                    if sh.now.swap(false, Ordering::Relaxed) || last.elapsed() > Duration::from_secs(30) {
+                        last = Instant::now();
+                        match src.fetch.get(&url).map_err(|e| e.to_string()).and_then(|d| parse_servers(&d, &url).ok_or_else(|| "unreadable list".to_string())) {
+                            Ok(mut list) => {
+                                for s in list.iter_mut().filter(|s| s.up) {
+                                    s.ping_ms = ping(&s.address);
+                                }
+                                *sh.servers.lock().unwrap() = list;
+                                *sh.error.lock().unwrap() = None;
+                            }
+                            Err(e) => *sh.error.lock().unwrap() = Some(e),
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            })
+            .ok();
+        Directory { shared }
+    }
+    pub fn servers(&self) -> Vec<ServerEntry> {
+        self.shared.servers.lock().unwrap().clone()
+    }
+    pub fn error(&self) -> Option<String> {
+        self.shared.error.lock().unwrap().clone()
+    }
+    /// Reads the list again now.
+    pub fn refresh(&self) {
+        self.shared.now.store(true, Ordering::Relaxed);
+    }
+    /// The server that answers us fastest.
+    pub fn best(&self) -> Option<ServerEntry> {
+        self.servers().into_iter().filter(|s| s.up && s.ping_ms.is_some()).min_by_key(|s| s.ping_ms)
+    }
+}
+
+impl Drop for Directory {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// "host:port", the default port added when there is none.
+pub fn with_port(server: &str) -> String {
+    let s = server.trim();
+    if s.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { s.to_string() } else { format!("{s}:{}", proto::DEFAULT_PORT) }
+}
+
+/// The list in `/servers.json`. A server without an address (the main relay
+/// itself, when it does not say) is at the list's own host.
+fn parse_servers(data: &[u8], url: &str) -> Option<Vec<ServerEntry>> {
+    let j: serde_json::Value = serde_json::from_slice(data).ok()?;
+    let host = url.split("://").nth(1)?.split(['/', ':']).next()?.to_string();
+    let list = j["servers"].as_array()?;
+    Some(
+        list.iter()
+            .take(64)
+            .filter_map(|s| {
+                let name = proto::clean_name(s["name"].as_str()?);
+                let address = with_port(s["address"].as_str().unwrap_or(&host));
+                Some(ServerEntry { name, address, up: s["up"].as_bool().unwrap_or(false), flying: s["flying"].as_u64().unwrap_or(0) as u32, ping_ms: None })
+            })
+            .collect(),
+    )
+}
+
+/// The best of two Hello / Welcome round trips (ms), None if it never answers.
+fn ping(server: &str) -> Option<u32> {
+    let addr = server.to_socket_addrs().ok()?.next()?;
+    let sock = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
+    sock.connect(addr).ok()?;
+    sock.set_read_timeout(Some(Duration::from_millis(800))).ok()?;
+    let hello = Msg::Hello { name: String::new() }.encode();
+    let mut buf = [0u8; 256];
+    let mut best: Option<u32> = None;
+    for _ in 0..2 {
+        let t0 = Instant::now();
+        if sock.send(&hello).is_err() {
+            continue;
+        }
+        if let Ok(n) = sock.recv(&mut buf) {
+            if matches!(Msg::decode(&buf[..n]), Some(Msg::Welcome { .. })) {
+                let ms = t0.elapsed().as_millis() as u32;
+                best = Some(best.map_or(ms, |b| b.min(ms)));
+            }
+        }
+    }
+    best
+}
+
 /// Which traffic model stands for each of our aircraft (airmodels::TYPES:
 /// light single, business jet, regional, narrow-body, wide-body).
 pub fn size_of(aircraft: u8) -> u8 {
@@ -290,6 +419,17 @@ mod tests {
         assert!((at(1, &p, 1.05).unwrap().pos.y - 2.5).abs() < 1e-6, "halfway");
         assert!((at(1, &p, 1.3).unwrap().pos.y - 15.0).abs() < 1e-6, "flown on at 50 m/s");
         assert!((at(1, &p, 9.0).unwrap().pos.y - 55.0).abs() < 1e-6, "for a second at most");
+    }
+
+    #[test]
+    fn the_server_list_is_read() {
+        let j = r#"{"servers":[{"name":"France · danux.be","address":null,"up":true,"flying":3},{"name":"US","address":"203.0.113.9:7480","up":false,"flying":0},{"name":"Asia","address":"asia.example.com","up":true,"flying":1}]}"#.as_bytes();
+        let l = parse_servers(j, "https://fableflight.danux.be/servers.json").unwrap();
+        assert_eq!(l.len(), 3);
+        assert_eq!((l[0].name.as_str(), l[0].address.as_str(), l[0].flying), ("France · danux.be", "fableflight.danux.be:7480", 3));
+        assert_eq!((l[1].address.as_str(), l[1].up), ("203.0.113.9:7480", false));
+        assert_eq!(l[2].address, "asia.example.com:7480");
+        assert!(parse_servers(b"nonsense", DIRECTORY_URL).is_none());
     }
 
     #[test]

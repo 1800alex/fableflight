@@ -18,6 +18,8 @@ services:
       FFMP_RANGE_KM: "150"
       # This relay's name, as the network and the status page show it.
       FFMP_NAME: "my relay"
+      # Where players reach this relay, as the game's server list shows it.
+      FFMP_PUBLIC: ""
       # Federation: the network's shared secret (16+ characters, the same on
       # every relay), and its main relay: this one makes itself known there and
       # finds all the others. (On the main relay itself, leave FFMP_HUB empty.)
