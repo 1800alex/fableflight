@@ -93,16 +93,21 @@ impl Graphics {
     /// Sets everything a preset covers (not taa or vsync).
     pub fn apply(&mut self, l: Level) {
         let l = if l == Level::Off { Level::Low } else { l };
-        self.scale = l.pick(0.5, 0.85, 1.0, 1.5) as f32;
-        // Low is for weak GPUs: the shadow cascades redraw the whole scene, so they go.
-        self.shadows = if l == Level::Low { Level::Off } else { l };
+        // One step per preset: each one down is roughly half the GPU work of
+        // the one above (pixels, then the shadow cascades, which redraw the scene).
+        self.scale = l.pick(0.5, 0.7, 1.0, 1.5) as f32;
+        self.shadows = match l {
+            Level::Off | Level::Low => Level::Off,
+            Level::Medium => Level::Low,
+            h => h,
+        };
         self.clouds = l;
         self.terrain = l;
         self.scenery = l;
         self.city = l;
         self.trees = l;
         self.cars = if l == Level::Ultra { Level::High } else { l };
-        self.ao = l != Level::Low;
+        self.ao = matches!(l, Level::High | Level::Ultra);
     }
 
     /// The preset these settings are, if any.
@@ -250,7 +255,7 @@ impl Graphics {
         });
         ui.label(RichText::new(match self.matches() {
             Some(Level::Low) => "Low: 50% resolution, no shadows, quicker clouds, nearer scenery, simpler cities and trees, light traffic, no ambient occlusion.",
-            Some(Level::Medium) => "Medium: 85% resolution and a lighter version of everything else.",
+            Some(Level::Medium) => "Medium: 70% resolution, a coarse shadow map, no ambient occlusion and a lighter version of everything else.",
             Some(Level::High) => "High: the full look at the window's own resolution (what the game has always drawn).",
             Some(Level::Ultra) => "Ultra: past High. Supersampled at 150%, a 6K shadow map, finer clouds, terrain and scenery further out. Wants a strong GPU.",
             _ => "Custom: tuned below.",
