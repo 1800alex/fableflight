@@ -2588,6 +2588,9 @@ impl Renderer {
         };
         let mut inst_ranges = Vec::new();
         if let Some(lib) = &self.inst_lib {
+            // near to far within each model, and the nearest kept if over the cap.
+            let d2 = |i: &Inst| i.m[0][3] * i.m[0][3] + i.m[1][3] * i.m[1][3] + i.m[2][3] * i.m[2][3];
+            f.insts.sort_by(|a, b| d2(&a.1).total_cmp(&d2(&b.1)));
             let n = f.insts.len().min(MAX_INST);
             let (order, ranges) = group(lib.ranges.len(), &mut f.insts.iter().take(n).map(|i| i.0));
             let mut data = vec![Inst::zeroed(); n];
