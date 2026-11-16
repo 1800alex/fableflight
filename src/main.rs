@@ -663,6 +663,10 @@ struct Game {
     pad_skip: Option<(egui::FocusDirection, u8, u8)>,
     pad_rep: Option<(egui::Key, f64)>,
     pad_home: bool,
+    /// Y (North) held on the gamepad, and whether it has been used with
+    /// another button since: a Y chord arms or locks; Y alone fires.
+    pad_y: bool,
+    pad_y_combo: bool,
     /// the camera look the view starts out at (right stick click goes back to it)
     cam_home: (f64, f64),
     rng: crash::Rng,
@@ -875,7 +879,7 @@ impl Game {
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
-            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
+            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
@@ -1332,7 +1336,7 @@ impl Game {
     fn gamepad(&mut self, dt: f64, c: &mut Controls) {
         use gilrs::{Axis, Button, EventType};
         let Some(g) = self.gilrs.as_mut() else { return };
-        let (mut pressed, mut relayout) = (Vec::new(), false);
+        let (mut pressed, mut released, mut relayout) = (Vec::new(), Vec::new(), false);
         while let Some(ev) = g.next_event() {
             // Every device's axes and buttons go to the bindings (joysticks,
             // pedals, throttles); one with something bound is not the gamepad.
@@ -1355,6 +1359,7 @@ impl Game {
                     self.pad_id = Some(ev.id);
                     pressed.push(b);
                 }
+                EventType::ButtonReleased(b, _) => released.push(b),
                 EventType::AxisChanged(..) | EventType::ButtonChanged(..) => {
                     if self.pad_id.is_none() {
                         self.pad_id = Some(ev.id);
@@ -1387,6 +1392,7 @@ impl Game {
             self.pad = Controls::default();
             padui::set_active(false);
             self.pad_rep = None;
+            (self.pad_y, self.pad_y_combo) = (false, false);
             return;
         };
         padui::set_active(true);
@@ -1498,8 +1504,25 @@ impl Game {
             }
         }
 
-        for b in pressed {
+        for &b in &pressed {
             self.pad_button(nav, b, modifier);
+        }
+        // Y is the weapon chord: Y + left/right arms or locks and uses the
+        // chord up, so releasing Y alone only fires when it was not used with
+        // another button. Y on its own fires at a locked target.
+        if pressed.contains(&Button::North) {
+            self.pad_y = true;
+            self.pad_y_combo = false;
+        }
+        if self.pad_y && pressed.iter().any(|b| *b != Button::North) {
+            self.pad_y_combo = true;
+        }
+        if released.contains(&Button::North) {
+            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && !self.crashed && self.mode == Mode::Fly && !self.pause_open && self.weapons.has_weapons() && self.weapons.lock >= 1.0 {
+                self.weapons.request_fire();
+            }
+            self.pad_y = false;
+            self.pad_y_combo = false;
         }
     }
 
@@ -2005,6 +2028,24 @@ impl Game {
                 self.pad_home = true;
             }
             (Nav::Panel, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) => {}
+            // Y and the d-pad: master arm and target lock.
+            (Nav::Off, Button::DPadLeft) if modifier => {
+                if !self.weapons.has_weapons() {
+                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                } else {
+                    let on = self.weapons.toggle_arm();
+                    self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
+                }
+                self.status_until = self.real + 3.0;
+            }
+            (Nav::Off, Button::DPadRight) if modifier => {
+                if !self.weapons.has_weapons() {
+                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                } else {
+                    self.weapons.request_cycle();
+                }
+                self.status_until = self.real + 3.0;
+            }
             (_, Button::Start) => self.set_pause_menu(true),
             (_, Button::South) if self.crashed => self.respawn_here(),
             (_, Button::Select) if modifier => {
@@ -5393,7 +5434,10 @@ impl ApplicationHandler for App {
                     std::process::exit(0);
                 }
             }
-            WindowEvent::Focused(false) => g.keys.clear(),
+            WindowEvent::Focused(false) => {
+                g.keys.clear();
+                (g.pad_y, g.pad_y_combo) = (false, false);
+            }
             WindowEvent::KeyboardInput { event: k, .. } => {
                 if let PhysicalKey::Code(raw) = k.physical_key {
                     // Waiting for a key (or Esc) to bind, or Esc calling off a joystick capture.
