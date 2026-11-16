@@ -59,6 +59,8 @@ pub struct Remote {
     pub vel: DVec3,
     pub gear: f32,
     pub flags: u8,
+    /// the report nearest that instant (controls, flaps, throttle…)
+    pub state: PlayerState,
 }
 
 pub struct Mp {
@@ -131,7 +133,7 @@ fn at(id: u32, p: &Peer, t: f64) -> Option<Remote> {
         let u = ((t - t0) / (t1 - t0).max(1e-6)).clamp(0.0, 1.0);
         (v3(a.pos).lerp(v3(b.pos), u), quat(a.rot).slerp(quat(b.rot), u), if u < 0.5 { a } else { b })
     };
-    Some(Remote { id, name: p.name.clone(), aircraft: s.aircraft, pos, rot, vel: v3(s.vel.map(|x| x as f64)), gear: s.gear as f32 / 255.0, flags: s.flags })
+    Some(Remote { id, name: p.name.clone(), aircraft: s.aircraft, pos, rot, vel: v3(s.vel.map(|x| x as f64)), gear: s.gear as f32 / 255.0, flags: s.flags, state: s })
 }
 
 /// The network side, until told to stop.
@@ -227,9 +229,11 @@ fn wheels_below(aircraft: u8) -> f64 {
 }
 
 /// The other players as traffic models with their lights (as live.rs draws
-/// the real traffic).
-pub fn instances(players: &[Remote], cam: DVec3, out: &mut Vec<(u32, Inst)>, lights: &mut Vec<Light>) {
+/// the real traffic). Those `full` are drawn with their own model already
+/// (main.rs `draw_mp_planes`): only their lights' glow is added here.
+pub fn instances(players: &[Remote], full: &[bool], cam: DVec3, out: &mut Vec<(u32, Inst)>, lights: &mut Vec<Light>) {
     for (i, p) in players.iter().enumerate() {
+        let own_model = full.get(i).copied().unwrap_or(false);
         if (p.pos - cam).length() > 40_000.0 {
             continue;
         }
@@ -240,10 +244,12 @@ pub fn instances(players: &[Remote], cam: DVec3, out: &mut Vec<(u32, Inst)>, lig
         let size = size_of(p.aircraft);
         let m = am::M_BODY + 3 * size as u32;
         // Each player gets a fin colour of their own.
-        out.push((m, inst(crate::traffic::BODY[0])));
-        out.push((m + 1, inst(crate::traffic::FIN[p.id as usize % crate::traffic::FIN.len()])));
-        if p.gear > 0.5 {
-            out.push((m + 2, inst([0.5; 3])));
+        if !own_model {
+            out.push((m, inst(crate::traffic::BODY[0])));
+            out.push((m + 1, inst(crate::traffic::FIN[p.id as usize % crate::traffic::FIN.len()])));
+            if p.gear > 0.5 {
+                out.push((m + 2, inst([0.5; 3])));
+            }
         }
         let ty = TYPES[size as usize];
         let at = |q: Vec3| -> [f32; 3] { (o + x * q.x + y * q.y - z * q.z).into() };

@@ -34,7 +34,8 @@ const VOL_CELLS: u64 = (VOL_N[0] * VOL_N[1] * VOL_N[2]) as u64;
 const UB_ALIGN: u64 = 256;
 const MAX_TILES: u64 = 1024;
 const MAX_BUILDS: u64 = 512; // detail tiles; one extra slot is kept for loose trees
-const MAX_OBJS: u64 = 256;
+/// pieces of aircraft (ours, wreckage, the other players') drawn in a frame
+pub const MAX_OBJS: u64 = 1024;
 /// airfields drawn at once, and lights on moving things (aircraft)
 pub const MAX_FIELDS: usize = 8;
 pub const MAX_DYN_LIGHTS: usize = 8192;
