@@ -119,6 +119,12 @@ impl Graphics {
         })
     }
 
+    /// Antialiasing samples per pixel (applied at the next start): Low keeps
+    /// to 2, which halves the G-buffer's memory and bandwidth.
+    pub fn samples(&self) -> u32 {
+        if self.matches() == Some(Level::Low) || self.scale <= 0.5 { 2 } else { 4 }
+    }
+
     /// Side of the sun's shadow map (texels; Off keeps a small unused one).
     pub fn shadow_res(&self) -> u32 {
         match self.shadows {

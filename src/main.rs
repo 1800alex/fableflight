@@ -972,7 +972,7 @@ impl Game {
         }
         gfx.vsync &= args.vsync;
         gfx.taa &= args.taa && prefs.taa;
-        let r = pollster::block_on(Renderer::new(window.clone(), gfx.vsync))?;
+        let r = pollster::block_on(Renderer::new(window.clone(), gfx.vsync, std::env::var("FABLE_MSAA").ok().and_then(|v| v.parse().ok()).unwrap_or(gfx.samples())))?;
         if let Some(sc) = args.render_scale {
             gfx.scale = sc;
         } else if r.integrated && !graphics::Graphics::saved() {

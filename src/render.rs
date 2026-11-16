@@ -18,7 +18,12 @@ pub(crate) const AMB: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// (`Renderer::set_shadow_res`; the shaders read the size off the texture).
 const SHADOW_RES: u32 = 4096;
 pub const CASCADES: usize = 3;
-pub(crate) const MSAA: u32 = 4;
+/// Samples per pixel of the scene's G-buffer: 4, or 2 on the Low preset
+/// (half the memory and bandwidth, for integrated GPUs). Fixed at startup.
+static MSAA_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4);
+pub(crate) fn msaa() -> u32 {
+    MSAA_N.load(std::sync::atomic::Ordering::Relaxed)
+}
 const MAX_INST: usize = 16384;
 const MAX_FALL: usize = 4096;
 /// trees and undergrowth close enough to the camera for their leaf cards
@@ -1386,7 +1391,7 @@ fn wave_texture() -> Vec<u8> {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<winit::window::Window>, vsync: bool) -> anyhow::Result<Self> {
+    pub async fn new(window: Arc<winit::window::Window>, vsync: bool, samples: u32) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone())?;
         let adapter = instance
@@ -1395,8 +1400,15 @@ impl Renderer {
         let info = adapter.get_info();
         log::info!("GPU: {} ({:?})", info.name, info.device_type);
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
+        // (4 samples are always supported; other counts need the adapter's own
+        // format features, and every G-buffer format to allow them)
+        let afeat = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        let ok = samples == 4 || (adapter.features().contains(afeat) && [HDR, AMB, DEPTH].iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(samples)));
+        MSAA_N.store(if ok { samples } else { 4 }, std::sync::atomic::Ordering::Relaxed);
+        let required_features = if msaa() != 4 { afeat } else { wgpu::Features::empty() };
+        log::info!("MSAA {}x", msaa());
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: None, required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, max_sampled_textures_per_shader_stage: adapter.limits().max_sampled_textures_per_shader_stage.clamp(16, 32), ..Default::default() }, memory_hints: MEMORY_HINTS, ..Default::default() })
+            .request_device(&wgpu::DeviceDescriptor { label: None, required_features, required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, max_sampled_textures_per_shader_stage: adapter.limits().max_sampled_textures_per_shader_stage.clamp(16, 32), ..Default::default() }, memory_hints: MEMORY_HINTS, ..Default::default() })
             .await?;
         let size = window.inner_size();
         let mut config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).ok_or_else(|| anyhow::anyhow!("surface unsupported"))?;
@@ -1822,7 +1834,7 @@ impl Renderer {
                     stencil: Default::default(),
                     bias: if shadow { wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 } } else { Default::default() },
                 }),
-                multisample: wgpu::MultisampleState { count: if shadow { 1 } else { MSAA }, mask: !0, alpha_to_coverage_enabled: false },
+                multisample: wgpu::MultisampleState { count: if shadow { 1 } else { msaa() }, mask: !0, alpha_to_coverage_enabled: false },
                 fragment: if mode == 4 || mode == 13 {
                     Some(wgpu::FragmentState { module: m, entry_point: Some("fs_shadow"), compilation_options: Default::default(), targets: &[] })
                 } else if shadow {
@@ -2119,7 +2131,7 @@ impl Renderer {
         // scales it to the window's, where the UI goes on top.
         let (ow, oh) = (config.width, config.height);
         let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let ms = |label: &str, f| view(&make_tex_ms(d, label, w, h, 1, 1, f, rt, MSAA));
+        let ms = |label: &str, f| view(&make_tex_ms(d, label, w, h, 1, 1, f, rt, msaa()));
         let (color_ms, aux_ms, amb_ms, depth_ms) = (ms("color ms", HDR), ms("aux ms", HDR), ms("amb ms", AMB), ms("depth ms", DEPTH));
         let amb = view(&make_tex(d, "amb", w, h, 1, 1, AMB, rt));
         let ao_raw = view(&make_tex(d, "ao raw", w, h, 1, 1, AMB, rt));
