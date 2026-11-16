@@ -263,36 +263,55 @@ fn controls(b: &mut Builder) {
 
 // ---------------------------------------------------------------- canopy
 
+/// How far the bubble slides open (m), and which way: forward, rising a
+/// little on its rails so it rides over the windscreen.
+const SLIDE: f32 = 0.58;
+fn slide_dir() -> Vec3 {
+    Vec3::new(0.0, 0.17, -1.0).normalize()
+}
+
 fn canopy(b: &mut Builder) {
     let (z0, z1) = (CANOPY[0] - 0.02, CANOPY[1] + 0.02);
-    let nz = 90;
-    let nu = 48;
-    let rows: Vec<Vec<SP>> = (0..=nz)
-        .map(|i| {
-            let z = z0 + (z1 - z0) * i as f32 / nz as f32;
-            (0..=nu).map(|k| { let p = canopy_pt(z, k as f32 / nu as f32 * 2.0); (p, [z, p.x], 0.0) }).collect()
-        })
-        .collect();
-    let mut g = Mesh::default();
-    g.grid(&mt(mat::GLASS, 0.0, 0.0, 0.0), &rows, false, false);
-    let k = b.fixed("canopy", G_FUSE, g);
+    let glass = |za: f32, zb: f32, nz: usize, grow: f32| -> Mesh {
+        let nu = 48;
+        let rows: Vec<Vec<SP>> = (0..=nz)
+            .map(|i| {
+                let z = za + (zb - za) * i as f32 / nz as f32;
+                (0..=nu).map(|k| { let p = canopy_pt(z, k as f32 / nu as f32 * 2.0); let p = Vec3::new(p.x * grow, p.y + (grow - 1.0) * 0.5, p.z); (p, [z, p.x], 0.0) }).collect()
+            })
+            .collect();
+        let mut g = Mesh::default();
+        g.grid(&mt(mat::GLASS, 0.0, 0.0, 0.0), &rows, false, false);
+        g
+    };
+    // The windscreen, fixed to the cowl deck, and the bubble behind it (a
+    // shade bigger, so it slides over the windscreen without touching it).
+    let k = b.fixed("windscreen", G_FUSE, glass(z0, SCREEN_Z, 30, 1.0));
     b.pieces[k].glass = true;
     b.pieces[k].occluder = false;
-    // Its frame: the arch where the windscreen ends, the rear bow, the rails on the sills.
-    let mut f = Mesh::default();
+    let open = || Anim::slide(Drive::new(Input::Canopy, SLIDE), slide_dir());
+    let k = b.add("canopy", G_FUSE, glass(SCREEN_Z, z1, 64, 1.01), open(), Vec3::ZERO, Vec3::Z, None);
+    b.pieces[k].glass = true;
+    b.pieces[k].occluder = false;
+    // The bubble's frame: its front arch with the handle, the rear bow.
     let frame = mt(mat::PAINT, 0.80, 0.80, 0.78);
-    for (z, r) in [(SCREEN_Z, 0.012f32), (CANOPY[1] - 0.05, 0.016)] {
-        let arc: Vec<Vec3> = (0..=40).map(|k| canopy_pt(z, k as f32 / 20.0) + Vec3::Y * 0.004).collect();
+    let mut f = Mesh::default();
+    for (z, r) in [(SCREEN_Z + 0.006, 0.012f32), (CANOPY[1] - 0.05, 0.016)] {
+        let arc: Vec<Vec3> = (0..=40).map(|k| { let p = canopy_pt(z, k as f32 / 20.0); Vec3::new(p.x * 1.01, p.y + 0.009, p.z) }).collect();
         f.tube(&frame, &arc, &|_| r, 8, true);
     }
+    let h = canopy_pt(SCREEN_Z + 0.04, 1.0) - Vec3::Y * 0.03;
+    f.tube(&BLACK, &[h - Vec3::X * 0.06, h - Vec3::X * 0.06 - Vec3::Y * 0.02, h + Vec3::X * 0.06 - Vec3::Y * 0.02, h + Vec3::X * 0.06], &|_| 0.007, 8, true);
+    b.add("canopy frame", G_FUSE, f, open(), Vec3::ZERO, Vec3::Z, None);
+    // Fixed: the windscreen's top edge and the rails on the sills.
+    let mut r = Mesh::default();
+    let arc: Vec<Vec3> = (0..=40).map(|k| canopy_pt(SCREEN_Z - 0.004, k as f32 / 20.0) + Vec3::Y * 0.002).collect();
+    r.tube(&frame, &arc, &|_| 0.006, 8, true);
     for sx in [-1.0f32, 1.0] {
         let rail: Vec<Vec3> = (0..=30).map(|k| { let z = z0 + (z1 - z0) * k as f32 / 30.0; let s = sill(z); Vec3::new(sx * (s.x + 0.004), s.y + 0.006, z) }).collect();
-        f.tube(&CHROME, &rail, &|_| 0.008, 8, true);
+        r.tube(&CHROME, &rail, &|_| 0.008, 8, true);
     }
-    // The handle inside the arch.
-    let h = canopy_pt(SCREEN_Z + 0.03, 1.0) - Vec3::Y * 0.03;
-    f.tube(&BLACK, &[h - Vec3::X * 0.06, h - Vec3::X * 0.06 - Vec3::Y * 0.02, h + Vec3::X * 0.06 - Vec3::Y * 0.02, h + Vec3::X * 0.06], &|_| 0.007, 8, true);
-    b.fixed("canopy frame", G_FUSE, f);
+    b.fixed("canopy rails", G_FUSE, r);
 }
 
 // ---------------------------------------------------------------- what the eye sees

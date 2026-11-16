@@ -604,6 +604,8 @@ pub enum Input {
     Reverser,
     /// the Mach number (inlet spikes follow it)
     Mach,
+    /// a sliding canopy, 0 shut .. 1 fully open
+    Canopy,
 }
 
 /// How an input is shaped before it moves a piece.
@@ -694,6 +696,13 @@ impl Anim {
     /// Turns by `t`, then slides along `dir` by `s`.
     pub const fn turn_slide(t: Drive, s: Drive, dir: Vec3) -> Self {
         Anim::Move(Motion { turn: [t, Drive::NONE], slide: s, dir })
+    }
+    /// Whether any of its drives follows `i`.
+    pub fn uses(&self, i: Input) -> bool {
+        match self {
+            Anim::Move(m) => m.turn.iter().chain(std::iter::once(&m.slide)).any(|d| d.gain != 0.0 && d.input == i),
+            _ => false,
+        }
     }
 }
 

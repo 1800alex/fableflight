@@ -123,6 +123,9 @@ pub struct Plane {
     /// gear position, 0 stowed .. 1 down and locked, and where the handle is
     pub gear: f64,
     pub gear_down: bool,
+    /// a sliding canopy, 0 shut .. 1 open, and which way it is going
+    pub canopy: f64,
+    pub canopy_open: bool,
     /// per landing gear leg (see `Spec::gear`): how far its oleo or spring is
     /// compressed (m), how far its wheels have turned (rad) and how fast (rad/s)
     pub compress: [f64; MAX_GEAR],
@@ -259,6 +262,8 @@ impl Plane {
             // Airborne starts are cleaned up: gear stowed (unless it is fixed).
             gear: if spec.fixed_gear() { 1.0 } else { 0.0 },
             gear_down: spec.fixed_gear(),
+            canopy: 0.0,
+            canopy_open: false,
             compress: [0.0; MAX_GEAR],
             wheel_rot: [0.0; MAX_GEAR],
             wheel_spin: [0.0; MAX_GEAR],
@@ -456,6 +461,10 @@ impl Plane {
             self.gear_down = !self.gear_down;
         }
     }
+    /// Slides the canopy open or shut (the model decides whether it has one).
+    pub fn toggle_canopy(&mut self) {
+        self.canopy_open = !self.canopy_open;
+    }
     pub fn set_flaps(&mut self, delta: i32) {
         self.flap_set = (self.flap_set as i32 + delta).clamp(0, self.spec.max_notch() as i32) as u8;
     }
@@ -556,6 +565,7 @@ impl Plane {
             Input::Trim => self.trim as f32,
             Input::Reverser => self.reverser as f32,
             Input::Mach => self.mach() as f32,
+            Input::Canopy => self.canopy as f32,
         }
     }
 
@@ -1212,6 +1222,8 @@ impl Plane {
             self.gear_down = true;
         }
         self.gear = (self.gear + if self.gear_down { spec.gear_rate * dt } else { -spec.gear_rate * dt }).clamp(0.0, 1.0);
+        // A canopy slides open or shut in about two seconds.
+        self.canopy = (self.canopy + if self.canopy_open { 0.5 * dt } else { -0.5 * dt }).clamp(0.0, 1.0);
 
         let (lat, lon, h) = geo::pos_to_lla(self.pos);
         let upw = self.pos.normalize();
@@ -1284,6 +1296,8 @@ impl Plane {
             // Ragged stumps and missing fairings all drag.
             let rag = ((spec.span - dm.wing[0]) + (spec.span - dm.wing[1])) as f64 / k as f64;
             let cd = cd
+                // An open canopy: the cockpit is a hole in the airframe.
+                + 0.03 * self.canopy
                 + spec.chute.as_ref().map_or(0.0, |ch| ch.cda * self.spoilers / area)
                 + self.wave_cd(mach)
                 + 0.02 * rag
@@ -3254,6 +3268,26 @@ mod tests {
     }
 
     #[test]
+    fn a_dr400_canopy_slides_open_and_drags() {
+        let w = empty_world();
+        let model = (DR400.build)();
+        let k = model.pieces.iter().position(|p| p.name == "canopy").unwrap();
+        assert!(model.pieces[k].anim.uses(Input::Canopy));
+        let mut p = Plane::spawn(DR400, 0.6, -2.1, 300.0, 0.0, 50.0);
+        let shut = p.pose(&model.pieces)[k];
+        p.toggle_canopy();
+        let (v_open, _) = fly(&mut p, &w, 60.0, 0.75, hold_alt(300.0));
+        assert_eq!(p.canopy, 1.0);
+        let moved = p.pose(&model.pieces)[k].transform_point3(Vec3::ZERO) - shut.transform_point3(Vec3::ZERO);
+        println!("DR 400 canopy open: moved {moved:?}, {:.0} kt", v_open * KT);
+        assert!(moved.z < -0.5 && moved.y > 0.05, "{moved:?}");
+        p.toggle_canopy();
+        let (v_shut, _) = fly(&mut p, &w, 60.0, 0.75, hold_alt(300.0));
+        assert_eq!(p.canopy, 0.0);
+        assert!(v_shut > v_open + 1.0, "{v_shut} {v_open}");
+    }
+
+    #[test]
     fn a_dr400_takes_off_and_climbs() {
         let w = flat_world();
         let s = DR400;
@@ -3280,7 +3314,7 @@ mod tests {
         let (dist, vlo) = lifted.expect("it never left the ground");
         let (_, _, h) = geo::pos_to_lla(p.pos);
         println!("DR 400 lift-off after {dist:.0} m at {:.0} kt; at 60 s: {h:.0} m, {:.0} kt", vlo * KT, p.vel.length() * KT);
-        assert!(dist > 150.0 && dist < 350.0, "{dist}");
+        assert!(dist > 120.0 && dist < 300.0 && vlo * KT < 62.0, "{dist} {}", vlo * KT);
         assert!(h > 150.0, "{h}");
         assert!(p.notes.is_empty() && p.dmg.gear.iter().all(|g| *g), "{:?}", p.notes);
     }
@@ -4010,7 +4044,7 @@ mod tests {
     #[test]
     fn a_747_settles_on_its_gear() {
         let w = flat_world();
-        for (spec, wind) in [(C172, 0.0), (B747, 0.0), (C172, 6.0), (B747, 6.0)] {
+        for (spec, wind) in [(C172, 0.0), (B747, 0.0), (DR400, 0.0), (C172, 6.0), (B747, 6.0), (DR400, 6.0)] {
             let mut p = Plane::spawn_ground(spec, 37.6, -122.37, 0.0, 0.5, 0.0);
             // A tailwind, parked: no airflow worth the name over the wing.
             p.wind = p.forward() * wind;

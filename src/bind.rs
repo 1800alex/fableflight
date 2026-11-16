@@ -117,6 +117,7 @@ pub const ACTIONS: &[Action] = &[
     act("flaps_up", KeyCode::KeyV, "Flaps up a notch", "Volets : rentrer d'un cran"),
     act("gear", KeyCode::KeyL, "Landing gear", "Train d'atterrissage"),
     act("speedbrake", KeyCode::Slash, "Speedbrake", "Aérofreins"),
+    act("canopy", KeyCode::Digit3, "Canopy open / shut", "Verrière : ouvrir / fermer"),
     act("reversers", KeyCode::KeyZ, "Thrust reversers (hold)", "Inverseurs de poussée (maintenir)"),
     act("boost", KeyCode::Space, "Boost / afterburner", "Boost / postcombustion"),
     act("engines", KeyCode::Digit1, "Rocket: which engines burn", "Fusée : choix des moteurs allumés"),

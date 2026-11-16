@@ -159,6 +159,7 @@ fn fr(en: &str) -> Option<&'static str> {
         "wheel brakes" => "freins de roues",
         "flaps down / up a notch" => "volets : sortir / rentrer d'un cran",
         "landing gear down / up" => "train d'atterrissage : sortir / rentrer",
+        "slide the canopy open / shut (Robin)" => "ouvrir / fermer la verrière coulissante (Robin)",
         "speedbrake (airliners)" => "aérofreins (avions de ligne)",
         "thrust reversers, on the ground (hold)" => "inverseurs de poussée, au sol (maintenir)",
         "set the heading indicator to the compass" => "recaler le conservateur de cap sur le compas",

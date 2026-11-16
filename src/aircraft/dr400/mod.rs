@@ -52,9 +52,9 @@ const V_NONE: f64 = 1e9;
 /// The tyres touch the ground here (body y), the gear at rest.
 pub const GROUND_Y: f32 = -1.20;
 
-const fn leg(at: DVec3, r: f32, travel: f64, steer: f64, name: &'static str) -> Leg {
+const fn leg(at: DVec3, r: f32, travel: f64, k: f64, steer: f64, name: &'static str) -> Leg {
     // (Fixed gear: it never folds, so no fold speed or kick.)
-    Leg { at, wheel_r: r as f64, travel, k: 60_000.0, c: 6_000.0, nf_max: 110_000.0, steer, brakes: true, side_k: 5000.0, side_mu: 0.9, roll_k: 80.0, roll_mu: 0.025, brake_k: 2400.0, brake_mu: 0.55, fold_vn: 1e9, fold_kick: DVec3::ZERO, name }
+    Leg { at, wheel_r: r as f64, travel, k, c: k * 0.1, nf_max: 110_000.0, steer, brakes: true, side_k: 5000.0, side_mu: 0.9, roll_k: 80.0, roll_mu: 0.025, brake_k: 2400.0, brake_mu: 0.55, fold_vn: 1e9, fold_kick: DVec3::ZERO, name }
 }
 
 pub static SPEC: Spec = Spec {
@@ -122,9 +122,9 @@ pub static SPEC: Spec = Spec {
         DVec3::new(0.0, -0.965, NOSE_AXLE.z as f64 + DZ64),
     ],
     gear: &[
-        leg(DVec3::new(0.0, -1.20, NOSE_AXLE.z as f64 + DZ64), NOSE_R, 0.10, 1.0, "NOSE GEAR"),
-        leg(DVec3::new(-1.30, -1.20, MAIN_AXLE.z as f64 + DZ64), MAIN_R, 0.08, 0.0, "LEFT MAIN GEAR"),
-        leg(DVec3::new(1.30, -1.20, MAIN_AXLE.z as f64 + DZ64), MAIN_R, 0.08, 0.0, "RIGHT MAIN GEAR"),
+        leg(DVec3::new(0.0, -1.20, NOSE_AXLE.z as f64 + DZ64), NOSE_R, 0.10, 45_000.0, 1.0, "NOSE GEAR"),
+        leg(DVec3::new(-1.30, -1.20, MAIN_AXLE.z as f64 + DZ64), MAIN_R, 0.08, 120_000.0, 0.0, "LEFT MAIN GEAR"),
+        leg(DVec3::new(1.30, -1.20, MAIN_AXLE.z as f64 + DZ64), MAIN_R, 0.08, 120_000.0, 0.0, "RIGHT MAIN GEAR"),
     ],
     hull: Hull { k: 50_000.0, c: 7_500.0, nf_max: 100_000.0, drag: 2600.0 },
     hole: Hole { fus: [0.56, 0.62, -0.30, 0.45], wing: [-0.66, 0.14, 0.13, 0.08], stab: [0.06, 0.05, 1.60], fin: [0.06, 0.97, 0.12, 0.06], pods: [[0.0; 3]; 2] },
@@ -356,10 +356,10 @@ fn skin_th0(z: f32) -> f32 {
 // Landing gear geometry (body frame, right side for the mains).
 pub const NOSE_AXLE: Vec3 = Vec3::new(0.0, GROUND_Y + NOSE_R, -1.98);
 pub const NOSE_R: f32 = 0.165;
-pub const MAIN_AXLE: Vec3 = Vec3::new(1.30, GROUND_Y + MAIN_R, -0.30);
+pub const MAIN_AXLE: Vec3 = Vec3::new(1.30, GROUND_Y + MAIN_R, -0.40);
 pub const MAIN_R: f32 = 0.19;
 /// where the main legs come out of the wing's lower skin
-pub const MAIN_ROOT: Vec3 = Vec3::new(1.10, -0.76, -0.45);
+pub const MAIN_ROOT: Vec3 = Vec3::new(1.10, -0.76, -0.55);
 pub const PROP_HUB: Vec3 = Vec3::new(0.0, -0.05, -2.46);
 /// the pilot's eye (left front seat)
 pub const EYE: Vec3 = Vec3::new(-0.27, 0.30, -0.36);
@@ -771,14 +771,15 @@ fn engine(b: &mut Builder) {
 /// for the tyre, `l` long, `w` wide, `h` tall.
 fn spat(m: &mut Mesh, axle: Vec3, l: f32, w: f32, h: f32) {
     let mat = WHITE.pat(pat::COWL);
-    m.patch(&mat, 24, 20, false, |a, c| {
+    m.patch(&mat, 24, 20, true, |a, c| {
         // a: round the shell from the slot's right edge over the top to its left; c: nose to tail.
-        let th = -0.62 * PI + a * 1.24 * PI;
+        // (Down to below the axle on both sides: only the bottom of the tyre shows.)
+        let th = -0.72 * PI + a * 1.44 * PI;
         let zt = -0.42 + c * 1.0;
         // Teardrop: blunt nose, long tail.
         let r = if zt < 0.0 { (1.0 - (zt / 0.42).powi(2)).max(0.0).sqrt() } else { (1.0 - (zt / 0.58).powf(1.6)).max(0.0).powf(0.8) };
         let p = Vec3::new(w * 0.5 * r * th.sin(), h * 0.5 * r * th.cos(), zt * l);
-        (axle + p + Vec3::new(0.0, 0.03, 0.0), [a, c], 0.0)
+        (axle + p - Vec3::new(0.0, 0.01, 0.0), [a, c], 0.0)
     });
 }
 
@@ -796,7 +797,7 @@ fn gear(b: &mut Builder) {
     let (l, r) = b.pair(["left main wheel", "right main wheel"], [G_GEAR, G_GEAR], wh, |s| Anim::hinge(Drive::new(Input::Wheel(if s < 0.0 { 1 } else { 2 }), -1.0)), MAIN_AXLE, Vec3::X, [Some(ll), Some(lr)]);
     b.role(l, Role::Gear(1)).role(r, Role::Gear(2));
     let mut sp = Mesh::default();
-    spat(&mut sp, MAIN_AXLE, 0.80, 0.26, 0.46);
+    spat(&mut sp, MAIN_AXLE, 0.82, 0.24, 0.42);
     let (l, r) = b.pair(["left wheel fairing", "right wheel fairing"], [G_GEAR, G_GEAR], sp, |_| Anim::Fixed, MAIN_AXLE, Vec3::X, [Some(ll), Some(lr)]);
     b.role(l, Role::Gear(1)).role(r, Role::Gear(2));
 
@@ -816,7 +817,7 @@ fn gear(b: &mut Builder) {
     let k = b.add("nose wheel", G_GEAR, nw, Anim::hinge(Drive::new(Input::Wheel(0), -1.0)), NOSE_AXLE, Vec3::X, Some(fork));
     b.role(k, Role::Gear(0));
     let mut ns = Mesh::default();
-    spat(&mut ns, NOSE_AXLE, 0.62, 0.20, 0.40);
+    spat(&mut ns, NOSE_AXLE, 0.66, 0.20, 0.40);
     let k = b.add("nose fairing", G_GEAR, ns, Anim::Fixed, NOSE_AXLE, Vec3::X, Some(fork));
     b.role(k, Role::Gear(0));
 }
