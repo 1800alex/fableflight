@@ -2267,6 +2267,11 @@ impl Game {
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
             KeyCode::KeyL if !self.crashed => self.plane.toggle_gear(),
             KeyCode::Slash if !self.crashed => self.plane.toggle_speedbrake(),
+            KeyCode::Digit3 if !self.crashed && self.model.pieces.iter().any(|p| p.anim.uses(airframe::Input::Canopy)) => {
+                self.plane.toggle_canopy();
+                self.status = if self.plane.canopy_open { t!("Canopy open", "Verrière ouverte") } else { t!("Canopy shut", "Verrière fermée") }.into();
+                self.status_until = self.real + 3.0;
+            }
             KeyCode::Digit1 if !self.crashed => {
                 self.plane.next_engines();
                 if let Some((name, lit, _)) = self.plane.engines() {
