@@ -50,9 +50,15 @@ pub struct Local {
 /// A cell as seen from a point: (metres downwind of its centre, metres across
 /// the wind, metres above the cloud base, tower radius m, maturity 0..1,
 /// height of its tower above the base m), and the downwind and across axes.
+/// A squall line (common.wgsl `storm_sd`) lies across the wind, `len2` metres
+/// either side of its centre: `cxl` is along it, `cx` how far past its nearer
+/// end (for a lone cell the two are the same).
 struct At {
     dw0: f64,
     cx: f64,
+    cxl: f64,
+    len2: f64,
+    seed: f64,
     hb: f64,
     r: f64,
     age: f64,
@@ -82,7 +88,39 @@ fn cell_at(wx: &Weather, c: &[[f32; 4]; 2], pos: DVec3, w: DVec3) -> At {
     let alt = pos.length() - geo::R;
     let age = c[1][0] as f64;
     let at = c[1][1] as f64 - wx.base() as f64;
-    At { dw0: dv.dot(w), cx: dv.dot(x), hb: alt - wx.base() as f64, r: c[0][3] as f64 * 1000.0, age, htop: at * storm_top(age), w, x }
+    let (len2, seed) = line_of(c);
+    let cxl = dv.dot(x);
+    let cx = cxl.signum() * (cxl.abs() - len2).max(0.0);
+    At { dw0: dv.dot(w), cx, cxl, len2, seed, hb: alt - wx.base() as f64, r: c[0][3] as f64 * 1000.0, age, htop: at * storm_top(age), w, x }
+}
+
+/// A cell's squall-line half-length (m, 0 for a lone cell) and its seed: the
+/// whole and fractional parts of its 8th value (weather.rs).
+pub fn line_of(c: &[[f32; 4]; 2]) -> (f64, f64) {
+    let v = c[1][3] as f64;
+    (v.floor() * 500.0, v - v.floor())
+}
+
+/// A squall line's shelf cloud: its leading edge (the gust front) this far
+/// ahead of the line's axis, and its width, x the line's radius (common.wgsl
+/// SHELF_F, SHELF_W).
+pub const SHELF_F: f64 = 1.4;
+const SHELF_W: f64 = 0.65;
+
+/// How far back from a squall line's gust front a point is, m (negative
+/// ahead of it); the front bows in and out along the line (common.wgsl storm_sd).
+fn shelf_u(a: &At) -> f64 {
+    a.r * (SHELF_F + 0.12 * (a.cxl / 9000.0 + a.seed * 40.0).sin() + 0.07 * (a.cxl / 3700.0 + a.seed * 17.0).sin()) - a.dw0
+}
+
+/// A squall line's rain `u` m back from its gust front (radius `r`): how
+/// much, and how much of that is the heavy curtain (clouds.wgsl line_rain).
+fn line_rain(u: f64, r: f64) -> (f64, f64) {
+    let ws = SHELF_W * r;
+    let heavy = 1.0 - smoothstep(ws + 0.6 * r, ws + 1.2 * r, u);
+    let tail = 0.35 * (1.0 - smoothstep(ws + 1.2 * r, ws + 3.6 * r, u));
+    let on = smoothstep(0.7 * ws, 1.1 * ws, u);
+    (on * (tail + (1.0 - tail) * heavy), on * heavy)
 }
 
 /// How much rain a cell's shaft carries (clouds.wgsl `storm_rain`): once its
@@ -104,16 +142,22 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
     for (i, c) in wx.cells.iter().enumerate() {
         let a = cell_at(wx, c, pos, w);
         let r = a.r;
-        if a.dw0.hypot(a.cx) > r * 3.2 || a.hb > a.htop + 2000.0 {
+        let line = a.len2 > 0.0;
+        if a.dw0.hypot(a.cx) > r * if line { 5.0 } else { 3.2 } || a.hb > a.htop + 2000.0 {
             continue;
         }
         let mature = smoothstep(0.5, 0.8, a.age);
         let size = smoothstep(2500.0, 8000.0, r);
         let amt = shaft_amount(&a);
-        // The rain shaft hangs under the downwind half of the base.
+        // The rain shaft hangs under the downwind half of the base. Along a
+        // squall line: a curtain right behind the shelf cloud, a long tail of
+        // lighter rain behind that.
         let rs = (a.dw0 - 0.45 * r).hypot(a.cx) / (0.8 * r);
-        let heavy = 1.0 - smoothstep(0.35, 1.0, rs);
-        let fringe = 1.0 - smoothstep(0.85, 1.45, rs);
+        let u = shelf_u(&a);
+        let ends = 1.0 - smoothstep(a.len2 - 0.3 * r, a.len2 + 0.7 * r, a.cxl.abs());
+        let (lr, lh) = line_rain(u, r);
+        let heavy = if line { lr * ends } else { 1.0 - smoothstep(0.35, 1.0, rs) };
+        let fringe = if line { heavy } else { 1.0 - smoothstep(0.85, 1.45, rs) };
         // The tower, leaning downwind with height.
         let hb = a.hb.max(0.0);
         let hc = (hb / a.htop.max(1.0)).min(1.2);
@@ -137,21 +181,38 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
         let ru = (dw + 0.25 * r).hypot(a.cx) / (0.6 * r);
         let core = (-ru * ru).exp();
         let up_prof = if a.hb < 0.0 { 0.15 + 0.35 * smoothstep(-1500.0, 0.0, a.hb) } else { (1.0 - smoothstep(0.55, 1.05, hc)) * (0.75 + 0.5 * smoothstep(0.0, 0.5, hc)) };
-        let shaft = (-(rs / 0.85).powi(2)).exp();
+        let shaft = if line { lh * ends } else { (-(rs / 0.85).powi(2)).exp() };
         let dn_prof = if a.hb < 0.0 { smoothstep(0.0, 300.0, agl) } else { 1.0 - smoothstep(0.0, 0.5, hc) };
         // (Even a young shower tower has a brisk updraft and some bumps.)
         let vigour = 0.35 + 0.65 * a.age.min(1.0);
         o.draft += vigour * ((7.0 + 13.0 * size) * core * up_prof) - amt * (5.0 + 7.0 * size) * shaft * dn_prof;
+        // A squall line's gust front: the cold outflow undercuts the warm air
+        // ahead and lifts it, a narrow band of updraft under the shelf's nose,
+        // with severe turbulence where the two meet.
+        let front = if line { ends * mature * (-((u - 300.0) / (0.3 * SHELF_W * r)).powi(2)).exp() } else { 0.0 };
+        if line && a.hb < 300.0 {
+            o.draft += (5.0 + 4.0 * size) * front * smoothstep(0.0, 250.0, agl);
+        }
         // Turbulence: severe in the cloud and where updraft meets downdraft,
         // moderate in the rain, light around the cell. It comes in bursts.
         let shear = core * shaft * 4.0;
         let near = 1.0 - smoothstep(1.0, 3.0, a.dw0.hypot(a.cx) / r);
-        let s = vigour * (1.2 * near + 4.5 * inside * (0.6 + 0.4 * size) + 2.8 * amt * heavy + 3.0 * shear.min(1.0));
+        let low_front = if a.hb < 300.0 { front } else { front * (1.0 - smoothstep(300.0, 1500.0, a.hb)) };
+        let s = vigour * (1.2 * near + 4.5 * inside * (0.6 + 0.4 * size) + 2.8 * amt * heavy * if line { 0.5 + 0.5 * lh } else { 1.0 } + 3.0 * shear.min(1.0) + 5.5 * low_front);
         let k = i as f64 * 1.731;
         let burst = ((0.21 * t + k).sin() * 0.6 + (0.53 * t + 2.3 * k).sin() * 0.4 + (1.37 * t + 4.1 * k).sin() * 0.25) / 1.25;
         o.sigma = o.sigma.max(s * (0.6 + 0.65 * smoothstep(-0.2, 0.7, burst)));
         // Gust front: the downdraft fans out from under the shaft, low down.
-        if a.hb < 0.0 && amt > 0.0 {
+        // Under a squall line it rushes forward all along it: a sudden wind
+        // shift as the shelf passes over, the outflow blowing on through the
+        // rain behind (and ahead, the warm air drawn in towards the line).
+        if line && a.hb < 0.0 {
+            let low = 1.0 - smoothstep(150.0, 1000.0, agl);
+            let out = smoothstep(-200.0, 600.0, u) * (1.0 - smoothstep(SHELF_W * r + 1.5 * r, SHELF_W * r + 3.5 * r, u));
+            let inflow = (1.0 - smoothstep(-200.0, 400.0, u)) * (-(u / (2.0 * r)).powi(2)).exp();
+            let fw = (a.w - up * a.w.dot(up)).normalize_or_zero();
+            o.gust += fw * (ends * mature * low * (amt * (10.0 + 9.0 * size) * out - 3.0 * inflow));
+        } else if a.hb < 0.0 && amt > 0.0 {
             let out = a.w * (a.dw0 - 0.45 * r) + a.x * a.cx;
             let d = out.length();
             if d > 1.0 {
@@ -173,7 +234,7 @@ pub fn near_mask(wx: &Weather, cam: DVec3) -> u32 {
     for (i, c) in wx.cells.iter().enumerate().take(24) {
         let cen = DVec3::new(c[0][0] as f64, c[0][1] as f64, c[0][2] as f64) * 1000.0 - wx.cloud_off;
         let d = (cen.normalize() - cam.normalize()).length() * geo::R;
-        if d < c[0][3] as f64 * 1000.0 * 6.5 + 40_000.0 {
+        if d < c[0][3] as f64 * 1000.0 * 6.5 + 40_000.0 + line_of(c).0 {
             m |= 1 << i;
         }
     }
@@ -192,7 +253,7 @@ pub fn shade(wx: &Weather, pos: DVec3) -> f64 {
         let rc = (a.dw0 - 0.25 * r).hypot(a.cx) / r;
         let core = (1.0 - smoothstep(0.7, 1.7, rc)) * smoothstep(0.3, 0.75, a.age) * smoothstep(1500.0, 4000.0, r);
         let mature = smoothstep(0.5, 0.8, a.age);
-        let an = (r * (1.0 + 4.5 * mature), r * (0.8 + 0.35 * mature), r * (1.0 + 0.6 * mature));
+        let an = (r * (1.0 + if a.len2 > 0.0 { 2.8 } else { 4.5 } * mature), r * (0.8 + 0.35 * mature), r * (1.0 + 0.6 * mature));
         let lc = an.2 + a.dw0.max(0.0) * 0.45;
         let rn = (a.dw0 / if a.dw0 > 0.0 { an.0 } else { an.1 }).hypot(a.cx / lc);
         let lid = (1.0 - smoothstep(0.5, 1.05, rn)) * 0.55 * mature;
@@ -476,7 +537,9 @@ impl Lightning {
             let tall = smoothstep(LIGHTNING_TOP - 800.0, LIGHTNING_TOP + 800.0, c[1][1] as f64 - (c[1][1] as f64 - base) * (1.0 - storm_top(age)));
             let strength = tall * smoothstep(0.5, 0.9, age) * (0.12 + 0.88 * smoothstep(2500.0, 8000.0, r)) * (0.5 + 0.5 * wx.storms.max(0.6) as f64);
             // A big mature cell: ~10 flashes a minute; an ordinary one, one or two.
-            let rate = strength * 10.0 / 60.0;
+            // A squall line flashes all along its length, like a row of them.
+            let (len2, _) = line_of(&c);
+            let rate = strength * 10.0 / 60.0 * (1.0 + 0.7 * len2 / r);
             if rate <= 0.0 || self.flashes.len() >= 12 || self.u() >= rate * dt {
                 continue;
             }
@@ -490,7 +553,8 @@ impl Lightning {
                 // Down to the ground, mostly in and around the rain shaft;
                 // now and then a stronger one out from under the anvil.
                 let out = self.u() < 0.08;
-                let (along, across) = if out { (self.range(1.4, 2.6) * r, self.range(-0.8, 0.8) * r) } else { (0.45 * r + self.range(-0.9, 0.9) * r * 0.8, self.range(-0.9, 0.9) * r * 0.75) };
+                let (along, mut across) = if out { (self.range(1.4, 2.6) * r, self.range(-0.8, 0.8) * r) } else if len2 > 0.0 { ((SHELF_F - SHELF_W - self.range(0.1, 1.0)) * r, 0.0) } else { (0.45 * r + self.range(-0.9, 0.9) * r * 0.8, self.range(-0.9, 0.9) * r * 0.75) };
+                across += self.range(-len2, len2);
                 let foot_dir = (un * geo::R + w * along + x * across).normalize();
                 let g = ground(foot_dir * geo::R).max(0.0);
                 let hstart = if out { at - 2500.0 } else { self.range(2000.0, 4500.0).min(htop * 0.6) };
@@ -501,7 +565,7 @@ impl Lightning {
                 // In the cloud: mostly in the middle of the tower, sometimes out in the anvil.
                 let anvil = age > 0.7 && self.u() < 0.3;
                 let (along, h) = if anvil { (self.range(1.0, 3.5) * r, at - self.range(800.0, 2500.0)) } else { (self.range(-0.4, 0.5) * r, htop * self.range(0.35, 0.8)) };
-                let across = self.range(-0.5, 0.5) * r;
+                let across = self.range(-0.5, 0.5) * r + self.range(-len2, len2);
                 let p = (un * geo::R + w * (along + h * 0.15) + x * across).normalize() * (geo::R + base + h);
                 self.cloud_flash(p, (0.5 * r).clamp(1500.0, 4500.0), power * 0.8, false)
             };
@@ -712,6 +776,59 @@ mod tests {
             n += lt.thunder.drain(..).count();
         }
         assert!((3..=30).contains(&n), "{n} thunderclaps in 10 minutes from an ordinary storm");
+    }
+
+    #[test]
+    fn flying_through_a_squall_line() {
+        // A squall line 20 km west of p, coming on from the west.
+        let mut wx = Weather::new(0.3);
+        wx.storms = 0.0;
+        (wx.wind, wx.wind_from) = (10.0, 270.0);
+        let p = geo::lla_to_pos(0.72, -1.68, 400.0);
+        wx.place_squall(p, 20.0, 270.0, 100.0);
+        wx.cells = wx.storm_cells(p);
+        let (e, _, _) = geo::enu(p);
+        let wob = |km: f64| {
+            let q = (p - e * (km * 1000.0)).normalize() * (geo::R + 400.0);
+            let a = cell_at(&wx, &wx.cells[0], q, downwind(&wx, q));
+            (q, shelf_u(&a))
+        };
+        // Walk west along the line of flight, 400 m up, and note what happens.
+        let mut seen = Vec::new();
+        for i in 0..400 {
+            let km = 10.0 + i as f64 * 0.1;
+            let (q, u) = wob(km);
+            seen.push((km, u, local(&wx, q, 330.0, 0.0)));
+        }
+        let at = |u0: f64, u1: f64| seen.iter().filter(move |s| s.1 >= u0 && s.1 < u1).map(|s| s.2);
+        // Ahead of it: dry, smooth, a little inflow towards it.
+        for l in at(-8000.0, -3000.0) {
+            assert!(l.rain == 0.0 && l.sigma < 1.5 && l.draft.abs() < 1.5, "{l:?}");
+        }
+        // The gust front under the shelf's nose: lift, severe turbulence, and
+        // the wind swinging round to blow out ahead of the line.
+        let front: Vec<Local> = at(0.0, 800.0).collect();
+        assert!(front.iter().any(|l| l.draft > 3.0) && front.iter().all(|l| l.sigma > 3.0 && l.rain == 0.0), "{front:?}");
+        let gust_ahead = at(-3000.0, -1500.0).map(|l| l.gust.dot(e)).fold(0.0, f64::min);
+        let gust_behind = at(2000.0, 3000.0).map(|l| l.gust.dot(e)).fold(0.0, f64::max);
+        assert!(gust_ahead <= 0.0 && gust_behind > 10.0, "{gust_ahead} {gust_behind}");
+        // Behind the shelf: heavy rain coming down in a downdraft...
+        let core: Vec<Local> = at(5500.0, 8000.0).collect();
+        assert!(!core.is_empty() && core.iter().all(|l| l.rain > 0.8 && l.draft < -3.0), "{core:?}");
+        // ...then lighter, steady rain easing off far behind.
+        let tail: Vec<Local> = at(14000.0, 20000.0).collect();
+        assert!(!tail.is_empty() && tail.iter().all(|l| l.rain > 0.05 && l.rain < 0.45), "{tail:?}");
+        // Lightning all along it: far more often than one big cell.
+        let mut lt = Lightning::new();
+        let mut n = 0;
+        for i in 0..36000 {
+            lt.step(1.0 / 60.0, i as f64 / 60.0, &wx, p, p, &|_| 0.0);
+            n += lt.thunder.drain(..).count();
+        }
+        assert!(n > 150, "{n} thunderclaps in 10 minutes");
+        // The ground under the line is in its shade.
+        let under = (p - e * 30_000.0).normalize() * geo::R;
+        assert!(shade(&wx, under) > 0.5);
     }
 
     #[test]

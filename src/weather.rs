@@ -145,6 +145,9 @@ pub struct LiveCell {
     /// turret layout seed and anvil height
     pub seed: f32,
     pub top: f32,
+    /// a squall line: its length (km, across the wind), now and wanted; 0 = a lone cell
+    pub len: f64,
+    pub len_goal: f64,
 }
 
 /// Live storm cells grow in or die away over about this long (time constant, s).
@@ -183,6 +186,11 @@ const DECK_EDGE: f64 = 10.0;
 pub const DECK_RAG: f32 = 320.0;
 /// Spacing of candidate storm sites, km.
 const STORM_GRID: f64 = 40.0;
+/// Spacing of candidate squall-line sites, km (on stormy days one now and then
+/// stands in for the scattered cells around it).
+const SQUALL_GRID: f64 = 400.0;
+/// A squall line's tower radius (km): its depth across is about 3x this.
+pub const SQUALL_R: f64 = 6.5;
 /// Storm cells are found out to this distance from the camera, km.
 const STORM_RANGE: f64 = 260.0;
 
@@ -216,6 +224,14 @@ fn smoothstep(a: f64, b: f64, x: f64) -> f64 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
+/// A squall line for the shaders: like a storm cell (centre in cloud space km,
+/// tower radius km; maturity, anvil height m, overshoot m), with its length in
+/// km as the whole part of the 8th value (the seed its fraction).
+fn squall_cell(cen: DVec3, rad: f64, len_km: f64, age: f64, top: f32, seed: f64) -> [[f32; 4]; 2] {
+    let over = STORM_OVERSHOOT * 0.8 * smoothstep(0.6, 0.95, age) as f32;
+    let len = len_km.round().max(1.0);
+    [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, top, over, (len + seed.clamp(0.0, 0.999)) as f32]]
+}
 /// The cube face (0..6) whose direction dominates `q`, with its normal and in-plane axes.
 fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
     let a = q.abs();
@@ -225,6 +241,40 @@ fn cube_face(q: DVec3) -> (u32, DVec3, DVec3, DVec3) {
         (2 + (q.y < 0.0) as u32, DVec3::Y * q.y.signum(), DVec3::Z, DVec3::X)
     } else {
         (4 + (q.z < 0.0) as u32, DVec3::Z * q.z.signum(), DVec3::X, DVec3::Y)
+    }
+}
+
+/// Candidate sites on a jittered `grid` (km) on each face of a cube projected
+/// onto the planet, within `range` km of `q` (cloud space): f(centre,
+/// distance, hash). They stay put, and each belongs to exactly one face.
+fn sites(q: DVec3, grid: f64, range: f64, mut f: impl FnMut(DVec3, f64, u32)) {
+    let reach = (range / grid).ceil() as i32 + 1;
+    for face in 0..6u32 {
+        let n = [DVec3::X, -DVec3::X, DVec3::Y, -DVec3::Y, DVec3::Z, -DVec3::Z][face as usize];
+        if q.normalize().dot(n) < 0.45 {
+            continue;
+        }
+        let (_, _, u, v) = cube_face(n);
+        let g = DVec2::new(q.dot(u), q.dot(v)) * (6371.0 / q.dot(n)) / grid;
+        // (A coarser grid gets its own hashes.)
+        let salt = if grid == STORM_GRID { 0 } else { (grid as u32).wrapping_mul(2654435761) };
+        for j in -reach..=reach {
+            for i in -reach..=reach {
+                let (cx, cy) = (g.x.floor() as i32 + i, g.y.floor() as i32 + j);
+                let h0 = shash((cx as u32).wrapping_mul(73856093) ^ (cy as u32).wrapping_mul(19349663) ^ face.wrapping_mul(83492791) ^ salt);
+                let h1 = shash(h0);
+                let jit = DVec2::new(unit(h1), unit(h1 >> 16));
+                let cg = (DVec2::new(cx as f64, cy as f64) + 0.2 + 0.6 * jit) * grid;
+                let cen = (n * 6371.0 + u * cg.x + v * cg.y).normalize() * 6371.0;
+                if cube_face(cen).0 != face {
+                    continue;
+                }
+                let dist = cen.distance(q);
+                if dist <= range {
+                    f(cen, dist, h0);
+                }
+            }
+        }
     }
 }
 
@@ -396,7 +446,9 @@ impl Weather {
     /// tower radius km, maturity 0..1). Each is matched to a cell already
     /// standing near there, which glides to it; cells no longer seen die away
     /// and new ones grow in. `jump`: a fresh start, show them as they are.
-    pub fn set_live_cells(&mut self, cells: &[(DVec3, f64, f64)], jump: bool) {
+    /// A squall line comes as one cell with its length (km, the 4th value; 0 =
+    /// a lone cell); lines only match lines.
+    pub fn set_live_cells(&mut self, cells: &[(DVec3, f64, f64, f64)], jump: bool) {
         if jump {
             self.live_cells.clear();
         }
@@ -406,25 +458,25 @@ impl Weather {
         order.sort_by(|&a, &b| cells[b].1.total_cmp(&cells[a].1));
         let mut fresh = Vec::new();
         for &k in &order {
-            let (p, rad, age) = cells[k];
+            let (p, rad, age, len) = cells[k];
             let near = self
                 .live_cells
                 .iter()
                 .enumerate()
-                .filter(|(i, c)| !used[*i] && c.alive)
+                .filter(|(i, c)| !used[*i] && c.alive && (c.len_goal > 0.0) == (len > 0.0))
                 .map(|(i, c)| (i, c.goal.distance(p)))
-                .filter(|&(i, d)| d < (1.3 * (rad + self.live_cells[i].rad_goal)).max(10.0))
+                .filter(|&(i, d)| d < (1.3 * (rad + self.live_cells[i].rad_goal) + 0.3 * len).max(10.0))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             match near {
                 Some((i, _)) => {
                     used[i] = true;
                     let c = &mut self.live_cells[i];
-                    (c.goal, c.rad_goal, c.age_goal) = (p, rad, age);
+                    (c.goal, c.rad_goal, c.age_goal, c.len_goal) = (p, rad, age, len);
                 }
                 None => {
                     let h = shash((p.x * 37.0) as i32 as u32 ^ ((p.y * 41.0) as i32 as u32).wrapping_mul(19349663) ^ ((p.z * 43.0) as i32 as u32).wrapping_mul(83492791));
                     let on = if jump { 1.0 } else { 0.0 };
-                    fresh.push(LiveCell { at: p, goal: p, rad, rad_goal: rad, age, age_goal: age, on, alive: true, seed: unit(h) as f32, top: STORM_TOP + 700.0 * (unit(h >> 16) as f32 * 2.0 - 1.0) });
+                    fresh.push(LiveCell { at: p, goal: p, rad, rad_goal: rad, age, age_goal: age, on, alive: true, seed: unit(h) as f32 * 0.999, top: STORM_TOP + 700.0 * (unit(h >> 16) as f32 * 2.0 - 1.0), len, len_goal: len });
                 }
             }
         }
@@ -444,6 +496,7 @@ impl Weather {
             c.at += (c.goal - c.at) * kg;
             c.rad += (c.rad_goal - c.rad) * kg;
             c.age += (c.age_goal - c.age) * kg;
+            c.len += (c.len_goal - c.len) * kg;
         }
         self.live_cells.retain(|c| c.alive || c.on > 0.0);
     }
@@ -470,6 +523,24 @@ impl Weather {
             _ => (1.0, STORM_TOP + 500.0, 600.0 + (STORM_OVERSHOOT - 600.0) * size as f32),
         };
         self.placed.push([[cen.x as f32, cen.y as f32, cen.z as f32, rad_km as f32], [age, top, over, seed]]);
+    }
+
+    /// Put a squall line's leading edge `dist_km` from `pos` towards compass `bearing`: a
+    /// row of merged mature cumulonimbus `len_km` long lying across the wind,
+    /// with a shared anvil streaming ahead, a shelf cloud along its leading
+    /// edge, heavy rain right behind that and lighter rain trailing behind
+    /// (common.wgsl storm_sd, storm.rs). It drifts with the cloud field. For
+    /// testing: `--squall-at KM,BEARING[,LENGTH_KM]`.
+    pub fn place_squall(&mut self, pos: DVec3, dist_km: f64, bearing: f64, len_km: f64) {
+        let (e, n, up) = geo::enu(pos);
+        let b = bearing.to_radians();
+        let dir = e * b.sin() + n * b.cos();
+        // (`dist_km` is to its leading edge, the gust front under the shelf cloud.)
+        let a = (dist_km + crate::storm::SHELF_F * SQUALL_R) / 6371.0;
+        let p = up * a.cos() + dir * a.sin();
+        let cen = (p * 6371.0 + self.cloud_off / 1000.0).normalize() * 6371.0;
+        let seed = (0.37 + dist_km * 0.1373 + bearing * 0.0619 + len_km * 0.271).fract() * 0.999;
+        self.placed.push(squall_cell(cen, SQUALL_R, len_km, 1.0, STORM_TOP + 300.0, seed));
     }
 
     /// Set a named preset (case-insensitive, e.g. "storms"); false if there is none.
@@ -508,6 +579,10 @@ impl Weather {
             }
             let rad = c.rad * (0.6 + 0.4 * c.on);
             let age = c.age * c.on;
+            if c.len > 0.0 {
+                out.push(((dist - 0.5 * c.len).max(0.0), squall_cell(c.at, rad, c.len * (0.6 + 0.4 * c.on), age.max(0.9 * c.on), c.top, c.seed as f64)));
+                continue;
+            }
             // Weak echoes are showers; where the report has showers but no
             // thunder, all but the strongest (~47 dBZ and up) are.
             let shower = c.age < 0.4 || (self.live && self.showers_only && c.age < 0.8);
@@ -525,73 +600,72 @@ impl Weather {
             out.sort_by(|a, b| a.0.total_cmp(&b.0));
             return self.placed.iter().copied().chain(out.into_iter().map(|c| c.1)).take(MAX_STORMS).collect();
         }
-        let reach = (STORM_RANGE / STORM_GRID).ceil() as i32 + 1;
-        for face in 0..6u32 {
-            let n = [DVec3::X, -DVec3::X, DVec3::Y, -DVec3::Y, DVec3::Z, -DVec3::Z][face as usize];
-            if q.normalize().dot(n) < 0.45 {
-                continue;
-            }
-            let (_, _, u, v) = cube_face(n);
-            let g = DVec2::new(q.dot(u), q.dot(v)) * (6371.0 / q.dot(n)) / STORM_GRID;
-            for j in -reach..=reach {
-                for i in -reach..=reach {
-                    let (cx, cy) = (g.x.floor() as i32 + i, g.y.floor() as i32 + j);
-                    let h0 = shash((cx as u32).wrapping_mul(73856093) ^ (cy as u32).wrapping_mul(19349663) ^ face.wrapping_mul(83492791));
-                    let (h1, h2) = (shash(h0), shash(shash(h0)));
-                    let jit = DVec2::new(unit(h1), unit(h1 >> 16));
-                    let cg = (DVec2::new(cx as f64, cy as f64) + 0.2 + 0.6 * jit) * STORM_GRID;
-                    let cen = (n * 6371.0 + u * cg.x + v * cg.y).normalize() * 6371.0;
-                    // Each site belongs to exactly one face: no gaps or doubles at the seams.
-                    if cube_face(cen).0 != face {
-                        continue;
-                    }
-                    let dist = cen.distance(q);
-                    if dist > STORM_RANGE {
-                        continue;
-                    }
-                    let region = value_noise(cen / 320.0 + DVec3::new(0.41, 0.07, 0.66));
-                    let prob = prob_amount * smoothstep(0.2, 0.6, region + self.storms as f64 * 0.25);
-                    // Fades in rather than pops as the slider or the region changes.
-                    let r0 = unit(h0);
-                    // Where a weather radar sees, its cells stand instead (fading
-                    // across the edge of its coverage as the cloud drifts).
-                    let seen = self.radar_cover.as_ref().map_or(0.0, |cv| {
-                        let (la, lo, _) = geo::pos_to_lla(cen - self.cloud_off / 1000.0);
-                        cv.at(la.to_degrees(), lo.to_degrees())
-                    });
-                    let on = smoothstep(r0 - 0.04, r0 + 0.04, prob) * (1.0 - seen);
-                    if on <= 0.0 {
-                        continue;
-                    }
-                    // A cell fading out shrinks into a smaller, younger (lower) tower.
-                    let us = unit(h2);
-                    let u = unit(h2 >> 16);
-                    let h3 = shash(h2 ^ 0x9e3779b9);
-                    let seed = unit(h3 >> 16) as f32;
-                    if unit(shash(h3 ^ 0x5bd1e995)) < p_shower {
-                        // A shower: a tower 2.4-5 km across, no anvil, topping out at
-                        // 4-7 km (higher on stormier days).
-                        let rad = (1.2 + 1.3 * us) * (0.6 + 0.4 * on);
-                        let age = (0.12 + 0.25 * u) * on;
-                        let top = 4000.0 + 3000.0 * (unit(h3) * (0.6 + 0.4 * st));
-                        out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, shower_anvil(self.base() as f64, top, age), 0.0, seed]]));
-                        continue;
-                    }
-                    // Thunderstorms. Sizes have a long tail: mostly single towers a
-                    // few km across, now and then a giant multicell / supercell 12-18 km wide.
-                    let giant = smoothstep(0.82, 1.0, us) * (0.5 + 0.5 * st);
-                    let rad = (2.4 + 2.6 * us + 4.0 * giant * giant) * (0.6 + 0.4 * on);
-                    // Mature (with anvils); stormier days have more of the older,
-                    // bigger ones; giants always are.
-                    let age = (0.5 + 0.5 * (u + (1.0 - (1.0 - u) * (1.0 - u) - u) * st)).max(giant * 1.6).min(1.0) * on;
-                    // Anvil height (the tropopause varies a little) and how far the
-                    // strongest updraft overshoots it: big, mature cells the most.
-                    let top = STORM_TOP + 700.0 * (unit(h3) as f32 * 2.0 - 1.0);
-                    let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
-                    out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, top, over, seed]]));
+        // Where a weather radar sees, its cells stand instead of made-up ones
+        // (fading across the edge of its coverage as the cloud drifts).
+        let seen_at = |cen: DVec3| {
+            self.radar_cover.as_ref().map_or(0.0, |cv| {
+                let (la, lo, _) = geo::pos_to_lla(cen - self.cloud_off / 1000.0);
+                cv.at(la.to_degrees(), lo.to_degrees())
+            })
+        };
+        // Squall lines: on stormy days, now and then a line of storms 60-150 km
+        // long instead of the scattered cells round it (centre, half-length km).
+        let mut lines: Vec<(DVec3, f64)> = Vec::new();
+        let p_line = 0.4 * smoothstep(0.55, 0.95, st) * smoothstep(0.3, 0.5, self.clouds as f64) * if self.live && self.showers_only { 0.0 } else { 1.0 };
+        if p_line > 0.0 {
+            sites(q, SQUALL_GRID, STORM_RANGE + 75.0, |cen, dist, h0| {
+                let on = smoothstep(unit(h0) - 0.04, unit(h0) + 0.04, p_line) * (1.0 - seen_at(cen));
+                if on <= 0.0 {
+                    return;
                 }
-            }
+                let h1 = shash(h0 ^ 0x27d4eb2d);
+                let len = (60.0 + 90.0 * unit(h1)) * (0.6 + 0.4 * on);
+                let rad = (SQUALL_R - 1.0 + 2.0 * unit(h1 >> 16)) * (0.6 + 0.4 * on);
+                let h2 = shash(h1);
+                let top = STORM_TOP + 700.0 * (unit(h2) as f32 * 2.0 - 1.0);
+                lines.push((cen, 0.5 * len));
+                out.push(((dist - 0.5 * len).max(0.0), squall_cell(cen, rad, len, on, top, unit(h2 >> 16))));
+            });
         }
+        sites(q, STORM_GRID, STORM_RANGE, |cen, dist, h0| {
+            let h2 = shash(shash(h0));
+            let region = value_noise(cen / 320.0 + DVec3::new(0.41, 0.07, 0.66));
+            let prob = prob_amount * smoothstep(0.2, 0.6, region + self.storms as f64 * 0.25);
+            // Fades in rather than pops as the slider or the region changes.
+            let r0 = unit(h0);
+            // (A squall line takes the place of the cells round it.)
+            let clear = lines.iter().map(|&(c, l2)| smoothstep(l2 + 30.0, l2 + 90.0, c.distance(cen))).fold(1.0, f64::min);
+            let on = smoothstep(r0 - 0.04, r0 + 0.04, prob) * (1.0 - seen_at(cen)) * clear;
+            if on <= 0.0 {
+                return;
+            }
+            // A cell fading out shrinks into a smaller, younger (lower) tower.
+            let us = unit(h2);
+            let u = unit(h2 >> 16);
+            let h3 = shash(h2 ^ 0x9e3779b9);
+            let seed = unit(h3 >> 16) as f32;
+            if unit(shash(h3 ^ 0x5bd1e995)) < p_shower {
+                // A shower: a tower 2.4-5 km across, no anvil, topping out at
+                // 4-7 km (higher on stormier days).
+                let rad = (1.2 + 1.3 * us) * (0.6 + 0.4 * on);
+                let age = (0.12 + 0.25 * u) * on;
+                let top = 4000.0 + 3000.0 * (unit(h3) * (0.6 + 0.4 * st));
+                out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, shower_anvil(self.base() as f64, top, age), 0.0, seed]]));
+                return;
+            }
+            // Thunderstorms. Sizes have a long tail: mostly single towers a
+            // few km across, now and then a giant multicell / supercell 12-18 km wide.
+            let giant = smoothstep(0.82, 1.0, us) * (0.5 + 0.5 * st);
+            let rad = (2.4 + 2.6 * us + 4.0 * giant * giant) * (0.6 + 0.4 * on);
+            // Mature (with anvils); stormier days have more of the older,
+            // bigger ones; giants always are.
+            let age = (0.5 + 0.5 * (u + (1.0 - (1.0 - u) * (1.0 - u) - u) * st)).max(giant * 1.6).min(1.0) * on;
+            // Anvil height (the tropopause varies a little) and how far the
+            // strongest updraft overshoots it: big, mature cells the most.
+            let top = STORM_TOP + 700.0 * (unit(h3) as f32 * 2.0 - 1.0);
+            let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
+            out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, top, over, seed]]));
+        });
         out.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.placed.iter().copied().chain(out.into_iter().map(|c| c.1)).take(MAX_STORMS).collect()
     }
@@ -1069,7 +1143,7 @@ mod tests {
         let a = (q + e * 40.0).normalize() * 6371.0;
         let b = (q + n * 80.0).normalize() * 6371.0;
         // A fresh start shows the radar's cells as they are.
-        w.set_live_cells(&[(a, 7.0, 0.95), (b, 2.5, 0.3)], true);
+        w.set_live_cells(&[(a, 7.0, 0.95, 0.0), (b, 2.5, 0.3, 0.0)], true);
         assert_eq!(w.storm_cells(cam).len(), 2);
         assert!(w.live_cells.iter().all(|c| c.on == 1.0));
         let seed = w.live_cells[0].seed;
@@ -1077,7 +1151,7 @@ mod tests {
         // gone and a new one has popped up.
         let a2 = (a + e * 5.0).normalize() * 6371.0;
         let c = (q - n * 60.0).normalize() * 6371.0;
-        w.set_live_cells(&[(a2, 8.0, 1.0), (c, 3.0, 0.4)], false);
+        w.set_live_cells(&[(a2, 8.0, 1.0, 0.0), (c, 3.0, 0.4, 0.0)], false);
         assert_eq!(w.live_cells.len(), 3);
         assert_eq!(w.live_cells[0].seed, seed, "the big cell is the same cell");
         w.step_live(1.0);
@@ -1136,6 +1210,54 @@ mod tests {
         let c = w.storm_cells(cam)[0];
         let top = w.base() as f64 + (c[1][1] as f64 - w.base() as f64) * storm_top_share(c[1][0] as f64);
         assert!(c[1][0] < 0.45 && (top - 6000.0).abs() < 1.0 && c[1][2] == 0.0, "{c:?} top {top}");
+    }
+
+    #[test]
+    fn squall_lines_on_stormy_days_and_by_hand() {
+        // Placed by hand: one cell carrying its length, its leading edge where asked.
+        let cam = geo::lla_to_pos(0.72, -1.68, 500.0);
+        let mut w = Weather::new(0.3);
+        w.storms = 0.0;
+        w.place_squall(cam, 20.0, 270.0, 100.0);
+        let c = w.storm_cells(cam);
+        assert_eq!(c.len(), 1);
+        let (len2, seed) = crate::storm::line_of(&c[0]);
+        assert!(len2 == 50_000.0 && (0.0..1.0).contains(&seed), "{:?}", c[0]);
+        let cen = DVec3::new(c[0][0][0] as f64, c[0][0][1] as f64, c[0][0][2] as f64);
+        let d = cen.distance(cam.normalize() * 6371.0);
+        assert!((d - 20.0 - crate::storm::SHELF_F * SQUALL_R).abs() < 0.5, "{d}");
+        // On a stormy day somewhere a line stands in for the cells round it;
+        // on an ordinary one never.
+        let lines = |st: f32| {
+            let mut w = Weather::new(0.55);
+            w.storms = st;
+            let mut n = 0;
+            for k in 0..40 {
+                let p = geo::lla_to_pos(0.3 + 0.05 * k as f64, -1.5 - 0.07 * k as f64, 500.0);
+                let cells = w.storm_cells(p);
+                let near: Vec<_> = cells.iter().filter(|c| c[1][3] >= 1.0).collect();
+                if let Some(l) = near.first() {
+                    let len = l[1][3].floor() as f64;
+                    assert!((36.0..=150.0).contains(&len) && l[0][3] > 2.5, "{l:?}");
+                    let lc = DVec3::new(l[0][0] as f64, l[0][1] as f64, l[0][2] as f64);
+                    // (no thunderstorm right beside it)
+                    assert!(cells.iter().filter(|c| c[1][3] < 1.0 && c[0][3] > 2.6).all(|c| DVec3::new(c[0][0] as f64, c[0][1] as f64, c[0][2] as f64).distance(lc) > 0.5 * len + 25.0));
+                    n += 1;
+                }
+            }
+            n
+        };
+        let stormy = lines(1.0);
+        assert!((4..40).contains(&stormy), "{stormy} of 40 places see a squall line on a stormy day");
+        assert_eq!(lines(0.4), 0);
+        // Live: the radar's line comes in as one, and only matches a line.
+        let mut w = Weather::new(0.5);
+        let a = (cam.normalize() * 6371.0 + DVec3::X * 30.0).normalize() * 6371.0;
+        w.set_live_cells(&[(a, 6.0, 1.0, 110.0)], true);
+        let c = w.storm_cells(cam);
+        assert!(c.iter().any(|c| c[1][3].floor() == 110.0), "{c:?}");
+        w.set_live_cells(&[(a, 6.0, 1.0, 0.0)], false);
+        assert_eq!(w.live_cells.len(), 2, "a lone cell does not take over a line");
     }
 
     #[test]

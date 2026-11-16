@@ -202,7 +202,20 @@ impl LiveWx {
             let drift = wx.steady(p, 2000.0) * 1.6 * age;
             (p.normalize() * 6371.0 + (wx.cloud_off + drift) / 1000.0).normalize() * 6371.0
         };
-        let cells: Vec<_> = r.cells.iter().map(|c| (cloud(c.lat, c.lon), c.rad, c.age)).collect();
+        // A squall line stands as one (the shaders draw it across the wind
+        // aloft) where it lies within 40 degrees of that; otherwise as its cells.
+        let across = (wx.wind_from + 90.0).rem_euclid(180.0);
+        let mut cells = Vec::new();
+        for c in &r.cells {
+            let off = ((c.axis - across).rem_euclid(180.0) + 90.0).rem_euclid(180.0) - 90.0;
+            if c.len > 0.0 && off.abs() < 40.0 {
+                cells.push((cloud(c.lat, c.lon), c.rad, c.age, c.len * off.to_radians().cos()));
+            } else if c.len > 0.0 {
+                cells.extend(c.parts.iter().map(|p| (cloud(p.lat, p.lon), p.rad, p.age, 0.0)));
+            } else {
+                cells.push((cloud(c.lat, c.lon), c.rad, c.age, 0.0));
+            }
+        }
         let deck = r.deck.as_ref().filter(|_| r.here).map(|d| cloud(d.lat, d.lon));
         wx.set_live_cells(&cells, jump);
         wx.deck_goal = deck;
@@ -212,7 +225,7 @@ impl LiveWx {
                 .cells
                 .iter()
                 .take(6)
-                .map(|c| format!("{:.0} km {:03.0}° r{:.1} age{:.2} {:.0}dBZ", radar::dist_km(a, (c.lat, c.lon)), bearing(a, (c.lat, c.lon)), c.rad, c.age, c.peak))
+                .map(|c| format!("{:.0} km {:03.0}° r{:.1} age{:.2} {:.0}dBZ{}", radar::dist_km(a, (c.lat, c.lon)), bearing(a, (c.lat, c.lon)), c.rad, c.age, c.peak, if c.len > 0.0 { format!(" squall line {:.0} km along {:03.0}°", c.len, c.axis) } else { String::new() }))
                 .collect();
             let deck = r.deck.as_ref().map(|d| format!("{:.0} km {:03.0}° rain {:.2} ({:.0}% wet)", radar::dist_km(a, (d.lat, d.lon)), bearing(a, (d.lat, d.lon)), d.amount, d.frac * 100.0));
             log::info!("radar ({} min old): {} cells{}, deck {:?}; nearest: {}", age as i64 / 60, r.cells.len(), if r.here { "" } else { " (no radar here)" }, deck, near.join(", "));

@@ -195,6 +195,8 @@ struct Args {
     storms: Option<f32>,
     /// storm cells placed by hand: distance (km), compass bearing (deg), tower radius (km)
     storm_at: Vec<(f64, f64, f64, Option<weather::CellKind>)>,
+    /// --squall-at: (km, bearing, length km) of squall lines
+    squall_at: Vec<(f64, f64, f64)>,
     /// km,bearing: where the rain deck's area is centred, from the spawn
     rain_at: Option<(f64, f64)>,
     time_rate: Option<f64>,
@@ -285,6 +287,7 @@ fn parse_args() -> Args {
         clouds: 0.5,
         storms: None,
         storm_at: Vec::new(),
+        squall_at: Vec::new(),
         rain_at: None,
         time_rate: None,
         alto: None,
@@ -408,6 +411,14 @@ fn parse_args() -> Args {
                 if p.len() >= 2 {
                     let r = p.get(2).copied().unwrap_or(if kind == Some(weather::CellKind::Shower) { 1.8 } else { 6.0 });
                     a.storm_at.push((p[0], p[1], r, kind));
+                }
+            }
+            "--squall-at" => {
+                // km,bearing[,length km]: a squall line that far from the spawn, lying
+                // across that bearing (the wind aloft blows from there unless --wind says)
+                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').map_while(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if p.len() >= 2 {
+                    a.squall_at.push((p[0], p[1], p.get(2).copied().unwrap_or(100.0)));
                 }
             }
             "--rain-at" => {
@@ -561,7 +572,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--fps-log] [--mute] [--lang en|fr] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -901,13 +912,19 @@ impl Game {
         }
         if let Some((kt, from)) = args.wind {
             (wx.wind, wx.wind_from) = (kt / 1.94384, from);
+        } else if let Some(&(_, b, _)) = args.squall_at.first() {
+            // A squall line comes on broadside with the wind: from where it was put.
+            (wx.wind, wx.wind_from) = (wx.wind.max(8.0), b.rem_euclid(360.0));
+        }
+        for &(d, b, l) in &args.squall_at {
+            wx.place_squall(plane.pos, d, b, l.clamp(10.0, 400.0));
         }
         if let Some(h) = args.haze {
             wx.haze = h.clamp(0.2, 40.0);
         }
         wx.open = args.weather_panel;
         // Real weather, unless the command line sets the weather itself.
-        let scripted = std::env::args().any(|a| matches!(a.as_str(), "--clouds" | "--rain" | "--storms" | "--alto" | "--wind" | "--haze"));
+        let scripted = std::env::args().any(|a| matches!(a.as_str(), "--clouds" | "--rain" | "--storms" | "--alto" | "--wind" | "--haze" | "--squall-at"));
         wx.live = (prefs.live_weather && !scripted) || args.live_weather;
         let set_time = std::env::args().any(|a| matches!(a.as_str(), "--time" | "--day" | "--time-rate"));
         wx.real_time = prefs.real_time && !set_time;
@@ -2954,6 +2971,8 @@ impl Game {
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
             g.storm[3] = cells.len() as f32;
+            // (the first squall line, whose anvil shades the air: common.wgsl atm_march)
+            g.alto[2] = cells.iter().position(|c| c[1][3] >= 1.0).map_or(0.0, |i| i as f32 + 1.0);
             for (i, c) in cells.iter().enumerate() {
                 g.storm_cells[2 * i] = c[0];
                 g.storm_cells[2 * i + 1] = c[1];

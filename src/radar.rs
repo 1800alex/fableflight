@@ -162,6 +162,11 @@ pub struct Cell {
     pub age: f64,
     /// strongest echo in it, dBZ
     pub peak: f32,
+    /// a squall line: its length (km; 0 = a lone cell), the compass bearing
+    /// its axis runs along (degrees, 0..180), and the cells it was made of
+    pub len: f64,
+    pub axis: f64,
+    pub parts: Vec<Cell>,
 }
 
 /// Where the rain deck goes: the middle of an area of widespread rain.
@@ -363,12 +368,85 @@ pub fn analyse(e: &Echo, at: (f64, f64)) -> Radar {
         }
         taken[k] = true;
         let (lat, lon) = e.deg(cx, cy);
-        cells.push(((cx - ax).hypot(cy - ay) * kp, Cell { lat, lon, rad, age, peak }));
+        cells.push(((cx - ax).hypot(cy - ay) * kp, Cell { lat, lon, rad, age, peak, len: 0.0, axis: 0.0, parts: Vec::new() }));
     }
     cells.sort_by(|a, b| a.0.total_cmp(&b.0));
     cells.truncate(MAX_CELLS);
+    let cells = find_lines(cells, at);
 
     Radar { cells: cells.into_iter().map(|c| c.1).collect(), deck: find_deck(e, (ax, ay)), cover, here, time: 0 }
+}
+
+/// A squall line is at least this long, km.
+const LINE_KM: f64 = 60.0;
+
+/// Strong cells (45 dBZ and up) close together in a long, narrow row become
+/// one squall line (`Cell::len` > 0, its cells kept in `parts`). Chains of
+/// neighbours (gaps no wider than the cells) of four or more, at least
+/// `LINE_KM` long end to end and no more than a fifth as wide as long (a
+/// cluster or a round complex stays cells). (distance km, cell) in and out,
+/// nearest first.
+fn find_lines(cells: Vec<(f64, Cell)>, at: (f64, f64)) -> Vec<(f64, Cell)> {
+    // km east and north of `at` (flat: a few hundred km at most)
+    let km = |c: &Cell| ((c.lon - at.1).to_radians() * 6371.0 * at.0.to_radians().cos(), (c.lat - at.0).to_radians() * 6371.0);
+    let strong: Vec<usize> = (0..cells.len()).filter(|&i| cells[i].1.peak >= 45.0 && cells[i].1.len == 0.0).collect();
+    let n = cells.len();
+    let mut group: Vec<usize> = (0..n).collect();
+    fn root(g: &mut [usize], mut i: usize) -> usize {
+        while g[i] != i {
+            g[i] = g[g[i]];
+            i = g[i];
+        }
+        i
+    }
+    for (k, &i) in strong.iter().enumerate() {
+        for &j in &strong[k + 1..] {
+            let (a, b) = (km(&cells[i].1), km(&cells[j].1));
+            if (a.0 - b.0).hypot(a.1 - b.1) < 1.6 * (cells[i].1.rad + cells[j].1.rad) + 8.0 {
+                let (ri, rj) = (root(&mut group, i), root(&mut group, j));
+                group[ri] = rj;
+            }
+        }
+    }
+    let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &i in &strong {
+        let r = root(&mut group, i);
+        members.entry(r).or_default().push(i);
+    }
+    let mut used = vec![false; n];
+    let mut lines = Vec::new();
+    for m in members.values().filter(|m| m.len() >= 4) {
+        // The row's axis: the main axis of its cells' spread.
+        let p: Vec<(f64, f64)> = m.iter().map(|&i| km(&cells[i].1)).collect();
+        let c = (p.iter().map(|q| q.0).sum::<f64>() / p.len() as f64, p.iter().map(|q| q.1).sum::<f64>() / p.len() as f64);
+        let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+        for q in &p {
+            let (dx, dy) = (q.0 - c.0, q.1 - c.1);
+            (sxx, syy, sxy) = (sxx + dx * dx, syy + dy * dy, sxy + dx * dy);
+        }
+        let th = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let (ex, ey) = (th.cos(), th.sin());
+        let along: Vec<f64> = p.iter().map(|q| (q.0 - c.0) * ex + (q.1 - c.1) * ey).collect();
+        let across = (p.iter().map(|q| ((q.0 - c.0) * -ey + (q.1 - c.1) * ex).powi(2)).sum::<f64>() / p.len() as f64).sqrt();
+        let (lo, hi) = along.iter().fold((f64::MAX, f64::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        let rad = m.iter().map(|&i| cells[i].1.rad).sum::<f64>() / m.len() as f64;
+        let len = hi - lo;
+        if len + 2.0 * rad < LINE_KM || across > 0.2 * (len + 2.0 * rad) {
+            continue;
+        }
+        let mid = 0.5 * (lo + hi);
+        let (x, y) = (c.0 + ex * mid, c.1 + ey * mid);
+        let lat = at.0 + (y / 6371.0).to_degrees();
+        let lon = at.1 + (x / (6371.0 * at.0.to_radians().cos())).to_degrees();
+        let parts: Vec<Cell> = m.iter().map(|&i| cells[i].1.clone()).collect();
+        let age = parts.iter().map(|c| c.age).fold(0.0, f64::max).max(0.9);
+        let peak = parts.iter().map(|c| c.peak).fold(0.0, f32::max);
+        m.iter().for_each(|&i| used[i] = true);
+        lines.push((x.hypot(y).max(0.0), Cell { lat, lon, rad: rad.clamp(5.0, 7.5), age, peak, len, axis: ex.atan2(ey).to_degrees().rem_euclid(180.0), parts }));
+    }
+    let mut out: Vec<(f64, Cell)> = cells.into_iter().enumerate().filter(|(i, _)| !used[*i]).map(|(_, c)| c).chain(lines).collect();
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
 }
 
 /// Coverage on blocks of `b` pixels.
@@ -545,6 +623,13 @@ mod tests {
             }
         });
         let r = analyse(&e, at);
+        // ...is one squall line along it, made of big mature cells
+        let lines: Vec<&Cell> = r.cells.iter().filter(|c| c.len > 0.0).collect();
+        assert_eq!(lines.len(), 1, "{:?}", r.cells);
+        let line = lines[0];
+        assert!(dist_km((line.lat, line.lon), c) < 15.0 && (60.0..130.0).contains(&line.len), "{line:?}");
+        assert!((line.axis - 90.0).abs() < 15.0, "an east-west line: {line:?}");
+        let r = Radar { cells: line.parts.clone(), ..r };
         assert!(r.cells.len() >= 3, "{:?}", r.cells);
         for cell in &r.cells {
             let (x, y) = ((cell.lon - c.1).to_radians() * 6371.0 * c.0.to_radians().cos(), (cell.lat - c.0).to_radians() * 6371.0);
