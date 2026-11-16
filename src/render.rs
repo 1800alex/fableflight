@@ -18,8 +18,7 @@ pub(crate) const AMB: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// (`Renderer::set_shadow_res`; the shaders read the size off the texture).
 const SHADOW_RES: u32 = 4096;
 pub const CASCADES: usize = 3;
-/// Samples per pixel of the scene's G-buffer: 4, or 2 on the Low preset
-/// (half the memory and bandwidth, for integrated GPUs). Fixed at startup.
+/// g-buffer msaa samples, 4 or 2 on low, set once at startup.
 static MSAA_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4);
 pub(crate) fn msaa() -> u32 {
     MSAA_N.load(std::sync::atomic::Ordering::Relaxed)
@@ -1400,8 +1399,7 @@ impl Renderer {
         let info = adapter.get_info();
         log::info!("GPU: {} ({:?})", info.name, info.device_type);
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
-        // (4 samples are always supported; other counts need the adapter's own
-        // format features, and every G-buffer format to allow them)
+        // 4x is always supported, other counts need adapter format features.
         let afeat = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let ok = samples == 4 || (adapter.features().contains(afeat) && [HDR, AMB, DEPTH].iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(samples)));
         MSAA_N.store(if ok { samples } else { 4 }, std::sync::atomic::Ordering::Relaxed);

@@ -35,15 +35,12 @@ zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 naga = { version = "=30.0.1", features = ["wgsl-in"] }
 
-# Optimised builds: the simulation, terrain/building generators and the
-# renderer's CPU side are hot loops. (Panics still unwind so a worker thread
-# hitting bad network data cannot take the game down.)
+# full lto and one codegen unit for faster release builds.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 
-# Debug builds are unplayable at opt-level 0: keep our code debuggable but
-# run the dependencies (wgpu, egui, image, naga) optimised.
+# optimised dependencies so debug builds stay playable.
 [profile.dev]
 opt-level = 1
 

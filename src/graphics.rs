@@ -93,8 +93,7 @@ impl Graphics {
     /// Sets everything a preset covers (not taa or vsync).
     pub fn apply(&mut self, l: Level) {
         let l = if l == Level::Off { Level::Low } else { l };
-        // One step per preset: each one down is roughly half the GPU work of
-        // the one above (pixels, then the shadow cascades, which redraw the scene).
+        // each preset down roughly halves gpu work, resolution first, then shadows.
         self.scale = l.pick(0.5, 0.7, 1.0, 1.5) as f32;
         self.shadows = match l {
             Level::Off | Level::Low => Level::Off,
@@ -119,8 +118,7 @@ impl Graphics {
         })
     }
 
-    /// Antialiasing samples per pixel (applied at the next start): Low keeps
-    /// to 2, which halves the G-buffer's memory and bandwidth.
+    /// msaa samples, 2 on low, applied on next start.
     pub fn samples(&self) -> u32 {
         if self.matches() == Some(Level::Low) || self.scale <= 0.5 { 2 } else { 4 }
     }

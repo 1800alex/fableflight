@@ -68,9 +68,7 @@ impl TileId {
     pub fn at(lat: f64, lon: f64, z: u8) -> TileId {
         Self::at_merc(lon_to_merc_x(lon).rem_euclid(1.0), lat_to_merc_y(lat), z)
     }
-    /// The tile at zoom `z` holding a point already in mercator units (x
-    /// wrapped to 0..1): looking a spot up at several zooms then converts it
-    /// once rather than per zoom (the conversion is a tan and a log).
+    /// tile at zoom z for a point already in mercator units, so callers convert once.
     #[inline]
     pub fn at_merc(mx: f64, my: f64, z: u8) -> TileId {
         let n = (1u64 << z) as f64;

@@ -8,7 +8,7 @@
 //! Each picture is stored premultiplied by its coverage (the multisampled
 //! bake is resolved over a transparent clear), so averaging, both in the
 //! mip chain and between pictures, keeps colour and coverage consistent.
-/// The impostor pictures are baked once with their own 4x targets.
+/// impostor bakes keep their own 4x targets.
 const BAKE_MSAA: u32 = 4;
 use crate::render::{tex_entry, ub_entry, TreeVertex, AMB, DEPTH, HDR};
 use crate::trees::{CARDS, LODS, TREE_SPECIES, VARIANTS};
