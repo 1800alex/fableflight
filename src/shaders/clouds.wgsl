@@ -343,6 +343,9 @@ fn depth_match(a: f32, b: f32) -> f32 {
   if (march) {
     // Steps grow with distance (a pixel covers more ground further out), and
     // stretch while the ray is in clear air.
+    // (the graphics settings scale the steps: longer for speed, shorter for detail)
+    let qs = select(clamp(G.quality.x, 0.5, 2.0), 1.0, G.quality.x <= 0.0);
+    let n_max = i32(200.0 / qs);
     var t = ta;
     var clear = 0.0;
     // How much further along the ray is sure to be clear of every storm cell's
@@ -356,16 +359,16 @@ fn depth_match(a: f32, b: f32) -> f32 {
     var ufree = false;
     var pts = ta;        // the previous sample, and whether it was in clear air
     var pempty = true;
-    for (var i = 0; i < 200; i++) {
+    for (var i = 0; i < n_max; i++) {
       // Never run out of steps before the end of the ray: long grazing rays through
       // the layer used to stop short, cutting off the clouds beyond. Late in the
       // budget, steps through clear air stretch to whatever reaches the end (never
       // inside cloud: coarse steps there turned near towers ghostly).
-      let dt0 = clamp(t * select(0.016, 0.03, ufree), 40.0, 2500.0);
+      let dt0 = clamp(t * select(0.016, 0.03, ufree), 40.0, 2500.0) * qs;
       ufree = false;
       var dt = dt0 * (1.0 + clear);
       if (smask != 0u) { dt = min(dt, max(sclear, dt0)); }
-      if (i >= 110 && clear > 0.0) { dt = max(dt, (tb - t) / f32(max(196 - i, 4))); }
+      if (i >= n_max * 11 / 20 && clear > 0.0) { dt = max(dt, (tb - t) / f32(max(n_max - 4 - i, 4))); }
       let ts = t + dt * jit;
       t += dt;
       sclear -= dt;
