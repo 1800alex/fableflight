@@ -30,6 +30,7 @@ ureq = "3.5.1"
 wgpu = "30"
 winit = "0.30"
 roxmltree = "0.20"
+rustc-hash = "2"
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
