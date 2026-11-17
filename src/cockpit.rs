@@ -20,6 +20,7 @@ pub struct Head {
     pub yaw: f64,
     pub pitch: f64,
     lean: DVec3,
+    seat_offset: glam::DVec2,
     roll: f64,
     /// zoom asked for (a factor on the field of view), and where it is now
     pub zoom: f64,
@@ -52,7 +53,7 @@ pub fn look(yaw: f64, pitch: f64) -> DQuat {
 
 impl Head {
     pub fn new(yaw: f64, pitch: f64) -> Head {
-        Head { yaw, pitch, lean: DVec3::ZERO, roll: 0.0, zoom: 1.0, zoom_s: 1.0, adapt: 0.55, inside: 0.5, rear: false }
+        Head { yaw, pitch, lean: DVec3::ZERO, seat_offset: glam::DVec2::ZERO, roll: 0.0, zoom: 1.0, zoom_s: 1.0, adapt: 0.55, inside: 0.5, rear: false }
     }
 
     /// Snap to the asked-for look at once (entering the cockpit, respawning).
@@ -60,7 +61,19 @@ impl Head {
         self.yaw = yaw;
         self.pitch = pitch;
         self.lean = DVec3::ZERO;
+        self.center_seat();
         self.roll = 0.0;
+    }
+
+    /// Move sideways or bend down to see past the yoke or panel lip.
+    /// The displacement stays inside the seated pilot's reach.
+    pub fn lean_by(&mut self, dx: f64, dy: f64) {
+        self.seat_offset += glam::DVec2::new(dx, dy);
+        self.seat_offset = self.seat_offset.clamp(glam::DVec2::new(-0.17, -0.40), glam::DVec2::new(0.17, 0.06));
+    }
+
+    pub fn center_seat(&mut self) {
+        self.seat_offset = glam::DVec2::ZERO;
     }
 
     pub fn zoom_by(&mut self, steps: f64) {
@@ -98,7 +111,8 @@ impl Head {
 
         let q = look(self.yaw, self.pitch);
         // The eyes swing round the neck joint behind them.
-        let eye = spec.eye2.filter(|_| self.rear).unwrap_or(spec.eye).as_dvec3() + shake + self.lean - NECK + q * NECK;
+        let offset = DVec3::new(self.seat_offset.x, self.seat_offset.y, self.seat_offset.y.min(0.0) * 0.35);
+        let eye = spec.eye2.filter(|_| self.rear).unwrap_or(spec.eye).as_dvec3() + shake + self.lean + offset + NECK - q * NECK;
 
         // Tilt part of the way back toward the horizon (only near level).
         let d = rot * (q * DVec3::NEG_Z);
@@ -225,7 +239,9 @@ impl WheelSteps {
 /// Coarse local bounds avoid testing triangles in pieces the pointer cannot meet.
 pub fn blockers(pieces: &[crate::airframe::Piece]) -> Vec<(usize, Vec3, Vec3)> {
     pieces.iter().enumerate().filter(|(_, p)| !p.glass &&
-        (p.name == "cabin" || p.name == "yoke" || p.name == "pedal" ||
+        (p.hotspot.is_some() || matches!(p.name, "cabin" | "yoke" | "pedal" | "cockpit tub" |
+            "ejection seat" | "rear ejection seat" | "instrument panel" | "consoles" | "stick" |
+            "flight deck panels" | "flight deck furnishings" | "pedestal" | "crew seats" | "control column") ||
          p.anim != crate::airframe::Anim::Fixed && p.group == crate::airframe::G_FUSE))
         .filter_map(|(i, p)| {
             if p.mesh.v.is_empty() { return None; }

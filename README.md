@@ -59,8 +59,22 @@ The fuel and the payload (crew, passengers, baggage: set on the start screen) ma
 # Electrics and failures
 A battery behind the master switch (Ins) and an alternator (the jets' generators) that charges it once the engine turns fast enough: the starter, the radios, the electric gauges and the lights need power, the engine itself runs on its magnetos. The pause menu's Failures page sets failures by hand or at random (about every N minutes): engine, alternator, flat battery, vacuum pump (the attitude and heading gyros run down), blocked pitot (the airspeed indicator turns into an altimeter) or static port (altimeter and VSI freeze), fuel leak. The flight panel shows the volts, battery and current, and the HUD warns LOW VOLTS and VACUUM.
 
-# Clickable cockpit
-In the Cessna's cockpit view the mouse works the controls: click the battery master, parking brake, gear handle, landing-light switch and fuel selector (BOTH/OFF); click the ignition key for the magnetos, or hold it to crank. Use the wheel over the throttle, blue propeller-RPM knob, red mixture knob, flaps, trim wheel and cowl-flap lever. The radio-stack wheel cycles nearby NAV stations (VOR/ILS); the lower navigation dial is the ADF, and its wheel cycles nearby NDBs. Hold either pilot's toe brake for independent braking, or the red yoke button for the game's boost. Hovering a working control identifies it and shows its setting; its mouse target follows its animation and cannot be operated through a blocking object. The cockpit navigation plot shows actual nearby VORs and the tuned NAV station within 10 NM, with ground speed; the ADF and CDI follow their receivers. Electrical displays, lights, flaps and gear require bus power. Dragging elsewhere still looks around.
+# Clickable cockpits
+
+In cockpit view, hover over a working control to see its action and setting. Click a switch, roll the mouse wheel over a lever, or hold a toe brake. Drag elsewhere to look around. Middle-drag to lean sideways or down around a yoke or panel, and middle-click to sit upright again. The target follows the visible part as it moves.
+
+| Aircraft | Controls available from the pilot seat |
+| --- | --- |
+| Cessna 172RG | Battery, magnetos and starter key, throttle, propeller RPM, mixture, cowl flaps, tank selector, landing lights, gear, flaps, parking brake, toe brakes, trim wheel and yoke trim, NAV and ADF tuning, OBS, heading sync and altimeter setting |
+| Robin DR400/180 Régent | Battery, magnetos, separate starter button, throttle, mixture, tank selector, landing light, parking brake, toe brakes, trim wheel, flap lever and sliding canopy handle |
+| Boeing 747-400 | Overhead battery pushbutton, four thrust levers and reverse levers, landing gear, flaps, speedbrake and toe brakes |
+| Concorde | Four thrust levers, gear, toe brakes and the nose/visor selector with up, visor down, 5° and 12.5° positions |
+| F/A-18C | Twin throttles, landing gear, flap selector, canopy switch and toe brakes |
+| F-4E | Twin throttles, landing gear, slats/flaps selector and toe brakes |
+| F-22A | Twin throttles, landing gear, canopy switch and toe brakes |
+| SR-71A | Twin throttles, landing gear, drag chute handle and toe brakes |
+
+The multi-engine aircraft share a thrust setting across engines. The piston aircraft have four fuel selector positions and a shared fuel quantity. Selecting OFF cuts fuel to the engine. The navigator and systems-operator stations, many panel switches and avionics pages remain simplified. Starship is uncrewed. [Cockpit references and modeling notes](docs/cockpits.md)
 
 # In-flight map
 

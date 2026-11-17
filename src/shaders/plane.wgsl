@@ -1394,10 +1394,11 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       arcs[0] = vec4f(-40.0, 0.0, 0.88, 0.95); arc_col[0] = vec3f(0.05, 0.15, 0.5);
       nd[0] = vec4f(dial(15.0 - 1.98 * P0.y / 1000.0, vmin, vmax, a0, a1), 0.84, 0.045, 0.15); nn = 1;
     }
-    case 19u: { // fuel selector plate
-      let arrow = step(abs(uv.x), (0.8 - uv.y) * 0.35) * step(-0.2, uv.y);
-      ink = max(arrow, 1.0 - smoothstep(0.0, px, abs(r - 0.85) - 0.02));
-      ink = max(ink, str_at(uv, vec2f(0.0,0.62), S_BOTH, 0.17, px, 0.0));
+    case 19u, 33u: { // 172RG and DR400 fuel selector plates
+      ink = 1.0 - smoothstep(0.0, px, abs(r - 0.92) - 0.02);
+      ink = max(ink, str_at(uv, vec2f(0.0,0.62), select(S_BOTH, S_MAIN, id == 33u), 0.17, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(-0.62,0.0), S_L, 0.17, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(0.62,0.0), S_R, 0.17, px, 0.0));
       ink = max(ink, str_at(uv, vec2f(0.0,-0.65), S_OFF, 0.17, px, 0.0));
       hub = false;
     }

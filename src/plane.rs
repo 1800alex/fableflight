@@ -51,6 +51,28 @@ pub struct Impact {
     pub building: Option<(geo::TileId, usize)>,
 }
 
+/// Positions around the piston aircraft's selector. The centre feed is BOTH
+/// on the 172RG and the main fuselage tank on the Régent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FuelSelector {
+    Center,
+    Right,
+    Off,
+    Left,
+}
+
+impl FuelSelector {
+    pub fn turn(self, clockwise: bool) -> Self {
+        use FuelSelector::*;
+        match (self, clockwise) {
+            (Center, true) | (Off, false) => Right,
+            (Right, true) | (Left, false) => Off,
+            (Off, true) | (Center, false) => Left,
+            (Left, true) | (Right, false) => Center,
+        }
+    }
+}
+
 pub struct Plane {
     /// what it is
     pub spec: &'static Spec,
@@ -100,7 +122,7 @@ pub struct Plane {
     pub parking_brake: bool,
     pub toe_brake: [f64; 2],
     pub landing_lights: bool,
-    pub fuel_valve: bool,
+    pub fuel_selector: FuelSelector,
     pub engine_hours: f64,
     pub propeller: f64,
     prop_coarse: f64,
@@ -261,7 +283,7 @@ impl Plane {
             parking_brake: false,
             toe_brake: [0.0; 2],
             landing_lights: true,
-            fuel_valve: true,
+            fuel_selector: FuelSelector::Center,
             engine_hours: 1834.6,
             propeller: 1.0,
             prop_coarse: 0.0,
@@ -602,7 +624,7 @@ impl Plane {
             Input::ParkingBrake => self.parking_brake as u8 as f32,
             Input::Brake(side) => self.toe_brake[if side < 0.0 { 0 } else { 1 }] as f32,
             Input::LandingLights => self.landing_lights as u8 as f32,
-            Input::FuelValve => self.fuel_valve as u8 as f32,
+            Input::FuelValve => self.fuel_selector as u8 as f32,
             Input::PropControl => self.propeller as f32,
             Input::CowlFlaps => self.cowl_flaps as f32,
             Input::Reverser => self.reverser as f32,
@@ -1500,7 +1522,7 @@ impl Plane {
                 // (The starter needs power from the bus; the magnetos do not.)
                 let cranking = (c.starter || self.auto_start > 0.0) && self.sys.powered();
                 self.cranking = cranking;
-                self.running = self.ignition && self.fuel_valve && self.fuel > 0.0 && self.mixture > 0.08 && w > 8.0 && eng > 0.0 && !self.sys.fail.engine;
+                self.running = self.ignition && self.fuel_selector != FuelSelector::Off && self.fuel > 0.0 && self.mixture > 0.08 && w > 8.0 && eng > 0.0 && !self.sys.fail.engine;
                 let mix = smooth(0.08, 0.45, self.mixture);
                 let q_eng = if self.running { Self::engine_torque(pe, self.charge, rho, c.boost, eng) * mix } else { 0.0 } + if cranking { 120.0 * (1.0 - w / 25.0).max(0.0) } else { 0.0 };
                 if self.auto_start > 0.0 {
@@ -3402,6 +3424,23 @@ mod tests {
         assert!(dist > 120.0 && dist < 300.0 && vlo * KT < 62.0, "{dist} {}", vlo * KT);
         assert!(h > 150.0, "{h}");
         assert!(p.notes.is_empty() && p.dmg.gear.iter().all(|g| *g), "{:?}", p.notes);
+    }
+
+    #[test]
+    fn piston_fuel_selectors_cut_and_restore_flow() {
+        use FuelSelector::*;
+        let world = flat_world();
+        for spec in [C172, DR400] {
+            let mut plane = Plane::spawn(spec, 0.6, -2.1, 1000.0, 0.0, 55.0);
+            for expected in [Right, Off, Left, Center] {
+                let previous = plane.fuel_selector;
+                plane.fuel_selector = previous.turn(true);
+                assert_eq!(plane.fuel_selector, expected);
+                assert_eq!(expected.turn(false), previous);
+                plane.step(1.0 / 180.0, &Controls::default(), &world);
+                assert_eq!(plane.running, expected != Off);
+            }
+        }
     }
 
     #[test]

@@ -53,18 +53,46 @@ pub fn pick(hs: &[Hotspot], o: Vec3, d: Vec3) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-/// Mouse targets follow the same rigid motions as their visible cockpit pieces.
-pub fn animated_hotspots(hs: &[Hotspot], pieces: &[crate::airframe::Piece], pose: &[glam::Mat4]) -> Vec<Hotspot> {
-    hs.iter().map(|h| {
-        let mut h = *h;
-        if let Some(name) = c172::cabin::moving_piece(&h) {
-            if let Some(i) = pieces.iter().position(|p| p.name == name && match h.hold {
+impl Hotspot {
+    pub fn click(at: Vec3, r: f32, id: &'static str) -> Self {
+        Self { at: at.to_array(), r, click: Some(id), hold: None, wheel: None }
+    }
+
+    pub fn hold(at: Vec3, r: f32, id: &'static str) -> Self {
+        Self { at: at.to_array(), r, click: None, hold: Some(id), wheel: None }
+    }
+
+    pub fn wheel(at: Vec3, r: f32, up: &'static str, down: &'static str) -> Self {
+        Self { at: at.to_array(), r, click: None, hold: None, wheel: Some((up, down)) }
+    }
+}
+
+/// Resolve the mouse targets once when loading the aircraft. Keep the exact
+/// piece index so identical levers and inherited cockpit meshes animate correctly.
+pub fn cockpit_controls(spec: &Spec, pieces: &[crate::airframe::Piece]) -> Vec<(Hotspot, Option<usize>)> {
+    let mut controls: Vec<_> = spec.hotspots.iter().map(|h| {
+        let index = c172::cabin::moving_piece(h).and_then(|name| pieces.iter().position(|p|
+            p.name == name && match h.hold {
                 Some("brake_left") => p.pivot.x < -0.27,
                 Some("brake_right") => p.pivot.x > -0.27 && p.pivot.x < 0.0,
                 _ => true,
-            }) {
-                h.at = pose[i].transform_point3(Vec3::from(h.at)).to_array();
-            }
+            }));
+        (*h, index)
+    }).collect();
+    if BUILTIN.iter().any(|s| std::ptr::eq(*s, spec)) {
+        controls.extend(pieces.iter().enumerate().filter_map(|(i, p)| {
+            let mut h = p.hotspot?;
+            h.at = (p.pivot + Vec3::from(h.at)).to_array();
+            Some((h, Some(i)))
+        }));
+    }
+    controls
+}
+
+pub fn animated_hotspots(controls: &[(Hotspot, Option<usize>)], pose: &[glam::Mat4]) -> Vec<Hotspot> {
+    controls.iter().map(|&(mut h, index)| {
+        if let Some(i) = index {
+            h.at = pose[i].transform_point3(Vec3::from(h.at)).to_array();
         }
         h
     }).collect()
@@ -621,15 +649,60 @@ mod hotspot_tests {
     use super::*;
 
     #[test]
-    fn hotspots_stand_for_real_actions() {
+    fn crewed_aircraft_have_bound_and_reachable_flight_controls() {
         let known = |id: &str| crate::bind::ACTIONS.iter().any(|a| a.id == id) || c172::cabin::MOUSE_ACTIONS.contains(&id);
-        for s in BUILTIN.iter() {
-            for h in s.hotspots {
+        let mut hidden = Vec::new();
+        for spec in BUILTIN {
+            let model = (spec.build)();
+            let controls = cockpit_controls(spec, &model.pieces);
+            if std::ptr::eq(spec, &starship::SPEC) {
+                assert!(controls.is_empty());
+                continue;
+            }
+            for (h, _) in &controls {
                 for id in h.click.iter().chain(h.hold.iter()).chain(h.wheel.iter().flat_map(|w| [&w.0, &w.1])) {
-                    assert!(known(id), "{}: no action {id}", s.name);
+                    assert!(known(id), "{}: no action {id}", spec.name);
+                }
+            }
+            let mut plane = crate::plane::Plane::spawn(spec, 0.6, -2.1, 1000.0, 0.0, 55.0);
+            let blockers = crate::cockpit::blockers(&model.pieces);
+            for extended in [false, true] {
+                plane.gear_down = extended;
+                plane.throttle = if extended { 0.0 } else { 1.0 };
+                let pose = plane.pose(&model.pieces);
+                let targets = animated_hotspots(&controls, &pose);
+                let target_action = |h: &Hotspot| h.click.or(h.wheel.map(|w| w.0)).or(h.hold);
+                let actions: std::collections::BTreeSet<_> = targets.iter().filter_map(target_action).collect();
+                assert!(actions.contains("throttle_up"));
+                assert_eq!(actions.contains("gear"), spec.gear_rate > 0.0);
+                for action in actions {
+                    let reachable = targets.iter().enumerate().any(|(i, h)| {
+                        if target_action(h) != Some(action) { return false; }
+                        let delta = Vec3::from(h.at) - spec.eye;
+                        let yaw = delta.x.atan2(-delta.z) as f64;
+                        let pitch = (-delta.y / delta.length()).asin() as f64;
+                        // The head moves forward and down when looking at a console.
+                        let mut head = crate::cockpit::Head::new(yaw, pitch);
+                        [(0.0, 0.0), (-0.14, -0.05), (0.14, -0.05), (0.0, -0.22),
+                         (-0.15, -0.35), (0.15, -0.35), (0.0, -0.40)].into_iter().any(|(x, y)| {
+                            head.center_seat();
+                            head.lean_by(x, y);
+                            let view = head.update(spec, 1.0, (yaw, pitch), 58.0, DVec3::ZERO,
+                                glam::DQuat::IDENTITY, DVec3::Y, 1.5, 1.0);
+                            let eye = view.eye.as_vec3();
+                            let ray = Vec3::from(h.at) - eye;
+                            let dir = ray.normalize();
+                            let picked = pick(&targets, eye, dir);
+                            let limit = ray.length() - h.r - 0.005;
+                            let clear = !crate::cockpit::occluded(&model.pieces, &pose, &blockers, eye, dir, limit);
+                            picked == Some(i) && clear
+                        })
+                    });
+                    if !reachable { hidden.push((spec.name, action, extended)); }
                 }
             }
         }
+        assert!(hidden.is_empty(), "Unreachable controls {hidden:?}");
     }
 
     #[test]
@@ -642,10 +715,10 @@ mod hotspot_tests {
             plane.throttle = state;
             plane.gear_down = state > 0.0;
             let pose = plane.pose(&pieces);
-            let hs = animated_hotspots(c172::cabin::HOTSPOTS,&pieces,&pose);
+            let hs = animated_hotspots(&cockpit_controls(&c172::SPEC, &pieces), &pose);
             for (name, point, action) in [
                 ("throttle",Vec3::new(0.0,-0.195,c172::cabin::PANEL_Z+0.043),"throttle_up"),
-                ("gear handle",Vec3::new(-0.09,-0.185,c172::cabin::PANEL_Z+0.05),"gear")
+                ("gear handle",c172::cabin::GEAR_PIVOT + Vec3::Z * 0.05,"gear")
             ] {
                 let i = pieces.iter().position(|p| p.name == name).unwrap();
                 let visible = pose[i].transform_point3(point);
