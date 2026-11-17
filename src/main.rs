@@ -12,6 +12,7 @@ mod crash;
 mod damage;
 mod destruct;
 mod fetch;
+mod frame_pacer;
 mod fgmodel;
 mod fluid;
 mod geo;
@@ -92,7 +93,7 @@ use render::{DrawObj, Frame, Globals, PSim, Renderer};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -770,9 +771,6 @@ struct Game {
     /// (pull up, too low, sink rate, gear) so they do not flicker
     warn: audio::Warn,
     warn_t: [f64; 4],
-    /// one repeating spoken warning at a time and an approach radio-height latch
-    last_callout: f64,
-    last_radio_ft: f64,
     /// for the sound: slow-following load factor (jolts stand out from it),
     /// when the last jolt was, last frame's ground contact, vertical speed,
     /// gear and flaps, and metal scraping along the ground this frame
@@ -968,7 +966,7 @@ impl Game {
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
-            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4], last_callout: -10.0, last_radio_ft: 1000.0,
+            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), weapon_flash: None, damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
@@ -1258,8 +1256,6 @@ impl Game {
         self.cam_dir = -self.plane.forward();
         self.prev_cam = self.cam_pos;
         self.warn_t = [-10.0; 4];
-        self.last_callout = -10.0;
-        self.last_radio_ft = 1000.0;
         (self.g_slow, self.was_ground, self.prev_vs, self.prev_gear, self.prev_flaps) = (1.0, false, 0.0, self.plane.gear, self.plane.flaps);
         self.gauges = gauges::Gauges::new(&self.plane, self.frame ^ 0x9e37);
         self.weapons.reset(self.spec, &self.model.pieces);
@@ -2856,7 +2852,7 @@ impl Game {
         let p = &self.plane;
         let mut w = audio::Warn::default();
         // (Nobody is aboard a rocket to be warned.)
-        if self.crashed || self.mode == Mode::Menu || p.on_ground {
+        if self.crashed || self.mode == Mode::Menu || p.on_ground || p.spec.rocket().is_some() {
             return w;
         }
         let up = p.pos.normalize();
@@ -2936,25 +2932,6 @@ impl Game {
         let jolt = if live && !p.on_ground { dg.abs() } else { 0.0 };
         let mut events = Vec::new();
         if live {
-            // Speak the most urgent active warning, with enough spacing to keep alerts clear.
-            let mut callout = if self.warn.pull_up { Some(0) }
-                else if self.warn.too_low { Some(1) }
-                else if self.warn.sink { Some(2) }
-                else if self.warn.gear { Some(3) }
-                else { None };
-            let (la, lo, h) = geo::pos_to_lla(p.pos);
-            let agl_ft = self.world.ground(la, lo).map(|g| (h - g.h) * 3.28084).unwrap_or(f64::INFINITY);
-            if p.spec.mass > 10_000.0 && p.gear >= 0.9 && vs < -0.5 && p.ias() > 25.0 {
-                if self.last_radio_ft > 50.0 && agl_ft <= 50.0 { callout = Some(4); }
-                self.last_radio_ft = agl_ft;
-            } else if agl_ft > 100.0 {
-                self.last_radio_ft = 1000.0;
-            }
-            let repeat = if callout == Some(0) { 1.8 } else { 3.5 };
-            if let Some(id) = callout.filter(|_| self.real - self.last_callout > repeat) {
-                events.push(audio::Event::Callout(id));
-                self.last_callout = self.real;
-            }
             if jolt > 0.35 && self.real - self.last_bump > 0.15 {
                 self.last_bump = self.real;
                 events.push(audio::Event::Bump(((jolt - 0.2) * 1.5) as f32));
@@ -3319,11 +3296,6 @@ impl Game {
                     let mut crash = Crash::new(&imp, &self.plane, &self.group_mesh, &self.model.groups, &self.group_pivots, &tears, through, self.rng.0 ^ self.frame, self.wx.steady(imp.pos, 40.0));
                     self.r.fluid.latest = None;
                     let (site, power) = (crash.site, crash.power);
-                    if !imp.water {
-                        if let Some(a) = &self.audio {
-                            a.event(audio::Event::Impact { strength: power * size.sqrt(), heavy });
-                        }
-                    }
                     self.fx_anchor = site;
                     let mut gone = 0.0;
                     // How far the blast reaches beyond a light aircraft's.
@@ -3365,15 +3337,6 @@ impl Game {
                     self.cam_ang = None;
                     self.cam_clear_t = 0.0;
                     self.cam_rise = 0.0;
-                    self.cam_hold = 0.0;
-                    // Seed the crash orbit behind the impact so it does not inherit a cockpit view.
-                    self.cam_look = site;
-                    let up = site.normalize_or_zero();
-                    let fwd = self.plane.forward();
-                    let back = (fwd - up * fwd.dot(up)).normalize_or_zero();
-                    let back = if back.length_squared() > 0.5 { back } else { geo::enu(site).1 };
-                    let view_dist = (70.0 + 34.0 * power as f64) * (self.spec.span as f64 / 5.5).max(1.0).sqrt() + self.cam_dist;
-                    self.cam_pos = site - back * view_dist + up * (18.0 + view_dist * 0.24);
                     self.acc = 0.0;
                     break;
                 }
@@ -3599,12 +3562,12 @@ impl Game {
             let horiz = |a: f64| e * a.cos() + n * a.sin();
             // Keep a clear view: swing round, or rise a little, to see past
             // whatever building stands in the way.
-            if self.real - self.cam_clear_t > 0.4 {
+            if self.real - self.cam_clear_t > 0.25 {
                 self.cam_clear_t = self.real;
                 let look = centre + u * 6.0;
                 let clear = |from: DVec3| {
-                    !(0..12).any(|k| {
-                        let p = from + (look - from) * (k as f64 / 12.0);
+                    !(0..18).any(|k| {
+                        let p = from + (look - from) * (k as f64 / 20.0);
                         let (la, lo, h) = geo::pos_to_lla(p);
                         self.world.building(la, lo).is_some_and(|b| h < b.top + 3.0 && h > b.base - 2.0)
                             // (under the 3D tiles the buildings are the mesh, the ground's top)
@@ -3614,8 +3577,8 @@ impl Game {
                 // Only move when the view is blocked, and then stay a while.
                 if !clear(centre + horiz(a) * dist + u * (rise + dist * self.cam_rise)) && self.real > self.cam_hold {
                     let mut best = (0.0, 0.4);
-                    'search: for off in [0.0, 0.55, -0.55, 1.1, -1.1, 1.65, -1.65] {
-                        for k in [0.0, 0.25] {
+                    'search: for off in [0.0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4, 1.75, -1.75, 2.1, -2.1] {
+                        for k in [0.0, 0.15, 0.3] {
                             if clear(centre + horiz(a + off) * dist + u * (rise + dist * k)) {
                                 best = (off, k);
                                 break 'search;
@@ -3681,8 +3644,6 @@ impl Game {
         };
         let calt = geo::pos_to_lla(cam).2;
         let agl = calt - ground.unwrap_or(0.0);
-        // Keep terrain correction synchronized with the smoothed crash orbit.
-        self.cam_pos = cam;
         let scrape = if steps > 0 { (scrape_n as f32 / steps as f32 * 0.5).min(1.0) } else { 0.0 };
         self.update_audio(cam, fire, in_menu, &c, dt, scrape);
 
@@ -4205,7 +4166,7 @@ impl Game {
                         self.menu.markers.push((i, p.x * ppp, p.y * ppp));
                         let chosen = self.menu.airport == Some(i);
                         let hover = ctx.pointer_hover_pos().is_some_and(|h| (h - p).length() < 14.0 / ppp) || aim.is_some_and(|c| (c - p).length() < 28.0);
-                        let col = if chosen || hover { Color32::from_rgb(255, 196, 64) } else if a.kind == 2 { Color32::from_rgb(194, 196, 198) } else { Color32::from_rgb(153, 155, 158) };
+                        let col = if chosen || hover { Color32::from_rgb(255, 196, 64) } else if a.kind == 2 { Color32::from_rgb(120, 200, 255) } else { Color32::from_rgb(170, 200, 220) };
                         if hover {
                             painter.circle_stroke(p, 8.0, egui::Stroke::new(1.5, col));
                             label(p + egui::vec2(6.0, 14.0), &a.name.chars().take(40).collect::<String>(), 11.0, col);
@@ -4245,10 +4206,9 @@ impl Game {
             // the chosen spot, take-off, settings and quit stay in view.
             let top = r.bottom() + 14.0;
             let foot_h = 42.0 + 6.0 + 34.0 + 6.0;
-            let panel_room = (screen.bottom() - M - top - 16.0).max(0.0);
-            let body_h = (panel_room - foot_h - 42.0).max(0.0);
+            let body_h = (screen.bottom() - M - top - 40.0 - 28.0 - foot_h).max(120.0);
             egui::Area::new(egui::Id::unique("menu")).anchor(Align2::LEFT_TOP, [M, top]).show(ctx, |ui| {
-                ui.set_max_height(panel_room);
+                ui.set_max_height(screen.bottom() - M - top);
                 menu::panel().inner_margin(egui::Margin::symmetric(16, 14)).show(ui, |ui| {
                     ui.set_width(W - 32.0);
                     menu::window_title(ui, t!("START LOCATION", "LIEU DE DÉPART"));
@@ -5250,7 +5210,7 @@ impl Game {
         let green = Color32::from_rgb(110, 235, 140);
         let amber = Color32::from_rgb(255, 190, 60);
         let red = Color32::from_rgb(255, 90, 60);
-        let accent = menu::ACCENT;
+        let accent = Color32::from_rgb(228, 230, 232);
         let glass = Color32::from_rgba_unmultiplied(20, 21, 23, 152);
         let box_fill = Color32::from_rgba_unmultiplied(15, 16, 18, 226);
         // Keep the traditional blue-over-earth attitude colors distinct from
@@ -5883,6 +5843,7 @@ impl Game {
 struct App {
     args: Args,
     game: Option<Game>,
+    frame_pacer: frame_pacer::FramePacer,
 }
 
 impl ApplicationHandler for App {
@@ -5917,6 +5878,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(s) => g.r.resize(s.width, s.height),
             WindowEvent::RedrawRequested => {
+                // The OS can also request redraws before our frame deadline.
+                let now = Instant::now();
+                if self.frame_pacer.control_flow(now, g.gfx.fps_cap) != ControlFlow::Poll {
+                    return;
+                }
+                self.frame_pacer.frame_started(now);
                 g.frame();
                 if g.quit {
                     g.keep_settings(true);
@@ -6057,12 +6024,11 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(g) = &self.game {
-            g.window.request_redraw();
-            if g.gfx.fps_cap > 0 {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_secs_f64(1.0 / g.gfx.fps_cap as f64)));
-            } else {
-                event_loop.set_control_flow(ControlFlow::Poll);
+            let flow = self.frame_pacer.control_flow(Instant::now(), g.gfx.fps_cap);
+            if flow == ControlFlow::Poll {
+                g.window.request_redraw();
             }
+            event_loop.set_control_flow(flow);
         }
     }
 }
@@ -6291,7 +6257,7 @@ fn main() -> anyhow::Result<()> {
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
-    el.run_app(&mut App { args, game: None })?;
+    el.run_app(&mut App { args, game: None, frame_pacer: frame_pacer::FramePacer::default() })?;
     Ok(())
 }
 

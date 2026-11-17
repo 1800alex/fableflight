@@ -192,32 +192,6 @@ fn facade(uv: vec2f, base: vec3f, ftype: u32, seed: f32, wealth: f32, H: f32, fw
     glass = rect(cx, uv.y, 5.0, 4.9, 5.7, fw) * step(h2, 0.3) * step(6.2, H);
   }
 
-  // Residential sash detail: narrow centre rails and crossbars break panes
-  // into believable sections. Restrict the extra pattern to single windows;
-  // office ribbons and curtain walls already have their own mullion grids.
-  if (ftype == 0u || ftype == 1u) {
-    let ww = select(1.25, 1.15, ftype == 1u);
-    let y0 = select(0.95, 0.85, ftype == 1u);
-    let y1 = select(2.15, 2.3, ftype == 1u);
-    let mid = (y0 + y1) * 0.5;
-    let vbar = box(cx, 0.022, fw.x) * box(fy - mid, (y1 - y0) * 0.5, fw.y);
-    let hbar = box(fy - mid, 0.022, fw.y) * box(cx, ww * 0.5 - 0.02, fw.x);
-    let sash = clamp(max(vbar, hbar) * glass, 0.0, 1.0);
-    frame = max(frame, sash * 0.92);
-    glass *= 1.0 - sash * 0.96;
-  }
-
-  // Tall office towers have a service level every fourteen storeys. A muted
-  // opaque band breaks up the uninterrupted glass and hides plant floors.
-  if (H > 60.0 && (ftype == 2u || ftype == 3u) && u32(id.y) % 14u == 0u) {
-    let mech = box(fy - 1.9, 1.35, fw.y);
-    wall = mix(wall, base * 0.62, mech);
-    glass *= 1.0 - mech;
-    frame = max(frame, mech * 0.45);
-    open *= 1.0 - mech;
-    span *= 1.0 - mech;
-  }
-
   // Weathering: streaks run down from the roof line and sills, dirt creeps up from the street.
   let streak = textureSampleLevel(t_wave, s_repeat, vec2f(uv.x / 2.3, uv.y / 17.0) + seed * 3.0, 0.0).a;
   let grime = (1.0 - wealth) * (0.55 * smoothstep(0.45, 0.8, streak) + 0.35 * (1.0 - smoothstep(0.0, 1.6, uv.y)));

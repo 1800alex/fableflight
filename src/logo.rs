@@ -40,7 +40,7 @@ pub fn mask(font: &[u8], w: u32, h: u32, scale: f32) -> Vec<u8> {
     let width = x - track;
     let x0 = (w as f32 - width) * 0.5;
     // Capitals sit between `top` and `top + cap`.
-    let top = 70.0 * scale;
+    let top = 30.0 * scale;
     let base = top + cap;
     for (id, gx) in glyphs {
         let g = id.with_scale_and_position(px, point(x0 + gx, base));

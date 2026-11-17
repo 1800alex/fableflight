@@ -1,4 +1,5 @@
-//! Gamepad button prompts in a restrained glass-and-metal style, and the
+//! Gamepad button prompts in the Xbox style (green A, red B, blue X,
+//! yellow Y, bumpers, triggers, sticks, d-pad, View and Menu), and the
 //! switch between keyboard hints and gamepad ones: while a pad is plugged
 //! in, the menus and the HUD show its buttons instead of keys.
 //!
@@ -81,8 +82,8 @@ impl Btn {
     }
 }
 
-const BODY: Color32 = Color32::from_rgb(46, 47, 49);
-const RIM: Color32 = Color32::from_rgb(196, 197, 198);
+const BODY: Color32 = Color32::from_rgb(46, 52, 62);
+const RIM: Color32 = Color32::from_rgb(196, 202, 212);
 const INK: Color32 = Color32::from_rgb(240, 242, 245);
 
 /// Text drawn twice, a hair apart: the only font has no bold face.
@@ -106,10 +107,10 @@ pub fn paint(p: &Painter, r: Rect, b: Btn) {
         bold(p, text_at, s, h * 0.6, ink);
     };
     match b {
-        Btn::A => face(Color32::from_rgb(52, 54, 56), Color32::WHITE, "A"),
-        Btn::B => face(Color32::from_rgb(58, 60, 62), Color32::WHITE, "B"),
-        Btn::X => face(Color32::from_rgb(64, 66, 68), Color32::WHITE, "X"),
-        Btn::Y => face(Color32::from_rgb(70, 72, 74), Color32::WHITE, "Y"),
+        Btn::A => face(Color32::from_rgb(84, 168, 58), Color32::WHITE, "A"),
+        Btn::B => face(Color32::from_rgb(212, 52, 48), Color32::WHITE, "B"),
+        Btn::X => face(Color32::from_rgb(38, 112, 214), Color32::WHITE, "X"),
+        Btn::Y => face(Color32::from_rgb(236, 182, 24), Color32::from_rgb(40, 30, 0), "Y"),
         Btn::LB | Btn::RB | Btn::LT | Btn::RT => {
             let big = (h * 0.5) as u8;
             let small = (h * 0.16) as u8;
@@ -195,7 +196,7 @@ pub fn paint(p: &Painter, r: Rect, b: Btn) {
             ];
             for (d, rr) in arms {
                 if lit(d) {
-                    p.rect_filled(rr.shrink(1.0), 1.5, if b == Btn::Dpad { Color32::from_rgb(120, 121, 123) } else { INK });
+                    p.rect_filled(rr.shrink(1.0), 1.5, if b == Btn::Dpad { Color32::from_rgb(120, 128, 140) } else { INK });
                 }
             }
             for rr in [v, hz] {
