@@ -557,6 +557,12 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // march's banding stood on the towers' sunlit faces as contour-line rings.)
       if (smask != 0u) { dt = min(dt, dt0 * max(floor(sclear / dt0), 1.0)); }
       if (i >= n_max * 11 / 20 && clear > 0.0) { dt = max(dt, (tb - t) / f32(max(n_max - 4 - i, 4))); }
+      // Never past the end of the ray: a sample short of the scene stands for
+      // its whole step. Inside a cloud, rays ending a metre off (the cockpit,
+      // the aircraft) took 40 m of cloud wherever the jitter put the sample in
+      // front of them: a lattice of dots in the jitter's pattern, sweeping
+      // across the screen.
+      dt = min(dt, tb - t);
       let ts = t + dt * jit;
       t += dt;
       sclear -= dt;
