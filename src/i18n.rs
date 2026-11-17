@@ -193,6 +193,7 @@ fn fr(en: &str) -> Option<&'static str> {
         "look around" => "regarder autour",
         "camera distance / cockpit zoom" => "distance caméra / zoom cockpit",
         "hide / show the HUD" => "masquer / afficher le HUD",
+        "hide / show the minimap" => "masquer / afficher la mini-carte",
         "screenshot" => "capture d'écran",
         "time of day forward / back" => "avancer / reculer l'heure",
         "more / fewer clouds" => "plus / moins de nuages",
