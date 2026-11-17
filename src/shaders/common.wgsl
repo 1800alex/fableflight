@@ -51,7 +51,7 @@ struct Globals {
   // it was begun. The looked-up one is a cross-fade of two maps, with their sun and
   // drift blended the same way.
   cs: array<vec4f, 12>,
-  alto: vec4f,       // mid-level cloud: amount 0..1, height (m); z 1 + index of a squall line among storm_cells (0 = none)
+  alto: vec4f,       // mid-level cloud: amount 0..1, height (m)
   // The ocean (ocean.rs): offset of its coordinates + direction the wind blows
   // toward (east, north); wind (m/s), significant wave height (m), whitecap
   // cover, 1; slope covariance (east-east, north-north, east-north) of the
@@ -222,10 +222,8 @@ fn phase_m(c: f32, g: f32) -> f32 {
 
 struct Scatter { L: vec3f, T: vec3f };
 // Single scattering plus the multi-scatter LUT along a ray segment. oc is the
-// ray origin relative to the planet centre. line: shade the air under a squall
-// line's anvil (only the haze in front of the clouds asks: a constant false
-// leaves the other callers as they were).
-fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32, line: bool) -> Scatter {
+// ray origin relative to the planet centre.
+fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32) -> Scatter {
   let sun = G.sun_dir.xyz;
   let c = dot(rd, sun);
   let pr = phase_r(c);
@@ -260,19 +258,6 @@ fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32, l
     var msl = ms_lut(h, mu);
     msl = mix(msl, vec3f(luma(msl)), cl.closed * 0.75) * (1.0 - 0.45 * cl.closed);
     var vis = cl.vis;
-    // A squall line: the air under its anvil is in its shade (and its dark
-    // lid hides most of the sky): the haze in front of the line is not lit up
-    // into a pale blue veil over it. (G.alto.z: 1 + its index, 0 = none.)
-    if (line) {
-      let li = 2u * (u32(G.alto.z) - 1u);
-      let lsc = G.storm_cells[li];
-      let lsp = G.storm_cells[li + 1u];
-      // (Only the anvil straight overhead: the sun ray's own lookup as well
-      // cost ~1% more with a line in view.)
-      let under = (1.0 - smoothstep(0.85, 1.05, line_rn(p / r, lsc, lsp))) * (1.0 - smoothstep(-500.0, 500.0, h - line_ab(lsc, lsp)));
-      vis *= 1.0 - 0.9 * under;
-      msl *= 1.0 - 0.65 * under;
-    }
     if (sdark > 0.0) {
       let k = 1.0 - 0.8 * sdark * exp(-mix(tp, tn, 0.5) / 15000.0);
       msl *= k;
@@ -300,7 +285,7 @@ fn sky_march(rd: vec3f, steps: i32, jit: f32) -> Scatter {
   var tmax = top.y;
   let gnd = ray_sphere(oc, rd, G.planet.w);
   if (gnd.x > 0.0) { tmax = gnd.x; }
-  return atm_march(oc, rd, max(top.x, 0.0), tmax, steps, jit, false);
+  return atm_march(oc, rd, max(top.x, 0.0), tmax, steps, jit);
 }
 
 fn sky_uv(rd: vec3f) -> vec2f {
@@ -377,6 +362,8 @@ fn nimbo_down(top: vec3f, h: f32) -> vec3f {
 fn nimbo_light(upn: vec3f, h: f32) -> vec3f { return nimbo_down(nimbo_top(upn), h); }
 // The wall cloud under a big storm hangs down to this far below the cloud base, m.
 const STORM_BELOW = 800.0;
+// ...and a squall line's shelf cloud this far (how far down storm rays march).
+const SHELF_BELOW = 1050.0;
 // A squall line's shelf cloud: its leading edge this far ahead of the line's
 // axis, and how far back from there its upper face rises into the base (x the
 // line's radius R). Must match storm.rs.
@@ -384,6 +371,15 @@ const SHELF_F = 1.4;
 const SHELF_W = 0.65;
 // ...and over how much of that its steep upper face rises (x R).
 const SHELF_FACE = 0.3;
+
+// How deep a squall line's shelf cloud hangs at cxl metres along the line (a
+// share of its full depth): scalloped, one shallow arc after another, deepest
+// in their middles, and swelling and easing over tens of km. (At one depth
+// all along, its lower edge ran ruler-straight across the sky.)
+fn shelf_depth(cxl: f32, seed: f32) -> f32 {
+  let a = fract(cxl / 5300.0 + seed * 7.0) * 2.0 - 1.0;
+  return (0.62 + 0.38 * (1.0 - a * a)) * (0.82 + 0.18 * sin(cxl / 14000.0 + seed * 5.0));
+}
 
 // How far the turrets push a storm cell's surface out past its envelope, m.
 fn storm_bulge(sc: vec4f) -> f32 { return clamp(sc.w * 280.0, 800.0, 2200.0); }
@@ -442,6 +438,9 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   let dw0 = dot(dv, W);
   let cxl = dot(dv, X);
   let cx = sign(cxl) * max(abs(cxl) - L2, 0.0);
+  // (A squall line's towers and anvil come down towards its ends, or it ended
+  // in one vertical cut through them all.)
+  let lend = smoothstep(L2 + 0.5 * R, L2 - 3.0 * R, abs(cxl));
   // Tower: leans downwind with height (wind shear). A core that tapers as it
   // climbs, ringed by turrets (rounded columns of their own height), so the
   // outline steps in and narrows upwards like a cluster of updrafts instead of
@@ -450,7 +449,9 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   let hc = clamp(hb / max(htop, 1.0), 0.0, 1.2);
   let dw = dw0 - hb * mix(0.12, 0.22, mature);
   let r = length(vec2f(dw, cx));
-  let rmax = R * 1.75;
+  // (A squall line's turrets stand within 1.1 R of its axis: a tighter bound
+  // lets the march stride past it sooner.)
+  let rmax = R * select(1.75, 1.2, L2 > 0.0);
   var sd = min(rmax - r, htop - hb);
   // (Not full: that cylinder is the bound. It must hold the turrets too, or the
   // march's clear-air strides skip over them.)
@@ -470,26 +471,38 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     // Its foot tucks in over the lowest few hundred metres, a rounded edge to
     // the base instead of a square corner (a straight dark wall seen from afar).
     let foot = 1.0 - 0.1 * (1.0 - smoothstep(0.0, 700.0, hb));
-    let Rt = R * 0.82 * lob * taper * foot * mix(dome, 1.0 + 1.5 * fq * sqrt(fq), mature);
+    // A squall line's core is the low, merged foot of its towers: they stand
+    // out of it, each to its own height, and its outline is theirs. (As one
+    // slab the full height of the line it stood as a flat-topped wall with no
+    // turrets of its own, its face one plane in shade or sun all along.)
+    let Rt = R * select(0.82, 0.5, L2 > 0.0) * lob * taper * foot * mix(dome, 1.0 + 1.5 * fq * sqrt(fq), mature);
     // (The flat base is put on below, once, rounded into the walls.)
-    sd = min(Rt - r, htop - hb);
-    if (r < R * 1.6 && hb < htop * 0.92) {
+    sd = min(Rt - r, select(htop, 0.5 * htop, L2 > 0.0) - hb);
+    if (r < R * select(1.6, 1.35, L2 > 0.0) && hb < htop * 0.92) {
       // Five turrets around the core, each a column of its own height ending
       // in a rounded top (a capsule), slightly narrowing as it climbs. Along a
-      // squall line, the five nearest of a row of them (0.85 R apart, each
-      // its own height and depth in the line; the line's ends round off).
+      // squall line, the three nearest of a row of them (0.85 R apart, each
+      // its own height and depth in the line; the line's ends round off): fat
+      // towers 0.6 to all of the line's height, the younger, lower ones along
+      // its leading edge and the tall ones behind them, with clefts where
+      // neighbours meet. (Above 0.92 of the height they are inside the anvil.)
       let D = 0.85 * R;
       let nj = floor(L2 / D);
       let j0 = round(clamp(cxl, -L2, L2) / D);
-      for (var k = 0; k < 5; k++) {
+      // (The next ones along stand a radius further off than the widest turret.)
+      for (var k = 0; k < select(5, 3, L2 > 0.0); k++) {
         let fk = f32(k);
-        let jk = clamp(j0 + fk - 2.0, -nj, nj);
+        let jk = clamp(j0 + fk - 1.0, -nj, nj);
         let hs = fract(sin(seed * 91.7 + select(fk, jk * 1.618 + 5.0, L2 > 0.0) * 12.989) * vec4f(43758.5, 22578.1, 19642.3, 47453.7));
         let th = 1.2566 * (fk + 0.35 * hs.x) + seed * 17.0;
-        let rk = R * (0.42 + 0.18 * hs.z);
-        let ft = htop * mix(0.42, 0.88, hs.w) * mix(0.75, 1.0, mature);
+        var rk = R * (0.42 + 0.18 * hs.z);
+        var ft = htop * mix(0.42, 0.88, hs.w) * mix(0.75, 1.0, mature);
         var tc = vec2f(cos(th), sin(th)) * (R * (0.6 + 0.3 * hs.y));
-        if (L2 > 0.0) { tc = vec2f(R * (1.1 * hs.y - 0.55), (jk + 0.6 * (hs.x - 0.5)) * D); }
+        if (L2 > 0.0) {
+          rk = R * (0.45 + 0.25 * hs.z);
+          ft = htop * mix(0.6, 1.05, 1.0 - (1.0 - hs.w) * (1.0 - hs.w)) * mix(0.45, 1.0, lend);
+          tc = vec2f(R * (0.3 - 0.55 * hs.w + 0.2 * (hs.y - 0.5)), (jk + 0.6 * (hs.x - 0.5)) * D);
+        }
         let dk = length(vec2f(dw, cxl) - tc);
         let ck = max(ft - rk, 0.0);
         let sk = rk * (1.0 - 0.18 * min(hb / max(ck, 1.0), 1.0)) - length(vec2f(dk, max(hb - ck, 0.0)));
@@ -541,7 +554,7 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     let lc = an.z + max(xa, 0.0) * 0.45;
     let rn = length(vec2f(xa / select(an.y, an.x, xa > 0.0), cx / lc));
     let edge = max(1.0 - rn, 0.0);
-    let th = mix(1500.0, 3500.0, size) * mature;
+    let th = mix(1500.0, 3500.0, size) * mature * select(1.0, mix(0.4, 1.0, lend), L2 > 0.0);
     // A slab with a nearly flat underside, a little deeper over the tower, thinning
     // only in its outer reaches to a sharp leading edge. (A wedge thinning all the
     // way out showed only its shaded underside from afar: a hairline anvil.)
@@ -558,13 +571,17 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     let Ro = R * mix(0.45, 0.6, size) * sqrt(smoothstep(0.3 * at, 0.75 * at, hb));
     let hf = select(1.0, 0.3 + 0.7 * fract(sin(jo * 7.13 + seed * 31.0) * 43758.5), L2 > 0.0);
     let ho = at + sp.z * hf * sqrt(max(1.0 - (ro / max(Ro, 1.0)) * (ro / max(Ro, 1.0)), 0.0));
-    let so = max(sd, min(min(ho - hb, Ro - ro), hb - 0.3 * at));
+    // (A squall line's overshooting tops rise out of the anvil itself: from its
+    // low core they stood under it as bare stems with a cap, mushrooms.)
+    let so = max(sd, min(min(ho - hb, Ro - ro), hb - select(0.3, 0.76, L2 > 0.0) * at));
     // Where the anvil is the part of the envelope that counts (cloud_shape_f
     // smooths it there instead of growing turrets, which hung from its underside
     // in pillars when this went by height alone).
     // The head the tower flares into counts as anvil too: with the tower's
     // turret noise and crisp edge it broke up into floating popcorn.
-    g_anvil = mature * max(smoothstep(-400.0, 400.0, sa - so), smoothstep(0.8, 0.97, hc));
+    // (Not a squall line's: its towers billow right up into the anvil, and as
+    // smooth, thin ice their tops left a gap of sky under it.)
+    g_anvil = mature * max(smoothstep(-400.0, 400.0, sa - so), smoothstep(0.8, 0.97, hc) * select(1.0, 0.0, L2 > 0.0));
     sd = max(so, sa);
   }
   // Under the base (only big, mature cells): a wall cloud under the updraft, a
@@ -604,15 +621,19 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
       // the sky ahead, flatter ledges between: the bands seen from in front),
       // its underside rising back slowly, ragged and lumpy, to meet the rain.
       // Fading out at the line's ends. (A face sloping up at ~10 degrees was
-      // seen edge-on from anywhere near the ground: a thin sliver.)
-      let Ds = STORM_BELOW * 0.92 * low * (1.0 - smoothstep(L2 - R, L2 + 0.3 * R, abs(cxl)));
+      // seen edge-on from anywhere near the ground: a thin sliver. With its
+      // underside rising right from the nose, the nose was a knife edge the
+      // billows wore through, and the bright sky far behind the line showed
+      // through it in specks along the shelf's foot: a rounded nose, its
+      // underside lumpy right to the front.)
+      let Ds = SHELF_BELOW * 0.92 * low * shelf_depth(cxl, seed) * (1.0 - smoothstep(L2 - R, L2 + 0.3 * R, abs(cxl)));
       let x = u / Ws;
       let xf = u / (SHELF_FACE * R);
       let xt = clamp(xf, 0.0, 1.0) * 3.0;
       let tier = (floor(xt) + smoothstep(0.1, 0.9, fract(xt))) / 3.0;
       let xc = clamp(xf, 0.0, 1.0);
-      let ztop = -Ds * select(1.0 - mix(xc, tier, 0.7), 1.0 - 2.0 * xf, xf < 0.0);
-      let zbot = -Ds * (1.0 - 0.55 * x) - Ds * 0.4 * (lump - 0.5) * smoothstep(0.0, 0.5, x);
+      let ztop = -Ds * select(1.0 - 0.4 * sqrt(xc) - 0.6 * tier, 1.0 - 2.0 * xf, xf < 0.0);
+      let zbot = -Ds * (1.0 - 0.55 * x * smoothstep(0.0, 0.35, x)) - Ds * 0.4 * (lump - 0.5) * mix(0.5, 1.0, smoothstep(0.0, 0.5, x));
       let st = ztop - hb;
       let sb = hb - zbot;
       swc = min(min(st, sb) * 0.9, min((1.9 * Ws - u) * 0.5, L2 + 0.3 * R - abs(cxl)));
@@ -634,30 +655,6 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
   return sd;
 }
 
-// A squall line's anvil footprint at a point's column (un its direction): its
-// rn in storm_sd, < 1 under the anvil.
-fn line_rn(un: vec3f, sc: vec4f, sp: vec4f) -> f32 {
-  let dv = (un * 6371.0 + G.weather.xyz * 0.001 - sc.xyz) * 1000.0;
-  let cx = max(abs(dot(dv, normalize(cross(un, G.storm.xyz)))) - floor(sp.w) * 500.0, 0.0);
-  let an = storm_anvil(sc, sp);
-  let xa = dot(dv, G.storm.xyz) - (sp.y - G.cloud.y) * 0.22;
-  return length(vec2f(xa / select(an.y, an.x, xa > 0.0), cx / (an.z + max(xa, 0.0) * 0.45)));
-}
-// Roughly where a squall line's anvil's underside is, m above sea level.
-fn line_ab(sc: vec4f, sp: vec4f) -> f32 { return sp.y - mix(1500.0, 3500.0, smoothstep(2500.0, 8000.0, sc.w * 1000.0)) * 0.8; }
-// The share of the sun a squall line's anvil leaves a point under it (the
-// line's leading face, its shelf cloud, the air in front): 0 where the sun ray
-// from it passes through the anvil, which overhangs the line by tens of km
-// downwind, so only a low sun gets under its edge. (The light march stops a km
-// or two out, far short of the anvil, and lit the shelf as if in the open.)
-fn line_sun(p: vec3f, sc: vec4f, sp: vec4f) -> f32 {
-  let r = length(p);
-  let mu = dot(p / r, G.sun_dir.xyz);
-  let ab = line_ab(sc, sp);
-  let h = r - G.planet.w;
-  if (mu <= 0.01 || h >= ab) { return 1.0; }
-  return smoothstep(0.8, 1.05, line_rn(normalize(p + G.sun_dir.xyz * ((ab - h) / mu)), sc, sp));
-}
 // A circle (horizontal) holding all of storm cell i: xyz its centre on the ground
 // (planet-centred), w its radius (m). Covers the anvil streaming downwind, the
 // flanking line upwind, the tower's lean and the turrets.
@@ -837,7 +834,7 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
   // Under the rain deck the layer reaches down to its scud; elsewhere the
   // ordinary cloud keeps to the base set for it.)
   let hs = h - G.cloud.y;
-  if (hs <= -STORM_BELOW || h >= G.cloud.w) { return 0.0; }
+  if (hs <= -SHELF_BELOW || h >= G.cloud.w) { return 0.0; }
   let hb = hs - (1.0 - wx.ns) * G.nimbo[3].y;
   // The storm envelope is re-evaluated here, not taken from the column: towers are
   // only a few km across, so light probes leave them quickly. Skip the noise where
@@ -1028,7 +1025,7 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
 }
 fn cloud_shape(pp: vec3f, h: f32, wx: Weather, detail: bool) -> f32 { return cloud_shape_f(pp, h, wx, detail, 0.0); }
 fn cloud_density(pp: vec3f, h: f32, cheap: bool) -> f32 {
-  if (h <= G.cloud.y - STORM_BELOW || h >= G.cloud.w) { return 0.0; }
+  if (h <= G.cloud.y - SHELF_BELOW || h >= G.cloud.w) { return 0.0; }
   return cloud_shape(pp, h, cloud_weather(pp), !cheap);
 }
 // Sunlight through the clouds at a point (planet-centred), from the cloud shadow map.

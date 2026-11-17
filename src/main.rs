@@ -2971,8 +2971,6 @@ impl Game {
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
             g.storm[3] = cells.len() as f32;
-            // (the first squall line, whose anvil shades the air: common.wgsl atm_march)
-            g.alto[2] = cells.iter().position(|c| c[1][3] >= 1.0).map_or(0.0, |i| i as f32 + 1.0);
             for (i, c) in cells.iter().enumerate() {
                 g.storm_cells[2 * i] = c[0];
                 g.storm_cells[2 * i + 1] = c[1];
