@@ -12,6 +12,7 @@ mod crash;
 mod damage;
 mod destruct;
 mod fetch;
+mod frame_pacer;
 mod fgmodel;
 mod fluid;
 mod geo;
@@ -5182,6 +5183,218 @@ impl Game {
         Some(out)
     }
 
+    /// The flight instruments drawn on the glass of the screen, in the manner
+    /// of a glass-cockpit primary flight display: a speed tape on the left, an
+    /// artificial horizon with a pitch ladder in the middle, an altitude tape
+    /// on the right, a heading ribbon over it, with the throttle and the
+    /// vertical speed in bars at either side. `ias` is in m/s, `alt` and `agl`
+    /// in metres, `vs` in m/s.
+    fn flight_hud(&self, ctx: &egui::Context, hdg: f64, ias: f64, alt: f64, vs: f64, agl: f64) {
+        use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Shape, Stroke, StrokeKind};
+        let p = &self.plane;
+        let (_, _, u) = geo::enu(p.pos);
+        let (fwd, right, up) = (p.forward(), p.right(), p.up());
+        let pitch = fwd.dot(u).clamp(-1.0, 1.0).asin().to_degrees() as f32;
+        let bank = (-right.dot(u)).atan2(up.dot(u)) as f32;
+        let ias_kt = (ias * 1.94384) as f32;
+        let gs_kt = (p.vel.length() * 1.94384) as f32;
+        let alt_ft = (alt * 3.28084) as f32;
+        let agl_ft = (agl.max(0.0) * 3.28084) as f32;
+        let vs_fpm = (vs * 196.85) as f32;
+        let hdg = hdg as f32;
+        let thr = (p.throttle as f32).clamp(0.0, 1.0);
+
+        let white = Color32::from_rgba_unmultiplied(255, 255, 255, 240);
+        let dim = Color32::from_rgba_unmultiplied(255, 255, 255, 150);
+        let faint = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
+        let green = Color32::from_rgb(110, 235, 140);
+        let amber = Color32::from_rgb(255, 190, 60);
+        let red = Color32::from_rgb(255, 90, 60);
+        let accent = Color32::from_rgb(228, 230, 232);
+        let glass = Color32::from_rgba_unmultiplied(20, 21, 23, 152);
+        let box_fill = Color32::from_rgba_unmultiplied(15, 16, 18, 226);
+        // Keep the traditional blue-over-earth attitude colors distinct from
+        // the neutral liquid-glass chrome around the rest of the interface.
+        let sky = Color32::from_rgb(55, 130, 190);
+        let ground = Color32::from_rgb(150, 91, 58);
+        let mono = |s: f32| FontId::monospace(s);
+
+        const W: f32 = 410.0;
+        const H: f32 = 200.0;
+        egui::Area::new(egui::Id::unique("flight_hud")).anchor(Align2::CENTER_BOTTOM, [0.0, -14.0]).interactable(false).show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(W, H), egui::Sense::hover());
+            let painter = ui.painter().clone();
+            let c = pos2(rect.center().x, rect.top() + 34.0 + 74.0);
+            let ar = Rect::from_center_size(c, vec2(196.0, 148.0));
+            let sr = Rect::from_min_size(pos2(ar.left() - 8.0 - 66.0, ar.top()), vec2(66.0, 148.0));
+            let tr = Rect::from_min_size(pos2(ar.right() + 8.0, ar.top()), vec2(66.0, 148.0));
+            let tb = Rect::from_min_size(pos2(sr.left() - 4.0 - 22.0, ar.top() + 14.0), vec2(22.0, 120.0));
+            let vr = Rect::from_min_size(pos2(tr.right() + 4.0, ar.top() + 14.0), vec2(22.0, 120.0));
+            let hr = Rect::from_min_size(pos2(ar.left(), rect.top()), vec2(196.0, 24.0));
+
+            // ---- the horizon
+            {
+                let ap = painter.with_clip_rect(ar);
+                ap.rect_filled(ar, 0.0, sky);
+                let (sn, cs) = (-bank).sin_cos();
+                let rot = |x: f32, y: f32| pos2(c.x + x * cs - y * sn, c.y + x * sn + y * cs);
+                const K: f32 = 3.6;
+                const L: f32 = 400.0;
+                let hy = pitch * K;
+                ap.add(Shape::convex_polygon(vec![rot(-L, hy), rot(L, hy), rot(L, hy + L), rot(-L, hy + L)], ground, Stroke::NONE));
+                ap.line_segment([rot(-L, hy), rot(L, hy)], Stroke::new(2.0, white));
+                for a in (-30i32..=30).step_by(5) {
+                    if a == 0 {
+                        continue;
+                    }
+                    let y = (pitch - a as f32) * K;
+                    if y.abs() > 130.0 {
+                        continue;
+                    }
+                    let half = if a % 10 == 0 { 28.0 } else { 14.0 };
+                    ap.line_segment([rot(-half, y), rot(half, y)], Stroke::new(1.5, white));
+                    if a % 10 == 0 {
+                        for sgn in [-1.0f32, 1.0] {
+                            ap.text(rot(sgn * (half + 12.0), y), Align2::CENTER_CENTER, format!("{}", a.abs()), mono(10.5), white);
+                        }
+                    }
+                }
+                // the bank scale, fixed, and the pointer that rides the horizon
+                const RR: f32 = 70.0;
+                for ang in [-45.0f32, -30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0, 45.0] {
+                    let (s, k) = ang.to_radians().sin_cos();
+                    let len = if ang % 30.0 == 0.0 { 9.0 } else { 5.0 };
+                    ap.line_segment([pos2(c.x + RR * s, c.y - RR * k), pos2(c.x + (RR - len) * s, c.y - (RR - len) * k)], Stroke::new(1.5, white));
+                }
+                ap.add(Shape::convex_polygon(vec![rot(0.0, -RR + 1.0), rot(-5.0, -RR + 11.0), rot(5.0, -RR + 11.0)], accent, Stroke::NONE));
+                // the aircraft
+                let wing = Stroke::new(3.5, amber);
+                ap.line_segment([pos2(c.x - 54.0, c.y), pos2(c.x - 16.0, c.y)], wing);
+                ap.line_segment([pos2(c.x - 16.0, c.y), pos2(c.x - 16.0, c.y + 7.0)], wing);
+                ap.line_segment([pos2(c.x + 16.0, c.y), pos2(c.x + 54.0, c.y)], wing);
+                ap.line_segment([pos2(c.x + 16.0, c.y), pos2(c.x + 16.0, c.y + 7.0)], wing);
+                ap.circle_filled(c, 3.0, amber);
+            }
+            painter.rect_stroke(ar, 0.0, Stroke::new(1.5, faint), StrokeKind::Outside);
+
+            // ---- speed
+            {
+                painter.rect_filled(sr, 3.0, glass);
+                let tp = painter.with_clip_rect(sr);
+                const PPK: f32 = 3.0;
+                let lo = ((ias_kt - 26.0) / 10.0).floor() as i32 * 10;
+                for v in (lo..=lo + 60).step_by(10) {
+                    if v < 0 {
+                        continue;
+                    }
+                    let y = c.y - (v as f32 - ias_kt) * PPK;
+                    let long = v % 20 == 0;
+                    tp.line_segment([pos2(sr.right(), y), pos2(sr.right() - if long { 12.0 } else { 6.0 }, y)], Stroke::new(1.3, white));
+                    if long {
+                        tp.text(pos2(sr.right() - 16.0, y), Align2::RIGHT_CENTER, format!("{v}"), mono(12.0), dim);
+                    }
+                }
+                let col = if p.stalled { red } else if p.overspeed() > 0.0 || (p.flaps > 0.25 && p.ias() > p.vfe()) { amber } else { white };
+                let b = Rect::from_min_max(pos2(sr.left() + 2.0, c.y - 13.0), pos2(sr.right() + 6.0, c.y + 13.0));
+                painter.rect_filled(b, 3.0, box_fill);
+                painter.rect_stroke(b, 3.0, Stroke::new(1.2, col.gamma_multiply(0.7)), StrokeKind::Inside);
+                painter.text(pos2(b.center().x - 3.0, c.y), Align2::CENTER_CENTER, format!("{:.0}", ias_kt), mono(19.0), col);
+                painter.text(pos2(sr.center().x, sr.top() - 8.0), Align2::CENTER_CENTER, "IAS KT", mono(10.0), dim);
+                painter.text(pos2(sr.center().x, sr.bottom() + 9.0), Align2::CENTER_CENTER, format!("GS {:.0}", gs_kt), mono(11.0), dim);
+            }
+
+            // ---- altitude
+            {
+                painter.rect_filled(tr, 3.0, glass);
+                let tp = painter.with_clip_rect(tr);
+                const PPF: f32 = 0.30;
+                let lo = ((alt_ft - 260.0) / 100.0).floor() as i32 * 100;
+                for v in (lo..=lo + 600).step_by(100) {
+                    let y = c.y - (v as f32 - alt_ft) * PPF;
+                    let long = v % 200 == 0;
+                    tp.line_segment([pos2(tr.left(), y), pos2(tr.left() + if long { 12.0 } else { 6.0 }, y)], Stroke::new(1.3, white));
+                    if long {
+                        tp.text(pos2(tr.left() + 16.0, y), Align2::LEFT_CENTER, format!("{v}"), mono(12.0), dim);
+                    }
+                }
+                let b = Rect::from_min_max(pos2(tr.left() - 6.0, c.y - 13.0), pos2(tr.right() - 2.0, c.y + 13.0));
+                painter.rect_filled(b, 3.0, box_fill);
+                painter.rect_stroke(b, 3.0, Stroke::new(1.2, white.gamma_multiply(0.5)), StrokeKind::Inside);
+                painter.text(pos2(b.center().x + 3.0, c.y), Align2::CENTER_CENTER, format!("{:.0}", (alt_ft / 10.0).round() * 10.0), mono(19.0), white);
+                painter.text(pos2(tr.center().x, tr.top() - 8.0), Align2::CENTER_CENTER, "ALT FT", mono(10.0), dim);
+                let col = if agl_ft < 300.0 && !p.on_ground { amber } else { dim };
+                painter.text(pos2(tr.center().x, tr.bottom() + 9.0), Align2::CENTER_CENTER, format!("AGL {:.0}", agl_ft), mono(11.0), col);
+            }
+
+            // ---- vertical speed
+            {
+                painter.rect_filled(vr, 3.0, glass);
+                let y0 = vr.center().y;
+                let span = vr.height() * 0.5 - 8.0;
+                for k in [-2.0f32, -1.0, 0.0, 1.0, 2.0] {
+                    let y = y0 - k * span * 0.5;
+                    painter.line_segment([pos2(vr.left() + 2.0, y), pos2(vr.left() + if k == 0.0 { 12.0 } else { 7.0 }, y)], Stroke::new(1.2, dim));
+                    if k != 0.0 {
+                        painter.text(pos2(vr.right() - 5.0, y), Align2::CENTER_CENTER, format!("{}", k.abs() as i32), mono(9.5), dim);
+                    }
+                }
+                let y = y0 - (vs_fpm / 2000.0).clamp(-1.0, 1.0) * span;
+                let col = if vs_fpm < -1500.0 && agl_ft < 2500.0 { red } else if vs_fpm.abs() < 100.0 { white } else { green };
+                painter.line_segment([pos2(vr.left() + 2.0, y0), pos2(vr.left() + 2.0, y)], Stroke::new(2.0, col.gamma_multiply(0.45)));
+                painter.rect_filled(Rect::from_min_max(pos2(vr.left() + 2.0, y - 2.5), pos2(vr.right() - 2.0, y + 2.5)), 1.0, col);
+                painter.text(pos2(vr.center().x, vr.top() - 8.0), Align2::CENTER_CENTER, "VS", mono(10.0), dim);
+                painter.text(pos2(vr.center().x, vr.bottom() + 9.0), Align2::CENTER_CENTER, format!("{:+.0}", (vs_fpm / 10.0).round() * 10.0), mono(11.0), col);
+            }
+
+            // ---- throttle
+            {
+                painter.rect_filled(tb, 3.0, glass);
+                let inner = tb.shrink2(vec2(6.0, 5.0));
+                let h = inner.height() * thr;
+                let col = if p.running { accent } else { red };
+                painter.rect_filled(Rect::from_min_max(pos2(inner.left(), inner.bottom() - h), inner.right_bottom()), 1.0, col.gamma_multiply(0.85));
+                painter.rect_stroke(inner, 1.0, Stroke::new(1.0, faint), StrokeKind::Inside);
+                painter.text(pos2(tb.center().x, tb.top() - 8.0), Align2::CENTER_CENTER, "THR", mono(10.0), dim);
+                painter.text(pos2(tb.center().x, tb.bottom() + 9.0), Align2::CENTER_CENTER, format!("{:.0}%", thr * 100.0), mono(11.0), dim);
+            }
+
+            // ---- heading ribbon
+            {
+                painter.rect_filled(hr, 3.0, glass);
+                let hp = painter.with_clip_rect(hr);
+                const PPD: f32 = 3.0;
+                let h0 = ((hdg - 34.0) / 5.0).floor() as i32 * 5;
+                for d in (h0..=h0 + 75).step_by(5) {
+                    let x = hr.center().x + (d as f32 - hdg) * PPD;
+                    let dd = d.rem_euclid(360);
+                    let long = dd % 10 == 0;
+                    hp.line_segment([pos2(x, hr.bottom()), pos2(x, hr.bottom() - if long { 8.0 } else { 4.0 })], Stroke::new(1.2, white));
+                    if long {
+                        let label = match dd {
+                            0 => "N".to_string(),
+                            90 => "E".to_string(),
+                            180 => "S".to_string(),
+                            270 => "W".to_string(),
+                            _ => format!("{:02}", dd / 10),
+                        };
+                        hp.text(pos2(x, hr.top() + 8.0), Align2::CENTER_CENTER, label, mono(11.0), if dd % 90 == 0 { accent } else { dim });
+                    }
+                }
+                let b = Rect::from_center_size(pos2(hr.center().x, hr.center().y), vec2(46.0, 22.0));
+                painter.rect_filled(b, 3.0, box_fill);
+                painter.rect_stroke(b, 3.0, Stroke::new(1.2, white.gamma_multiply(0.5)), StrokeKind::Inside);
+                painter.text(b.center(), Align2::CENTER_CENTER, format!("{:03.0}°", hdg.rem_euclid(360.0).round() % 360.0), mono(14.0), white);
+                // Fixed center index makes the direction of travel immediately
+                // readable while the compass tape slides beneath it.
+                painter.add(Shape::convex_polygon(
+                    vec![pos2(hr.center().x, hr.bottom() + 1.0), pos2(hr.center().x - 5.0, hr.bottom() - 4.0), pos2(hr.center().x + 5.0, hr.bottom() - 4.0)],
+                    amber,
+                    Stroke::NONE,
+                ));
+            }
+        });
+    }
+
     fn ui(&mut self, agl: f64) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32) {
         let raw = self.egui_input();
         let (lat, lon, alt) = geo::pos_to_lla(self.plane.pos);
@@ -5222,7 +5435,7 @@ impl Game {
             let shadow = |ui: &mut egui::Ui, text: String, size: f32, col: Color32| {
                 ui.label(RichText::new(text).font(mono(size)).color(col));
             };
-            let panel = egui::Frame::new().fill(Color32::from_rgba_unmultiplied(8, 12, 18, 120)).corner_radius(6.0).inner_margin(10.0);
+            let panel = egui::Frame::new().fill(Color32::from_rgba_unmultiplied(18, 19, 21, 120)).corner_radius(6.0).inner_margin(10.0);
             if self.pause_open {
                 self.pause_menu(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local);
                 padui::focus_ring(ctx, menu::ACCENT);
@@ -5232,6 +5445,7 @@ impl Game {
                 self.info_panel(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local, speed, alt, agl, hdg);
             }
             if self.show_hud {
+                self.flight_hud(ctx, hdg, speed, alt, vs, agl);
                 let hud = egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
                     panel.show(ui, |ui| {
                         shadow(ui, format!("IAS {:>4.0} kt", speed * 1.94384), 20.0, white);
@@ -5629,6 +5843,7 @@ impl Game {
 struct App {
     args: Args,
     game: Option<Game>,
+    frame_pacer: frame_pacer::FramePacer,
 }
 
 impl ApplicationHandler for App {
@@ -5663,6 +5878,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(s) => g.r.resize(s.width, s.height),
             WindowEvent::RedrawRequested => {
+                // The OS can also request redraws before our frame deadline.
+                let now = Instant::now();
+                if self.frame_pacer.control_flow(now, g.gfx.fps_cap) != ControlFlow::Poll {
+                    return;
+                }
+                self.frame_pacer.frame_started(now);
                 g.frame();
                 if g.quit {
                     g.keep_settings(true);
@@ -5801,9 +6022,13 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(g) = &self.game {
-            g.window.request_redraw();
+            let flow = self.frame_pacer.control_flow(Instant::now(), g.gfx.fps_cap);
+            if flow == ControlFlow::Poll {
+                g.window.request_redraw();
+            }
+            event_loop.set_control_flow(flow);
         }
     }
 }
@@ -6032,7 +6257,7 @@ fn main() -> anyhow::Result<()> {
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
-    el.run_app(&mut App { args, game: None })?;
+    el.run_app(&mut App { args, game: None, frame_pacer: frame_pacer::FramePacer::default() })?;
     Ok(())
 }
 

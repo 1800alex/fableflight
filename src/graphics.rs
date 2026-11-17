@@ -69,6 +69,8 @@ pub struct Graphics {
     /// temporal anti-aliasing (F2)
     pub taa: bool,
     pub vsync: bool,
+    /// Optional frame limit (0 means no software limit).
+    pub fps_cap: u16,
 }
 
 impl Default for Graphics {
@@ -83,7 +85,7 @@ pub const SCALE_MAX: f32 = 2.0;
 impl Graphics {
     /// One of the presets (taa and vsync on).
     pub fn preset(l: Level) -> Self {
-        let mut g = Graphics { scale: 1.0, shadows: Level::High, clouds: Level::High, terrain: Level::High, scenery: Level::High, city: Level::High, trees: Level::High, cars: Level::High, ao: true, taa: true, vsync: true };
+        let mut g = Graphics { scale: 1.0, shadows: Level::High, clouds: Level::High, terrain: Level::High, scenery: Level::High, city: Level::High, trees: Level::High, cars: Level::High, ao: true, taa: true, vsync: true, fps_cap: 0 };
         g.apply(l);
         g
     }
@@ -197,6 +199,7 @@ impl Graphics {
         g.ao = j["ao"].as_bool().unwrap_or(g.ao);
         g.taa = j["taa"].as_bool().unwrap_or(g.taa);
         g.vsync = j["vsync"].as_bool().unwrap_or(g.vsync);
+        g.fps_cap = j["fps_cap"].as_u64().map(|v| v as u16).filter(|v| [0, 30, 60, 90, 120, 144, 165, 240].contains(v)).unwrap_or(0);
         g
     }
 
@@ -215,6 +218,7 @@ impl Graphics {
             "ao": self.ao,
             "taa": self.taa,
             "vsync": self.vsync,
+            "fps_cap": self.fps_cap,
         });
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -327,6 +331,13 @@ impl Graphics {
             ui.label("VSync");
             let t = if self.vsync { "on (no tearing)" } else { "off (uncapped)" };
             ui.checkbox(&mut self.vsync, t);
+            ui.end_row();
+            ui.label("Frame limit");
+            ui.horizontal_wrapped(|ui| {
+                for cap in [0u16, 30, 60, 90, 120, 144, 165, 240] {
+                    ui.selectable_value(&mut self.fps_cap, cap, if cap == 0 { "Unlimited".to_owned() } else { format!("{cap} FPS") });
+                }
+            });
             ui.end_row();
         });
         ui.add_space(4.0);
