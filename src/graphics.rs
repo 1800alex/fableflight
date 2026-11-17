@@ -192,6 +192,7 @@ impl Graphics {
     pub fn load() -> Self {
         let j: serde_json::Value = Self::path().and_then(|p| std::fs::read(p).ok()).and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
         let mut g = Self::default();
+        g.fps_cap = j["fps_cap"].as_u64().map(|v| v as u16).filter(|v| [0, 30, 60, 90, 120, 144, 165, 240].contains(v)).unwrap_or(0);
         // a saved preset follows the code, so retuned presets reach old saves.
         if let Some(l) = j["preset"].as_str().and_then(Level::parse) {
             g.apply(l);
@@ -213,7 +214,6 @@ impl Graphics {
         g.ao = j["ao"].as_bool().unwrap_or(g.ao);
         g.taa = j["taa"].as_bool().unwrap_or(g.taa);
         g.vsync = j["vsync"].as_bool().unwrap_or(g.vsync);
-        g.fps_cap = j["fps_cap"].as_u64().map(|v| v as u16).filter(|v| [0, 30, 60, 90, 120, 144, 165, 240].contains(v)).unwrap_or(0);
         g
     }
 
