@@ -1744,13 +1744,6 @@ impl Game {
         }
     }
 
-    /// The nearest airport worth landing at.
-    fn nearest_airport(&self) -> Option<u32> {
-        let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
-        let db = airports::Db::get();
-        db.near(lat.to_degrees(), lon.to_degrees(), 150_000.0).into_iter().find(|(i, _)| { let a = &db.apts[*i as usize]; a.any_paved() && a.longest() > 700.0 }).map(|x| x.0)
-    }
-
 
     fn controls(&mut self, dt: f64) -> Controls {
         let k = |c: KeyCode| self.keys.contains(&c);

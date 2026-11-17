@@ -77,7 +77,6 @@ pub struct Parked {
 }
 
 pub struct BuildingData {
-    pub id: TileId,
     pub center: DVec3,
     pub radius: f64,
     pub verts: Vec<BVertex>,
@@ -2036,7 +2035,6 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
     indices.extend(m.fine);
     indices.extend(m.far);
     Ok(BuildingData {
-        id,
         center: cx.center,
         radius: m.radius.max(roads.radius) as f64 + 30.0,
         verts: m.v,

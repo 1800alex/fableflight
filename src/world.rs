@@ -125,7 +125,6 @@ pub struct Wreck {
     pub base: f64,
     pub top: f64,
     pub col: [u8; 3],
-    pub tile: TileId,
     /// how its walls were drawn (see `Footprint`)
     pub sty: [u8; 4],
     pub gref: f64,
@@ -565,7 +564,7 @@ impl World {
             let (lat, lon) = tile.lat_lon(p[0] as f64, p[1] as f64);
             geo::lla_to_pos(lat, lon, f.base as f64)
         }).collect();
-        Some(Wreck { ring, base: f.base as f64, top: f.top as f64, col: f.col, tile, sty: f.sty, gref: f.gref as f64, roof_col: f.roof_col, tiers: f.tiers.clone() })
+        Some(Wreck { ring, base: f.base as f64, top: f.top as f64, col: f.col, sty: f.sty, gref: f.gref as f64, roof_col: f.roof_col, tiers: f.tiers.clone() })
     }
 
     /// The rest of the building a footprint belongs to, which comes down with
@@ -787,7 +786,7 @@ impl World {
     /// moving ones that the 3D tiles hide (`photo_car_light`).
     pub fn car_instances(&self, cam: DVec3, activity: f32, sun: f64, out: &mut Vec<(u32, Inst)>, lights: &mut Vec<crate::airfield::Light>) {
         let fr = self.frustum.as_ref();
-        let mut push = |pos: DVec3, fwd: glam::Vec3, up: glam::Vec3, model: u8, col: [f32; 3], out: &mut Vec<(u32, Inst)>| {
+        let push = |pos: DVec3, fwd: glam::Vec3, up: glam::Vec3, model: u8, col: [f32; 3], out: &mut Vec<(u32, Inst)>| {
             let o = (pos - cam).as_vec3();
             if fr.map(|f| f.sphere(pos - cam, 8.0)).unwrap_or(true) {
                 let right = fwd.cross(up).normalize_or_zero();
