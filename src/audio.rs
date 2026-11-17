@@ -1089,7 +1089,7 @@ impl Thunder {
             claps.push(((d - near) / 343.0, (near / d).powf(0.7) * (0.2 + 1.5 * u * u * u), bright(d)));
         }
         claps.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let close = 1.0 - smooth(300.0, 2500.0, near);
+        let close = 1.0 - smooth(400.0, 3500.0, near);
         Self {
             t: -delay,
             claps,
@@ -1103,7 +1103,9 @@ impl Thunder {
             tear_env: 0.0,
             boom_ph: 0.0,
             pan: pan.clamp(-1.0, 1.0) * 0.7,
-            gain: power.min(2.0) * (1500.0 / (near + 700.0)).powf(0.6).min(1.6),
+            // Not the physical fall-off: far thunder is all lows, which the ear
+            // barely weighs, so it is held up enough to rumble under the engine.
+            gain: power.min(2.0) * (4000.0 / (near + 1500.0)).powf(0.45).min(1.6),
             dur: span + 6.0 + near / 2500.0,
         }
     }
@@ -1123,7 +1125,7 @@ impl Thunder {
         }
         self.env *= decay(0.13);
         self.roll += (self.env - self.roll) * kf(0.6);
-        self.k += (kf(70.0) - self.k) * kf(0.8);
+        self.k += (kf(110.0) - self.k) * kf(0.8);
         let x = rng.f() * (self.env + self.roll * 2.0);
         let k = self.k;
         self.lp[0] += (x - self.lp[0]) * k;
@@ -1797,6 +1799,32 @@ mod tests {
             let loud = rms(&render(Params { warn: w, ..base }, &[], 1.0));
             assert!(db(loud, quiet) > 3.0, "{w:?} barely audible: {:.1} dB", db(loud, quiet));
         }
+    }
+
+    /// Thunder against the engine at cruise: the loudest second of the thunder
+    /// (energy over the engine's) and the whole roll, in dB re the engine alone.
+    /// `cargo test thunder_levels -- --nocapture`
+    #[test]
+    fn thunder_levels() {
+        let win = |x: &[[f32; 2]]| -> Vec<f32> { x.chunks(RATE as usize / 2).map(|c| (c.iter().map(|s| s[0] * s[0] + s[1] * s[1]).sum::<f32>() / (2 * c.len()) as f32)).collect() };
+        let mut got = Vec::new();
+        for cabin in [0.0, 1.0] {
+            let p = Params { cabin, ..flying() };
+            let base = render(p, &[], 4.0);
+            let e = rms(&base).powi(2);
+            for km in [2.0f32, 12.0, 25.0] {
+                let near = km * 1000.0;
+                let x = render(p, &[Event::Thunder { delay: 0.2, near, far: near + 5000.0, power: 1.0, pan: 0.0 }], 22.0);
+                assert!(x.iter().all(|s| s[0].abs() <= 1.0 && s[1].abs() <= 1.0));
+                let w = win(&x);
+                let peak = w.iter().cloned().fold(0.0f32, f32::max);
+                let loud = w.iter().filter(|&&v| v > e * 1.26).count() as f32 * 0.5;
+                let th = (peak - e).max(1e-12).sqrt();
+                println!("{} {km:>4} km: loudest 0.5 s thunder {:+.1} dB re engine, {:.1} s over +1 dB, max sample {:.2}", if cabin > 0.5 { "cockpit" } else { "outside" }, db(th, e.sqrt()), loud, x.iter().map(|s| s[0].abs().max(s[1].abs())).fold(0.0, f32::max));
+                got.push(db(th, e.sqrt()));
+            }
+        }
+        let _ = got;
     }
 
     /// `AUDIO_DEMO=/path/demo.wav cargo test audio_demo -- --nocapture` writes a tour of the sounds.
