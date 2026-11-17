@@ -19,6 +19,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec2, DVec3};
 use std::f64::consts::PI;
+use std::sync::OnceLock;
 
 /// Texels across each cascade.
 pub const N: usize = 256;
@@ -232,8 +233,10 @@ pub struct Ocean {
     t: f64,
     /// cascade 0's random numbers
     noise0: Vec<[f32; 2]>,
-    /// cascade 0 on an M x M grid: Dx, Dy, height
-    field: Vec<[f32; 3]>,
+    /// cascade 0 on an M x M grid: Dx, Dy, height. Built from `spec` and `t`
+    /// on the first `height` query after an `update` (it is a function of
+    /// them alone), so frames with nothing on the water skip the FFT.
+    field: OnceLock<Vec<[f32; 3]>>,
     /// this frame's camera, its east and north, and the ocean's coordinates of it
     cam: DVec3,
     east: DVec3,
@@ -270,7 +273,7 @@ impl Ocean {
             dt: 0.0,
             t: 0.0,
             noise0,
-            field: vec![[0.0; 3]; M * M],
+            field: OnceLock::new(),
             cam: DVec3::ZERO,
             east: DVec3::X,
             north: DVec3::Y,
@@ -325,7 +328,7 @@ impl Ocean {
             self.lost_for = key;
             self.lost_slopes();
         }
-        self.cpu_field();
+        self.field = OnceLock::new();
     }
 
     /// Significant wave height, integrated over the cascades' bands.
@@ -438,8 +441,14 @@ impl Ocean {
         self.ripple = [rp[0] as f32, rp[1] as f32, rp[2] as f32, 0.0];
     }
 
+    /// Cascade 0 on the CPU grid, from the same spectrum and noise as the GPU,
+    /// built for this update's time the first time something asks.
+    fn field(&self) -> &[[f32; 3]] {
+        self.field.get_or_init(|| self.cpu_field())
+    }
+
     /// Cascade 0 on the CPU grid, from the same spectrum and noise as the GPU.
-    fn cpu_field(&mut self) {
+    fn cpu_field(&self) -> Vec<[f32; 3]> {
         let l = SIZES[0];
         let dk = 2.0 * PI / l;
         let (klo, khi) = band(0);
@@ -494,23 +503,26 @@ impl Ocean {
                 }
             }
         }
+        let mut field = vec![[0f32; 3]; M * M];
         for y in 0..M {
             for x in 0..M {
                 let sg = if (x + y) & 1 == 1 { -1.0 } else { 1.0 };
                 let d = fd[y * M + x];
-                self.field[y * M + x] = [(d[0] * sg * CHOP[0]) as f32, (d[1] * sg * CHOP[0]) as f32, (fh[y * M + x][0] * sg) as f32];
+                field[y * M + x] = [(d[0] * sg * CHOP[0]) as f32, (d[1] * sg * CHOP[0]) as f32, (fh[y * M + x][0] * sg) as f32];
             }
         }
+        field
     }
 
     /// Cascade 0 at ocean coordinates `p` (m), bilinear, sampled as the GPU's
     /// texture is (its texel centres sit half a texel off the grid).
     fn sample(&self, p: DVec2) -> [f64; 3] {
+        let field = self.field();
         let s = M as f64 / SIZES[0];
         let u = (p - DVec2::splat(SIZES[0] / (2.0 * N as f64))) * s;
         let (x0, y0) = (u.x.floor(), u.y.floor());
         let (fx, fy) = (u.x - x0, u.y - y0);
-        let at = |i: f64, j: f64| self.field[(j.rem_euclid(M as f64) as usize % M) * M + (i.rem_euclid(M as f64) as usize % M)];
+        let at = |i: f64, j: f64| field[(j.rem_euclid(M as f64) as usize % M) * M + (i.rem_euclid(M as f64) as usize % M)];
         let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
         let mut o = [0.0; 3];
         for i in 0..3 {
@@ -760,8 +772,8 @@ mod tests {
                 let k = lo + (hi - lo) * (i as f64 + 0.5) / steps as f64;
                 m0 += o.spec.omni(k) * (hi - lo) / steps as f64;
             }
-            let var = o.field.iter().map(|f| (f[2] as f64).powi(2)).sum::<f64>() / o.field.len() as f64;
-            let hmax = o.field.iter().map(|f| f[2].abs()).fold(0.0, f32::max);
+            let var = o.field().iter().map(|f| (f[2] as f64).powi(2)).sum::<f64>() / o.field().len() as f64;
+            let hmax = o.field().iter().map(|f| f[2].abs()).fold(0.0, f32::max);
             eprintln!("wind {wind}: Hs {:.2} m, long-wave rms {:.2} m (band {:.2}), max {hmax:.2}", o.hs, var.sqrt(), m0.sqrt());
             assert!(o.hs > last);
             assert!(var > m0 * 0.3 && var < m0 * 3.0);
@@ -769,6 +781,45 @@ mod tests {
             // Floating: the height found through the displacement stays near the field's.
             let h = o.height(DVec3::new(10.0, 20.0, 0.0));
             assert!(h.abs() < 4.0 * m0.sqrt() + 0.5);
+        }
+    }
+
+    /// Building the CPU field only when asked gives the same waves, bit for
+    /// bit, as building it on every update: frames nobody asks about leave
+    /// nothing behind, and a frame asked about twice is answered alike.
+    #[test]
+    fn lazy_field_matches_eager() {
+        let (mut eager, mut lazy) = (Ocean::new(), Ocean::new());
+        let pts = [DVec3::new(10.0, 20.0, 0.0), DVec3::new(-137.5, 61.25, 3.0), DVec3::new(900.0, -4000.0, -2.0)];
+        let mut time = 1234.5;
+        for frame in 0..40 {
+            let dt = [1.0 / 60.0, 1.0 / 144.0, 0.0, 0.25][frame % 4];
+            time += dt;
+            // A gusting wind that turns, so the spectrum moves frame by frame.
+            let wind = 6.0 + 4.0 * (frame as f64 * 0.37).sin();
+            let from = 250.0 + 30.0 * (frame as f64 * 0.11).cos();
+            let cam = DVec3::new(frame as f64 * 3.0, 0.0, 0.0);
+            let off = DVec2::new(frame as f64 * 3.0, 7.0).rem_euclid(DVec2::splat(WRAP));
+            for o in [&mut eager, &mut lazy] {
+                o.update(dt, time, wind, from, 0.6, cam, DVec3::X, DVec3::Y, off);
+            }
+            // As before: the field built in every update.
+            let _ = eager.field();
+            // Skip runs of frames, and ask twice on some.
+            if frame % 7 < 3 {
+                continue;
+            }
+            let reps = if frame % 5 == 0 { 2 } else { 1 };
+            for _ in 0..reps {
+                for p in pts {
+                    assert_eq!(eager.height(p).to_bits(), lazy.height(p).to_bits(), "frame {frame} at {p}");
+                }
+            }
+            let same = eager.field().iter().zip(lazy.field()).all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
+            assert!(same, "frame {frame}");
+            // And against a fresh build for this update.
+            let fresh = lazy.cpu_field();
+            assert!(fresh.iter().zip(lazy.field()).all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())), "frame {frame}");
         }
     }
 
