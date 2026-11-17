@@ -234,14 +234,14 @@ use crate::i18n::tr;
 use crate::padui::{self, Hint};
 use egui::{Color32, RichText, Stroke};
 
-pub const ACCENT: Color32 = Color32::from_rgb(255, 196, 64);
+pub const ACCENT: Color32 = Color32::from_rgb(228, 230, 232);
 /// dark text on the accent colour
-pub const ON_ACCENT: Color32 = Color32::from_rgb(24, 18, 4);
-pub const TEXT: Color32 = Color32::from_rgb(232, 235, 240);
-pub const DIM: Color32 = Color32::from_rgb(150, 158, 170);
-pub const PANEL: Color32 = Color32::from_rgba_premultiplied(9, 12, 17, 228);
+pub const ON_ACCENT: Color32 = Color32::from_rgb(20, 21, 23);
+pub const TEXT: Color32 = Color32::from_rgb(238, 239, 240);
+pub const DIM: Color32 = Color32::from_rgb(164, 166, 169);
+pub const PANEL: Color32 = Color32::from_rgba_premultiplied(19, 20, 21, 198);
 /// the see-through glass of the flight panel, over the running game
-pub const GLASS: Color32 = Color32::from_rgba_premultiplied(5, 8, 12, 140);
+pub const GLASS: Color32 = Color32::from_rgba_premultiplied(17, 18, 19, 138);
 
 /// Pages of the in-flight panels: the flight panel (Tab) runs beside the
 /// game; the pause menu (Esc) stops it.
@@ -374,7 +374,7 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
 ]),
 ];
 
-/// The one look shared by every panel: dark glass, amber accent, roomy widgets.
+/// The one look shared by every panel: neutral glass, a soft white accent, and roomy widgets.
 pub fn apply_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.all_styles_mut(|s| {
@@ -397,7 +397,7 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.panel_fill = PANEL;
         v.window_corner_radius = 10.into();
         v.window_stroke = Stroke::new(1.0, Color32::from_white_alpha(22));
-        v.extreme_bg_color = Color32::from_rgb(16, 20, 27);
+        v.extreme_bg_color = Color32::from_rgb(18, 19, 21);
         v.faint_bg_color = Color32::from_white_alpha(6);
         v.slider_trailing_fill = true;
         v.selection.bg_fill = ACCENT;
@@ -408,10 +408,10 @@ pub fn apply_theme(ctx: &egui::Context) {
         w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
         w.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_white_alpha(20));
         for (st, bg, fg) in [
-            (&mut w.inactive, Color32::from_rgb(34, 40, 50), Color32::from_rgb(222, 226, 232)),
-            (&mut w.hovered, Color32::from_rgb(50, 59, 73), Color32::WHITE),
-            (&mut w.active, Color32::from_rgb(66, 78, 96), Color32::WHITE),
-            (&mut w.open, Color32::from_rgb(50, 59, 73), Color32::WHITE),
+            (&mut w.inactive, Color32::from_rgb(36, 37, 39), Color32::from_rgb(225, 226, 227)),
+            (&mut w.hovered, Color32::from_rgb(51, 52, 54), Color32::WHITE),
+            (&mut w.active, Color32::from_rgb(64, 65, 67), Color32::WHITE),
+            (&mut w.open, Color32::from_rgb(51, 52, 54), Color32::WHITE),
         ] {
             st.bg_fill = bg;
             st.weak_bg_fill = bg;
@@ -419,8 +419,8 @@ pub fn apply_theme(ctx: &egui::Context) {
             st.corner_radius = 6.into();
         }
         w.inactive.bg_stroke = Stroke::NONE;
-        w.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
-        w.active.bg_stroke = Stroke::new(1.0, ACCENT);
+        w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_white_alpha(76));
+        w.active.bg_stroke = Stroke::new(1.0, Color32::from_white_alpha(120));
     });
 }
 
@@ -434,11 +434,11 @@ pub fn panel() -> egui::Frame {
 pub fn wide_button(ui: &mut egui::Ui, text: &str, hint: Hint, primary: bool, enabled: bool) -> egui::Response {
     let w = ui.available_width();
     let (fill, col) = if !enabled {
-        (Color32::from_rgb(40, 44, 50), Color32::from_rgb(110, 114, 120))
+        (Color32::from_rgb(40, 41, 43), Color32::from_rgb(110, 111, 113))
     } else if primary {
         (ACCENT, ON_ACCENT)
     } else {
-        (Color32::from_rgb(34, 40, 50), TEXT)
+        (Color32::from_rgb(36, 37, 39), TEXT)
     };
     let mut job = egui::text::LayoutJob::default();
     let font = egui::FontId::proportional(if primary { 17.0 } else { 15.0 });
@@ -515,7 +515,7 @@ pub fn heading(ui: &mut egui::Ui, s: &str) {
 
 /// One `keys … action` row of the controls list.
 pub fn key_row(ui: &mut egui::Ui, keys: &'static str, what: &'static str) {
-    egui::Frame::new().fill(Color32::from_rgb(38, 45, 56)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 0)).show(ui, |ui| {
+    egui::Frame::new().fill(Color32::from_rgb(38, 39, 41)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 0)).show(ui, |ui| {
         ui.label(RichText::new(tr(keys)).monospace().size(12.0).color(Color32::WHITE));
     });
     // Truncate the description so a long one can't spill into the next column.
