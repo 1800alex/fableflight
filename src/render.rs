@@ -652,6 +652,50 @@ pub struct MeshGpu {
     n_idx: u32,
     /// its own textures (a downloaded aircraft's), in place of `bg_obj`'s
     bind: Option<std::sync::Arc<wgpu::BindGroup>>,
+    /// indices before the instrument faces and displays, which come last.
+    n_main: u32,
+}
+
+/// the aircraft shader specialised for one kind, without the instrument faces.
+pub struct ObjFast {
+    kind: u32,
+    cut: wgpu::RenderPipeline,
+    solid: wgpu::RenderPipeline,
+}
+
+/// triangles of instrument faces (9) and displays (14) moved to the end, and where they start.
+fn split_instruments(verts: &[PartVertex], idx: &[u32]) -> (Vec<u32>, u32) {
+    let inst = |t: &[u32]| verts.get(t[0] as usize).is_some_and(|v| matches!(v.mat[0].round() as i32, 9 | 14));
+    let mut main: Vec<u32> = Vec::with_capacity(idx.len());
+    let mut rest = Vec::new();
+    for t in idx.chunks(3) {
+        if t.len() == 3 && inst(t) { rest.extend_from_slice(t) } else { main.extend_from_slice(t) }
+    }
+    let n = main.len() as u32;
+    main.extend(rest);
+    (main, n)
+}
+
+/// the g-buffer pipeline for aircraft parts with fixed constants, mode 0 or 5 of `geom`.
+fn obj_pipeline(d: &wgpu::Device, layout: &wgpu::PipelineLayout, m: &wgpu::ShaderModule, cut: bool, constants: &[(&str, f64)]) -> wgpu::RenderPipeline {
+    const A_PART: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x4];
+    let opts = wgpu::PipelineCompilationOptions { constants, ..Default::default() };
+    let targets = [
+        Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+        Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+        Some(wgpu::ColorTargetState { format: AMB, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+    ];
+    d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("obj fast"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState { module: m, entry_point: Some("vs"), compilation_options: opts.clone(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: 64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A_PART })] },
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Greater), stencil: Default::default(), bias: Default::default() }),
+        multisample: wgpu::MultisampleState { count: msaa(), mask: !0, alpha_to_coverage_enabled: false },
+        fragment: Some(wgpu::FragmentState { module: m, entry_point: Some(if cut { "fs" } else { "fs_solid" }), compilation_options: opts, targets: &targets }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 pub struct DrawObj {
     pub mesh: usize,
@@ -874,6 +918,11 @@ pub struct Renderer {
     obj_ub: wgpu::Buffer,
     bg_obj: wgpu::BindGroup,
     l_obj: wgpu::BindGroupLayout,
+    /// the aircraft shader and its layout, kept to specialise it per kind off the main thread
+    m_obj: wgpu::ShaderModule,
+    pl_obj: wgpu::PipelineLayout,
+    obj_fast: Option<ObjFast>,
+    obj_fast_rx: Option<(u32, crossbeam_channel::Receiver<ObjFast>)>,
     paint_ub: wgpu::Buffer,
     tile_ibuf: wgpu::Buffer,
     tile_nidx: u32,
@@ -1947,6 +1996,7 @@ impl Renderer {
         let p_obj_shadow = geom("obj shadow", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 4);
         let p_obj_solid = geom("obj solid", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 5);
         let p_obj_shadow_solid = geom("obj shadow solid", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 1);
+        let pl_obj = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&l0), Some(&l_obj)], immediate_size: 0 });
         // Glass and the propeller blur: blended over the finished, lit scene,
         // tested against the resolved depth.
         let p_glass = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2119,7 +2169,7 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, m_obj: m_obj.clone(), pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
@@ -2374,12 +2424,8 @@ impl Renderer {
     }
 
     pub fn add_mesh(&mut self, verts: &[PartVertex], idx: &[u32]) -> usize {
-        // (an empty piece, a hinge other pieces hang from, still gets a buffer: nothing is drawn from it)
-        let pad = [PartVertex::zeroed()];
-        let verts = if verts.is_empty() { &pad[..] } else { verts };
-        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
-        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(if idx.is_empty() { &[0u32][..] } else { idx }), usage: wgpu::BufferUsages::INDEX });
-        self.meshes.push(MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32, bind: None });
+        let m = self.mesh_gpu(verts, idx, None);
+        self.meshes.push(m);
         self.meshes.len() - 1
     }
     /// A downloaded aircraft's textures, as the object bind group its meshes draw with.
@@ -2395,10 +2441,44 @@ impl Renderer {
     }
     /// Swap the geometry behind an existing mesh id.
     pub fn replace_mesh(&mut self, i: usize, verts: &[PartVertex], idx: &[u32]) {
-        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
-        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(idx), usage: wgpu::BufferUsages::INDEX });
         let bind = self.meshes[i].bind.take();
-        self.meshes[i] = MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32, bind };
+        self.meshes[i] = self.mesh_gpu(verts, idx, bind);
+    }
+    /// ask for the aircraft shader specialised to `kind`, built on a worker thread.
+    /// until it is ready the generic pipelines draw everything.
+    fn want_obj_kind(&mut self, kind: u32) {
+        if let Some((k, rx)) = &self.obj_fast_rx {
+            if let Ok(f) = rx.try_recv() {
+                self.obj_fast = Some(f);
+                self.obj_fast_rx = None;
+            } else if *k == kind {
+                return;
+            }
+        }
+        if self.obj_fast.as_ref().is_some_and(|f| f.kind == kind) || kind >= 99 {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (d, m, pl) = (self.device.clone(), self.m_obj.clone(), self.pl_obj.clone());
+        let spawned = std::thread::Builder::new().name("obj shader".into()).spawn(move || {
+            let t = std::time::Instant::now();
+            let c = [("KIND", kind as f64), ("INSTR", 0.0)];
+            let f = ObjFast { kind, cut: obj_pipeline(&d, &pl, &m, true, &c), solid: obj_pipeline(&d, &pl, &m, false, &c) };
+            log::info!("aircraft shader for kind {kind} ready in {:.1} s", t.elapsed().as_secs_f64());
+            let _ = tx.send(f);
+        });
+        if spawned.is_ok() {
+            self.obj_fast_rx = Some((kind, rx));
+        }
+    }
+    fn mesh_gpu(&self, verts: &[PartVertex], idx: &[u32], bind: Option<std::sync::Arc<wgpu::BindGroup>>) -> MeshGpu {
+        // (an empty piece, a hinge other pieces hang from, still gets a buffer: nothing is drawn from it)
+        let pad = [PartVertex::zeroed()];
+        let verts = if verts.is_empty() { &pad[..] } else { verts };
+        let (idx, n_main) = split_instruments(verts, idx);
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(if idx.is_empty() { &[0u32][..] } else { &idx }), usage: wgpu::BufferUsages::INDEX });
+        MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32, n_main, bind }
     }
 
     /// Append particles to the ring buffer (oldest are overwritten).
@@ -2474,6 +2554,9 @@ impl Renderer {
         }
         let t_enc = std::time::Instant::now();
         self.stats[1] += (t_enc - t_acq).as_secs_f64();
+        if let Some(o) = f.objs.iter().find(|o| !o.glass) {
+            self.want_obj_kind(o.glow[1].round().max(0.0) as u32);
+        }
         let sview = frame.as_ref().map(|f| f.texture.create_view(&Default::default()));
         let q = &self.queue;
         self.cloud_flip ^= 1;
@@ -2906,28 +2989,47 @@ impl Renderer {
                     }
                 }
             }
-            let mut cur: Option<bool> = None;
+            // pipeline set last: 0 generic solid, 1 generic cut, 2 fast solid, 3 fast cut.
+            let mut cur: Option<u8> = None;
+            let fast = self.obj_fast.as_ref().filter(|_| !shadow);
             for (i, o) in f.objs.iter().take(if part & 1 == 0 { 0 } else { n_objs }).enumerate() {
                 if o.glass || if shadow { o.cast & bit == 0 } else { false } {
                     continue;
                 }
-                if cur != Some(o.cut) {
-                    rp.set_pipeline(match (shadow, o.cut) {
-                        (true, true) => &self.p_obj_shadow,
-                        (true, false) => &self.p_obj_shadow_solid,
-                        (false, true) => &self.p_obj,
-                        (false, false) => &self.p_obj_solid,
-                    });
-                    cur = Some(o.cut);
-                }
                 let m = &self.meshes[o.mesh];
+                let mut set = |rp: &mut wgpu::RenderPass, want: u8| {
+                    if cur != Some(want) {
+                        rp.set_pipeline(match (shadow, want) {
+                            (true, 1) => &self.p_obj_shadow,
+                            (true, _) => &self.p_obj_shadow_solid,
+                            (false, 1) => &self.p_obj,
+                            (false, 0) => &self.p_obj_solid,
+                            (false, 3) => &fast.expect("fast").cut,
+                            (false, _) => &fast.expect("fast").solid,
+                        });
+                        cur = Some(want);
+                    }
+                };
                 if m.n_idx == 0 {
                     continue;
                 }
                 rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[i as u32 * 256]);
                 rp.set_vertex_buffer(0, m.vbuf.slice(..));
                 rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..m.n_idx, 0, 0..1);
+                // the lean shader for the kind flown, the full one for the instruments.
+                if fast.is_some_and(|fp| fp.kind == o.glow[1].round() as u32) {
+                    if m.n_main > 0 {
+                        set(rp, 2 + o.cut as u8);
+                        rp.draw_indexed(0..m.n_main, 0, 0..1);
+                    }
+                    if m.n_main < m.n_idx {
+                        set(rp, o.cut as u8);
+                        rp.draw_indexed(m.n_main..m.n_idx, 0, 0..1);
+                    }
+                } else {
+                    set(rp, o.cut as u8);
+                    rp.draw_indexed(0..m.n_idx, 0, 0..1);
+                }
             }
         };
         // (first: the cascades leave out our scenery the mesh stands over)

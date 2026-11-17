@@ -52,7 +52,11 @@ struct Paint { box: vec4f, view: vec4f };
 // light single, 1 the 747, 2 the Hornet, 3 the Phantom, 4 the Raptor, 5 the Starship rocket. Its windows, wells,
 // paint and panel lines differ. tint.y and tint.z carry the engines: how far the afterburners
 // are lit, and how hard they are running dry (0 idle .. 1).
-fn kind() -> u32 { return u32(O.glow.y + 0.5); }
+// pipeline constants, render.rs obj_fast. a kind under 99 is fixed at compile time.
+override KIND: u32 = 99u;
+// instrument faces and displays, 0 left out (drawn by their own pipeline), 1 drawn.
+override INSTR: u32 = 1u;
+fn kind() -> u32 { if (KIND < 99u) { return KIND; } return u32(O.glow.y + 0.5); }
 // The fighters: modelled in Blender, their paint a picture, one blown canopy over a tub.
 fn fighter() -> bool { return (kind() >= 2u && kind() <= 4u) || kind() == 7u; }
 // The engines, of the aircraft being flown only (wreckage and parts that have come off carry a glow.x).
@@ -2049,11 +2053,13 @@ fn surface(in: VOut) -> Shaded {
       ssr = 0.5;
     }
     case 9u: { // instrument face under glass
-      let g = gauge(u32(in.mat.w + 0.5), in.uv, max(duv * 1.2, 0.004));
-      albedo = g.rgb;
-      rough = 0.04;
-      spec_k = 0.5;
-      emit = g.rgb * g.a * G.sun_dir.w * 0.0035 * night;
+      if (INSTR != 0u) {
+        let g = gauge(u32(in.mat.w + 0.5), in.uv, max(duv * 1.2, 0.004));
+        albedo = g.rgb;
+        rough = 0.04;
+        spec_k = 0.5;
+        emit = g.rgb * g.a * G.sun_dir.w * 0.0035 * night;
+      }
     }
     case 10u: { // matte black: scuffed
       rough = 0.65 + 0.2 * fine.g;
@@ -2166,6 +2172,7 @@ fn surface(in: VOut) -> Shaded {
       metal = ero;
     }
     case 14u: { // backlit display under glass
+      if (INSTR == 0u) { break; }
       albedo = vec3f(0.01);
       rough = 0.05;
       let did = u32(in.mat.w + 0.5);
