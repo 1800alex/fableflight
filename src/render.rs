@@ -534,6 +534,14 @@ pub struct TileGpu {
     vbuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
 }
+/// The cells of the terrain tiles' tessellated blocks (world.rs `tess_cells`),
+/// each `cell | k << 16` for a 2^k x 2^k patch (terrain.wgsl `vs_tess`), in
+/// groups of (tile index in `Frame::tiles`, k, first, count).
+#[derive(Default)]
+pub struct TessCells {
+    pub cells: Vec<u32>,
+    pub groups: Vec<(u32, u32, u32, u32)>,
+}
 /// A photorealistic 3D tile (tiles3d.rs) on the GPU.
 pub struct PhotoGpu {
     vbuf: wgpu::Buffer,
@@ -731,6 +739,8 @@ pub struct Frame<'a> {
     pub g: Globals,
     /// terrain tile and its uniform: offset, info, tessellated cell block (see terrain.wgsl)
     pub tiles: Vec<(&'a TileGpu, [f32; 12])>,
+    /// the cells of those blocks, by the patch they are drawn with
+    pub tess: TessCells,
     pub details: Vec<DetailDraw<'a>>,
     /// photorealistic 3D tiles: offset from the camera and geometric error,
     /// then their level-of-detail crossfade (photo.wgsl `PhotoTile`)
@@ -935,9 +945,13 @@ pub struct Renderer {
     p_terrain: wgpu::RenderPipeline,
     p_terrain_tess: wgpu::RenderPipeline,
     p_terrain_cells: wgpu::RenderPipeline,
-    /// index buffers of a tessellated cell patch and of a single cell quad
+    /// index buffers of the tessellated cell patches (1, 2, 4 .. TESS_N sub-cells
+    /// across, where each starts and ends), and of a single cell quad
     tess_ibuf: wgpu::Buffer,
-    tess_nidx: u32,
+    tess_idx: [std::ops::Range<u32>; 5],
+    /// per tessellated cell: which, and its patch (`TessCells`), and room for so many
+    tess_buf: wgpu::Buffer,
+    tess_cap: usize,
     cell_ibuf: wgpu::Buffer,
     p_build: wgpu::RenderPipeline,
     /// the same without any discard in the fragment shader (`fs_whole`)
@@ -1933,7 +1947,8 @@ impl Renderer {
         const A_INST: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
         let p_terrain = geom("terrain", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 0);
         // Mode 8: cells near the camera as tessellated patches; 9: the rest of such a tile.
-        let p_terrain_tess = geom("terrain tess", Some(&l_tile), &m_terrain, &[], 8);
+        let tess_layout = wgpu::VertexBufferLayout { array_stride: 4, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Uint32] };
+        let p_terrain_tess = geom("terrain tess", Some(&l_tile), &m_terrain, &[Some(tess_layout)], 8);
         let p_terrain_cells = geom("terrain cells", Some(&l_tile), &m_terrain, &[], 9);
         let p_build = geom("build", Some(&l_build), &m_build, &[vb(40, false, &A_BUILD)], 0);
         let p_build_whole = geom("build whole", Some(&l_build), &m_build, &[vb(40, false, &A_BUILD)], 14);
@@ -2144,7 +2159,15 @@ impl Renderer {
             }
             v
         };
-        let (tix, cix) = (patch(TESS_N), patch(1));
+        let (mut tix, mut tess_idx) = (Vec::new(), std::array::from_fn(|_| 0..0));
+        for (k, r) in tess_idx.iter_mut().enumerate() {
+            let p = patch(1 << k);
+            *r = tix.len() as u32..(tix.len() + p.len()) as u32;
+            tix.extend(p);
+        }
+        debug_assert_eq!(1 << (tess_idx.len() - 1), TESS_N);
+        let cix = patch(1);
+        let (tess_cap, tess_buf) = (4096, dynbuf("tess cells", 4096 * 4));
         let tess_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("tess idx"), contents: bytemuck::cast_slice(&tix), usage: wgpu::BufferUsages::INDEX });
         let cell_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cell idx"), contents: bytemuck::cast_slice(&cix), usage: wgpu::BufferUsages::INDEX });
 
@@ -2183,7 +2206,7 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_composite_edge, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_composite_edge, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
@@ -2614,6 +2637,13 @@ impl Renderer {
             blob[i * 256..i * 256 + 48].copy_from_slice(bytemuck::bytes_of(u));
         }
         q.write_buffer(&self.tile_ub, 0, &blob);
+        if f.tess.cells.len() > self.tess_cap {
+            self.tess_cap = f.tess.cells.len().next_power_of_two();
+            self.tess_buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tess cells"), size: self.tess_cap as u64 * 4, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        }
+        if !f.tess.cells.is_empty() {
+            q.write_buffer(&self.tess_buf, 0, bytemuck::cast_slice(&f.tess.cells));
+        }
         if let Some(px) = &f.glow {
             let n = crate::skyglow::N as u32;
             q.write_texture(
@@ -3242,6 +3272,7 @@ impl Renderer {
                 let first = if tess(u) { (crate::sources::GRID * crate::sources::GRID * 6) as u32 } else { 0 };
                 rp.draw_indexed(first..self.tile_nidx, 0, 0..1);
             }
+            let mut groups = f.tess.groups.iter().peekable();
             for (i, (tile, u)) in f.tiles.iter().take(n_tiles).enumerate() {
                 if !tess(u) {
                     continue;
@@ -3250,9 +3281,14 @@ impl Renderer {
                 rp.set_pipeline(&self.p_terrain_cells);
                 rp.set_index_buffer(self.cell_ibuf.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..6, 0, 0..(crate::sources::GRID * crate::sources::GRID) as u32);
+                // Each cell of the block as the smallest patch that makes the same triangles.
                 rp.set_pipeline(&self.p_terrain_tess);
                 rp.set_index_buffer(self.tess_ibuf.slice(..), wgpu::IndexFormat::Uint16);
-                rp.draw_indexed(0..self.tess_nidx, 0, 0..(u[10] * u[11]) as u32);
+                while groups.next_if(|g| (g.0 as usize) < i).is_some() {}
+                while let Some(&(_, k, first, n)) = groups.next_if(|g| g.0 as usize == i) {
+                    rp.set_vertex_buffer(0, self.tess_buf.slice(first as u64 * 4..(first + n) as u64 * 4));
+                    rp.draw_indexed(self.tess_idx[k as usize].clone(), 0, 0..n);
+                }
             }
             // Airfield pavement, then roads, straight onto the terrain.
             rp.set_pipeline(&self.p_field);
