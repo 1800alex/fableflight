@@ -845,13 +845,18 @@ pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32)
                 p.add(egui::Shape::line(arc(c - vec2(0.0, u * 0.15), u * r, pi - 0.75, pi + 0.75), st));
             }
         }
-        // an attitude indicator: the dial, the horizon, the little aircraft
+        // an aeroplane seen from above between two pairs of arcs, like a signal
         Icon::Autopilot => {
-            p.circle_stroke(c, u * 0.9, st);
-            p.line_segment([c + vec2(-u * 0.9, u * 0.1), c + vec2(u * 0.9, u * 0.1)], st);
-            p.line_segment([c + vec2(-u * 0.5, -u * 0.12), c + vec2(-u * 0.15, -u * 0.12)], st);
-            p.line_segment([c + vec2(u * 0.15, -u * 0.12), c + vec2(u * 0.5, -u * 0.12)], st);
-            p.circle_filled(c + vec2(0.0, -u * 0.12), u * 0.08, col);
+            let k = 0.55;
+            let pts = [(0.0, -1.0), (0.14, -0.78), (0.14, -0.25), (0.85, 0.25), (0.85, 0.45), (0.14, 0.2), (0.12, 0.62), (0.38, 0.78), (0.38, 0.95), (0.0, 0.85)];
+            let mut v: Vec<egui::Pos2> = pts.iter().map(|&(x, y)| c + vec2(x, y) * u * k).collect();
+            v.extend(pts.iter().rev().skip(1).take(pts.len() - 2).map(|&(x, y)| c + vec2(-x, y) * u * k));
+            p.add(egui::Shape::closed_line(v, st));
+            let pi = std::f32::consts::PI;
+            for r in [0.72, 0.98] {
+                p.add(egui::Shape::line(arc(c, u * r, -0.65, 0.65), st));
+                p.add(egui::Shape::line(arc(c, u * r, pi - 0.65, pi + 0.65), st));
+            }
         }
         // a cloud
         Icon::Weather => {

@@ -2320,9 +2320,9 @@ impl Game {
         let row = |ui: &mut egui::Ui, name: &str, value: String, minus: &mut bool, plus: &mut bool, sync: &mut bool| {
             ui.horizontal(|ui| {
                 ui.add_sized([44.0, 22.0], egui::Label::new(RichText::new(name).monospace().color(DIM)));
-                *minus = ui.add_sized([28.0, 22.0], egui::Button::new("−")).clicked();
+                *minus = hold_repeat(&ui.add_sized([28.0, 22.0], egui::Button::new("−")));
                 ui.add_sized([86.0, 22.0], egui::Label::new(RichText::new(value).monospace().size(14.0).color(ACCENT)));
-                *plus = ui.add_sized([28.0, 22.0], egui::Button::new("+")).clicked();
+                *plus = hold_repeat(&ui.add_sized([28.0, 22.0], egui::Button::new("+")));
                 *sync = ui.small_button("SYNC").clicked();
             });
         };
@@ -6840,4 +6840,37 @@ fn open_gamepads() -> Option<gilrs::Gilrs> {
         log::info!("gamepad: {} mapping {:?}", p.os_name(), p.mapping_source());
     }
     Some(g)
+}
+
+/// A button that steps once when pressed, then repeats while held
+/// (after 0.4 s, ten steps a second, speeding to twenty-five after 2 s).
+fn hold_repeat(r: &egui::Response) -> bool {
+    let id = r.id.with("hold_repeat");
+    // Keep holding while the primary button stays down over the button —
+    // egui's own press tracking drops out after a long press.
+    let held_on = r.ctx.input(|i| {
+        i.pointer.primary_down() && i.pointer.interact_pos().is_some_and(|p| r.rect.contains(p))
+    });
+    let started = r.ctx.data(|d| d.get_temp::<(f64, u32)>(id).is_some());
+    if !(r.is_pointer_button_down_on() || (started && held_on)) {
+        r.ctx.data_mut(|d| d.remove::<(f64, u32)>(id));
+        return false;
+    }
+    r.ctx.request_repaint();
+    let t = r.ctx.input(|i| i.time);
+    let (start, fired) = r.ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || (t, 0u32)));
+    let held = t - start;
+    let due = if held < 0.4 {
+        1
+    } else if held < 2.0 {
+        1 + ((held - 0.4) / 0.1) as u32
+    } else {
+        17 + ((held - 2.0) / 0.04) as u32
+    };
+    if due > fired {
+        r.ctx.data_mut(|d| d.insert_temp(id, (start, fired + 1)));
+        true
+    } else {
+        false
+    }
 }
