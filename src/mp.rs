@@ -402,7 +402,7 @@ pub fn size_of(aircraft: u8) -> u8 {
 /// How far below the body frame's origin the wheels touch, for an aircraft id
 /// (the traffic models stand on their wheels at their origin).
 fn wheels_below(aircraft: u8) -> f64 {
-    crate::aircraft::ALL.iter().find(|s| s.id == aircraft as u32).map_or(1.2, |s| -s.gear.iter().map(|l| l.at.y - l.wheel_r).fold(0.0, f64::min))
+    crate::aircraft::BUILTIN.iter().find(|s| s.id == aircraft as u32).map_or(1.2, |s| -s.gear.iter().map(|l| l.at.y - l.wheel_r).fold(0.0, f64::min))
 }
 
 /// The other players as traffic models with their lights (as live.rs draws
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn the_names_list_matches_the_aircraft() {
-        for s in crate::aircraft::ALL.iter() {
+        for s in crate::aircraft::BUILTIN.iter() {
             assert_eq!(proto::AIRCRAFT.get(s.id as usize).copied(), Some(s.name), "id {}", s.id);
         }
         assert_eq!(proto::PLANET_R, crate::geo::R);
