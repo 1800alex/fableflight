@@ -1456,6 +1456,10 @@ impl Renderer {
         let info = adapter.get_info();
         log::info!("GPU: {} ({:?})", info.name, info.device_type);
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
+        // Intel integrated GPUs hang (i915 "GPU HANG ... context reset", then a lost
+        // device) within a minute of the start screen at 4x; 2x runs clean (seen on
+        // Alder Lake with Mesa 25.3). FABLE_MSAA still forces a sample count.
+        let samples = if integrated && info.vendor == 0x8086 && std::env::var_os("FABLE_MSAA").is_none() { samples.min(2) } else { samples };
         // 4x is always supported, other counts need adapter format features.
         let afeat = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let ok = samples == 4 || (adapter.features().contains(afeat) && [HDR, AMB, DEPTH].iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(samples)));
