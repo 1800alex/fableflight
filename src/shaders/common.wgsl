@@ -363,23 +363,57 @@ fn nimbo_light(upn: vec3f, h: f32) -> vec3f { return nimbo_down(nimbo_top(upn), 
 // The wall cloud under a big storm hangs down to this far below the cloud base, m.
 const STORM_BELOW = 800.0;
 // ...and a squall line's shelf cloud this far (how far down storm rays march).
-const SHELF_BELOW = 1050.0;
+const SHELF_BELOW = 1150.0;
+// How deep its nose hangs at the deepest, m under the base (shelf_depth x
+// this; its lumpy underside up to a fifth deeper).
+const SHELF_D = 920.0;
+// The ragged ceiling (the storm's dark base) a squall line spreads out over its
+// shelf cloud and a little ahead of it: how deep it hangs under the base, m,
+// and how far ahead of the shelf's nose it reaches (x R).
+const SHELF_CEIL = 260.0;
+const SHELF_AHEAD = 0.35;
 // A squall line's shelf cloud: its leading edge this far ahead of the line's
 // axis, and how far back from there its upper face rises into the base (x the
 // line's radius R). Must match storm.rs.
 const SHELF_F = 1.4;
 const SHELF_W = 0.65;
 // ...and over how much of that its steep upper face rises (x R).
-const SHELF_FACE = 0.3;
+const SHELF_FACE = 0.16;
 
 // How deep a squall line's shelf cloud hangs at cxl metres along the line (a
 // share of its full depth): scalloped, one shallow arc after another, deepest
 // in their middles, and swelling and easing over tens of km. (At one depth
 // all along, its lower edge ran ruler-straight across the sky.)
-fn shelf_depth(cxl: f32, seed: f32) -> f32 {
-  let a = fract(cxl / 5300.0 + seed * 7.0) * 2.0 - 1.0;
-  return (0.62 + 0.38 * (1.0 - a * a)) * (0.82 + 0.18 * sin(cxl / 14000.0 + seed * 5.0));
+// (shelf_lobe: where in its scallop, 1 in the middle, 0 at the cusps.)
+fn shelf_lobe(cxl: f32, seed: f32) -> f32 {
+  let a = fract(cxl / 3600.0 + seed * 7.0) * 2.0 - 1.0;
+  return 1.0 - a * a;
 }
+fn shelf_depth(cxl: f32, seed: f32) -> f32 {
+  return (0.74 + 0.26 * shelf_lobe(cxl, seed)) * (0.9 + 0.1 * sin(cxl / 14000.0 + seed * 5.0));
+}
+// Each scallop bulges forward in its middle as well, a rounded lobe, the cusps
+// between them tucked back (m to add to u): along a straight nose the shelf
+// stood as a flat stripe across the view.
+fn shelf_bulge(cxl: f32, seed: f32, R: f32) -> f32 { return 0.07 * R * (shelf_lobe(cxl, seed) - 0.67); }
+
+// The height (m from the base) of a squall line's shelf cloud's upper face u
+// metres back from its nose, Ds its depth there: a blunt front SHELF_NOSE of
+// Ds tall, then three laminar tiers (a flat ledge, then a steep riser),
+// climbing into the ceiling over it (to the base, its upper tiers hid inside
+// that). (Each tier as one smooth ramp, the face showed as one even band.)
+const SHELF_NOSE = 0.33;
+fn shelf_tier(xc: f32) -> f32 {
+  let xt = min(xc * 3.0, 2.999);
+  return (floor(xt) + smoothstep(0.5, 0.85, fract(xt))) / 3.0;
+}
+fn shelf_top(u: f32, R: f32, Ds: f32) -> f32 {
+  let xc = clamp(u / (SHELF_FACE * R), 0.0, 1.0);
+  let lo = Ds * (1.0 - SHELF_NOSE);
+  return -lo + (lo - 0.5 * SHELF_CEIL) * (0.3 * sqrt(xc) + 0.7 * shelf_tier(xc));
+}
+// Rounded intersection of two half-spaces at distances a and b (radius r).
+fn round_min(a: f32, b: f32, r: f32) -> f32 { return max(r, min(a, b)) - length(max(vec2f(r - a, r - b), vec2f(0.0))); }
 
 // How far the turrets push a storm cell's surface out past its envelope, m.
 fn storm_bulge(sc: vec4f) -> f32 { return clamp(sc.w * 280.0, 800.0, 2200.0); }
@@ -609,7 +643,7 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
     let u = R * (SHELF_F + 0.12 * sin(cxl / 9000.0 + seed * 40.0) + 0.07 * sin(cxl / 3700.0 + seed * 17.0)) - dw0;
     let Ws = SHELF_W * R;
     var lump = 1.0;
-    if (full && select((rw < ww * 1.1), (u > -600.0 && u < 2.0 * Ws), line)) {
+    if (full && select((rw < ww * 1.1), (u > -SHELF_AHEAD * R - 900.0 && u < 2.0 * Ws), line)) {
       let nz = textureSampleLevel(t_noise, s_repeat, (pp + G.weather.xyz) / select(3200.0, 1700.0, line) + vec3f(0.27, 0.61, 0.09), 0.0);
       lump = nz.g * 0.65 + nz.b * 0.35;
     }
@@ -626,21 +660,37 @@ fn storm_sd(pp: vec3f, hb: f32, sc: vec4f, sp: vec4f, full: bool) -> f32 {
       // billows wore through, and the bright sky far behind the line showed
       // through it in specks along the shelf's foot: a rounded nose, its
       // underside lumpy right to the front.)
-      let Ds = SHELF_BELOW * 0.92 * low * shelf_depth(cxl, seed) * (1.0 - smoothstep(L2 - R, L2 + 0.3 * R, abs(cxl)));
+      let lend2 = 1.0 - smoothstep(L2 - R, L2 + 0.3 * R, abs(cxl));
+      let Ds = SHELF_D * low * shelf_depth(cxl, seed) * lend2;
       let x = u / Ws;
-      let xf = u / (SHELF_FACE * R);
-      let xt = clamp(xf, 0.0, 1.0) * 3.0;
-      let tier = (floor(xt) + smoothstep(0.1, 0.9, fract(xt))) / 3.0;
-      let xc = clamp(xf, 0.0, 1.0);
-      let ztop = -Ds * select(1.0 - 0.4 * sqrt(xc) - 0.6 * tier, 1.0 - 2.0 * xf, xf < 0.0);
-      let zbot = -Ds * (1.0 - 0.55 * x * smoothstep(0.0, 0.35, x)) - Ds * 0.4 * (lump - 0.5) * mix(0.5, 1.0, smoothstep(0.0, 0.5, x));
-      let st = ztop - hb;
+      let zbot = -Ds * (1.0 - 0.55 * x * smoothstep(0.0, 0.35, x)) - Ds * 0.3 * (lump - 0.5) * mix(0.4, 1.0, smoothstep(0.0, 0.5, x));
+      let ub = u + shelf_bulge(cxl, seed, R);
+      let st = shelf_top(ub, R, Ds) - hb;
       let sb = hb - zbot;
-      swc = min(min(st, sb) * 0.9, min((1.9 * Ws - u) * 0.5, L2 + 0.3 * R - abs(cxl)));
-      // (Packed for cloud_shape_f: negative where the smooth upper face is the
-      // nearer one, which keeps it laminar instead of billowed; above 1 on
-      // the underside, which keeps a crisper, ragged edge.)
-      let lamf = smoothstep(-120.0, 120.0, sb - st);
+      let lat = L2 + 0.3 * R - abs(cxl);
+      // (A blunt, rounded nose: tapering to a knife edge at the front, its
+      // lowest few hundred metres were thinner than the billows that wear the
+      // underside, and the shelf hung a kilometre back and far higher up
+      // than meant: a thin band on the horizon.)
+      let sw = min(round_min(round_min(st, sb, 120.0), ub, 160.0) * 0.9, min((1.9 * Ws - u) * 0.5, lat));
+      // The storm's base does not end at the shelf: it hangs over it as a
+      // dark, ragged ceiling a few hundred metres under the base, lumpy
+      // underneath, and reaches on a little ahead of the nose before it
+      // breaks off in a torn edge. (With the base ending where the towers
+      // stand, what showed above the shelf from in front was the cumulus
+      // field under the anvil, mottled and lit by the sun in specks.) It
+      // runs on up to the base unbounded (a top of its own, a little over
+      // the base, left it thin enough in the middle for the billows to wear
+      // holes right through it; a slab running on up into the layer cost
+      // ~7% wherever a squall line was in view).
+      let Hc = SHELF_CEIL * (0.55 + 0.9 * lump) * lend2;
+      let sc = min(hb + Hc, min((u + SHELF_AHEAD * R + 900.0 * (lump - 0.5)) * 0.4, min(1.9 * Ws - u, lat)));
+      swc = max(sw, sc);
+      // (Packed for cloud_shape_f: negative where the smooth upper face (or
+      // the blunt front) is the nearer one, which keeps it laminar instead of
+      // billowed; above 1 on the underside and the ceiling, which keeps a
+      // crisper, ragged edge.)
+      let lamf = smoothstep(-120.0, 120.0, min(sb, ub) - st) * smoothstep(-80.0, 80.0, sw - sc);
       let gw = smoothstep(-300.0, 300.0, swc - sd);
       g_wall = gw * (2.0 * (1.0 - lamf) - lamf);
     } else {
@@ -976,15 +1026,15 @@ fn cloud_shape_f(pp: vec3f, h: f32, wx: Weather, detail: bool, fine: f32) -> f32
     // Its underside (lineu) is torn into ragged scud with a crisp edge.
     let lam = max(-g_wall, 0.0);
     let lineu = max(g_wall - 1.0, 0.0);
-    var sdn = sd + bo * bulge * mix(1.3, 0.12, anvil) * (1.0 + 0.9 * flank * step(0.0, bo)) * select(mix(0.3, 1.0, max(smoothstep(0.0, 2000.0, hs), wallq)), mix(0.1, 0.25, min(abs(g_wall), 1.0)) * (1.0 - 0.85 * lam) * (1.0 + 1.5 * lineu), hs < 0.0);
+    var sdn = sd + bo * bulge * mix(1.3, 0.12, anvil) * (1.0 + 0.9 * flank * step(0.0, bo)) * select(mix(0.3, 1.0, max(smoothstep(0.0, 2000.0, hs), wallq)), mix(0.1, 0.25, min(abs(g_wall), 1.0)) * (1.0 - 0.85 * lam) * (1.0 - 0.15 * lineu), hs < 0.0);
     // Low down (the lower flanks, the base, the wall cloud) the big billows are
     // weak, and with nothing finer the outline ran straight for kilometres:
     // lumps a few hundred metres across break it up into ragged scud, fading
     // out towards the bottom of the band under the base.
     let lowz = (1.0 - smoothstep(0.0, 1500.0, hs)) * smoothstep(-STORM_BELOW, -STORM_BELOW + 250.0, hs);
-    sdn += (wv.x * 0.7 + wv.y * 0.3 + 0.08) * 650.0 * lowz * (1.0 - anvil) * (1.0 - 0.9 * lam);
+    sdn += (wv.x * 0.7 + wv.y * 0.3 + 0.08) * 650.0 * lowz * (1.0 - anvil) * (1.0 - 0.9 * lam) * (1.0 - 0.3 * lineu);
     // The anvil's underside is a soft, sagging veil, not a crisp wall.
-    let env = smoothstep(0.0, mix(mix(mix(mix(220.0, 500.0, anvil), 700.0, under), 150.0, lam), 260.0, lineu), sdn);
+    let env = smoothstep(0.0, mix(mix(mix(mix(220.0, 500.0, anvil), 700.0, under), 150.0, lam), 120.0, lineu), sdn);
     // Anvils are smooth ice sheets; the tower is solid and keeps the noise.
     let body = mix(0.6 + base * 0.6, 0.55 + base * 0.3, anvil);
     d = max(d, mix(remap(body * env, 0.2, 1.0, 0.0, 1.0), body * env, anvil));
