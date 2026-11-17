@@ -154,7 +154,12 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
         let a = cell_at(wx, c, pos, w);
         let r = a.r;
         let line = a.len2 > 0.0;
+        // Under (and in) the anvil streaming downwind: a light chop.
+        let anvil = anvil_lid(&a) / 0.55;
         if a.dw0.hypot(a.cx) > r * if line { 5.0 } else { 3.2 } || a.hb > a.htop + 2000.0 {
+            if a.hb < a.htop + 2000.0 {
+                o.sigma = o.sigma.max(0.7 * anvil * (1.0 + 0.5 * a.sup));
+            }
             continue;
         }
         let mature = smoothstep(0.5, 0.8, a.age);
@@ -215,15 +220,33 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
         if line && a.hb < 300.0 {
             o.draft += (5.0 + 4.0 * size) * front * smoothstep(0.0, 250.0, agl);
         }
-        // Turbulence: severe in the cloud and where updraft meets downdraft,
-        // moderate in the rain, light around the cell. It comes in bursts.
-        let shear = core * shaft * 4.0;
+        // Turbulence: how rough this cell's air gets at its worst (sigma, m/s)
+        // goes with how deep and big and vigorous it is: a young shower a
+        // couple of m/s (light to moderate), an ordinary thunderstorm 5-6
+        // (moderate to severe), a big severe storm or a squall line 7-8
+        // (severe), a supercell's rotating updraft 10 and more (extreme).
+        // Where in it: worst in the cloud and where the updraft meets the
+        // downdraft, in the heavy rain and along the gust front low down;
+        // around the cell it builds gradually, and the anvil overhead brings
+        // a light chop. It comes in bursts.
+        let deep = smoothstep(3000.0, 10500.0, a.htop);
+        let peak = vigour * (3.4 + 1.6 * deep + 2.2 * size + 3.5 * sup);
+        let shear = (core * shaft * 4.0).min(1.0);
         let near = 1.0 - smoothstep(1.0, 3.0, a.dw0.hypot(a.cx) / r);
         let low_front = if a.hb < 300.0 { front } else { front * (1.0 - smoothstep(300.0, 1500.0, a.hb)) };
-        let s = vigour * (1.0 + 0.6 * sup) * (1.2 * near + 4.5 * inside * (0.6 + 0.4 * size) + 2.8 * amt * heavy * if line { 0.5 + 0.5 * lh } else { 1.0 } + 3.0 * shear.min(1.0) + 5.5 * low_front);
+        let wet = (amt * heavy * if line { 0.5 + 0.5 * lh } else { 1.0 }).min(1.0);
+        // (a lone cell's outflow, low down ahead of its rain)
+        let ring = if !line && a.hb < 0.0 {
+            let d = (a.dw0 - sa * r).hypot(a.cx - sx * r);
+            amt * (d / (0.8 * r)) * (-(d / (1.3 * r)).powi(2)).exp() * 1.4 * (1.0 - smoothstep(150.0, 900.0, agl))
+        } else {
+            0.0
+        };
+        let calm = (1.0 - inside) * (1.0 - 0.6 * wet) * (1.0 - shear) * (1.0 - 0.75 * low_front.min(1.0)) * (1.0 - 0.6 * ring.min(1.0)) * (1.0 - 0.22 * near) * (1.0 - 0.12 * anvil);
+        let s = peak * (1.0 - calm);
         let k = i as f64 * 1.731;
         let burst = ((0.21 * t + k).sin() * 0.6 + (0.53 * t + 2.3 * k).sin() * 0.4 + (1.37 * t + 4.1 * k).sin() * 0.25) / 1.25;
-        o.sigma = o.sigma.max(s * (0.6 + 0.65 * smoothstep(-0.2, 0.7, burst)));
+        o.sigma = o.sigma.max(s * (0.7 + 0.45 * smoothstep(-0.2, 0.7, burst)));
         // Gust front: the downdraft fans out from under the shaft, low down.
         // Under a squall line it rushes forward all along it: a sudden wind
         // shift as the shelf passes over, the outflow blowing on through the
@@ -263,6 +286,18 @@ pub fn near_mask(wx: &Weather, cam: DVec3) -> u32 {
     m
 }
 
+/// How much of the anvil's thick grey lid is overhead, 0..0.55 (its shade).
+fn anvil_lid(a: &At) -> f64 {
+    let r = a.r;
+    let mature = smoothstep(0.5, 0.8, a.age);
+    let sup = a.sup;
+    let reach = if a.len2 > 0.0 { 2.8 } else { 4.5 };
+    let an = (r * (1.0 + (reach + (10.5 - reach) * sup) * mature), r * (0.8 + 0.35 * mature + 0.45 * sup), r * (1.0 + 0.6 * mature + 0.4 * sup));
+    let lc = an.2 + a.dw0.max(0.0) * (0.45 - 0.15 * sup);
+    let rn = (a.dw0 / if a.dw0 > 0.0 { an.0 } else { an.1 }).hypot(a.cx / lc);
+    (1.0 - smoothstep(0.5, 1.05, rn)) * 0.55 * mature
+}
+
 /// How deep in a storm's shade a point is, 0..1: under the tower and its rain
 /// nearly all the sky is dark cloud; under the anvil a thick grey lid. Must
 /// match common.wgsl `storm_shade`.
@@ -274,14 +309,7 @@ pub fn shade(wx: &Weather, pos: DVec3) -> f64 {
         let r = a.r;
         let rc = (a.dw0 - 0.25 * r).hypot(a.cx) / r;
         let core = (1.0 - smoothstep(0.7, 1.7, rc)) * smoothstep(0.3, 0.75, a.age) * smoothstep(1500.0, 4000.0, r);
-        let mature = smoothstep(0.5, 0.8, a.age);
-        let sup = a.sup;
-        let reach = if a.len2 > 0.0 { 2.8 } else { 4.5 };
-        let an = (r * (1.0 + (reach + (10.5 - reach) * sup) * mature), r * (0.8 + 0.35 * mature + 0.45 * sup), r * (1.0 + 0.6 * mature + 0.4 * sup));
-        let lc = an.2 + a.dw0.max(0.0) * (0.45 - 0.15 * sup);
-        let rn = (a.dw0 / if a.dw0 > 0.0 { an.0 } else { an.1 }).hypot(a.cx / lc);
-        let lid = (1.0 - smoothstep(0.5, 1.05, rn)) * 0.55 * mature;
-        dark = dark.max(core.max(lid));
+        dark = dark.max(core.max(anvil_lid(&a)));
     }
     let alt = pos.length() - geo::R;
     dark * (1.0 - smoothstep(wx.base() as f64, wx.base() as f64 + 3000.0, alt))
@@ -798,7 +826,9 @@ mod tests {
         // Far off in clear air: nothing.
         let far = (p + e * 30000.0).normalize() * (geo::R + 600.0);
         let l = local(&wx, far, 600.0, 0.0);
-        assert!(l.rain == 0.0 && l.sigma < 0.1, "{l:?}");
+        assert!(l.rain == 0.0 && l.sigma < 1.0, "only a light chop under the anvil: {l:?}");
+        let side = (p + geo::enu(p).1 * 30000.0).normalize() * (geo::R + 600.0);
+        assert!(local(&wx, side, 600.0, 0.0).sigma == 0.0);
         // In the tower's heart: cloud, updraft.
         let core = (p - e * 1000.0).normalize() * (geo::R + wx.base() as f64 + 3000.0);
         let l = local(&wx, core, 4000.0, 0.0);
@@ -935,6 +965,83 @@ mod tests {
             }
         }
         assert!(nf > 300 && far > 2, "{nf} flashes, {far} strikes far out under the anvil in 10 minutes");
+    }
+
+    /// The worst turbulence (sigma) and drafts met crossing a weather `setup`
+    /// placed at `p` along a few lines through it, from 400 m up to well into
+    /// the tower, as the flight model gets it (weather.rs `air`).
+    fn roughest(setup: impl Fn(&mut Weather, DVec3)) -> (f64, f64, f64) {
+        let mut wx = Weather::new(0.3);
+        wx.storms = 0.0;
+        (wx.wind, wx.wind_from) = (8.0, 270.0);
+        let p = geo::lla_to_pos(0.72, -1.68, 0.0);
+        setup(&mut wx, p);
+        wx.cells = wx.storm_cells(p);
+        let (e, n, _) = geo::enu(p);
+        let (mut sig, mut up, mut dn) = (0.0f64, 0.0f64, 0.0f64);
+        for alt in [400.0, 1200.0, 2500.0, 4000.0, 6000.0] {
+            for k in -100..=100 {
+                for off in [e * 1.0, n * 1.0, e - n * 0.3, n + e * 0.4] {
+                    let x = off.normalize() * (k as f64 * 250.0);
+                    let q = (p + x).normalize() * (geo::R + alt);
+                    // (at a few moments, as it comes in bursts)
+                    for t in [0.0, 4.0, 9.0, 15.0] {
+                        let a = wx.air(q, alt, t, false);
+                        sig = sig.max(a.sigma_w);
+                        up = up.max(a.draft);
+                        dn = dn.min(a.draft);
+                    }
+                }
+            }
+        }
+        (sig, up, dn)
+    }
+
+    #[test]
+    fn turbulence_ranks_the_kinds_of_weather() {
+        use crate::weather::CellKind;
+        let deck = roughest(|wx, p| {
+            wx.rain_set = Some(1.0);
+            for _ in 0..600 {
+                wx.step_deck(1.0, p, Some(0.0));
+            }
+        });
+        let shower = roughest(|wx, p| wx.place_storm(p, 0.0, 0.0, 1.8, Some(CellKind::Shower)));
+        let thunder = roughest(|wx, p| wx.place_storm(p, 0.0, 0.0, 5.0, Some(CellKind::Thunder)));
+        let severe = roughest(|wx, p| wx.place_storm(p, 0.0, 0.0, 6.0, None));
+        let squall = roughest(|wx, p| wx.place_squall(p, 0.0, 0.0, 60.0));
+        let sup = roughest(|wx, p| wx.place_storm(p, 0.0, 0.0, crate::weather::SUPER_R, Some(CellKind::Supercell)));
+        for (k, v) in [("deck", deck), ("shower", shower), ("thunder", thunder), ("severe", severe), ("squall", squall), ("supercell", sup)] {
+            println!("{k:10} sigma {:4.1}  draft {:+5.1} {:+5.1}", v.0, v.1, v.2);
+        }
+        // The rain deck: smooth to a light chop, no storm drafts.
+        assert!(deck.0 > 0.5 && deck.0 < 1.5 && deck.1 < 1.0 && deck.2 > -1.0, "{deck:?}");
+        // A shower: light to moderate, a gentle updraft and a little sink.
+        assert!(shower.0 > 1.5 && shower.0 < 3.0 && shower.1 > 2.0 && shower.1 < 6.0, "{shower:?}");
+        // A thunderstorm: moderate to severe, a clear up- and downdraft couplet.
+        assert!(thunder.0 > 4.0 && thunder.0 < 7.0 && thunder.1 > 4.0 && thunder.2 < -3.0, "{thunder:?}");
+        // Severe storms and squall lines: severe.
+        assert!(severe.0 > thunder.0 + 1.0 && severe.0 < 9.5 && severe.1 > thunder.1, "{severe:?}");
+        assert!(squall.0 > thunder.0 + 1.0 && squall.0 < 9.5, "{squall:?}");
+        // A supercell: extreme, an updraft of 30 m/s and more.
+        assert!(sup.0 > severe.0.max(squall.0) + 2.0 && sup.1 > 30.0, "{sup:?}");
+        assert!(deck.0 < shower.0 && shower.0 < thunder.0);
+    }
+
+    #[test]
+    fn storm_turbulence_builds_gradually_and_ends_a_few_km_out() {
+        let (wx, p) = storm();
+        let (e, n, _) = geo::enu(p);
+        let r = 6000.0;
+        // Coming in from the side (no anvil overhead), 1500 m up.
+        let at = |d: f64| local(&wx, (p + n * d).normalize() * (geo::R + 1500.0), 1500.0, 0.0).sigma;
+        let s: Vec<f64> = [4.0, 3.0, 2.5, 2.0, 1.5, 1.2].iter().map(|k| at(k * r)).collect();
+        println!("{s:?}");
+        assert!(s[0] == 0.0 && s[1] < 0.3, "back to the day's own air a few km clear: {s:?}");
+        assert!(s.windows(2).all(|w| w[1] >= w[0]) && s[3] > 0.3 && s[5] < 3.0, "building gradually: {s:?}");
+        // Downwind, far out under the anvil: a light chop.
+        let anvil = local(&wx, (p + e * 4.0 * r).normalize() * (geo::R + 1500.0), 1500.0, 0.0).sigma;
+        assert!(anvil > 0.2 && anvil < 1.2, "{anvil}");
     }
 
     #[test]

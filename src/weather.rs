@@ -841,7 +841,9 @@ impl Weather {
         let w20 = self.wind * 0.93;
         let mech = (0.1 + 0.2 * self.gusts) * w20 * (1.0 - 0.65 * smoothstep(250.0, 900.0, agl));
         // Convective eddies through the mixed layer.
-        let conv = self.convection() * if water { 0.25 } else { 1.0 };
+        // (Under the rain deck the sun is gone and the thermals with it.)
+        let sunlit = 1.0 - 0.9 * self.deck_shade(pos);
+        let conv = self.convection() * sunlit * if water { 0.25 } else { 1.0 };
         let top = self.mixed_top();
         let convt = 1.1 * conv * (1.0 - smoothstep(0.85 * top, 1.15 * top, agl)) * smoothstep(0.0, 60.0, agl).max(0.3);
         // In the cloud layer itself (strongest where it is cumulus-like rather than a flat deck).
@@ -849,6 +851,9 @@ impl Weather {
         let (base, ctop) = (self.base() as f64, (self.base() + self.depth()) as f64);
         let inside = smoothstep(base - 150.0, base + 100.0, alt) * (1.0 - smoothstep(ctop - 100.0, ctop + 200.0, alt));
         let cloud = inside * self.clouds as f64 * (0.7 + 0.8 * self.convection() + 0.6 * self.storms as f64);
+        // In and under the rain deck: smooth, a light chop in the heavier rain
+        // (the falling rain drags the air down unevenly).
+        let deck = self.deck_area(pos).min(1.0) * self.deck as f64 * 0.25 + 0.6 * self.deck_rain(pos);
         // A light background chop everywhere, as there always is a little.
         let background = 0.12 + 0.03 * self.wind;
 
@@ -858,14 +863,17 @@ impl Weather {
         let st = crate::storm::local(self, pos, agl, t);
         let storm = st.sigma;
         let draft = st.draft;
-        let sigma_w = (mech * mech + convt * convt + cloud * cloud + storm * storm + background * background).sqrt().min(9.0);
+        let rest = convt * convt + cloud * cloud + deck * deck + storm * storm + background * background;
+        let sigma_w = (mech * mech + rest).sqrt().min(13.0);
         // Near the ground the eddies are as small as the height and the horizontal
         // gusts larger than the vertical; aloft they are a few hundred metres across.
         let k = 0.177 + 0.000823 * ft.min(1000.0);
         let len_w = agl.clamp(12.0, 530.0);
         let len_h = (agl / k.powf(1.2)).clamp(40.0, 530.0);
-        let sigma_h = sigma_w / k.powf(0.4).max(0.5).min(1.0);
-        Air { sigma_w, sigma_h, len_w, len_h, draft: self.thermal(pos, agl, t) * if water { 0.2 } else { 1.0 } + draft, gust: st.gust }
+        // (Only the wind's own eddies, tumbling over the ground, are stretched
+        // out sideways like that; a storm's are as strong across as up.)
+        let sigma_h = (mech * mech / k.powf(0.8).clamp(0.25, 1.0) + rest).sqrt().min(13.0);
+        Air { sigma_w, sigma_h, len_w, len_h, draft: self.thermal(pos, agl, t) * sunlit * if water { 0.2 } else { 1.0 } + draft, gust: st.gust }
     }
 
     /// The floating weather & time window (F3). `utc` and `doy` belong to the
