@@ -537,7 +537,10 @@ struct TopOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f, @locatio
 // Tessellation without a tessellation stage: every coarse grid cell near the
 // camera is drawn as a TN x TN patch whose vertices snap to a coarser lattice
 // with distance. Each edge picks its level from its own midpoint, so the two
-// cells sharing it agree and the surface stays closed.
+// cells sharing it agree and the surface stays closed. Most cells need far
+// fewer than TN x TN vertices: each is drawn as an n x n patch (n a power of
+// two, from world.rs `tess_cells`) whose vertices are every (TN / n)-th of the
+// full patch's, which makes the very same triangles where n is large enough.
 const TN = 16u;
 // Triangles are kept to about TESS_K of their distance across.
 const TESS_K = 0.03;
@@ -584,12 +587,14 @@ fn relief(P: vec3f, N: vec3f, uv: vec2f, sp: f32) -> f32 {
   return h * g.amp;
 }
 
-@vertex fn vs_tess(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
-  let rw = u32(T.tess.z);
-  let ci = u32(T.tess.x) + ii % rw;
-  let cj = u32(T.tess.y) + ii / rw;
-  let a = vi % (TN + 1u);
-  let b = vi / (TN + 1u);
+// `cell`: the cell's index in the grid | log2(n) << 16 (render.rs `TessCells`).
+@vertex fn vs_tess(@builtin(vertex_index) vi: u32, @location(0) cell: u32) -> VOut {
+  let n = 1u << (cell >> 16u);
+  let ci = (cell & 0xffffu) % GRID;
+  let cj = (cell & 0xffffu) / GRID;
+  // The vertex's place in the full TN x TN patch.
+  let a = vi % (n + 1u) * (TN / n);
+  let b = vi / (n + 1u) * (TN / n);
   let i00 = cj * GV + ci;
   let c00 = cv(i00);
   let c10 = cv(i00 + 1u);
