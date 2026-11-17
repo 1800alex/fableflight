@@ -603,26 +603,40 @@ fn composite_sample(in: FsIn, z: f32, c0: vec4f, a0: vec4f, amb: f32) -> vec3f {
   return clamp(col, vec3f(0.0), vec3f(3000.0));
 }
 
+// The resolved pixel, shaded once. Pixels where water shares the pixel with
+// something else are shaded again, sample by sample, by `fs_edge` after this.
+// (Two passes rather than a branch here: with both paths in one shader the
+// whole pass ran about 2.5x slower on an Intel iGPU, edge pixels or not,
+// presumably from the per-sample path's register needs.)
 @fragment fn fs(in: FsIn) -> @location(0) vec4f {
   let px = vec2i(in.pos.xy);
+  return vec4f(composite_sample(in, textureLoad(t_depth, px, 0),
+    textureLoad(t_color, px, 0), textureLoad(t_aux, px, 0),
+    textureLoad(t_amb, px, 0).r), 1.0);
+}
+
+// Where water shares a pixel, shade before resolving: each water sample needs
+// its own tint, parameters and depth, even when no neighbouring pixel is
+// entirely water. Foreground samples retain their own lighting and haze rather
+// than water's colour. Every other pixel keeps what `fs` gave it.
+@fragment fn fs_edge(in: FsIn) -> @location(0) vec4f {
+  let px = vec2i(in.pos.xy);
+  // Water writes aux.a = 1 and everything else aux.a <= 0 (glass negative, sky
+  // cleared to 0), so the resolved alpha lies strictly between 0 and 1, or
+  // below 0, wherever water shares a pixel with anything else.
+  let a = textureLoad(t_aux, px, 0).a;
+  if (!(a < 0.0 || (a > 0.0 && a < 1.0))) { discard; }
   let ns = i32(textureNumSamples(t_aux_ms));
   var water_samples = 0;
   for (var i = 0; i < ns; i++) {
     if (textureLoad(t_aux_ms, px, i).a > 0.996) { water_samples++; }
   }
-  if (water_samples > 0 && water_samples < ns) {
-    // Shade before resolving: each water sample needs its own tint, parameters
-    // and depth, even when no neighbouring pixel is entirely water. Foreground
-    // samples retain their own lighting and haze rather than water's colour.
-    var col = vec3f(0.0);
-    for (var i = 0; i < ns; i++) {
-      col += composite_sample(in, textureLoad(t_depth_ms, px, i),
-        textureLoad(t_color_ms, px, i), textureLoad(t_aux_ms, px, i),
-        textureLoad(t_amb_ms, px, i).r);
-    }
-    return vec4f(col / f32(ns), 1.0);
+  if (water_samples == 0 || water_samples == ns) { discard; }
+  var col = vec3f(0.0);
+  for (var i = 0; i < ns; i++) {
+    col += composite_sample(in, textureLoad(t_depth_ms, px, i),
+      textureLoad(t_color_ms, px, i), textureLoad(t_aux_ms, px, i),
+      textureLoad(t_amb_ms, px, i).r);
   }
-  return vec4f(composite_sample(in, textureLoad(t_depth, px, 0),
-    textureLoad(t_color, px, 0), textureLoad(t_aux, px, 0),
-    textureLoad(t_amb, px, 0).r), 1.0);
+  return vec4f(col / f32(ns), 1.0);
 }

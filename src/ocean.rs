@@ -171,9 +171,29 @@ fn band(c: usize) -> (f64, f64) {
     }
 }
 
-/// In-place inverse FFT (positive exponent, unnormalised) of a power-of-two run.
+/// The FFT's twiddle factors (cos, sin of 2 pi k / len) for every stage up to
+/// `M` points: stage `len` holds its `len / 2` of them from `len / 2 - 1` on.
+/// Worked out once: per butterfly they were most of `cpu_field`'s time.
+fn twiddles() -> &'static [[f64; 2]] {
+    static TW: std::sync::OnceLock<Vec<[f64; 2]>> = std::sync::OnceLock::new();
+    TW.get_or_init(|| {
+        let mut tw = Vec::with_capacity(M);
+        let mut len = 2;
+        while len <= M {
+            let ang = 2.0 * PI / len as f64;
+            tw.extend((0..len / 2).map(|k| [(ang * k as f64).cos(), (ang * k as f64).sin()]));
+            len *= 2;
+        }
+        tw
+    })
+}
+
+/// In-place inverse FFT (positive exponent, unnormalised) of a power-of-two
+/// run of at most `M` points.
 fn ifft(a: &mut [[f64; 2]]) {
     let n = a.len();
+    assert!(n.is_power_of_two() && n <= M);
+    let tw = twiddles();
     let bits = n.trailing_zeros();
     for i in 0..n {
         let j = i.reverse_bits() >> (usize::BITS - bits);
@@ -183,10 +203,10 @@ fn ifft(a: &mut [[f64; 2]]) {
     }
     let mut len = 2;
     while len <= n {
-        let ang = 2.0 * PI / len as f64;
+        let tw = &tw[len / 2 - 1..len - 1];
         for s in (0..n).step_by(len) {
             for k in 0..len / 2 {
-                let (wc, ws) = ((ang * k as f64).cos(), (ang * k as f64).sin());
+                let [wc, ws] = tw[k];
                 let p = a[s + k];
                 let q = a[s + k + len / 2];
                 let q = [q[0] * wc - q[1] * ws, q[0] * ws + q[1] * wc];
@@ -427,6 +447,8 @@ impl Ocean {
         let mut fd = vec![[0f64; 2]; M * M];
         let mut fh = vec![[0f64; 2]; M * M];
         let h = M as i64 / 2;
+        // Rows with no wave in the band stay zero, and so does their transform.
+        let mut live = [false; M];
         for cy in 0..M {
             for cx in 0..M {
                 let n = (cx as i64 - h, cy as i64 - h);
@@ -435,6 +457,7 @@ impl Ocean {
                 if k < klo || k >= khi || k <= 0.0 {
                     continue;
                 }
+                live[cy] = true;
                 let (gx, gy) = ((n.0 + 128) as usize, (n.1 + 128) as usize);
                 let a = dk * 0.5f64.sqrt();
                 let np = self.noise0[gy * N + gx];
@@ -457,7 +480,7 @@ impl Ocean {
             }
         }
         for f in [&mut fd, &mut fh] {
-            for r in f.chunks_mut(M) {
+            for (r, _) in f.chunks_mut(M).zip(live).filter(|(_, l)| *l) {
                 ifft(r);
             }
             let mut col = vec![[0f64; 2]; M];
@@ -680,6 +703,45 @@ impl OceanGpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cached twiddles give the transform bit for bit as working them out
+    /// at every butterfly did.
+    #[test]
+    fn ifft_matches_per_butterfly_twiddles() {
+        fn reference(a: &mut [[f64; 2]]) {
+            let n = a.len();
+            let bits = n.trailing_zeros();
+            for i in 0..n {
+                let j = i.reverse_bits() >> (usize::BITS - bits);
+                if j > i {
+                    a.swap(i, j);
+                }
+            }
+            let mut len = 2;
+            while len <= n {
+                let ang = 2.0 * PI / len as f64;
+                for s in (0..n).step_by(len) {
+                    for k in 0..len / 2 {
+                        let (wc, ws) = ((ang * k as f64).cos(), (ang * k as f64).sin());
+                        let p = a[s + k];
+                        let q = a[s + k + len / 2];
+                        let q = [q[0] * wc - q[1] * ws, q[0] * ws + q[1] * wc];
+                        a[s + k] = [p[0] + q[0], p[1] + q[1]];
+                        a[s + k + len / 2] = [p[0] - q[0], p[1] - q[1]];
+                    }
+                }
+                len *= 2;
+            }
+        }
+        let noise = noise();
+        for n in [2, 8, M] {
+            let mut a: Vec<[f64; 2]> = noise[..n].iter().map(|v| [v[0] as f64, v[1] as f64]).collect();
+            let mut b = a.clone();
+            ifft(&mut a);
+            reference(&mut b);
+            assert!(a.iter().zip(&b).all(|(x, y)| x[0].to_bits() == y[0].to_bits() && x[1].to_bits() == y[1].to_bits()), "n = {n}");
+        }
+    }
 
     /// The CPU copy of the long waves carries the energy its band should, and
     /// the sea grows with the wind.

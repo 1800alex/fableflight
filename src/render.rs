@@ -949,6 +949,8 @@ pub struct Renderer {
     p_obj_shadow_solid: wgpu::RenderPipeline,
     p_glass: wgpu::RenderPipeline,
     p_composite: wgpu::RenderPipeline,
+    /// the composite again, sample by sample, where water shares a pixel
+    p_composite_edge: wgpu::RenderPipeline,
     p_cloud: wgpu::RenderPipeline,
     p_cloud_apply: wgpu::RenderPipeline,
     p_cloud_temporal: wgpu::RenderPipeline,
@@ -1803,6 +1805,7 @@ impl Renderer {
             mix: ([0; 8], 1.0),
         };
         let p_composite = full("composite", &pl(&l_composite), &m_comp, "fs", HDR, None);
+        let p_composite_edge = full("composite edge", &pl(&l_composite), &m_comp, "fs_edge", HDR, None);
         let p_gtao = full("gtao", &pl(&l_ao), &m_ao, "fs_gtao", AMB, None);
         let p_ao_blur = full("ao blur", &pl(&l_ao), &m_ao, "fs_blur", AMB, None);
         let p_cloud = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2180,7 +2183,7 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_composite_edge, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
@@ -3295,6 +3298,7 @@ impl Renderer {
         }
         mark(&mut enc, "resolve+ao");
         full(&mut enc, &t.hdr, true, &self.p_composite, &t.bg_composite);
+        full(&mut enc, &t.hdr, false, &self.p_composite_edge, &t.bg_composite);
         mark(&mut enc, "composite");
         // Lights over the lit scene, under the clouds.
         if n_fields > 0 || n_dyn > 0 {
