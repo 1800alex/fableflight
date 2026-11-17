@@ -129,6 +129,10 @@ pub enum Event {
     Splash(f32),
     /// a missile leaving its rail (strength ~0.2 .. 2)
     Missile(f32),
+    /// hard airframe impact: strength and whether the aircraft is heavy
+    Impact { strength: f32, heavy: bool },
+    /// avionics voice: terrain/pull-up, terrain, sink rate, too-low gear, or fifty
+    Callout(u8),
 }
 
 #[derive(Default)]
@@ -307,6 +311,8 @@ enum Bus {
     Struct,
     /// the aircraft's outside noises: full outside, dulled inside
     Mid,
+    /// impact, debris and water remain audible after the aircraft stops
+    World,
 }
 
 /// A one-shot sound: a gliding tone, gliding filtered noise, and pulses
@@ -679,6 +685,17 @@ impl Clip {
         let f = pos.fract() as f32;
         (self.l[i] + (self.l[j] - self.l[i]) * f, self.r[i] + (self.r[j] - self.r[i]) * f)
     }
+}
+
+fn callout_clips() -> &'static [Clip; 5] {
+    static CLIPS: OnceLock<[Clip; 5]> = OnceLock::new();
+    CLIPS.get_or_init(|| [
+        Clip::wav(include_bytes!("../assets/audio/gpws_terrain_pullup.wav"), false),
+        Clip::wav(include_bytes!("../assets/audio/gpws_terrain.wav"), false),
+        Clip::wav(include_bytes!("../assets/audio/gpws_sink_rate.wav"), false),
+        Clip::wav(include_bytes!("../assets/audio/gpws_too_low_gear.wav"), false),
+        Clip::wav(include_bytes!("../assets/audio/radio_fifty.wav"), false),
+    ])
 }
 
 /// The fighter's recordings (generated with ElevenLabs, see assets/audio).
@@ -1215,6 +1232,7 @@ struct Synth {
     wind: Wind,
     body: Body,
     voices: Vec<Voice>,
+    speech: Option<(u8, f64)>,
     alarms: Alarms,
     world: World,
     cab: Cabin,
@@ -1243,6 +1261,7 @@ impl Synth {
             wind: Wind::new(),
             body: Body::new(),
             voices: Vec::with_capacity(MAX_VOICES),
+            speech: None,
             alarms: Alarms::new(),
             world: World { lp_boom: 0.0, lp_boom2: 0.0, lp_wind: 0.0, booms: Vec::new(), crackle: 0.0 },
             cab: Cabin::new(),
@@ -1270,6 +1289,28 @@ impl Synth {
         let r = &mut self.rng;
         match e {
             Event::Boom(p) => self.world.booms.push((0.0, p)),
+            Event::Callout(id) => {
+                if id < 5 { self.speech = Some((id, 0.0)); }
+            }
+            Event::Impact { strength, heavy } => {
+                let s = strength.clamp(0.2, 2.5);
+                let scale = if heavy { 0.62 } else { 1.0 };
+                let pn = r.range(-0.18, 0.18);
+                let thump = Voice::new(if heavy { 2.4 } else { 1.35 }, pn, Bus::World)
+                    .tone(if heavy { 34.0 } else { 58.0 }, if heavy { 19.0 } else { 26.0 }, 1.4 * s, if heavy { 0.7 } else { 0.36 })
+                    .noise(if heavy { 520.0 } else { 900.0 }, 90.0, 0.65, 2.0 * s, 0.38)
+                    .pulses(if heavy { 38.0 } else { 72.0 }, 9.0, true, 0.8 * s);
+                let tear = Voice::new(0.95, -pn, Bus::World)
+                    .strike(1.2 * s * scale)
+                    .res([if heavy { 420.0 } else { 780.0 }, if heavy { 980.0 } else { 2100.0 }], [24.0, 32.0], [0.4, 0.28])
+                    .noise(3600.0, 900.0, 0.75, 1.4 * s * scale, 0.18)
+                    .pulses(240.0, 24.0, true, 0.55 * s * scale);
+                let rattle = Voice::new(if heavy { 2.8 } else { 1.8 }, r.range(-0.4, 0.4), Bus::World)
+                    .delay(if heavy { 0.16 } else { 0.09 })
+                    .noise(if heavy { 1100.0 } else { 1850.0 }, 340.0, 0.55, 0.7 * s * scale, 1.2)
+                    .pulses(52.0, 8.0, true, 0.45 * s);
+                for v in [thump, tear, rattle] { self.push(v); }
+            }
             Event::Snap(s) => {
                 let s = s.min(2.0);
                 let pn = r.range(-0.6, 0.6);
@@ -1296,7 +1337,7 @@ impl Synth {
             }
             Event::Crunch(s) => {
                 let s = s.min(2.0);
-                let v = Voice::new(0.6, r.range(-0.5, 0.5), Bus::Mid).pulses(160.0, 15.0, true, 0.9 * s).res([r.range(800.0, 1100.0), r.range(2200.0, 3000.0)], [3.0, 4.0], [0.4, 0.25]).noise(4200.0, 3000.0, 0.7, 0.8 * s, 0.25).tone(70.0, 45.0, 0.5 * s, 0.06);
+                let v = Voice::new(0.6, r.range(-0.5, 0.5), Bus::World).pulses(160.0, 15.0, true, 0.9 * s).res([r.range(800.0, 1100.0), r.range(2200.0, 3000.0)], [3.0, 4.0], [0.4, 0.25]).noise(4200.0, 3000.0, 0.7, 0.8 * s, 0.25).tone(70.0, 45.0, 0.5 * s, 0.06);
                 self.push(v);
             }
             Event::Missile(s) => {
@@ -1308,11 +1349,11 @@ impl Synth {
                 let s = s.min(2.0);
                 let pn = r.range(-0.3, 0.3);
                 // The slap: a dull thump with a burst of torn water.
-                let slap = Voice::new(1.4, pn, Bus::Mid).tone(r.range(42.0, 55.0), 28.0, 0.9 * s, 0.2).noise(1100.0, 240.0, 0.6, 2.4 * s, 0.3);
+                let slap = Voice::new(1.4, pn, Bus::World).tone(r.range(42.0, 55.0), 28.0, 0.9 * s, 0.2).noise(1100.0, 240.0, 0.6, 2.4 * s, 0.3);
                 // The sheet thrown up roaring as it breaks into spray.
-                let sheet = Voice::new(2.6, -pn, Bus::Mid).noise(2400.0, 650.0, 0.5, 1.3 * s, 0.8);
+                let sheet = Voice::new(2.6, -pn, Bus::World).noise(2400.0, 650.0, 0.5, 1.3 * s, 0.8);
                 // Then it rains back down: a hiss and a patter of drops.
-                let rain = Voice::new(3.6, pn * 0.5, Bus::Mid).delay(r.range(0.7, 1.1) * s.sqrt()).noise(5200.0, 2600.0, 0.6, 0.55 * s, 1.6).pulses(900.0, 60.0, true, 0.5 * s).res([r.range(2600.0, 3400.0), r.range(5000.0, 6500.0)], [2.5, 3.0], [0.12, 0.08]);
+                let rain = Voice::new(3.6, pn * 0.5, Bus::World).delay(r.range(0.7, 1.1) * s.sqrt()).noise(5200.0, 2600.0, 0.6, 0.55 * s, 1.6).pulses(900.0, 60.0, true, 0.5 * s).res([r.range(2600.0, 3400.0), r.range(5000.0, 6500.0)], [2.5, 3.0], [0.12, 0.08]);
                 for v in [slap, sheet, rain] {
                     self.push(v);
                 }
@@ -1453,18 +1494,16 @@ impl Iterator for Synth {
         let rg = (150.0 / (p.dist + 60.0)).min(1.5);
         let w = self.wind.sample(&p, rng);
         let b = self.body.sample(&p, rng);
-        let (mut sl, mut sr, mut ml, mut mr) = (b[0], b[1], b[2], b[3]);
+        let (mut sl, mut sr, mut ml, mut mr, mut wl, mut wr) = (b[0], b[1], b[2], b[3], 0.0, 0.0);
         let mut i = 0;
         while i < self.voices.len() {
             let v = &mut self.voices[i];
             let y = v.sample(rng);
             let (l, r) = pan(y, v.pan);
-            if v.bus == Bus::Struct {
-                sl += l;
-                sr += r;
-            } else {
-                ml += l;
-                mr += r;
+            match v.bus {
+                Bus::Struct => { sl += l; sr += r; }
+                Bus::Mid => { ml += l; mr += r; }
+                Bus::World => { wl += l; wr += r; }
             }
             if v.done() {
                 self.voices.swap_remove(i);
@@ -1516,10 +1555,24 @@ impl Iterator for Synth {
         let mut l = (el * (1.0 - x) + il * x) * p.live;
         let mut r = (er * (1.0 - x) + ir * x) * p.live;
 
+        let (voice_l, voice_r) = if let Some((id, pos)) = self.speech {
+            let clip = &callout_clips()[id as usize];
+            if pos < clip.len() {
+                self.speech = Some((id, pos + clip.step));
+                clip.at(pos)
+            } else {
+                self.speech = None;
+                (0.0, 0.0)
+            }
+        } else { (0.0, 0.0) };
+        let voice_gain = (0.22 + 0.78 * x) * dg;
+        l += voice_l * voice_gain;
+        r += voice_r * voice_gain;
+
         // The world, and the warnings (louder in the cockpit, where the speaker is).
         let world = self.world.sample(p.fire, rng);
-        l += world;
-        r += world;
+        l += world + wl * dg;
+        r += world + wr * dg;
         let alarm = self.alarms.sample(&p.warn) * (0.55 + 0.45 * x) * 0.32;
         l += alarm;
         r += alarm;
