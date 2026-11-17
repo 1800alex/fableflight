@@ -445,6 +445,8 @@ fn depth_match(a: f32, b: f32) -> f32 {
   var sunw = vec3f(0.0);  // opacity-weighted sunlight and sunward transmittance, for the rim
   var litw = 0.0;
   var cw = 0.0;
+  // Whether the last sample was in cloud: the ray then ended in it, not past it.
+  var incloud = false;
 
   // Sky light for the ambient term: zenith and horizon from the sky table, plus
   // sunlight bounced off the ground below.
@@ -614,12 +616,13 @@ fn depth_match(a: f32, b: f32) -> f32 {
         slook = max(-wx.sd - max(storm_bulge(wx.sc), 2600.0), 0.0) * 0.8;
       }
       // Stride faster through the empty storm-only air above the ordinary layer.
-      if (d <= 0.002) { pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, floor(min(sclear, h - base - G.cloud.z + dt0) / dt0) - 1.0); }
+      if (d <= 0.002) { incloud = false; pempty = true; pts = ts; clear = min(clear + 0.2, select(1.0, 3.0, h > base + G.cloud.z && wx.cb <= 0.0)); if (h > base + G.cloud.z && smask != 0u) { clear = max(clear, floor(min(sclear, h - base - G.cloud.z + dt0) / dt0) - 1.0); }
         // Under a storm's base the clear air between the scud takes longer
         // steps (grazing rays cross kilometres of it).
         ufree = h < base && smask != 0u;
         continue; }
       clear = 0.0;
+      incloud = true;
       // Light the cloud near where the ray went in, not where the (long, far
       // off) step happened to land: a sample hundreds of metres deep sees the sun
       // through that much cloud, which turned distant sunlit towers dull grey. A
@@ -880,7 +883,12 @@ fn depth_match(a: f32, b: f32) -> f32 {
     // Only the share the march did not already light (litw) is added.
     // (Not through cloud the march found opaque: T was zeroed, and the floor's
     // tau e^-tau times the sharp lobe lit a disc round the sun on a storm's base.)
-    if (cw > 0.0 && cs > 0.5 && T > 0.0) {
+    // (Nor where the ray ends on something inside the cloud, the cockpit or
+    // the aircraft flying through it: there is no sunlit far side, and the
+    // metre of cloud in front of every pixel lit a glare round the sun over
+    // the cabin, the march itself finding the sun hidden.)
+    let cut = incloud && tb >= tscene;
+    if (cw > 0.0 && cs > 0.5 && T > 0.0 && !cut) {
       let tau = -log(max(T, 1e-4));
       let lit = litw / cw;
       L += (sunw / cw) * (RIM * hg(cs, 0.94) * tau * exp(-tau) * (1.0 - lit));
