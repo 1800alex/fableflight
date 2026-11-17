@@ -594,6 +594,13 @@ pub fn build(cx: &Ctx, vt: &VecTile, src: &crate::sources::Sources, mesh: &mut M
                     let clear = ((ea + cum[i]).min(total - ea - cum[i]) / 45.0).min(1.0) * 5.5;
                     zs[i] = (za + (zb - za) * t + camber * 4.0 * t * (1.0 - t)).max(zs[i] + clear);
                 }
+            } else if zs.len() > 2 {
+                // DEM samples can change abruptly on a hillside. Ease short
+                // wavelength bumps while keeping the road endpoints anchored.
+                let raw = zs.clone();
+                for i in 1..zs.len() - 1 {
+                    zs[i] = raw[i - 1] * 0.2 + raw[i] * 0.6 + raw[i + 1] * 0.2;
+                }
             }
 
             if line.brunnel != 2 {
@@ -601,13 +608,18 @@ pub fn build(cx: &Ctx, vt: &VecTile, src: &crate::sources::Sources, mesh: &mut M
                     // Solid deck with parapets, soffit and piers, in the building mesh.
                     let thick = if len + pre > 300.0 { 1.8 } else { 1.0 };
                     let sty = [(half * 4.0).min(255.0) as u8, (kind & 255) as u8, (kind >> 8) as u8, 0];
-                    let grey = [150, 148, 142, K_PLAIN];
+                    let grey = [142, 141, 136, K_PLAIN];
+                    let rail = [178, 177, 171, K_PLAIN];
                     for i in 0..n - 1 {
                         let c = |k: usize, s: f32, dz: f32| cx.pos(side(k, s, half), zs[k] + dz);
                         let (al0, al1) = (pre + cum[i], pre + cum[i + 1]);
                         mesh.poly(false, &[(c(i, 1.0, 0.0), [-half, al0]), (c(i, -1.0, 0.0), [half, al0]), (c(i + 1, -1.0, 0.0), [half, al1]), (c(i + 1, 1.0, 0.0), [-half, al1])], [0, 0, 0, K_DECK], sty, Some(upv));
                         for s in [1.0f32, -1.0] {
                             mesh.poly(false, &[(c(i, s, -thick), [al0, 0.0]), (c(i + 1, s, -thick), [al1, 0.0]), (c(i + 1, s, 0.9), [al1, 1.9]), (c(i, s, 0.9), [al0, 1.9])], grey, [90, 0, 120, 0], None);
+                            // A lighter coping cap makes each concrete parapet
+                            // read as a finished barrier instead of a flat wall.
+                            let inset = ((half - 0.16) / half).clamp(0.0, 1.0);
+                            mesh.poly(false, &[(c(i, s, 0.9), [al0, 0.0]), (c(i + 1, s, 0.9), [al1, 0.0]), (c(i + 1, s * inset, 0.9), [al1, 0.3]), (c(i, s * inset, 0.9), [al0, 0.3])], rail, [35, 0, 105, 0], Some(upv));
                         }
                         mesh.poly(false, &[(c(i, 1.0, -thick), [0.0, al0]), (c(i, -1.0, -thick), [1.0, al0]), (c(i + 1, -1.0, -thick), [1.0, al1]), (c(i + 1, 1.0, -thick), [0.0, al1])], grey, [90, 0, 120, 0], None);
                         let ring: Vec<[f32; 2]> = [side(i, 1.0, half), side(i, -1.0, half), side(i + 1, -1.0, half), side(i + 1, 1.0, half)].iter().map(|p| [p[0] / ext, p[1] / ext]).collect();
@@ -628,8 +640,17 @@ pub fn build(cx: &Ctx, vt: &VecTile, src: &crate::sources::Sources, mesh: &mut M
                             if zs[i] - g > 3.5 {
                                 let m = cx.metres(pts[i]);
                                 let t = Vec2::new(nrm[i].y, -nrm[i].x).normalize_or_zero();
-                                let (a, b) = (nrm[i].normalize_or_zero() * (half * if sp > 100.0 { 0.9 } else { 0.55 }), t * if sp > 100.0 { 2.6 } else { 0.7 });
-                                mesh.boxm(cx, false, m, a, b, g - 3.0, zs[i] - thick, grey, [40, 0, 110, 0], None);
+                                let normal = nrm[i].normalize_or_zero();
+                                let deck_bottom = zs[i] - thick;
+                                // A broad crosshead and two separate columns
+                                // give elevated spans a readable viaduct frame.
+                                mesh.boxm(cx, false, m, normal * half * 0.88, t * if sp > 100.0 { 1.3 } else { 0.45 }, deck_bottom - 0.85, deck_bottom, [128, 127, 122, K_PLAIN], [35, 0, 105, 0], None);
+                                for side_off in [-half * 0.48, half * 0.48] {
+                                    let q = [pts[i][0] + normal.x * side_off / um, pts[i][1] + normal.y * side_off / um];
+                                    let foot = cx.metres(q);
+                                    let base = cx.ground(q) - 2.0;
+                                    mesh.boxm(cx, false, foot, normal * 0.52, t * 0.42, base, deck_bottom - 0.85, grey, [35, 0, 105, 0], None);
+                                }
                             }
                             next += sp;
                         }
@@ -642,7 +663,10 @@ pub fn build(cx: &Ctx, vt: &VecTile, src: &crate::sources::Sources, mesh: &mut M
                         let endd = stops.iter().fold(1e4f32, |m, (s, j)| m.min((cum[i] - s).abs() - (j.half - half)));
                         for s in [1.0f32, -1.0] {
                             let p = side(i, s, half);
-                            let pos = cx.pos(p, cx.ground(p) + 0.12);
+                            // Keep the terrain's cross-slope while carrying
+                            // the smoothed road profile along both edges.
+                            let z = zs[i] + (cx.ground(p) - cx.ground(pts[i]));
+                            let pos = cx.pos(p, z + 0.12);
                             out.radius = out.radius.max(pos.length());
                             out.verts.push(RoadVertex { pos: pos.into(), q: [-s * half, cum[i], half, endd], kind: kind as f32 });
                         }
