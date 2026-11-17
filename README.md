@@ -67,7 +67,7 @@ In cockpit view, hover over a working control to see its action and setting. Cli
 | --- | --- |
 | Cessna 172RG | Battery, magnetos and starter key, throttle, propeller RPM, mixture, cowl flaps, tank selector, landing lights, gear, flaps, parking brake, toe brakes, trim wheel and yoke trim, NAV and ADF tuning, OBS, heading sync and altimeter setting |
 | Robin DR400/180 Régent | Battery, magnetos, separate starter button, throttle, mixture, tank selector, landing light, parking brake, toe brakes, trim wheel, flap lever and sliding canopy handle |
-| Boeing 747-400 | Overhead battery pushbutton, four thrust levers and reverse levers, landing gear, flaps, speedbrake and toe brakes |
+| Boeing 747-400 | Overhead battery pushbutton and engine start switches, four thrust levers and reverse levers, fuel control switches, landing gear, flaps, speedbrake, alternate stabiliser trim, parking brake and toe brakes |
 | Concorde | Four thrust levers, gear, toe brakes and the nose/visor selector with up, visor down, 5° and 12.5° positions |
 | F/A-18C | Twin throttles, landing gear, flap selector, canopy switch and toe brakes |
 | F-4E | Twin throttles, landing gear, slats/flaps selector and toe brakes |
