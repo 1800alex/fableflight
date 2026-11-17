@@ -6,6 +6,7 @@ use crate::geo::{self, TileId};
 use crate::render::{BuildGpu, DetailDraw, Inst, NearDraw, Renderer, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
 use crate::roads::RoadNet;
 use crate::trees::{lod_span, tree_jit, NearCell, TreeDim, Under, CARDS, CARD_RANGE, IMP_DIST, LODS, LOD_DIST, LOD_JITTER, TREE_SPECIES, VARIANTS};
+use crate::weapons::{Target, TargetKey};
 use crate::sources::{Job, JobResult, Loader, DATA_ZOOM, GRID, GV};
 use glam::{DMat4, DVec3, DVec4, Vec3};
 use std::collections::{HashMap, VecDeque};
@@ -234,6 +235,11 @@ impl World {
     pub fn new(loader: Loader, max_zoom: u8) -> Self {
         let photo = Some(Box::new(crate::tiles3d::Photo::new(loader.src.google.clone(), Some(loader.src.clone()))));
         Self { photo, flat: None, loader, tiles: HashMap::new(), builds: HashMap::new(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, reach_k: 1.0, city_k: 1.0, tree_far: 3200.0, tree_imp_k: 1.0, cars: (1.0, 2200.0, 1100.0), buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::new(), ocean: crate::ocean::Ocean::new() }
+    }
+
+    /// Tiles wanted but not yet asked for (at most 28 are on their way at once).
+    pub fn queued(&self) -> usize {
+        self.wanted.len()
     }
 
     /// Height of the ground (or water surface) at a lat/lon: the top of the
@@ -982,10 +988,15 @@ impl World {
 
         // Dispatch the most urgent requests.
         self.wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (prio, id) in self.wanted.drain(..) {
+        // (What is not asked for this time stays in `wanted` until the next
+        // update clears it: `queued` counts it.)
+        let mut sent = 0;
+        for k in 0..self.wanted.len() {
             if self.in_flight >= 28 {
                 break;
             }
+            let (prio, id) = self.wanted[k];
+            sent += 1;
             self.in_flight += 1;
             if id.z & 0x80 != 0 {
                 let id = TileId::new(id.z & 0x7f, id.x, id.y);
@@ -1006,6 +1017,8 @@ impl World {
                 self.loader.submit(prio, Job::Terrain(id));
             }
         }
+
+        self.wanted.drain(..sent);
 
         // Evict what has not been needed for a while.
         if self.frame % 120 == 0 {
@@ -1089,6 +1102,26 @@ impl World {
             });
             f.traffic.step(&f.geo, dt, wind_from, wind_kt, activity, pl);
         }
+    }
+
+    /// The airborne aircraft at nearby airports, as missile targets.
+    pub fn air_targets(&self, near: DVec3) -> Vec<Target> {
+        let mut out = Vec::new();
+        for s in self.fields.values() {
+            let FSlot::Ready(f) = s else { continue };
+            if (f.geo.center - near).length() > 40_000.0 {
+                continue;
+            }
+            f.traffic.targets(&f.geo, &mut out);
+        }
+        out
+    }
+
+    /// A missile hit an airport mover: take it out of the traffic.
+    pub fn down_air_target(&mut self, key: &TargetKey) -> bool {
+        let TargetKey::Airport { apt, mover } = key else { return false };
+        let Some(FSlot::Ready(f)) = self.fields.get_mut(apt) else { return false };
+        f.traffic.down(*mover)
     }
 
     /// Pavement to draw: each airfield with its centre relative to the camera.

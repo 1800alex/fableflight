@@ -555,7 +555,7 @@ pub fn v2(a: [[f32; 2]; 4]) -> [Vec2; 4] {
 }
 /// Does this surface pattern have the openings (windows, gear wells) cut out of it?
 pub fn cut_by(pattern: f32) -> bool {
-    pattern == pat::FUSE || pattern == pat::LINING || pattern == pat::COWL
+    pattern == pat::FUSE || pattern == pat::LINING || pattern == pat::COWL || pattern == crate::fgmodel::P_TEX
 }
 /// Only the skin has the gear wells cut in it (a cabin lining runs down to the floor above them).
 pub fn well_cut_by(pattern: f32) -> bool {
@@ -604,6 +604,8 @@ pub enum Input {
     Reverser,
     /// the Mach number (inlet spikes follow it)
     Mach,
+    /// a sliding canopy, 0 shut .. 1 fully open
+    Canopy,
 }
 
 /// How an input is shaped before it moves a piece.
@@ -694,6 +696,13 @@ impl Anim {
     /// Turns by `t`, then slides along `dir` by `s`.
     pub const fn turn_slide(t: Drive, s: Drive, dir: Vec3) -> Self {
         Anim::Move(Motion { turn: [t, Drive::NONE], slide: s, dir })
+    }
+    /// Whether any of its drives follows `i`.
+    pub fn uses(&self, i: Input) -> bool {
+        match self {
+            Anim::Move(m) => m.turn.iter().chain(std::iter::once(&m.slide)).any(|d| d.gain != 0.0 && d.input == i),
+            _ => false,
+        }
     }
 }
 
@@ -792,6 +801,8 @@ pub struct Model {
     pub pieces: Vec<Piece>,
     /// every group's pieces merged at rest, for the wreckage
     pub groups: Vec<Mesh>,
+    /// a downloaded aircraft's own textures (see fgmodel.rs), drawn from by its M_TEX surfaces
+    pub tex: Option<std::sync::Arc<crate::fgmodel::TexSet>>,
 }
 
 /// One of the outside lights, found from its lens: the glow sprites and the
@@ -838,7 +849,7 @@ impl Model {
                 groups[p.group].append(&p.mesh);
             }
         }
-        Model { pieces, groups }
+        Model { pieces, groups, tex: None }
     }
     /// Centre and half size of everything solid in it (body frame, at rest).
     pub fn bounds(&self) -> (Vec3, Vec3) {
