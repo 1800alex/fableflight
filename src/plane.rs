@@ -1221,6 +1221,10 @@ impl Plane {
         if !self.gear_down && self.on_ground {
             self.gear_down = true;
         }
+        if spec.gear_rate <= 0.0 {
+            // fixed gear (a downloaded aircraft's): always down
+            (self.gear, self.gear_down) = (1.0, true);
+        }
         self.gear = (self.gear + if self.gear_down { spec.gear_rate * dt } else { -spec.gear_rate * dt }).clamp(0.0, 1.0);
         // A canopy slides open or shut in about two seconds.
         self.canopy = (self.canopy + if self.canopy_open { 0.5 * dt } else { -0.5 * dt }).clamp(0.0, 1.0);
@@ -2836,7 +2840,7 @@ mod tests {
         assert!(p.step(dt, &Controls::default(), &w).is_none());
         assert!(p.chute_spent && p.spoilers == 0.0 && p.notes == ["DRAG CHUTE TORN AWAY (OVERSPEED)"], "{:?}", p.notes);
         // No other type has one, or an engine that fades without its afterburners.
-        for s in crate::aircraft::ALL.iter().filter(|s| s.id != bird.id) {
+        for s in crate::aircraft::BUILTIN.iter().filter(|s| s.id != bird.id) {
             assert!(s.chute.is_none() && s.dry_mach == 0.0, "{}", s.name);
         }
     }

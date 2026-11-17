@@ -12,8 +12,11 @@ mod crash;
 mod damage;
 mod destruct;
 mod fetch;
+mod fgmodel;
 mod fluid;
 mod geo;
+mod hangar;
+mod hangar_ui;
 mod bind;
 mod i18n;
 mod jsbsim;
@@ -49,6 +52,7 @@ mod ocean;
 mod shore;
 mod skyglow;
 mod world;
+mod yasim;
 
 #[derive(Copy, Clone, PartialEq)]
 enum Mode {
@@ -159,7 +163,14 @@ impl Loaded {
     /// The CPU half (mesh generation): safe to run off the main thread.
     fn make(spec: &'static aircraft::Spec) -> airframe::Model {
         let t0 = Instant::now();
-        let model = (spec.build)();
+        let model = match spec.ext.map(|e| e.build()) {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
+                log::warn!("{}: its own model doesn't load ({e}); drawing the stand-in", spec.name);
+                (spec.build)()
+            }
+            None => (spec.build)(),
+        };
         log::info!("{}: {} pieces, {} vertices, built in {:.0} ms", spec.name, model.pieces.len(), model.pieces.iter().map(|p| p.mesh.v.len()).sum::<usize>(), t0.elapsed().as_secs_f64() * 1000.0);
         model
     }
@@ -168,6 +179,13 @@ impl Loaded {
         let piece_mesh: Vec<usize> = model.pieces.iter().map(|p| r.add_mesh(&p.mesh.v, &p.mesh.i)).collect();
         let piece_cut: Vec<bool> = model.pieces.iter().map(|p| p.mesh.v.iter().any(|v| airframe::cut_by(v.mat[1]))).collect();
         let mut group_mesh: Vec<usize> = model.groups.iter().map(|m| r.add_mesh(&m.v, &m.i)).collect();
+        // A downloaded aircraft's own textures, for its pieces and its wreckage.
+        if let Some(t) = &model.tex {
+            let bind = r.texture_set(t);
+            for &i in piece_mesh.iter().chain(group_mesh.iter()) {
+                r.set_mesh_bind(i, bind.clone());
+            }
+        }
         for m in crash::shards() {
             group_mesh.push(r.add_mesh(&m.v, &m.i));
         }
@@ -259,6 +277,8 @@ struct Args {
     damage: Option<String>,
     /// open the in-flight menu on this page after this many seconds, for scripted screenshots
     pause_menu: Option<(menu::Page, f64)>,
+    /// `--hangar mine|download[:FOLDER]`: the start screen opens with the hangar on that page (scripted screenshots)
+    hangar: Option<(hangar_ui::Tab, Option<String>)>,
     /// start at an airport (ICAO or IATA code), on a runway or on approach
     airport: Option<String>,
     runway: Option<String>,
@@ -323,6 +343,7 @@ fn parse_args() -> Args {
         menu_go: None,
         damage: None,
         pause_menu: None,
+        hangar: None,
         airport: None,
         runway: None,
         approach: false,
@@ -380,7 +401,7 @@ fn parse_args() -> Args {
                 a.aircraft = v.get(i + 1).cloned();
                 if let Some(k) = &a.aircraft {
                     if aircraft::by_key(k).is_none() {
-                        eprintln!("unknown aircraft {k} (try {})", aircraft::ALL.iter().map(|s| s.keys[0]).collect::<Vec<_>>().join(", "));
+                        eprintln!("unknown aircraft {k} (try {})", aircraft::list().iter().map(|s| s.keys[0]).collect::<Vec<_>>().join(", "));
                     }
                 }
             }
@@ -431,6 +452,12 @@ fn parse_args() -> Args {
                 if let Some(page) = f.first().and_then(|p| menu::Page::parse(p)) {
                     a.pause_menu = Some((page, f.get(1).and_then(|t| t.parse().ok()).unwrap_or(0.0)));
                 }
+            }
+            "--hangar" => {
+                let f = v.get(i + 1).cloned().unwrap_or_default();
+                let (page, sel) = f.split_once(':').map(|(p, s)| (p.to_string(), Some(s.to_string()))).unwrap_or((f, None));
+                a.hangar = Some((if page.starts_with('d') { hangar_ui::Tab::Download } else { hangar_ui::Tab::Mine }, sel));
+                a.menu.get_or_insert(true);
             }
             "--width" => a.size.0 = num(&v, i).unwrap_or(1600.0) as u32,
             "--height" => a.size.1 = num(&v, i).unwrap_or(900.0) as u32,
@@ -605,8 +632,8 @@ struct Game {
     gkey_show: bool,
     /// Google Maps logo, once it has been shown
     gm_logo: Option<egui::TextureHandle>,
-    /// the start screen's aircraft pictures (by index into `aircraft::ALL`), once shown
-    stills: Vec<Option<egui::TextureHandle>>,
+    /// the start screen's aircraft pictures (by index into `aircraft::list()`), once shown
+    stills: std::collections::HashMap<usize, egui::TextureHandle>,
     /// the aircraft being flown, and its model
     spec: &'static aircraft::Spec,
     model: airframe::Model,
@@ -854,7 +881,7 @@ impl Game {
             }
         }
         let alt = args.alt.unwrap_or_else(|| ground_elev(&src, lat, lon) + args.agl.unwrap_or(450.0));
-        let spec = args.aircraft.as_deref().and_then(aircraft::by_key).unwrap_or(aircraft::ALL[0]);
+        let spec = args.aircraft.as_deref().and_then(aircraft::by_key).unwrap_or(aircraft::BUILTIN[0]);
         let mut plane = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt, args.heading.to_radians(), spec.cruise);
         if args.ship {
             plane.rocket_return();
@@ -880,10 +907,17 @@ impl Game {
         let mut menu = menu::Menu::new(lat, lon, args.hour);
         menu.fuel = args.fuel.unwrap_or(menu.fuel);
         menu.cold = args.cold;
-        menu.aircraft = aircraft::ALL.iter().position(|s| std::ptr::eq(*s, spec)).unwrap_or(0);
+        menu.aircraft = aircraft::index_of(spec);
         if let Some((la, lo, al)) = args.menu_view {
             menu.look_at(la, lo, al);
             menu.alt = al;
+        }
+        if let Some((tab, sel)) = &args.hangar {
+            menu.hangar = Some(*tab);
+            menu.hangar_sel = sel.clone();
+            if *tab == hangar_ui::Tab::Download {
+                hangar::open();
+            }
         }
         let mut wx = weather::Weather::new(args.clouds);
         if let Some(s) = args.storms {
@@ -924,7 +958,8 @@ impl Game {
         // for the gear, flaps and control surfaces as they move.
         let (cy, cp, cd) = args.cam.unwrap_or((0.0, 0.2, spec.cam_dist));
         let mut g = Self {
-            minimap: minimap::Minimap::new(&prefs), gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: vec![None; aircraft::ALL.len()], window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
+            gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: std::collections::HashMap::new(), window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
+            minimap: minimap::Minimap::new(&prefs),
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
@@ -1017,7 +1052,7 @@ impl Game {
         self.spec = spec;
         self.weapons.reset(spec, &self.model.pieces);
         self.cam_dist = spec.cam_dist;
-        self.menu.aircraft = aircraft::ALL.iter().position(|s| std::ptr::eq(*s, spec)).unwrap_or(0);
+        self.menu.aircraft = aircraft::index_of(spec);
     }
 
     /// Menu selection: swap to `spec` without stalling the frame. A model not
@@ -1292,15 +1327,8 @@ impl Game {
             None => 1.0,
         };
         let screen = ctx.content_rect();
-        let k = aircraft::ALL.iter().position(|s| std::ptr::eq(*s, self.spec)).unwrap_or(0);
         let spec = self.spec;
-        let tex = self.stills[k]
-            .get_or_insert_with(|| {
-                let img = image::load_from_memory(spec.still).expect("aircraft still").to_rgba8();
-                let size = [img.width() as usize, img.height() as usize];
-                ctx.load_texture(format!("aircraft {k}"), egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
-            })
-            .clone();
+        let tex = self.still(ctx, spec);
         let fade = |c: Color32| c.gamma_multiply(a);
         egui::Area::new(egui::Id::unique("loading")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
             let p = ui.painter();
@@ -2178,6 +2206,7 @@ impl Game {
             (Nav::Globe, Button::South) => self.pad_key(egui::Key::Enter),
             (Nav::Globe, Button::West) => self.pad_pick_centre(),
             (Nav::Globe, Button::Select) => self.menu.show_controls = !self.menu.show_controls,
+            (Nav::Globe, Button::East) if self.menu.hangar.is_some() => self.menu.hangar = None,
             (Nav::Globe, Button::East) => self.menu.show_controls = false,
             (Nav::Globe, _) => {}
             // The pause menu: A presses, the bumpers turn the page, B or Menu resumes.
@@ -2292,7 +2321,9 @@ impl Game {
     fn key(&mut self, code: KeyCode) {
         if self.mode == Mode::Menu {
             match code {
+                KeyCode::Escape if self.menu.hangar.is_some() => self.menu.hangar = None,
                 KeyCode::Escape if self.menu.show_controls => self.menu.show_controls = false,
+                KeyCode::Enter | KeyCode::NumpadEnter if self.menu.hangar.is_some() => {}
                 KeyCode::Escape => self.quit = true,
                 KeyCode::Enter | KeyCode::NumpadEnter => self.begin(),
                 KeyCode::F12 => self.shots.insert(0, (0.0, PathBuf::from(format!("screenshot-{}.png", self.frame)), None)),
@@ -2583,7 +2614,7 @@ impl Game {
         if self.menu.starting {
             return;
         }
-        self.set_aircraft(aircraft::ALL[self.menu.aircraft.min(aircraft::ALL.len() - 1)]);
+        self.set_aircraft(aircraft::nth(self.menu.aircraft));
         if let Some(i) = self.menu.airport.filter(|_| self.menu.start != menu::Start::Overhead) {
             self.start_airport(i, self.menu.runway.clone(), self.menu.start == menu::Start::Approach, false);
             return;
@@ -4068,7 +4099,7 @@ impl Game {
         let had_shots = shot.is_some() && self.shots.is_empty();
         let (skin_slots, skins) = if in_menu { (Vec::new(), Vec::new()) } else { self.destr.skin_draws() };
         self.r.stats[0] += now.elapsed().as_secs_f64();
-        self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: in_menu.then(|| self.window.scale_factor() as f32), cover, glow: glow_px });
+        self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && self.menu.hangar.is_none()).then(|| self.window.scale_factor() as f32), cover, glow: glow_px });
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
         }
@@ -4167,54 +4198,8 @@ impl Game {
             const W: f32 = 340.0;
             const M: f32 = 22.0;
             let screen = ctx.content_rect();
-            let n_air = aircraft::ALL.len();
-            let mut choose_air: Option<usize> = None;
-
-            // Top left: the aircraft window. Its name in the title bar with
-            // arrows to the others, and a picture of it below.
-            let air = egui::Area::new(egui::Id::unique("menu_air")).anchor(Align2::LEFT_TOP, [M, M]).show(ctx, |ui| {
-                ui.set_width(W);
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let spec = aircraft::ALL[self.menu.aircraft.min(n_air - 1)];
-                let top = egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 };
-                let bottom = egui::CornerRadius { nw: 0, ne: 0, sw: 12, se: 12 };
-                egui::Frame::new().fill(menu::PANEL).corner_radius(top).inner_margin(egui::Margin { left: 10, right: 10, top: 12, bottom: 10 }).show(ui, |ui| {
-                    ui.set_width(W - 20.0);
-                    ui.horizontal(|ui| {
-                        let arrow = |ui: &mut egui::Ui, turn: f32| {
-                            let r = ui.add(egui::Button::new("").min_size(egui::vec2(34.0, 34.0)).fill(Color32::from_white_alpha(8)).corner_radius(8.0));
-                            menu::chevron(ui.painter(), r.rect.center(), 6.0, turn, if r.hovered() || r.has_focus() { Color32::WHITE } else { DIM });
-                            r
-                        };
-                        if arrow(ui, 2.0).clicked() {
-                            choose_air = Some((self.menu.aircraft + n_air - 1) % n_air);
-                        }
-                        let name_w = ui.available_width() - 34.0 - ui.spacing().item_spacing.x;
-                        ui.allocate_ui_with_layout(egui::vec2(name_w, 34.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(t!("AIRCRAFT", "AVION")).size(10.5).strong().color(DIM).extra_letter_spacing(1.5));
-                            ui.label(RichText::new(spec.name).size(18.0).strong().color(Color32::WHITE));
-                        });
-                        if arrow(ui, 0.0).clicked() {
-                            choose_air = Some((self.menu.aircraft + 1) % n_air);
-                        }
-                    });
-                });
-                let k = self.menu.aircraft.min(n_air - 1);
-                let tex = self.stills[k].get_or_insert_with(|| {
-                    let img = image::load_from_memory(spec.still).expect("aircraft still").to_rgba8();
-                    let size = [img.width() as usize, img.height() as usize];
-                    ctx.load_texture(format!("aircraft {k}"), egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
-                });
-                let (pic, _) = ui.allocate_exact_size(egui::vec2(W, 196.0), egui::Sense::hover());
-                ui.painter().rect_filled(pic, 0.0, menu::PANEL);
-                egui::Image::new(&*tex).paint_at(ui, pic);
-                egui::Frame::new().fill(menu::PANEL).corner_radius(bottom).inner_margin(egui::Margin { left: 16, right: 16, top: 10, bottom: 12 }).show(ui, |ui| {
-                    ui.set_width(W - 32.0);
-                    ui.label(RichText::new(tr(spec.blurb)).size(12.0).color(DIM));
-                });
-            });
-            let r = air.response.rect;
-            ctx.layer_painter(air.response.layer_id).rect_stroke(r, 12.0, egui::Stroke::new(1.0, Color32::from_white_alpha(22)), egui::StrokeKind::Inside);
+            // Top left: the aircraft window (hangar_ui.rs).
+            let r = self.aircraft_window(ctx, W, M);
 
             // Below it: where to start. Search, places and airports fold away;
             // the chosen spot, take-off, settings and quit stay in view.
@@ -4502,9 +4487,7 @@ impl Game {
                     });
                 });
             });
-            if let Some(k) = choose_air {
-                self.menu.aircraft = k;
-            }
+            self.hangar_window(ctx);
             self.credits(ctx);
             padui::focus_ring(ctx, ACCENT);
         });
@@ -4519,7 +4502,7 @@ impl Game {
         if let Some(i) = airport {
             self.choose_airport(i);
         }
-        let want = aircraft::ALL[self.menu.aircraft.min(aircraft::ALL.len() - 1)];
+        let want = aircraft::nth(self.menu.aircraft);
         if !std::ptr::eq(want, self.spec) {
             self.want_aircraft(want);
         }
@@ -5664,14 +5647,19 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let Some(g) = self.game.as_mut() else { return };
         let consumed = g.egui_state.on_window_event(&g.window, &event).consumed;
         match event {
             WindowEvent::CloseRequested => {
                 g.keep_settings(true);
                 g.src.google.save();
-                el.exit()
+                // Dropped here, while the event loop (and with it the Wayland
+                // connection) is still alive: egui's clipboard thread tears
+                // down its Wayland objects on drop, and if the game outlived
+                // `run_app` that would be on an already freed display.
+                self.game = None;
+                std::process::exit(0);
             }
             WindowEvent::Resized(s) => g.r.resize(s.width, s.height),
             WindowEvent::RedrawRequested => {
@@ -5900,8 +5888,8 @@ fn jsbsim_compare(file: Option<&String>, which: Option<&String>) -> i32 {
         }
     };
     let want = which.map(|w| w.to_lowercase()).unwrap_or_else(|| "172".into());
-    let Some(spec) = aircraft::ALL.iter().copied().find(|s| s.name.to_lowercase().contains(&want)) else {
-        eprintln!("no aircraft of ours matches {want:?}: {}", aircraft::ALL.iter().map(|s| s.name).collect::<Vec<_>>().join(", "));
+    let Some(spec) = aircraft::BUILTIN.iter().copied().find(|s| s.name.to_lowercase().contains(&want)) else {
+        eprintln!("no aircraft of ours matches {want:?}: {}", aircraft::BUILTIN.iter().map(|s| s.name).collect::<Vec<_>>().join(", "));
         return 2;
     };
     println!("{}", jsbsim::compare(&j, spec, our_roll_rate(spec)));
@@ -5928,6 +5916,97 @@ fn our_roll_rate(spec: &'static aircraft::Spec) -> Option<f64> {
     Some(best)
 }
 
+/// `--fly-check KEY`: flies an aircraft in an empty world and prints how it
+/// does: a take-off run at full power, level flight at full power (its top
+/// speed) and a power-off slow-down to the stall. For checking a fit (hangar.rs).
+fn fly_check(key: Option<&String>) -> i32 {
+    hangar::load_installed();
+    let Some(spec) = key.and_then(|k| aircraft::by_key(k)) else {
+        eprintln!("--fly-check KEY: one of {}", aircraft::list().iter().map(|s| s.keys[0]).collect::<Vec<_>>().join(", "));
+        return 1;
+    };
+    let dir = std::env::temp_dir().join("fablegame-jsbsim-compare");
+    let src = Arc::new(sources::Sources::new(fetch::Fetcher::new(dir, true), String::new()));
+    let mut w = world::World::new(sources::Loader::new(src, 0), 14);
+    w.flat = Some(0.0);
+    let dt = 1.0 / 120.0;
+    let kt = |v: f64| v * 1.943_84;
+    println!("{}: mass {:.0} kg, cruise {:.0} kt, approach {:.0} kt, vne {:.0} kt", spec.name, spec.mass, kt(spec.cruise), kt(spec.approach.0), kt(spec.vne));
+    let (lat, lon) = (37.6f64, -122.37f64);
+    // wings held level; pitch to an attitude (degrees), gently
+    let level = |p: &Plane| (p.right().dot(p.pos.normalize()) * 3.0 + p.omega.z * 0.5).clamp(-1.0, 1.0);
+    let attitude = |p: &Plane, want: f64| ((want - p.forward().dot(p.pos.normalize()).asin().to_degrees()) * 0.1 - p.omega.x * 0.3).clamp(-1.0, 1.0);
+    // Take-off: first flap notch, full power, rotate to 10° at 1.1 times the clean stall.
+    let mut p = Plane::spawn_ground(spec, lat.to_radians(), lon.to_radians(), 0.0, 0.5, 0.0);
+    p.hold = false;
+    p.t = 2.0;
+    if spec.max_notch() > 0 {
+        p.flap_set = 1;
+        p.flaps = spec.flap_frac(1);
+    }
+    let vr = spec.approach.0 / 1.3 * 1.15;
+    let start = p.pos;
+    let (mut off, mut t, mut crashed) = (None, 0.0, false);
+    while t < 120.0 {
+        let c = Controls { throttle: 1.0, pitch: if p.vel.length() > vr { attitude(&p, 10.0) } else { 0.0 }, roll: level(&p), ..Default::default() };
+        if p.step(dt, &c, &w).is_some() {
+            crashed = true;
+            break;
+        }
+        if off.is_none() && !p.on_ground && t > 5.0 {
+            off = Some((t, (p.pos - start).length(), kt(p.vel.length())));
+        }
+        if off.is_some_and(|o| t > o.0 + 20.0) {
+            break;
+        }
+        t += dt;
+    }
+    let h = geo::pos_to_lla(p.pos).2;
+    match off {
+        Some((t, d, v)) => println!("  take-off: lift-off after {t:.0} s, {d:.0} m, {v:.0} kt; 20 s later {h:.0} m{}", if crashed { ", CRASHED" } else { "" }),
+        None => println!("  take-off: never left the ground ({:.0} kt){}", kt(p.vel.length()), if crashed { ", CRASHED" } else { "" }),
+    }
+    println!("    notes {:?}, gear {:?}", p.notes, p.dmg.gear);
+    // Level at full power: hold the height, see where the speed settles.
+    let alt0 = 1500.0;
+    let hold = |p: &Plane| {
+        let h = geo::pos_to_lla(p.pos).2;
+        ((alt0 - h) * 0.002 - p.vel.dot(p.pos.normalize()) * 0.02 - p.omega.x * 0.3).clamp(-1.0, 1.0)
+    };
+    let mut p = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt0, 0.0, spec.cruise);
+    p.throttle = 1.0;
+    let mut line = String::new();
+    for k in 0..(180.0 / dt) as usize {
+        let c = Controls { throttle: 1.0, pitch: hold(&p), roll: level(&p), ..Default::default() };
+        if p.step(dt, &c, &w).is_some() {
+            line += " CRASHED";
+            break;
+        }
+        if k % (30.0 / dt) as usize == 0 {
+            line += &format!("  {:.0}kt/{:.0}m", kt(p.ias()), geo::pos_to_lla(p.pos).2);
+        }
+    }
+    println!("  level, full power:{line}  -> {:.0} kt, alpha {:.1}°, wings {:?}, notes {:?}", kt(p.ias()), p.alpha.to_degrees(), p.dmg.wing, p.notes);
+    // Power off, hold the height until it stalls.
+    let mut p = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt0, 0.0, spec.cruise * 0.7);
+    p.throttle = 0.0;
+    let mut stall = None;
+    for k in 0..(240.0 / dt) as usize {
+        let c = Controls { throttle: 0.0, pitch: hold(&p), roll: level(&p), ..Default::default() };
+        if p.step(dt, &c, &w).is_some() {
+            break;
+        }
+        if stall.is_none() && k as f64 * dt > 5.0 && (p.alpha > spec.stall_alpha * 0.98 || alt0 - geo::pos_to_lla(p.pos).2 > 60.0) {
+            stall = Some((kt(p.ias()), p.alpha.to_degrees()));
+        }
+    }
+    match stall {
+        Some((v, a)) => println!("  slow-down, power off: stalls at {v:.0} kt, {a:.1}°"),
+        None => println!("  slow-down: no stall in 240 s"),
+    }
+    0
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,fablegame=info")).init();
     // A JSBSim aircraft compared with one of ours (see jsbsim.rs), and out.
@@ -5935,6 +6014,20 @@ fn main() -> anyhow::Result<()> {
     if let Some(i) = argv.iter().position(|a| a == "--jsbsim-compare") {
         std::process::exit(jsbsim_compare(argv.get(i + 1), argv.iter().position(|a| a == "--aircraft").and_then(|k| argv.get(k + 1))));
     }
+    if let Some(i) = argv.iter().position(|a| a == "--fg-survey") {
+        std::process::exit(hangar::survey(argv.get(i + 1).map(|s| s.as_str())));
+    }
+    if let Some(i) = argv.iter().position(|a| a == "--jsbsim-fit") {
+        std::process::exit(hangar::fit_report(&argv[i + 1..]));
+    }
+    if let Some(i) = argv.iter().position(|a| a == "--fly-check") {
+        std::process::exit(fly_check(argv.get(i + 1)));
+    }
+    if let Some(i) = argv.iter().position(|a| a == "--fg-install") {
+        std::process::exit(hangar::install_report(&argv[i + 1..]));
+    }
+    // Downloaded JSBSim aircraft join the list before `--aircraft` is read.
+    hangar::load_installed();
     let args = parse_args();
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
     let el = EventLoop::new()?;

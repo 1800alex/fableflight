@@ -24,7 +24,7 @@ struct Obj { model: mat4x4f, tint: vec4f, glow: vec4f, params: array<vec4f, 6>, 
 const M_PAINT = 0u; const M_LIVERY = 1u; const M_ALU = 2u; const M_STEEL = 3u; const M_RUBBER = 4u;
 const M_PLASTIC = 5u; const M_FABRIC = 6u; const M_GLASS = 7u; const M_LAMP = 8u; const M_GAUGE = 9u;
 const M_BLACK = 10u; const M_EXHAUST = 11u; const M_SCREW = 12u; const M_PROP = 13u; const M_DISPLAY = 14u;
-const M_SATIN = 15u; const M_PROPDISC = 16u; const M_PLUME = 17u;
+const M_SATIN = 15u; const M_PROPDISC = 16u; const M_PLUME = 17u; const M_TEX = 18u;
 const P_FUSE = 1u; const P_WING = 2u; const P_CTRL = 3u; const P_COWL = 4u; const P_TAIL = 5u; const P_TREAD = 6u;
 const P_LINING = 7u; const P_SEAT = 8u; const P_CARPET = 9u; const P_PANEL = 10u; const P_PLACARD = 11u; const P_KNURL = 12u;
 const P_NACELLE = 13u; const P_LEGEND = 14u; const P_FLEECE = 15u; const P_SPINNER = 16u; const P_HORNET = 17u;
@@ -39,6 +39,12 @@ const P_PIT = 18u; const P_MESH = 19u; const P_WEBBING = 20u; const P_NONSLIP = 
 // many pictures (0: it has no paint); .y: how much relief its lines stand
 // for; .z: how much its sheen follows its tone (a dark paint's panels).
 @group(1) @binding(1) var t_paint: texture_2d_array<f32>;
+// A downloaded aircraft's meshes bind its own textures there instead (fgmodel.rs):
+// layer `layer` (< 0: none), repeating.
+fn tex_at(uv: vec2f, layer: f32, dx: vec2f, dy: vec2f) -> vec4f {
+  if (layer < -0.5) { return vec4f(1.0); }
+  return textureSampleGrad(t_paint, s_aniso, fract(uv), i32(layer + 0.5), dx, dy);
+}
 struct Paint { box: vec4f, view: vec4f };
 @group(1) @binding(2) var<uniform> PT: Paint;
 
@@ -1732,7 +1738,9 @@ fn surface(in: VOut) -> Shaded {
   let dPx = dpdx(in.P);
   let dPy = dpdy(in.P);
   let px = max(length(dPx), length(dPy));
-  let duv = max(length(dpdx(in.uv)), length(dpdy(in.uv)));
+  let duvx = dpdx(in.uv);
+  let duvy = dpdy(in.uv);
+  let duv = max(length(duvx), length(duvy));
   let dLx = dpdx(in.L);
   let dLy = dpdy(in.L);
   var rel = relief(pt, in.uv, in.L, in.Nl, px);
@@ -1760,7 +1768,10 @@ fn surface(in: VOut) -> Shaded {
   // belly that stretches distances along the skin, so measure the edge there.
   let wl_s = wl * px / max(length(vec2f(dpdx(wl), dpdy(wl))), 1e-7);
   let td = tear_d(in.L);
-  let kill = (cuts && (wd < 0.0 || wl < 0.0)) || id == M_GLASS || id == M_PROPDISC || id == M_PLUME || td > 0.0;
+  // A downloaded aircraft's own texture (fgmodel.rs), its see-through parts cut out.
+  var tex = vec4f(1.0);
+  if (id == M_TEX) { tex = tex_at(in.uv, in.mat.w, duvx, duvy); }
+  let kill = (cuts && (wd < 0.0 || wl < 0.0)) || id == M_GLASS || id == M_PROPDISC || id == M_PLUME || td > 0.0 || tex.a < 0.5;
 
   var n0 = in.N;
   if (dot(n0, n0) < 1e-10) { n0 = -in.P; }
@@ -2166,6 +2177,15 @@ fn surface(in: VOut) -> Shaded {
       emit = display(did, in.uv, max(duv * 0.012, 0.00015)) * G.sun_dir.w * mix(0.09, 0.012, night);
       }
     }
+    case 18u: { // a downloaded aircraft's surface: its texture times its material colour
+      albedo = tex.rgb * in.col.rgb;
+      ao = 1.0;
+      let r = in.mat.z;
+      let glow = r >= 1.5;
+      rough = clamp(select(r, r - 2.0, glow), 0.08, 1.0);
+      if (glow) { emit = albedo * G.sun_dir.w * mix(0.02, 0.004, 1.0 - night); }
+      ssr = select(0.0, 0.25, rough < 0.3);
+    }
     default: {}
   }
 
@@ -2248,6 +2268,8 @@ fn surface(in: VOut) -> Shaded {
   if (kind() == 6u) { inside = step(abs(L.x), CONCORDE_TUB.x) * step(CONCORDE_TUB.z, L.z) * step(L.z, CONCORDE_TUB.w) * step(CONCORDE_TUB.y, L.y) * select(0.0, 1.0, pt != P_HORNET); }
   if (kind() == 8u) { inside = step(abs(L.x), 0.56) * step(-0.62, L.z) * step(L.z, 1.66) * step(L.y, 0.62) * select(0.0, 1.0, id != M_LIVERY && pt != P_FUSE && pt != P_COWL); }
   if (kind() == 7u) { inside = step(abs(L.x), SR71_TUB.x) * step(SR71_TUB.z, L.z) * step(L.z, SR71_TUB.w) * step(SR71_TUB.y, L.y) * select(0.0, 1.0, pt != P_HORNET); }
+  // (a downloaded aircraft has no cabin of ours where its own model is)
+  if (id == M_TEX) { inside = 0.0; }
   // (The baked occlusion already counts only the sky seen through the
   // windows; the eye adapts to the dimmer cabin, main.rs / cockpit.rs.)
   let amb_ao = mix(ao * ao * (3.0 - 2.0 * ao), 0.06 + 0.94 * ao, inside);
@@ -2313,10 +2335,34 @@ fn cabin_mirror(p0: vec3f, r: vec3f, l: Light, ls: vec3f) -> vec3f {
 }
 const GS_Z = -1.30; // cabin::PANEL_Z
 
+// A downloaded aircraft's see-through surfaces (windows, propeller discs):
+// its texture's alpha times its material's, lit, with the sky mirrored on top.
+fn tex_glass(in: VOut) -> vec4f {
+  let t = tex_at(in.uv, in.mat.w, dpdx(in.uv), dpdy(in.uv));
+  let V = normalize(in.P);
+  var N = normalize(in.N);
+  if (dot(N, V) > 0.0) { N = -N; }
+  let l = light_at(in.P);
+  let sh = shadow_at(in.P, N);
+  let Ls = G.sun_dir.xyz;
+  let a = sat(t.a * in.col.a);
+  let base = t.rgb * in.col.rgb;
+  let lit = base * (l.sun * max(dot(N, Ls), 0.0) * sh / PI + l.amb * (0.55 + 0.45 * dot(N, l.upn)));
+  let ndv = max(dot(N, -V), 0.0);
+  let F = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+  let R = reflect(V, N);
+  // (a window, whose material is see-through, reflects; a texture's cut-outs, like a propeller's blur, don't)
+  let k = select(0.0, F * (1.0 - a * 0.8), in.col.a < 0.99);
+  let H = normalize(Ls - V);
+  let glint = l.sun * ggx(max(dot(N, H), 0.0), 0.004) * vis(ndv, max(dot(N, Ls), 0.0), 0.004) * F * max(dot(N, Ls), 0.0) * sh;
+  return vec4f(lit * a + env_reflect(in.P, R, l.upn, false) * k + glint * k, sat(a + k));
+}
+
 @fragment fn fs_glass(in: VOut) -> @location(0) vec4f {
   let px = max(length(dpdx(in.P)), length(dpdy(in.P)));
   let id = u32(in.mat.x + 0.5);
   if (id == M_PLUME) { return plume(in); }
+  if (id == M_TEX) { return tex_glass(in); }
   let V = normalize(in.P);
   var N = normalize(in.N);
   let from_inside = dot(N, V) > 0.0;

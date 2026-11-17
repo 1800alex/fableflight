@@ -66,6 +66,8 @@ pub static SPEC: Spec = Spec {
     name: "Robin DR 400/180",
     keys: &["dr400", "robin", "regent"],
     blurb: "French four-seat wooden tourer and glider tug, 180 hp, fixed gear. Light on the controls; 60° flaps for steep, short landings.",
+    origin: None,
+    ext: None,
     still: include_bytes!("../../../assets/aircraft/dr400.png"),
     paint: None,
     build,
