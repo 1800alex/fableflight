@@ -36,6 +36,15 @@ fn num_opt(x: Option<f64>) -> Value {
     x.map(num).unwrap_or(Value::Null)
 }
 
+/// Idents and frequencies are reused worldwide; tune the closest match.
+fn nearest_station(pos: DVec3, matches: impl Fn(&nav::Station) -> bool) -> Option<nav::Station> {
+    nav::db()
+        .iter()
+        .filter(|st| matches(st))
+        .min_by(|a, b| (a.pos() - pos).length_squared().total_cmp(&(b.pos() - pos).length_squared()))
+        .cloned()
+}
+
 fn kind_name(k: nav::Kind) -> &'static str {
     match k {
         nav::Kind::Vor => "VOR",
@@ -906,7 +915,7 @@ impl Game {
         let mut any = false;
         if let Some(query) = args.nav1.as_deref() {
             any = true;
-            let Some(st) = self.find_nav_station(query) else {
+            let Some(st) = Self::find_nav_station(query, self.plane.pos) else {
                 let nearby: Vec<String> = nav::near(lat.to_degrees(), lon.to_degrees(), 100_000.0, nav::Kind::Vor).iter().take(6).map(|(s, _)| s.label()).collect();
                 return Err(format!("no NAV1 station matches {query:?}{}", if nearby.is_empty() { String::new() } else { format!("; nearby VORs: {}", nearby.join(", ")) }));
             };
@@ -916,7 +925,7 @@ impl Game {
         }
         if let Some(query) = args.adf.as_deref() {
             any = true;
-            let Some(st) = self.find_adf_station(query) else {
+            let Some(st) = Self::find_adf_station(query, self.plane.pos) else {
                 let nearby: Vec<String> = nav::near(lat.to_degrees(), lon.to_degrees(), 150_000.0, nav::Kind::Ndb).iter().take(6).map(|(s, _)| s.label()).collect();
                 return Err(format!("no ADF station matches {query:?}{}", if nearby.is_empty() { String::new() } else { format!("; nearby NDBs: {}", nearby.join(", ")) }));
             };
@@ -957,7 +966,7 @@ impl Game {
         Ok(json!({ "ok": true, "notes": notes, "radios": radios }))
     }
 
-    fn find_nav_station(&self, query: &str) -> Option<nav::Station> {
+    fn find_nav_station(query: &str, pos: DVec3) -> Option<nav::Station> {
         let q = query.trim();
         if q.is_empty() {
             return None;
@@ -965,8 +974,8 @@ impl Game {
         if let Ok(f) = q.parse::<f64>() {
             if (108.0..=118.0).contains(&f) {
                 let khz = (f * 1000.0).round() as u32;
-                if let Some(st) = nav::db().iter().find(|s| s.kind == nav::Kind::Vor && s.freq_khz == khz) {
-                    return Some(st.clone());
+                if let Some(st) = nearest_station(pos, |s| s.kind == nav::Kind::Vor && s.freq_khz == khz) {
+                    return Some(st);
                 }
             }
         }
@@ -975,7 +984,7 @@ impl Game {
             Some((a, b)) => (Some(a.trim()), b.trim()),
             None => (None, up.as_str()),
         };
-        let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
+        let (lat, lon, _) = geo::pos_to_lla(pos);
         let ils = nav::near(lat.to_degrees(), lon.to_degrees(), 80_000.0, nav::Kind::Ils);
         if let Some((st, _)) = ils.iter().find(|(st, _)| {
             let name_ok = apt.map(|a| st.name.eq_ignore_ascii_case(a)).unwrap_or(true);
@@ -988,22 +997,22 @@ impl Game {
                 return Some(st.clone());
             }
         }
-        nav::db().iter().find(|s| s.kind == nav::Kind::Vor && s.ident.eq_ignore_ascii_case(&up)).cloned()
+        nearest_station(pos, |s| s.kind == nav::Kind::Vor && s.ident.eq_ignore_ascii_case(&up))
     }
 
-    fn find_adf_station(&self, query: &str) -> Option<nav::Station> {
+    fn find_adf_station(query: &str, pos: DVec3) -> Option<nav::Station> {
         let q = query.trim();
         if q.is_empty() {
             return None;
         }
         if let Ok(f) = q.parse::<f64>() {
             let khz = f.round() as u32;
-            if let Some(st) = nav::db().iter().find(|s| s.kind == nav::Kind::Ndb && s.freq_khz == khz) {
-                return Some(st.clone());
+            if let Some(st) = nearest_station(pos, |s| s.kind == nav::Kind::Ndb && s.freq_khz == khz) {
+                return Some(st);
             }
         }
         let up = q.to_ascii_uppercase();
-        nav::db().iter().find(|s| s.kind == nav::Kind::Ndb && s.ident.eq_ignore_ascii_case(&up)).cloned()
+        nearest_station(pos, |s| s.kind == nav::Kind::Ndb && s.ident.eq_ignore_ascii_case(&up))
     }
 
     fn mcp_set_environment(&mut self, args: &Value) -> Result<Value, String> {
@@ -1069,10 +1078,12 @@ impl Game {
         }
         let mut time = false;
         if let Some(v) = args.time_utc_hours {
+            any = true;
             time = true;
             self.utc = v.rem_euclid(24.0);
         }
         if let Some(v) = args.day_of_year {
+            any = true;
             time = true;
             self.doy = v.rem_euclid(365.0);
         }
@@ -1278,4 +1289,42 @@ fn send_shot(shot: PendingShot) {
         Err(e) => tools::error_result(e),
     };
     let _ = shot.reply.send(result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn near_sfo() -> DVec3 {
+        geo::lla_to_pos(37.6_f64.to_radians(), -122.4_f64.to_radians(), 3000.0)
+    }
+
+    #[test]
+    fn adf_selects_nearest_station_with_matching_ident_or_frequency() {
+        for query in ["SF", " sf ", "379"] {
+            let st = Game::find_adf_station(query, near_sfo()).unwrap();
+            assert_eq!(st.name, "Brijj", "query {query:?}");
+            assert_eq!(st.freq_khz, 379);
+        }
+    }
+
+    #[test]
+    fn nav_selects_nearest_station_with_matching_ident_or_frequency() {
+        for query in ["SAU", " sau ", "116.20"] {
+            let st = Game::find_nav_station(query, near_sfo()).unwrap();
+            assert_eq!(st.name, "Sausalito", "query {query:?}");
+            assert_eq!(st.freq_khz, 116200);
+        }
+    }
+
+    #[test]
+    fn radio_lookup_preserves_ils_and_missing_station_handling() {
+        let pos = near_sfo();
+        let st = Game::find_nav_station("KSFO 28L", pos).unwrap();
+        assert_eq!((st.kind, st.name.as_str(), st.ident.as_str()), (nav::Kind::Ils, "KSFO", "28L"));
+        for query in ["", "  ", "no-such-station"] {
+            assert!(Game::find_adf_station(query, pos).is_none());
+            assert!(Game::find_nav_station(query, pos).is_none());
+        }
+    }
 }
