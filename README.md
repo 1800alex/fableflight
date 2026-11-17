@@ -63,6 +63,20 @@ The minimap shares the terrain imagery and OpenFreeMap vector data caches. It lo
 # Radio navigation
 VORs and NDBs from [OurAirports](https://ourairports.com/data/) (public domain), and an ILS on every paved runway end of 1500 m or more at medium and large airports. Tune NAV 1 (VOR or ILS) and the ADF on the flight panel's Radio page (Tab); J shows the instruments: a course deviation indicator with TO/FROM, the glide slope on an ILS and DME, and an ADF needle. [ and ] turn the OBS. Starting on a final approach tunes the runway's ILS. The altimeter is set to the QNH (from the METAR when the weather is real) unless you set it yourself; X sets it back. Courses are true: the world has no magnetic variation. `assets/mknav.py` rebuilds `assets/navaids.tsv.gz` from OurAirports' `navaids.csv`.
 
+# Autopilot
+Every aircraft has one, on the flight panel's AP page (Tab) and on keys you can rebind:
+- **F5**: engage or disconnect it. It starts by holding the heading and altitude of the moment.
+- **7 HDG**: fly the heading bug, moved with **−** / **=**.
+- **8 NAV**: track NAV 1, a VOR radial or a localizer.
+- **9 APR**: fly an ILS, localizer then glide slope.
+- **0 ALT**: hold the altitude.
+- **; / '**: move the preselected altitude.
+- On the page: **VS** climbs or descends at a set rate and levels off at the preselected altitude; **AT**, the autothrottle, holds an airspeed.
+
+NAV and APR can be armed before the signal comes in: they fly the heading bug until they capture the course, and APR captures the glide slope from below or from above. The modes show above the HUD's figures, green when flying them, grey when armed.
+
+It gives up the vertical speed rather than stall the aircraft (MIN SPD), and climbs rather than pass the never-exceed speed (MAX SPD). A firm push on the controls, the ground, a stall or an unusual attitude disconnects it, with a warning tone. The AI copilot (docs/mcp.md) can set it too, with `set_autopilot`.
+
 # More aircraft: FlightGear's collection
 Click the aircraft picture on the start screen (or **All aircraft**) to see every aircraft you can fly as a gallery; **Get more…** opens [FlightGear's aircraft collection](https://wiki.flightgear.org/FGAddon) (its 2020 catalogue, about 650 aircraft). Pick one to read its files from FGAddon: its flight model, author, the license its JSBSim file states (else FGAddon's GNU GPL v2 or later), and what it becomes here; the ones that can't be flown are hidden once read (tick **Show all**). **Download** takes its package from a FlightGear mirror and unpacks it, without sounds, scripts and splash screens, into `~/.local/share/fablegame/aircraft/<folder>/` (with a `source.json` recording the source, revision and license), and it joins the list. Nothing from FlightGear ships with the game.
 

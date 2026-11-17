@@ -250,6 +250,7 @@ pub enum Page {
     Flight,
     Places,
     Radio,
+    Autopilot,
     Weather,
     Game,
     Settings,
@@ -260,7 +261,7 @@ pub enum Page {
 }
 
 impl Page {
-    pub const INFO: [Page; 4] = [Page::Flight, Page::Places, Page::Radio, Page::Weather];
+    pub const INFO: [Page; 5] = [Page::Flight, Page::Places, Page::Radio, Page::Autopilot, Page::Weather];
     pub const PAUSE: [Page; 6] = [Page::Game, Page::Settings, Page::Graphics, Page::Controls, Page::Bindings, Page::Failures];
 
     pub fn name(self) -> &'static str {
@@ -268,6 +269,7 @@ impl Page {
             Page::Flight => "Flight",
             Page::Places => "Go to",
             Page::Radio => "Radio",
+            Page::Autopilot => "Autopilot",
             Page::Weather => "Weather",
             Page::Game => "Game",
             Page::Settings => "Settings",
@@ -281,7 +283,11 @@ impl Page {
     /// The name shown on its tab, in the interface language (`name` stays
     /// English: the command line's `--pause-menu` goes by it).
     pub fn label(self) -> &'static str {
-        crate::i18n::tr(self.name())
+        match self {
+            // (Short, as pilots say it: the flight panel's tabs are narrow.)
+            Page::Autopilot => "AP",
+            _ => crate::i18n::tr(self.name()),
+        }
     }
 
     /// on the flight panel (Tab), not the pause menu
