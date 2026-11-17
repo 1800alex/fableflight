@@ -1,4 +1,0 @@
-FROM qwen3:1.7b
-PARAMETER num_ctx 16384
-PARAMETER num_batch 128
-PARAMETER temperature 0.1
