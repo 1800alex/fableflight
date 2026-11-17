@@ -53,6 +53,23 @@ pub fn pick(hs: &[Hotspot], o: Vec3, d: Vec3) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
+/// Mouse targets follow the same rigid motions as their visible cockpit pieces.
+pub fn animated_hotspots(hs: &[Hotspot], pieces: &[crate::airframe::Piece], pose: &[glam::Mat4]) -> Vec<Hotspot> {
+    hs.iter().map(|h| {
+        let mut h = *h;
+        if let Some(name) = c172::cabin::moving_piece(&h) {
+            if let Some(i) = pieces.iter().position(|p| p.name == name && match h.hold {
+                Some("brake_left") => p.pivot.x < -0.27,
+                Some("brake_right") => p.pivot.x > -0.27 && p.pivot.x < 0.0,
+                _ => true,
+            }) {
+                h.at = pose[i].transform_point3(Vec3::from(h.at)).to_array();
+            }
+        }
+        h
+    }).collect()
+}
+
 /// The types built into the game, in the order the menu lists them.
 pub static BUILTIN: [&Spec; 9] = [&c172::SPEC, &dr400::SPEC, &b747::SPEC, &fa18::SPEC, &f4::SPEC, &f22::SPEC, &starship::SPEC, &concorde::SPEC, &sr71::SPEC];
 
@@ -600,12 +617,35 @@ mod hotspot_tests {
 
     #[test]
     fn hotspots_stand_for_real_actions() {
-        let known = |id: &str| crate::bind::ACTIONS.iter().any(|a| a.id == id);
+        let known = |id: &str| crate::bind::ACTIONS.iter().any(|a| a.id == id) || c172::cabin::MOUSE_ACTIONS.contains(&id);
         for s in BUILTIN.iter() {
             for h in s.hotspots {
                 for id in h.click.iter().chain(h.hold.iter()).chain(h.wheel.iter().flat_map(|w| [&w.0, &w.1])) {
                     assert!(known(id), "{}: no action {id}", s.name);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn animated_targets_follow_actual_throttle_and_gear_geometry() {
+        let mut builder = crate::airframe::Builder::default();
+        c172::cabin::build(&mut builder);
+        let pieces = builder.pieces;
+        let mut plane = crate::plane::Plane::spawn(&c172::SPEC,0.6,-2.1,1000.0,0.0,55.0);
+        for state in [0.0,0.5,1.0] {
+            plane.throttle = state;
+            plane.gear_down = state > 0.0;
+            let pose = plane.pose(&pieces);
+            let hs = animated_hotspots(c172::cabin::HOTSPOTS,&pieces,&pose);
+            for (name, point, action) in [
+                ("throttle",Vec3::new(0.0,-0.195,c172::cabin::PANEL_Z+0.043),"throttle_up"),
+                ("gear handle",Vec3::new(-0.09,-0.185,c172::cabin::PANEL_Z+0.05),"gear")
+            ] {
+                let i = pieces.iter().position(|p| p.name == name).unwrap();
+                let visible = pose[i].transform_point3(point);
+                let hit = pick(&hs,c172::SPEC.eye,(visible-c172::SPEC.eye).normalize()).expect(name);
+                assert_eq!(hs[hit].click.or(hs[hit].wheel.map(|w| w.0)),Some(action),"{name} at {state}");
             }
         }
     }

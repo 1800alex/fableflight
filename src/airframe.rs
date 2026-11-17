@@ -607,6 +607,11 @@ pub enum Input {
     Ignition,
     Mixture,
     ParkingBrake,
+    Brake(f32),
+    LandingLights,
+    FuelValve,
+    PropControl,
+    CowlFlaps,
     /// thrust reversers, 0 stowed .. 1 deployed
     Reverser,
     /// the Mach number (inlet spikes follow it)

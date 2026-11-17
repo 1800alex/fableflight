@@ -29,6 +29,9 @@ pub struct Controls {
     pub yaw: f64,   // +1 = nose right
     pub throttle: f64,
     pub brake: bool,
+    /// Independent toe-brake pressure, 0..1.
+    pub brake_left: f64,
+    pub brake_right: f64,
     pub boost: bool,
     /// thrust reversers (on the ground, jets)
     pub reverse: bool,
@@ -91,6 +94,13 @@ pub struct Plane {
     pub cranking: bool,
     /// the parking brake is set (it holds the wheel brakes on)
     pub parking_brake: bool,
+    pub toe_brake: [f64; 2],
+    pub landing_lights: bool,
+    pub fuel_valve: bool,
+    pub engine_hours: f64,
+    pub propeller: f64,
+    prop_coarse: f64,
+    pub cowl_flaps: f64,
     auto_start: f64,
     /// the electrical system and the failures (systems.rs)
     pub sys: crate::systems::Systems,
@@ -243,6 +253,13 @@ impl Plane {
             starter_on: false,
             cranking: false,
             parking_brake: false,
+            toe_brake: [0.0; 2],
+            landing_lights: true,
+            fuel_valve: true,
+            engine_hours: 1834.6,
+            propeller: 1.0,
+            prop_coarse: 0.0,
+            cowl_flaps: 1.0,
             auto_start: 0.0,
             sys: Default::default(),
             payload: spec.payload[0],
@@ -461,6 +478,10 @@ impl Plane {
     pub fn flap_notch_deg(&self) -> f64 {
         self.spec.flaps.get(self.flap_set as usize).copied().unwrap_or(0.0)
     }
+    fn brake_pressure(&self, c: &Controls, side: f64) -> f64 {
+        if c.brake || self.parking_brake { 1.0 } else if side < 0.0 { c.brake_left.clamp(0.0, 1.0) } else { c.brake_right.clamp(0.0, 1.0) }
+    }
+
     pub fn toggle_gear(&mut self) {
         // The squat switch blocks retraction on the ground. (A rocket has none to raise.)
         if !(self.gear_down && self.on_ground) && self.spec.rocket().is_none() && !self.spec.fixed_gear() {
@@ -573,6 +594,11 @@ impl Plane {
             Input::Ignition => if self.starter_on || self.cranking { 1.5 } else if self.ignition { 1.0 } else { 0.0 },
             Input::Mixture => self.mixture as f32,
             Input::ParkingBrake => self.parking_brake as u8 as f32,
+            Input::Brake(side) => self.toe_brake[if side < 0.0 { 0 } else { 1 }] as f32,
+            Input::LandingLights => self.landing_lights as u8 as f32,
+            Input::FuelValve => self.fuel_valve as u8 as f32,
+            Input::PropControl => self.propeller as f32,
+            Input::CowlFlaps => self.cowl_flaps as f32,
             Input::Reverser => self.reverser as f32,
             Input::Mach => self.mach() as f32,
             Input::Canopy => self.canopy as f32,
@@ -1224,8 +1250,13 @@ impl Plane {
         self.stick += (target - self.stick) * (dt * 7.0).min(1.0);
         // Flaps run on an electric motor (or hydraulics), the gear on a pump;
         // the squat switch keeps the gear down while there is weight on the wheels.
+        let actuator_power = spec.id != 0 || self.sys.powered();
         let flap_target = spec.flap_frac(self.flap_set);
-        self.flaps += (flap_target - self.flaps).clamp(-spec.flap_rate * dt, spec.flap_rate * dt);
+        if actuator_power {
+            self.flaps += (flap_target - self.flaps).clamp(-spec.flap_rate * dt, spec.flap_rate * dt);
+        }
+        self.toe_brake = [self.brake_pressure(c, -1.0), self.brake_pressure(c, 1.0)];
+        if self.running { self.engine_hours += dt / 3600.0; }
         let slat_target = if spec.slats_at > 0 && self.flap_set >= spec.slats_at { 1.0 } else { 0.0 };
         self.slats += (slat_target - self.slats).clamp(-dt * 0.12, dt * 0.12);
         if !self.gear_down && self.on_ground {
@@ -1235,7 +1266,9 @@ impl Plane {
             // fixed gear (a downloaded aircraft's): always down
             (self.gear, self.gear_down) = (1.0, true);
         }
-        self.gear = (self.gear + if self.gear_down { spec.gear_rate * dt } else { -spec.gear_rate * dt }).clamp(0.0, 1.0);
+        if actuator_power {
+            self.gear = (self.gear + if self.gear_down { spec.gear_rate * dt } else { -spec.gear_rate * dt }).clamp(0.0, 1.0);
+        }
         // A canopy slides open or shut in about two seconds.
         self.canopy = (self.canopy + if self.canopy_open { 0.5 * dt } else { -0.5 * dt }).clamp(0.0, 1.0);
 
@@ -1424,14 +1457,24 @@ impl Plane {
                 // only slowing nearly to the stall stops it.
                 let w = self.prop_rate.max(0.0);
                 let v_ax = (-vb.z).max(0.0);
-                let (mut thrust, q_prop) = Self::prop_load(pe, w, v_ax, rho, prop_k);
+                let mut prop = pe.clone();
+                if spec.id == 0 && self.running && self.propeller < 0.999 {
+                    // Coarsening the blades increases their load, governing the selected RPM.
+                    let target = (1800.0 + 900.0 * self.propeller) * std::f64::consts::TAU / 60.0;
+                    self.prop_coarse = (self.prop_coarse + (w - target) * dt * 0.08).clamp(0.0, 2.0);
+                } else { self.prop_coarse = (self.prop_coarse - dt * 2.0).max(0.0); }
+                prop.cp0 *= 1.0 + self.prop_coarse;
+                prop.ct0 *= 1.0 + 0.3 * self.prop_coarse;
+                prop.j_t *= 1.0 + 0.2 * self.prop_coarse;
+                prop.j_p *= 1.0 + 0.2 * self.prop_coarse;
+                let (mut thrust, q_prop) = Self::prop_load(&prop, w, v_ax, rho, prop_k);
                 // It fires with the magnetos on, fuel, a mixture that will burn and the
                 // crankshaft turning (by the starter, or windmilling in the air); the
                 // starter motor's torque falls away as it spins up (it cranks at ~200 rpm).
                 // (The starter needs power from the bus; the magnetos do not.)
                 let cranking = (c.starter || self.auto_start > 0.0) && self.sys.powered();
                 self.cranking = cranking;
-                self.running = self.ignition && self.fuel > 0.0 && self.mixture > 0.08 && w > 8.0 && eng > 0.0 && !self.sys.fail.engine;
+                self.running = self.ignition && self.fuel_valve && self.fuel > 0.0 && self.mixture > 0.08 && w > 8.0 && eng > 0.0 && !self.sys.fail.engine;
                 let mix = smooth(0.08, 0.45, self.mixture);
                 let q_eng = if self.running { Self::engine_torque(pe, self.charge, rho, c.boost, eng) * mix } else { 0.0 } + if cranking { 120.0 * (1.0 - w / 25.0).max(0.0) } else { 0.0 };
                 if self.auto_start > 0.0 {
@@ -1841,9 +1884,10 @@ impl Plane {
                     let side = fwd.cross(upw);
                     let (vl, vs) = (pv.dot(fwd), pv.dot(side));
                     let f_side = (-vs * leg.side_k).clamp(-leg.side_mu * nf, leg.side_mu * nf);
-                    let braking = c.brake && leg.brakes;
-                    let mu = if braking { leg.brake_mu } else { leg.roll_mu };
-                    let f_long = (-vl * if braking { leg.brake_k } else { leg.roll_k }).clamp(-mu * nf, mu * nf);
+                    let brake = if leg.brakes { self.brake_pressure(c, leg.at.x) } else { 0.0 };
+                    let mu = leg.roll_mu + (leg.brake_mu - leg.roll_mu) * brake;
+                    let drag = leg.roll_k + (leg.brake_k - leg.roll_k) * brake;
+                    let f_long = (-vl * drag).clamp(-mu * nf, mu * nf);
                     let f = upw * nf + side * f_side + fwd * f_long;
                     force_w += f;
                     torque_b += r.cross(self.rot.inverse() * f);
@@ -1864,7 +1908,7 @@ impl Plane {
         // Wheels spin down in the air; brakes stop the mains at once.
         for (gi, leg) in spec.gear.iter().enumerate() {
             if !self.on_ground {
-                self.wheel_spin[gi] *= (1.0 - dt * if c.brake && leg.brakes && leg.steer == 0.0 { 8.0 } else { 0.25 }).max(0.0);
+                self.wheel_spin[gi] *= (1.0 - dt * if leg.brakes && leg.steer == 0.0 { 0.25 + 7.75 * self.brake_pressure(c, leg.at.x) } else { 0.25 }).max(0.0);
             }
             self.wheel_rot[gi] = (self.wheel_rot[gi] + self.wheel_spin[gi] * dt) % std::f64::consts::TAU;
         }
@@ -3332,6 +3376,47 @@ mod tests {
         assert!(dist > 120.0 && dist < 300.0 && vlo * KT < 62.0, "{dist} {}", vlo * KT);
         assert!(h > 150.0, "{h}");
         assert!(p.notes.is_empty() && p.dmg.gear.iter().all(|g| *g), "{:?}", p.notes);
+    }
+
+    #[test]
+    fn cessna_actuators_wait_for_electrical_power() {
+        let world = flat_world();
+        let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
+        p.gear_down = true;
+        p.flap_set = 2;
+        p.sys.elec.master = false;
+        for _ in 0..180 { p.step(1.0/180.0, &Controls::default(), &world); }
+        assert_eq!(p.gear, 0.0);
+        assert_eq!(p.flaps, 0.0);
+        p.sys.elec.master = true;
+        for _ in 0..180 { p.step(1.0/180.0, &Controls::default(), &world); }
+        assert!(p.gear > 0.1 && p.flaps > 0.1);
+    }
+
+    #[test]
+    fn toe_brakes_are_independent_and_parking_brake_overrides_both() {
+        let world = flat_world();
+        let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
+        p.step(1.0/180.0, &Controls { brake_left: 0.7, ..Default::default() }, &world);
+        assert!((p.input(Input::Brake(-1.0))-0.7).abs()<1e-5);
+        assert_eq!(p.input(Input::Brake(1.0)),0.0);
+        p.parking_brake = true;
+        p.step(1.0/180.0, &Controls::default(), &world);
+        assert_eq!(p.toe_brake,[1.0,1.0]);
+        assert!(!C172.gear[0].brakes);
+    }
+
+    #[test]
+    fn prop_control_reduces_rpm_without_cutting_ignition() {
+        let world = flat_world();
+        let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
+        let mut fast = p.prop_rate;
+        p.propeller = 0.2;
+        for _ in 0..900 {
+            p.step(1.0/180.0, &Controls { throttle_set: Some(0.75), ..Default::default() }, &world);
+            fast = fast.max(p.prop_rate);
+        }
+        assert!(p.running && p.prop_rate < fast * 0.9, "{} / {}",p.prop_rate,fast);
     }
 
     #[test]

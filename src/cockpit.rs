@@ -202,3 +202,95 @@ mod tests {
         assert!(lookup(t, dir_of(-1.15, 0.25).as_dvec3()) < 0.4);
     }
 }
+
+/// Fractional trackpad motion belongs to the control it started on.
+#[derive(Default)]
+pub struct WheelSteps {
+    target: Option<usize>,
+    fraction: f64,
+}
+impl WheelSteps {
+    pub fn steps(&mut self, target: usize, delta: f64) -> i32 {
+        if self.target != Some(target) {
+            self.fraction = 0.0;
+            self.target = Some(target);
+        }
+        self.fraction += delta;
+        let steps = self.fraction.trunc() as i32;
+        self.fraction -= steps as f64;
+        steps
+    }
+}
+
+/// Coarse local bounds avoid testing triangles in pieces the pointer cannot meet.
+pub fn blockers(pieces: &[crate::airframe::Piece]) -> Vec<(usize, Vec3, Vec3)> {
+    pieces.iter().enumerate().filter(|(_, p)| !p.glass &&
+        (p.name == "cabin" || p.name == "yoke" || p.name == "pedal" ||
+         p.anim != crate::airframe::Anim::Fixed && p.group == crate::airframe::G_FUSE))
+        .filter_map(|(i, p)| {
+            if p.mesh.v.is_empty() { return None; }
+            let (lo, hi) = p.mesh.v.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo,hi), v| {
+                let v = Vec3::from(v.pos); (lo.min(v), hi.max(v))
+            });
+            Some((i, lo, hi))
+        }).collect()
+}
+
+fn triangle_depth(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1,e2) = (b-a,c-a);
+    let h = d.cross(e2);
+    let det = e1.dot(h);
+    if det.abs() < 1e-8 { return None; }
+    let s = o-a;
+    let u = s.dot(h) / det;
+    let q = s.cross(e1);
+    let v = d.dot(q) / det;
+    if u < 0.0 || v < 0.0 || u+v > 1.0 { return None; }
+    let t = e2.dot(q) / det;
+    (t > 0.001).then_some(t)
+}
+
+pub fn occluded(pieces: &[crate::airframe::Piece], pose: &[glam::Mat4], bounds: &[(usize, Vec3, Vec3)], o: Vec3, d: Vec3, depth: f32) -> bool {
+    for &(i, lo, hi) in bounds {
+        let inv = pose[i].inverse();
+        let (o,d) = (inv.transform_point3(o), inv.transform_vector3(d));
+        let mut near = 0.0f32;
+        let mut far = depth;
+        for axis in 0..3 {
+            if d[axis].abs() < 1e-8 {
+                if o[axis] < lo[axis] || o[axis] > hi[axis] { far = -1.0; }
+            } else {
+                let (a,b) = ((lo[axis]-o[axis])/d[axis],(hi[axis]-o[axis])/d[axis]);
+                near = near.max(a.min(b)); far = far.min(a.max(b));
+            }
+        }
+        if near > far { continue; }
+        let m = &pieces[i].mesh;
+        for t in m.i.chunks_exact(3) {
+            // Lining windows are shader-cut; they are not solid blockers.
+            if m.v[t[0] as usize].mat[1] == crate::airframe::pat::LINING { continue; }
+            if triangle_depth(o,d,m.v[t[0] as usize].pos.into(),m.v[t[1] as usize].pos.into(),m.v[t[2] as usize].pos.into()).is_some_and(|t| t < depth) { return true; }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    #[test]
+    fn fractional_scroll_does_not_leak_between_controls() {
+        let mut wheel = WheelSteps::default();
+        assert_eq!(wheel.steps(0,0.6),0);
+        assert_eq!(wheel.steps(1,0.6),0);
+        assert_eq!(wheel.steps(1,0.6),1);
+        assert_eq!(wheel.steps(1,-1.4),-1);
+    }
+    #[test]
+    fn obstruction_depth_is_double_sided() {
+        let (a,b,c) = (Vec3::new(-1.0,-1.0,-1.0),Vec3::new(1.0,-1.0,-1.0),Vec3::new(0.0,1.0,-1.0));
+        assert!((triangle_depth(Vec3::ZERO,Vec3::NEG_Z,a,b,c).unwrap()-1.0).abs()<1e-6);
+        assert!(triangle_depth(Vec3::ZERO,Vec3::NEG_Z,a,c,b).is_some());
+        assert!(triangle_depth(Vec3::ZERO,Vec3::Z,a,b,c).is_none());
+    }
+}
