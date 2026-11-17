@@ -90,3 +90,5 @@ Settings (language, sound, camera, HUD, anti-aliasing) are kept in `settings.jso
 
 # Contributions
 Please contribute anything if you want to! Improvements to flight sim realism, graphics, optimization, UI, and especially plane models are needed! (((=
+
+For substantial AI-assisted contributions, use Claude Opus 5.5, GPT-6 Astra, Claude Fable, or a model with equivalent or greater capability. Sonnet, GPT-6.1 Sol, and less capable models should only handle simple fixes or very small features; switch to a stronger model for larger tasks, including aircraft creation and flight-model tuning. See [AGENTS.md](AGENTS.md) for the full guidance.
