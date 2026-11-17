@@ -37,6 +37,12 @@
 //! and numbered, and comes from a listed relay's address, or it is dropped
 //! (no forged, replayed or stray players); a relay never answers one.
 //!
+//! The world map: a player on the game's start screen (not flying) sends a
+//! Watch about once a second; while it does, the relay sends it every
+//! player of the network once a second, coarsely (`proto::Spot`: ~600 m,
+//! no attitude), for the globe. Watchers are not players: they take no
+//! slot, are listed to nobody and are not counted as flying.
+//!
 //! Safe to leave open on the internet: nothing is sent to an address until
 //! it has echoed a cookie only that address could have received (so a forged
 //! sender cannot make it send anything anywhere, and the one answer to a
@@ -117,6 +123,12 @@ const IDLE: Duration = Duration::from_secs(10);
 const PENDING_MAX: usize = 256;
 /// most players listed to one player, nearest first
 const SHOWN_MAX: usize = 30;
+/// a watcher (see the module notes) is dropped after this long without a Watch
+const WATCH_IDLE: Duration = Duration::from_secs(4);
+/// most watchers at once (past it, the one quiet longest goes)
+const WATCHERS_MAX: usize = 1024;
+/// most players in one round of World packets
+const WORLD_MAX: usize = 480;
 
 struct Relay {
     cfg: Config,
@@ -125,6 +137,8 @@ struct Relay {
     secret: RandomState,
     players: HashMap<SocketAddr, Player>,
     pending: HashMap<SocketAddr, (String, Instant)>,
+    /// on the start screen, watching the world: their name, their last Watch
+    watchers: HashMap<SocketAddr, (String, Instant)>,
     next_id: u32,
     /// federation: the other relays, the players they report (by relay index
     /// and their id), our id for this run and the number of our next datagram
@@ -139,7 +153,7 @@ impl Relay {
     fn new(cfg: Config) -> Self {
         let secret = RandomState::new();
         let me = { let mut h = secret.build_hasher(); std::process::id().hash(&mut h); Instant::now().hash(&mut h); h.finish() as u32 };
-        Relay { cfg, secret, players: HashMap::new(), pending: HashMap::new(), next_id: 1, peers: Vec::new(), remote: HashMap::new(), me, fed_seq: 0 }
+        Relay { cfg, secret, players: HashMap::new(), pending: HashMap::new(), watchers: HashMap::new(), next_id: 1, peers: Vec::new(), remote: HashMap::new(), me, fed_seq: 0 }
     }
 
     /// Looks the other relays' names up again (their addresses may change).
@@ -303,7 +317,9 @@ impl Relay {
                     if self.players.len() >= self.cfg.max_players {
                         return None;
                     }
-                    let name = self.pending.remove(&addr).map(|p| p.0).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("pilot {}", self.next_id));
+                    // (Its name from its Hello, or from when it watched the world before taking off.)
+                    let watched = self.watchers.remove(&addr).map(|w| w.0);
+                    let name = self.pending.remove(&addr).map(|p| p.0).or(watched).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("pilot {}", self.next_id));
                     let id = self.next_id;
                     self.next_id = (self.next_id + 1) % LOCAL_IDS;
                     self.next_id = self.next_id.max(1);
@@ -320,10 +336,35 @@ impl Relay {
             }
             Msg::Bye { cookie } => {
                 if cookie == self.cookie(&addr) {
+                    self.watchers.remove(&addr);
                     if let Some(p) = self.players.remove(&addr) {
                         println!("- {} (#{}), {} flying", p.name, p.id, self.players.len());
                     }
                 }
+                None
+            }
+            Msg::Watch { cookie } => {
+                if cookie != self.cookie(&addr) {
+                    return None;
+                }
+                // Back on the start screen: no longer flying (nobody sees it frozen in the air).
+                let name = match self.players.remove(&addr) {
+                    Some(p) => {
+                        println!("- {} (#{}) landed in the menu, {} flying", p.name, p.id, self.players.len());
+                        Some(p.name)
+                    }
+                    None => self.pending.remove(&addr).map(|p| p.0),
+                };
+                if !self.watchers.contains_key(&addr) && self.watchers.len() >= WATCHERS_MAX {
+                    if let Some(old) = self.watchers.iter().min_by_key(|(_, w)| w.1).map(|(a, _)| *a) {
+                        self.watchers.remove(&old);
+                    }
+                }
+                let w = self.watchers.entry(addr).or_insert_with(|| (String::new(), now));
+                if let Some(n) = name {
+                    w.0 = n;
+                }
+                w.1 = now;
                 None
             }
             Msg::Fed { relay, relay_name, ts, seq, players, tag } => {
@@ -334,7 +375,7 @@ impl Relay {
                 self.directory(addr, data, relay, ts, seq, members, tag, now, unix);
                 None
             }
-            Msg::Welcome { .. } | Msg::Peers { .. } => None,
+            Msg::Welcome { .. } | Msg::Peers { .. } | Msg::World { .. } => None,
         }
     }
 
@@ -373,6 +414,28 @@ impl Relay {
         out
     }
 
+    /// The World packets for every watcher: the whole network's players,
+    /// coarsely, in rounds of `WORLD_PER_PACKET` (one empty packet when
+    /// nobody flies, to say the relay is there).
+    fn world_packets(&self) -> Vec<(SocketAddr, Vec<u8>)> {
+        if self.watchers.is_empty() {
+            return Vec::new();
+        }
+        let mut spots: Vec<proto::Spot> = self.players.values().filter_map(|p| Some(proto::Spot::of(p.id, &p.name, &p.state?))).collect();
+        spots.extend(self.remote.iter().map(|((rel, id), r)| {
+            let i = self.peers.iter().position(|p| p.relay == *rel).unwrap_or(254) as u32;
+            proto::Spot::of(((i + 1) << 24) | (id & (LOCAL_IDS - 1)), &r.name, &r.state)
+        }));
+        let total = spots.len() as u32;
+        spots.truncate(WORLD_MAX);
+        let packets: Vec<Vec<u8>> = if spots.is_empty() {
+            vec![Msg::World { total, spots: Vec::new() }.encode()]
+        } else {
+            spots.chunks(proto::WORLD_PER_PACKET).map(|c| Msg::World { total, spots: c.to_vec() }.encode()).collect()
+        };
+        self.watchers.keys().flat_map(|a| packets.iter().map(move |p| (*a, p.clone()))).collect()
+    }
+
     /// What the status page shows: the players, as JSON.
     fn status_json(&self, started: Instant, packets: u64) -> String {
         let mut list: Vec<(&str, &str, PlayerState)> = self.players.values().filter_map(|p| Some((self.cfg.name.as_str(), p.name.as_str(), p.state?))).collect();
@@ -406,7 +469,7 @@ impl Relay {
             format!("{{\"name\":{},\"up\":{},\"self\":false,\"flying\":{}}}", json_str(name), up, if up { n } else { 0 })
         }));
         format!(
-            "{{\"version\":{},\"relay\":{},\"uptime_s\":{},\"max_players\":{},\"range_km\":{:.0},\"packets\":{},\"flying\":{},\"here\":{},\"network\":[{}],\"players\":[{}]}}",
+            "{{\"version\":{},\"relay\":{},\"uptime_s\":{},\"max_players\":{},\"range_km\":{:.0},\"packets\":{},\"flying\":{},\"here\":{},\"watching\":{},\"network\":[{}],\"players\":[{}]}}",
             json_str(env!("CARGO_PKG_VERSION")),
             json_str(&self.cfg.name),
             started.elapsed().as_secs(),
@@ -415,6 +478,7 @@ impl Relay {
             packets,
             list.len(),
             here,
+            self.watchers.len(),
             network.join(","),
             players.join(",")
         )
@@ -446,6 +510,7 @@ impl Relay {
             }
         }
         self.pending.retain(|_, (_, t)| now.saturating_duration_since(*t) < IDLE);
+        self.watchers.retain(|_, (_, t)| now.saturating_duration_since(*t) < WATCH_IDLE);
         self.remote.retain(|_, r| now.saturating_duration_since(r.last) < REMOTE_IDLE);
         // Relays that found their own way in and have gone quiet.
         self.peers.retain(|p| {
@@ -602,6 +667,9 @@ fn main() -> std::io::Result<()> {
         if now.duration_since(last_expire) >= Duration::from_secs(1) {
             last_expire = now;
             relay.expire(now);
+            for (addr, p) in relay.world_packets() {
+                let _ = sock.send_to(&p, addr);
+            }
             if federated && now.duration_since(last_resolve) >= Duration::from_secs(60) {
                 last_resolve = now;
                 relay.resolve_peers();
@@ -666,6 +734,77 @@ mod tests {
         assert!(r.players.is_empty());
         // Junk gets no answer at all.
         assert!(r.receive(addr(4), b"GET / HTTP/1.1", now, T).is_none());
+    }
+
+    fn world_of(out: &[(SocketAddr, Vec<u8>)], a: SocketAddr) -> (Vec<String>, Option<u32>) {
+        let mut total = None;
+        let names = out.iter().filter(|(x, _)| *x == a).flat_map(|(_, b)| match Msg::decode(b) {
+            Some(Msg::World { total: t, spots }) => {
+                total = Some(t);
+                spots.into_iter().map(|s| s.name).collect()
+            }
+            _ => vec![],
+        }).collect();
+        (names, total)
+    }
+
+    #[test]
+    fn a_watcher_sees_the_whole_world_and_is_not_a_player() {
+        let (mut r, now) = (relay(), Instant::now());
+        join(&mut r, addr(1), "Dany", 0.0, now);
+        // Far beyond the range: never in Dany's Peers, but on the world map.
+        join(&mut r, addr(2), "Roland", 4_000_000.0, now);
+        let w = r.receive(addr(3), &Msg::Hello { name: "Ana".into() }.encode(), now, T).unwrap();
+        let Some(Msg::Welcome { cookie, .. }) = Msg::decode(&w) else { panic!() };
+        // Without its cookie a Watch is nothing; with it, the world comes once a second.
+        r.receive(addr(3), &Msg::Watch { cookie: cookie ^ 2 }.encode(), now, T);
+        assert!(r.world_packets().is_empty());
+        r.receive(addr(3), &Msg::Watch { cookie }.encode(), now, T);
+        let (mut names, total) = world_of(&r.world_packets(), addr(3));
+        names.sort();
+        assert_eq!((names, total), (vec!["Dany".to_string(), "Roland".to_string()], Some(2)));
+        // Nobody sees the watcher, it takes no slot, and is not counted as flying.
+        assert!(r.broadcast().iter().all(|(a, _)| *a != addr(3)) && peers_of(&r.broadcast(), addr(1)).is_empty());
+        assert!(r.status_json(now, 0).contains("\"flying\":2") && r.players.len() == 2);
+        // It takes off under the name it said Hello with, long after.
+        let later = now + Duration::from_secs(30);
+        for k in 0..10 {
+            r.receive(addr(3), &Msg::Watch { cookie }.encode(), later - Duration::from_secs(10 - k as u64 * 1), T);
+        }
+        r.expire(later);
+        r.receive(addr(3), &Msg::State { cookie, state: st(1, 1000.0) }.encode(), later, T);
+        assert_eq!(r.players.get(&addr(3)).map(|p| p.name.as_str()), Some("Ana"));
+        assert!(r.watchers.is_empty());
+        // Back in the menu: off the players at once (not left frozen in the sky), still watching.
+        r.receive(addr(3), &Msg::Watch { cookie }.encode(), later, T);
+        assert!(!r.players.contains_key(&addr(3)) && r.watchers.contains_key(&addr(3)));
+        assert!(!peers_of(&r.broadcast(), addr(1)).contains(&"Ana".to_string()));
+        // A watcher that stops asking is forgotten.
+        r.expire(later + WATCH_IDLE + Duration::from_secs(1));
+        assert!(r.watchers.is_empty() && r.world_packets().is_empty());
+    }
+
+    #[test]
+    fn an_empty_world_still_answers() {
+        let (mut r, now) = (relay(), Instant::now());
+        let w = r.receive(addr(3), &Msg::Hello { name: "Ana".into() }.encode(), now, T).unwrap();
+        let Some(Msg::Welcome { cookie, .. }) = Msg::decode(&w) else { panic!() };
+        r.receive(addr(3), &Msg::Watch { cookie }.encode(), now, T);
+        assert_eq!(world_of(&r.world_packets(), addr(3)), (vec![], Some(0)));
+    }
+
+    #[test]
+    fn federated_players_are_on_the_world_map() {
+        let now = Instant::now();
+        let (mut a, mut b) = (fed_relay("A", &[2]), fed_relay("B", &[1]));
+        join(&mut a, addr(1), "Dany", 0.0, now);
+        for (_, d) in a.fed_packets(T) {
+            b.receive(SocketAddr::from(([10, 0, 0, 1], 7480)), &d, now, T);
+        }
+        let w = b.receive(addr(3), &Msg::Hello { name: "Ana".into() }.encode(), now, T).unwrap();
+        let Some(Msg::Welcome { cookie, .. }) = Msg::decode(&w) else { panic!() };
+        b.receive(addr(3), &Msg::Watch { cookie }.encode(), now, T);
+        assert_eq!(world_of(&b.world_packets(), addr(3)), (vec!["Dany".to_string()], Some(1)));
     }
 
     #[test]

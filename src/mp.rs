@@ -5,10 +5,14 @@
 //! two reports, so that they move smoothly whatever the network does; past
 //! the last report they fly on along their velocity for a moment.
 //!
+//! On the start screen the connection stays up but nothing of the aircraft
+//! is sent: it watches instead (`set_watching`), and the relay sends the
+//! whole network's players, coarsely, for the globe (`world`).
+//!
 //! Nothing is sent unless multiplayer is switched on; what is sent is the
 //! aircraft's state and the name the player chose.
 use crate::airmodels::{self as am, TYPES};
-use crate::mp_proto::{self as proto, Msg, PlayerState};
+use crate::mp_proto::{self as proto, Msg, PlayerState, Spot};
 use crate::airfield::{Light, L_GREEN, L_RED, L_STROBE, L_WHITE};
 use crate::render::Inst;
 use glam::{DQuat, DVec3, Vec3};
@@ -26,6 +30,10 @@ const SEND_EVERY: Duration = Duration::from_millis(66);
 const STALE: f64 = 3.0;
 /// no word from the relay for this long: say Hello again
 const LOST: Duration = Duration::from_secs(5);
+/// how often a Watch goes out on the start screen
+const WATCH_EVERY: Duration = Duration::from_millis(1000);
+/// a player on the world map not heard of for this long is gone (s)
+const WORLD_STALE: f64 = 3.5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -46,6 +54,18 @@ struct Shared {
     peers: Mutex<HashMap<u32, Peer>>,
     status: Mutex<Status>,
     stop: AtomicBool,
+    /// on the start screen: watch the world, send nothing of the aircraft
+    watching: AtomicBool,
+    /// the world map: each player as last reported (when, where), the
+    /// network's count, and when a World last came (None: never, an older relay)
+    world: Mutex<World>,
+}
+
+#[derive(Default)]
+struct World {
+    spots: HashMap<u32, (f64, Spot)>,
+    total: u32,
+    heard: Option<f64>,
 }
 
 /// Another player, where they are now (as best we know).
@@ -74,7 +94,7 @@ pub struct Mp {
 impl Mp {
     /// Connects to the relay at `server` ("host" or "host:port") as `name`.
     pub fn start(server: &str, name: &str) -> Self {
-        let shared = Arc::new(Shared { epoch: Instant::now(), ours: Mutex::new(None), peers: Mutex::new(HashMap::new()), status: Mutex::new(Status::Connecting), stop: AtomicBool::new(false) });
+        let shared = Arc::new(Shared { epoch: Instant::now(), ours: Mutex::new(None), peers: Mutex::new(HashMap::new()), status: Mutex::new(Status::Connecting), stop: AtomicBool::new(false), watching: AtomicBool::new(false), world: Mutex::new(World::default()) });
         let (sv, nm, sh) = (server.trim().to_string(), proto::clean_name(name), shared.clone());
         std::thread::Builder::new()
             .name("multiplayer".into())
@@ -95,6 +115,35 @@ impl Mp {
 
     pub fn status(&self) -> Status {
         self.shared.status.lock().unwrap().clone()
+    }
+
+    /// On the start screen (true): our aircraft is no longer sent (the relay
+    /// takes us off the players flying) and the world map comes in instead.
+    /// In flight (false): the other way round.
+    pub fn set_watching(&self, on: bool) {
+        if self.shared.watching.swap(on, Ordering::Relaxed) != on {
+            if on {
+                *self.shared.ours.lock().unwrap() = None;
+            }
+            // (Nobody near any more, or a world seen from the menu: start afresh either way.)
+            self.shared.peers.lock().unwrap().clear();
+            let mut w = self.shared.world.lock().unwrap();
+            w.spots.clear();
+            w.total = 0;
+        }
+    }
+
+    /// The world map: every player of the network the relay lists, the
+    /// number in all (it may list fewer), and whether the relay sends one at
+    /// all (false for a relay from before the world map, or not yet).
+    pub fn world(&self) -> (Vec<Spot>, u32, bool) {
+        let t = self.shared.epoch.elapsed().as_secs_f64();
+        let mut w = self.shared.world.lock().unwrap();
+        w.spots.retain(|_, (ts, _)| t - *ts < WORLD_STALE);
+        let mut out: Vec<Spot> = w.spots.values().map(|(_, s)| s.clone()).collect();
+        out.sort_by_key(|s| s.id);
+        let known = w.heard.is_some_and(|h| t - h < WORLD_STALE);
+        (out, if known { w.total } else { 0 }, known)
     }
 
     /// The other players, interpolated to now (minus `DELAY`).
@@ -147,6 +196,7 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
     sock.set_read_timeout(Some(Duration::from_millis(15))).map_err(|e| e.to_string())?;
     let mut cookie: Option<u64> = None;
     let (mut last_send, mut last_hello, mut last_heard) = (Instant::now() - Duration::from_secs(10), Instant::now() - Duration::from_secs(10), Instant::now());
+    let mut last_watch = Instant::now() - Duration::from_secs(10);
     let mut seq = 0u32;
     let mut buf = [0u8; 2048];
     while !sh.stop.load(Ordering::Relaxed) {
@@ -155,6 +205,12 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
             None if now.duration_since(last_hello) > Duration::from_secs(1) => {
                 last_hello = now;
                 let _ = sock.send(&Msg::Hello { name: name.to_string() }.encode());
+            }
+            Some(c) if sh.watching.load(Ordering::Relaxed) => {
+                if now.duration_since(last_watch) >= WATCH_EVERY {
+                    last_watch = now;
+                    let _ = sock.send(&Msg::Watch { cookie: c }.encode());
+                }
             }
             Some(c) if now.duration_since(last_send) >= SEND_EVERY => {
                 last_send = now;
@@ -167,9 +223,14 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
             _ => {}
         }
         if cookie.is_some() && now.duration_since(last_heard) > LOST {
-            // The relay went quiet (restarted, or the network dropped): start over.
+            // The relay went quiet (restarted, or the network dropped): start
+            // over. (Watching a relay from before the world map, which never
+            // answers a Watch, is no reason to look lost.)
             cookie = None;
-            *sh.status.lock().unwrap() = Status::Connecting;
+            let old_relay = sh.watching.load(Ordering::Relaxed) && sh.world.lock().unwrap().heard.is_none();
+            if !old_relay {
+                *sh.status.lock().unwrap() = Status::Connecting;
+            }
         }
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
@@ -186,6 +247,24 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
             Some(Msg::Welcome { cookie: c, .. }) => {
                 cookie = Some(c);
                 last_heard = now;
+                last_watch = now - WATCH_EVERY;
+                // (Watching, the relay has answered: that is all there is to being connected.)
+                if sh.watching.load(Ordering::Relaxed) {
+                    *sh.status.lock().unwrap() = Status::Connected;
+                }
+            }
+            Some(Msg::World { total, spots }) => {
+                last_heard = now;
+                *sh.status.lock().unwrap() = Status::Connected;
+                let t = sh.epoch.elapsed().as_secs_f64();
+                let mut w = sh.world.lock().unwrap();
+                if sh.watching.load(Ordering::Relaxed) {
+                    w.total = total;
+                    w.heard = Some(t);
+                    for s in spots {
+                        w.spots.insert(s.id, (t, s));
+                    }
+                }
             }
             Some(Msg::Peers { peers }) => {
                 last_heard = now;
@@ -574,6 +653,94 @@ mod tests {
             assert_eq!(proto::AIRCRAFT.get(s.id as usize).copied(), Some(s.name), "id {}", s.id);
         }
         assert_eq!(proto::PLANET_R, crate::geo::R);
+    }
+
+    /// A relay answering Hello; with `world`, a Watch gets two players on
+    /// the world map back (else it is ignored, as by a relay from before it).
+    /// It counts the States it gets.
+    fn watch_relay(world: bool) -> (u16, Arc<std::sync::atomic::AtomicU32>) {
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = relay.local_addr().unwrap().port();
+        let states = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let n = states.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((len, from)) = relay.recv_from(&mut buf) {
+                match Msg::decode(&buf[..len]) {
+                    Some(Msg::Hello { .. }) => {
+                        let _ = relay.send_to(&Msg::Welcome { id: 1, cookie: 9 }.encode(), from);
+                    }
+                    Some(Msg::State { .. }) => {
+                        n.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(Msg::Watch { cookie: 9 }) if world => {
+                        let s = PlayerState { pos: [0.0, 0.0, 6_372_000.0], rot: [0.0, 0.0, 0.0, 1.0], ..Default::default() };
+                        let spots = vec![proto::Spot::of(4, "Dany", &s), proto::Spot { id: 5, name: "Roland".into(), lat: 16000, ..Default::default() }];
+                        let _ = relay.send_to(&Msg::World { total: 7, spots }.encode(), from);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (port, states)
+    }
+
+    #[test]
+    fn on_the_start_screen_the_world_comes_in_and_nothing_goes_out() {
+        let (port, states) = watch_relay(true);
+        let c = Mp::start(&format!("127.0.0.1:{port}"), "A");
+        c.set_state(PlayerState { pos: [6_372_000.0, 0.0, 0.0], rot: [0.0, 0.0, 0.0, 1.0], ..Default::default() });
+        c.set_watching(true);
+        let t0 = Instant::now();
+        while c.world().0.len() < 2 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let (spots, total, known) = c.world();
+        assert_eq!((spots.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), total, known), (vec!["Dany", "Roland"], 7, true));
+        assert!((spots[0].lat_deg() - 90.0).abs() < 0.01);
+        assert_eq!(c.status(), Status::Connected);
+        assert_eq!(states.load(Ordering::Relaxed), 0, "the aircraft is not sent from the menu");
+        // Off to fly: the aircraft goes out again, the world map is let go.
+        c.set_watching(false);
+        assert!(c.world().0.is_empty());
+        c.set_state(PlayerState { pos: [6_372_000.0, 0.0, 0.0], rot: [0.0, 0.0, 0.0, 1.0], ..Default::default() });
+        let t0 = Instant::now();
+        while states.load(Ordering::Relaxed) == 0 && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(states.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn an_older_relay_is_connected_without_a_world_map() {
+        let (port, _) = watch_relay(false);
+        let c = Mp::start(&format!("127.0.0.1:{port}"), "A");
+        c.set_watching(true);
+        let t0 = Instant::now();
+        while c.status() != Status::Connected && t0.elapsed() < Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(c.status(), Status::Connected);
+        // (past LOST it says Hello again, without looking lost)
+        std::thread::sleep(LOST + Duration::from_millis(1500));
+        assert_eq!(c.status(), Status::Connected);
+        assert_eq!(c.world(), (Vec::new(), 0, false));
+    }
+
+    #[test]
+    fn a_spot_agrees_with_the_games_frame() {
+        let (lat, lon) = (-33.9f64, 151.2f64);
+        let pos = crate::geo::lla_to_pos(lat.to_radians(), lon.to_radians(), 2500.0);
+        let (e, n, u) = crate::geo::enu(pos);
+        // heading 300°: forward in the world, and the body's right, up and back
+        let h = 300f64.to_radians();
+        let fwd = n * h.cos() + e * h.sin();
+        let right = fwd.cross(u);
+        let q = DQuat::from_mat3(&glam::DMat3::from_cols(right, u, -fwd));
+        let s = PlayerState { pos: pos.to_array(), rot: [q.x as f32, q.y as f32, q.z as f32, q.w as f32], vel: (fwd * 60.0).as_vec3().to_array(), ..Default::default() };
+        let p = proto::Spot::of(1, "x", &s);
+        assert!((p.lat_deg() - lat).abs() < 0.01 && (p.lon_deg() - lon).abs() < 0.01);
+        assert!((p.heading_deg() - 300.0).abs() < 1.5 && p.alt_m() == 2500.0 && p.speed == 117, "{p:?}");
     }
 
     #[test]
