@@ -181,8 +181,6 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
     if (amt <= 0.0) { continue; }
     let young = 1.0 - smoothstep(0.4, 0.6, sp.x);
     let up = normalize(c.xyz - G.weather.xyz * 0.001);
-    let cen = up * rg + G.storm.xyz * (R * 0.45);
-    let rr = R * 0.8;
     // A squall line (its half-length L2; storm_sd): a curtain of heavy rain all
     // along it right behind the shelf cloud, then lighter rain trailing far
     // behind (storm.rs line_rain). X along it, Y downwind.
@@ -190,6 +188,12 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
     let line = L2 > 0.0;
     let X = normalize(cross(up, G.storm.xyz));
     let Y = cross(X, up);
+    // A supercell's core (rain and hail) falls off to the downwind left of
+    // its updraft, a dense, dark shaft with a sharp edge, leaving the base
+    // over the updraft and its wall cloud rain-free (storm.rs shaft_at).
+    let sup = storm_super(sp);
+    let cen = up * rg + G.storm.xyz * (R * mix(0.45, 0.32, sup)) + X * (R * 0.28 * sup);
+    let rr = R * mix(0.8, 0.42, sup);
     // (The test cylinder also holds the shaft's slant and its foot.)
     let rt = rr * 1.75 + base * 0.15;
     let v = cen - oc;
@@ -256,8 +260,8 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
       // Finer sheets of heavier rain within the shaft.
       let sf = textureSampleLevel(t_noise, s_repeat, qc / sc.y + vec3f(0.17, 0.83, 0.52), 0.0);
       let streak = smoothstep(0.25, 0.75, sn.g * 0.45 + sn.b * 0.3 + sf.g * 0.35 - 0.05);
-      var core = (1.0 - smoothstep(0.35, 1.0, rad + (sn.r - 0.5) * 0.5));
-      var heavy = 0.0;
+      var core = (1.0 - smoothstep(mix(0.35, 0.55, sup), 1.0, rad + (sn.r - 0.5) * 0.5));
+      var heavy = 0.75 * sup;
       var cores = 1.0;
       var vtop = base;
       if (line) {
@@ -284,7 +288,7 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
       // grey from afar: extinction goes as the square root of the amount.)
       // A young cell's (a shower's) rain falls as one denser, more even shaft.
       // (A squall line's heavy rain falls in denser, more even sheets.)
-      let e = 0.0015 * sqrt(amt) * core * cores * mix(mix(mix(0.5, 0.1, young), mix(0.5, 0.12, f32(line)), heavy), 1.0, streak * streak) * vert * (1.0 + 2.0 * young);
+      let e = 0.0015 * (1.0 + 0.5 * sup) * sqrt(amt) * core * cores * mix(mix(mix(0.5, 0.1, young), mix(0.5, 0.12, f32(line)), heavy) * (1.0 - 0.4 * sup), 1.0, streak * streak) * vert * (1.0 + 2.0 * young);
       if (e <= 1e-7) { continue; }
       let upn = p / length(p);
       let mu = dot(upn, G.sun_dir.xyz);
@@ -297,9 +301,10 @@ fn storm_rain(oc: vec3f, rd: vec3f, tmax: f32, mask: u32, jit: f32, sky_amb: vec
       // cell per sample cost a few % fps whenever a shaft was in view.)
       let pc = storm_hoff(ph, up, L2) + G.storm.xyz * (0.2 * R);
       // (Even a shower's base hides half the sky from its rain.)
-      let dark = (1.0 - smoothstep(0.7, 1.7, length(pc) / R)) * max(smoothstep(0.3, 0.75, sp.x) * smoothstep(1500.0, 4000.0, R), 0.5);
+      let dark = max((1.0 - smoothstep(0.7, 1.7, length(pc) / R)) * max(smoothstep(0.3, 0.75, sp.x) * smoothstep(1500.0, 4000.0, R), 0.5), sup);
       // (A squall line's heavy core takes on the green-grey of hail-laden rain.)
-      var amb = storm_light(sky_amb * 0.13 + gnd_amb * 0.3, dark);
+      // (A supercell's core, dense with rain and hail, the darkest of all.)
+      var amb = storm_light(sky_amb * 0.13 + gnd_amb * 0.3, dark) * (1.0 - 0.45 * sup);
       // A squall line's curtain hangs right behind the gust front, open to the
       // bright sky low ahead: lit from the front, a dull grey-green, paler
       // where it is dense (it sends that light back) and towards the ground,
@@ -664,8 +669,11 @@ fn depth_match(a: f32, b: f32) -> f32 {
       od *= SIGMA;
       // (After the light march, like everything below: any value carried
       // through it cost ~18% of the cloud pass in every view.)
-      let sdq = floor(anvp);
-      let anv = (anvp - sdq) / 0.99;
+      let sdq0 = floor(anvp);
+      let anv = (anvp - sdq0) / 0.99;
+      // (A supercell's rotating updraft: flagged +256, cloud_shape_f.)
+      let meso = sdq0 >= 256.0 && sdq0 < 512.0;
+      let sdq = sdq0 - select(0.0, 256.0, meso);
       // How much of the cloud here is the rain deck's, not a storm tower's
       // standing in it (lit with the deck's flat glow, the tower's lower half
       // came out as one pale drum up to the layer's top): not at the tower's
@@ -718,9 +726,17 @@ fn depth_match(a: f32, b: f32) -> f32 {
           let vl = smoothstep(0.7 * Rq, 0.3 * Rq, u) * (1.0 - smoothstep(base + 800.0, base + 1300.0, hl));
           if (vl > vw) { vw = vl; lift = 2000.0; }
         }
+        // A supercell's rotating updraft stands under the storm's head and
+        // anvil: in their shade unless the sun is low enough to get in under
+        // them (the march alone lit it in full).
+        // (In full, where the sun got in under the anvil it lit a window on
+        // the dark drum: the march's own light keeps a share.)
+        if (meso) { vw = 0.8; }
       }
       var vsh = 1.0;
-      if (vw > 0.0) { vsh = mix(1.0, cloud_sun(pl + sun * lift, false).vis, vw); }
+      // (Smoothly filtered for the rotating updraft: its smooth plates showed
+      // the map's texels as teeth along the shadow's edge.)
+      if (vw > 0.0) { vsh = mix(1.0, cloud_sun(pl + sun * lift, meso).vis, vw); }
       if (lsq && hl < base) {
         // A squall line's shelf cloud and the ceiling over it: what sky they
         // see follows from where on them the light is taken, no probes (the

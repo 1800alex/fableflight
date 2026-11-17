@@ -45,6 +45,8 @@ pub struct Local {
     pub draft: f64,
     /// outflow along the ground from the downdraft (the gust front), planet frame m/s
     pub gust: DVec3,
+    /// how much of the rain here is hail, 0..1 (a supercell's core)
+    pub hail: f64,
 }
 
 /// A cell as seen from a point: (metres downwind of its centre, metres across
@@ -63,6 +65,8 @@ struct At {
     r: f64,
     age: f64,
     htop: f64,
+    /// how much of a supercell it is, 0..1 (weather.rs `supercell`)
+    sup: f64,
     w: DVec3,
     x: DVec3,
 }
@@ -91,7 +95,14 @@ fn cell_at(wx: &Weather, c: &[[f32; 4]; 2], pos: DVec3, w: DVec3) -> At {
     let (len2, seed) = line_of(c);
     let cxl = dv.dot(x);
     let cx = cxl.signum() * (cxl.abs() - len2).max(0.0);
-    At { dw0: dv.dot(w), cx, cxl, len2, seed, hb: alt - wx.base() as f64, r: c[0][3] as f64 * 1000.0, age, htop: at * storm_top(age), w, x }
+    At { dw0: dv.dot(w), cx, cxl, len2, seed, hb: alt - wx.base() as f64, r: c[0][3] as f64 * 1000.0, age, htop: at * storm_top(age), sup: crate::weather::supercell(c), w, x }
+}
+
+/// A supercell's rain and hail core: its centre downwind and to the left of
+/// the cell's centre, and its radius, x the tower radius (clouds.wgsl
+/// storm_rain; for sup = 0 an ordinary cell's shaft).
+fn shaft_at(sup: f64) -> (f64, f64, f64) {
+    (0.45 - 0.13 * sup, 0.28 * sup, 0.8 - 0.38 * sup)
 }
 
 /// A cell's squall-line half-length (m, 0 for a lone cell) and its seed: the
@@ -152,17 +163,21 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
         // The rain shaft hangs under the downwind half of the base. Along a
         // squall line: a curtain right behind the shelf cloud, a long tail of
         // lighter rain behind that.
-        let rs = (a.dw0 - 0.45 * r).hypot(a.cx) / (0.8 * r);
+        let sup = a.sup;
+        let (sa, sx, sr) = shaft_at(sup);
+        let rs = (a.dw0 - sa * r).hypot(a.cx - sx * r) / (sr * r);
         let u = shelf_u(&a);
         let ends = 1.0 - smoothstep(a.len2 - 0.3 * r, a.len2 + 0.7 * r, a.cxl.abs());
         let (lr, lh) = line_rain(u, r);
-        let heavy = if line { lr * ends } else { 1.0 - smoothstep(0.35, 1.0, rs) };
-        let fringe = if line { heavy } else { 1.0 - smoothstep(0.85, 1.45, rs) };
+        // (A supercell's core is denser and sharp-edged.)
+        let heavy = if line { lr * ends } else { 1.0 - smoothstep(0.35 + 0.27 * sup, 1.0, rs) };
+        let fringe = if line { heavy } else { 1.0 - smoothstep(0.85 + 0.15 * sup, 1.45 - 0.3 * sup, rs) };
+        let amt = (amt * (1.0 + 0.8 * sup)).min(1.0);
         // The tower, leaning downwind with height.
         let hb = a.hb.max(0.0);
         let hc = (hb / a.htop.max(1.0)).min(1.2);
-        let dw = a.dw0 - hb * (0.12 + 0.1 * mature);
-        let rt = 0.82 * r * (1.0 - 0.28 * smoothstep(0.0, 0.9, hc));
+        let dw = a.dw0 - hb * (0.12 + 0.1 * mature + 0.08 * sup);
+        let rt = (0.82 - 0.2 * sup) * r * (1.0 - 0.28 * smoothstep(0.0, 0.9, hc));
         let rr = dw.hypot(a.cx) / rt;
         let inside = if a.hb >= 0.0 && a.hb < a.htop { 1.0 - smoothstep(0.85, 1.08, rr) } else { 0.0 };
         o.cloud = o.cloud.max(inside);
@@ -174,6 +189,11 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
             core.max(amt * heavy * (1.0 - smoothstep(0.0, 1500.0, a.hb))) * (if a.hb < a.htop { 1.0 } else { 0.0 })
         };
         o.rain = o.rain.max(rain);
+        // Hail in a supercell's core: under the base and up through the
+        // lower half of the tower.
+        if sup > 0.0 && a.hb < 0.6 * a.htop {
+            o.hail = o.hail.max(sup * (1.0 - smoothstep(0.3, 0.75, rs)));
+        }
 
         // Drafts: the updraft rises through the core (inflow from under the
         // base upwind), strongest halfway up; the downdraft comes down in the
@@ -185,7 +205,9 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
         let dn_prof = if a.hb < 0.0 { smoothstep(0.0, 300.0, agl) } else { 1.0 - smoothstep(0.0, 0.5, hc) };
         // (Even a young shower tower has a brisk updraft and some bumps.)
         let vigour = 0.35 + 0.65 * a.age.min(1.0);
-        o.draft += vigour * ((7.0 + 13.0 * size) * core * up_prof) - amt * (5.0 + 7.0 * size) * shaft * dn_prof;
+        // (A supercell's rotating updraft is the strongest of all: 30-40 m/s
+        // in its core.)
+        o.draft += vigour * ((7.0 + 13.0 * size + 12.0 * sup) * core * up_prof) - amt * (5.0 + 7.0 * size + 6.0 * sup) * shaft * dn_prof;
         // A squall line's gust front: the cold outflow undercuts the warm air
         // ahead and lifts it, a narrow band of updraft under the shelf's nose,
         // with severe turbulence where the two meet.
@@ -198,7 +220,7 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
         let shear = core * shaft * 4.0;
         let near = 1.0 - smoothstep(1.0, 3.0, a.dw0.hypot(a.cx) / r);
         let low_front = if a.hb < 300.0 { front } else { front * (1.0 - smoothstep(300.0, 1500.0, a.hb)) };
-        let s = vigour * (1.2 * near + 4.5 * inside * (0.6 + 0.4 * size) + 2.8 * amt * heavy * if line { 0.5 + 0.5 * lh } else { 1.0 } + 3.0 * shear.min(1.0) + 5.5 * low_front);
+        let s = vigour * (1.0 + 0.6 * sup) * (1.2 * near + 4.5 * inside * (0.6 + 0.4 * size) + 2.8 * amt * heavy * if line { 0.5 + 0.5 * lh } else { 1.0 } + 3.0 * shear.min(1.0) + 5.5 * low_front);
         let k = i as f64 * 1.731;
         let burst = ((0.21 * t + k).sin() * 0.6 + (0.53 * t + 2.3 * k).sin() * 0.4 + (1.37 * t + 4.1 * k).sin() * 0.25) / 1.25;
         o.sigma = o.sigma.max(s * (0.6 + 0.65 * smoothstep(-0.2, 0.7, burst)));
@@ -213,7 +235,7 @@ pub fn local(wx: &Weather, pos: DVec3, agl: f64, t: f64) -> Local {
             let fw = (a.w - up * a.w.dot(up)).normalize_or_zero();
             o.gust += fw * (ends * mature * low * (amt * (10.0 + 9.0 * size) * out - 3.0 * inflow));
         } else if a.hb < 0.0 && amt > 0.0 {
-            let out = a.w * (a.dw0 - 0.45 * r) + a.x * a.cx;
+            let out = a.w * (a.dw0 - sa * r) + a.x * (a.cx - sx * r);
             let d = out.length();
             if d > 1.0 {
                 let ring = (d / (0.8 * r)) * (-(d / (1.3 * r)).powi(2)).exp() * 1.6;
@@ -253,8 +275,10 @@ pub fn shade(wx: &Weather, pos: DVec3) -> f64 {
         let rc = (a.dw0 - 0.25 * r).hypot(a.cx) / r;
         let core = (1.0 - smoothstep(0.7, 1.7, rc)) * smoothstep(0.3, 0.75, a.age) * smoothstep(1500.0, 4000.0, r);
         let mature = smoothstep(0.5, 0.8, a.age);
-        let an = (r * (1.0 + if a.len2 > 0.0 { 2.8 } else { 4.5 } * mature), r * (0.8 + 0.35 * mature), r * (1.0 + 0.6 * mature));
-        let lc = an.2 + a.dw0.max(0.0) * 0.45;
+        let sup = a.sup;
+        let reach = if a.len2 > 0.0 { 2.8 } else { 4.5 };
+        let an = (r * (1.0 + (reach + (10.5 - reach) * sup) * mature), r * (0.8 + 0.35 * mature + 0.45 * sup), r * (1.0 + 0.6 * mature + 0.4 * sup));
+        let lc = an.2 + a.dw0.max(0.0) * (0.45 - 0.15 * sup);
         let rn = (a.dw0 / if a.dw0 > 0.0 { an.0 } else { an.1 }).hypot(a.cx / lc);
         let lid = (1.0 - smoothstep(0.5, 1.05, rn)) * 0.55 * mature;
         dark = dark.max(core.max(lid));
@@ -298,6 +322,9 @@ struct Flash {
     segs: Vec<Seg>,
     power: f64,
     end: f64,
+    /// how brightly an in-cloud flash's channel shows (anvil crawlers, under
+    /// the thin ice, the most)
+    vis: f64,
 }
 
 /// A thunderclap on its way: how long until it arrives, the nearest and
@@ -435,7 +462,9 @@ impl Lightning {
     }
 
     /// A cloud-to-ground flash from `top` (in the cloud) down to `foot` on the ground.
-    fn ground_flash(&mut self, top: DVec3, foot: DVec3, ground: f64, power: f64, forced: bool) -> Flash {
+    /// `positive`: a positive strike out of the anvil, one stroke with a long
+    /// continuing current (re-brightening twice) and a long in-cloud root.
+    fn ground_flash(&mut self, top: DVec3, foot: DVec3, ground: f64, power: f64, forced: bool, positive: bool) -> Flash {
         let up = foot.normalize();
         let mut segs = Vec::new();
         // The part in the cloud runs off sideways from where the leader started.
@@ -444,8 +473,12 @@ impl Lightning {
         let nb = 2 + (self.u() * 3.5) as usize;
         self.branches(&pts, up, ground, nb, 1, 0.0, 1.0, &mut segs);
         let side = self.unit();
-        let root = top + (side - up * side.dot(up)).normalize_or_zero() * h * 0.35 + up * h * 0.08;
-        self.channel(top, root, 5, 0.22, 0.7, 1, 0.0, 0.0, true, &mut segs);
+        let root = top + (side - up * side.dot(up)).normalize_or_zero() * h * if positive { 1.3 } else { 0.35 } + up * h * 0.08;
+        self.channel(top, root, if positive { 6 } else { 5 }, 0.22, 0.7, 1, 0.0, 0.0, true, &mut segs);
+        if positive {
+            let spans = vec![[top, foot]; 3];
+            return Flash { kind: Kind::Ground, age: 0.0, leader: self.range(0.03, 0.05), end: 1.2, strokes: vec![(0.0, 1.0), (0.14, 0.4), (0.38, 0.25)], spans, segs, power, vis: 1.0 };
+        }
         // Strokes: the first and strongest, then up to four more down the same channel.
         let mut strokes = vec![(0.0, 1.0)];
         let n = if forced { 4 } else { 1 + (self.u().powf(0.8) * 4.0) as usize };
@@ -456,7 +489,7 @@ impl Lightning {
             strokes.push((t, a));
         }
         let spans = vec![[top, foot]; strokes.len()];
-        Flash { kind: Kind::Ground, age: 0.0, leader: if forced { 0.03 } else { self.range(0.02, 0.035) }, end: t + 0.5, strokes, spans, segs, power }
+        Flash { kind: Kind::Ground, age: 0.0, leader: if forced { 0.03 } else { self.range(0.02, 0.035) }, end: t + 0.5, strokes, spans, segs, power, vis: 1.0 }
     }
 
     /// An in-cloud flash around `c`: a few pulses, each lighting another
@@ -486,7 +519,7 @@ impl Lightning {
             let d = flat(self.unit()) * spread * self.range(0.2, 0.6);
             self.channel(p, p + d, 4, 0.22, 0.4, 1, 0.0, 0.0, true, &mut segs);
         }
-        Flash { kind: Kind::Cloud, age: 0.0, leader: 0.0, end: t + 0.3, strokes, spans, segs, power }
+        Flash { kind: Kind::Cloud, age: 0.0, leader: 0.0, end: t + 0.3, strokes, spans, segs, power, vis: 1.0 }
     }
 
     /// Advance by `dt` game seconds at game time `time`: let the cells flash,
@@ -520,7 +553,7 @@ impl Lightning {
                 Kind::Ground => {
                     let side = self.unit();
                     let top = un * (geo::R + base + 3200.0) + (side - un * side.dot(un)) * 500.0;
-                    self.ground_flash(top, un * (geo::R + g), g, 1.2, true)
+                    self.ground_flash(top, un * (geo::R + g), g, 1.2, true, false)
                 }
                 Kind::Cloud => self.cloud_flash(un * (geo::R + base + 4500.0), 3500.0, 1.0, true),
             };
@@ -539,7 +572,9 @@ impl Lightning {
             // A big mature cell: ~10 flashes a minute; an ordinary one, one or two.
             // A squall line flashes all along its length, like a row of them.
             let (len2, _) = line_of(&c);
-            let rate = strength * 10.0 / 60.0 * (1.0 + 0.7 * len2 / r);
+            // A supercell: near-continuous, a flash every second or so.
+            let sup = crate::weather::supercell(&c);
+            let rate = strength * 10.0 / 60.0 * (1.0 + 0.7 * len2 / r) * (1.0 + 5.0 * sup);
             if rate <= 0.0 || self.flashes.len() >= 12 || self.u() >= rate * dt {
                 continue;
             }
@@ -549,25 +584,53 @@ impl Lightning {
             let at = c[1][1] as f64 - base;
             let htop = at * storm_top(age);
             let power = self.range(0.6, 1.3) * (0.6 + 0.4 * strength);
-            let f = if self.u() < 0.3 {
+            let (sa, sx, sr) = shaft_at(sup);
+            let f = if self.u() < 0.3 - 0.08 * sup {
                 // Down to the ground, mostly in and around the rain shaft;
-                // now and then a stronger one out from under the anvil.
-                let out = self.u() < 0.08;
-                let (along, mut across) = if out { (self.range(1.4, 2.6) * r, self.range(-0.8, 0.8) * r) } else if len2 > 0.0 { ((SHELF_F - SHELF_W - self.range(0.1, 1.0)) * r, 0.0) } else { (0.45 * r + self.range(-0.9, 0.9) * r * 0.8, self.range(-0.9, 0.9) * r * 0.75) };
+                // now and then a stronger one out from under the anvil (from
+                // a supercell's, often, and far out: positive strikes tens
+                // of km from the core, out of a clear sky).
+                let out = self.u() < 0.08 + 0.25 * sup;
+                let far = out && sup > 0.0;
+                let (along, mut across) = if far {
+                    (self.range(1.6, 5.5) * r, self.range(-1.0, 1.0) * r)
+                } else if out {
+                    (self.range(1.4, 2.6) * r, self.range(-0.8, 0.8) * r)
+                } else if len2 > 0.0 {
+                    ((SHELF_F - SHELF_W - self.range(0.1, 1.0)) * r, 0.0)
+                } else {
+                    (sa * r + self.range(-0.9, 0.9) * r * sr, sx * r + self.range(-0.9, 0.9) * r * 0.94 * sr)
+                };
                 across += self.range(-len2, len2);
                 let foot_dir = (un * geo::R + w * along + x * across).normalize();
                 let g = ground(foot_dir * geo::R).max(0.0);
-                let hstart = if out { at - 2500.0 } else { self.range(2000.0, 4500.0).min(htop * 0.6) };
+                let hstart = if far { at - self.range(1200.0, 2200.0) } else if out { at - 2500.0 } else { self.range(2000.0, 4500.0).min(htop * 0.6) };
                 let lean = hstart * 0.15;
-                let top = (un * geo::R + w * (along * 0.4 + lean) + x * across * 0.4).normalize() * (geo::R + base + hstart);
-                self.ground_flash(top, foot_dir * (geo::R + g), g, power * if out { 2.0 } else { 1.0 }, false)
+                let top = (un * geo::R + w * (along * if far { 0.85 } else { 0.4 } + lean) + x * across * 0.4).normalize() * (geo::R + base + hstart);
+                self.ground_flash(top, foot_dir * (geo::R + g), g, power * if far { 2.5 } else if out { 2.0 } else { 1.0 }, false, far)
             } else {
-                // In the cloud: mostly in the middle of the tower, sometimes out in the anvil.
+                // In the cloud: mostly in the middle of the tower, sometimes out
+                // in the anvil. A supercell's flicker all through its tower,
+                // and anvil crawlers: long branching channels spreading for
+                // tens of km just under the anvil's thin underside, far
+                // downwind of the core, the channels showing through the ice.
                 let anvil = age > 0.7 && self.u() < 0.3;
-                let (along, h) = if anvil { (self.range(1.0, 3.5) * r, at - self.range(800.0, 2500.0)) } else { (self.range(-0.4, 0.5) * r, htop * self.range(0.35, 0.8)) };
-                let across = self.range(-0.5, 0.5) * r + self.range(-len2, len2);
-                let p = (un * geo::R + w * (along + h * 0.15) + x * across).normalize() * (geo::R + base + h);
-                self.cloud_flash(p, (0.5 * r).clamp(1500.0, 4500.0), power * 0.8, false)
+                let crawl = anvil && sup > 0.0 && self.u() < 0.7 * sup;
+                let (along, h) = if crawl {
+                    (self.range(1.5, 7.5) * r, at - self.range(2600.0, 4200.0))
+                } else if anvil {
+                    (self.range(1.0, 3.5) * r, at - self.range(800.0, 2500.0))
+                } else {
+                    (self.range(-0.4, 0.5) * r, htop * self.range(0.35 - 0.15 * sup, 0.8))
+                };
+                let across = self.range(-0.5, 0.5) * r * (1.0 + 2.0 * crawl as u8 as f64) + self.range(-len2, len2);
+                let p = (un * geo::R + w * (along + h * (0.15 + 0.1 * sup)) + x * across).normalize() * (geo::R + base + h);
+                let spread = if crawl { self.range(7000.0, 16000.0) } else { (0.5 * r).clamp(1500.0, 4500.0) };
+                let mut f = self.cloud_flash(p, spread, power * if crawl { 1.2 } else { 0.8 }, false);
+                if crawl {
+                    f.vis = 2.6;
+                }
+                f
             };
             let mut f = f;
             f.age = -f.leader;
@@ -645,7 +708,7 @@ impl Lightning {
             }
             // The stepped leader: a faint, branching feeler working its way down.
             let lead = if f.age < 0.0 && f.leader > 0.0 { Some(((f.age + f.leader) / f.leader) as f32) } else { None };
-            let kind = if f.kind == Kind::Ground { 1.0 } else { 0.3 };
+            let kind = if f.kind == Kind::Ground { 1.0 } else { 0.3 * f.vis };
             for s in &f.segs {
                 let b = match lead {
                     Some(p) if s.t <= p => 0.05 * (0.3 + 0.7 * ((s.t - p + 0.15) / 0.15).clamp(0.0, 1.0)) as f64,
@@ -829,6 +892,49 @@ mod tests {
         // The ground under the line is in its shade.
         let under = (p - e * 30_000.0).normalize() * geo::R;
         assert!(shade(&wx, under) > 0.5);
+    }
+
+    #[test]
+    fn a_supercell_is_the_worst_of_them() {
+        let mut wx = Weather::new(0.3);
+        wx.storms = 0.0;
+        (wx.wind, wx.wind_from) = (10.0, 270.0);
+        let p = geo::lla_to_pos(0.72, -1.68, 400.0);
+        wx.place_storm(p, 0.0, 0.0, crate::weather::SUPER_R, crate::weather::CellKind::parse("supercell"));
+        wx.cells = wx.storm_cells(p);
+        let (e, n, _) = geo::enu(p);
+        let at = |east: f64, north: f64, alt: f64| local(&wx, (p + e * east + n * north).normalize() * (geo::R + alt), alt, 0.0);
+        // The rotating updraft: 30 m/s and more in its core, extreme turbulence.
+        let core = (0..12).map(|k| at(-2500.0 + 200.0 * k as f64, 0.0, wx.base() as f64 + 5000.0)).fold(Local::default(), |a, l| if l.draft > a.draft { l } else { a });
+        assert!(core.draft > 30.0 && core.sigma > 6.0, "{core:?}");
+        // Its core, downwind and to the left (north of a westerly): very heavy rain and hail.
+        let r = crate::weather::SUPER_R * 1000.0;
+        let (sa, sx, _) = shaft_at(1.0);
+        let wet = at(sa * r, sx * r, 600.0);
+        assert!(wet.rain > 0.9 && wet.hail > 0.5 && wet.draft < -5.0, "{wet:?}");
+        // The rain-free base over the updraft, upwind.
+        let dry = at(-0.4 * r, -0.2 * r, 600.0);
+        assert!(dry.rain < 0.1 && dry.hail == 0.0, "{dry:?}");
+        // The anvil shades the ground 60 km downwind, and still a little at 100 km.
+        assert!(shade(&wx, (p + e * 60_000.0).normalize() * geo::R) > 0.3);
+        assert!(shade(&wx, (p + e * 100_000.0).normalize() * geo::R) > 0.01);
+        // Near-continuous lightning: several times a big ordinary storm's.
+        let mut lt = Lightning::new();
+        let mut nf = 0;
+        let mut far = 0;
+        for i in 0..36000 {
+            lt.step(1.0 / 60.0, i as f64 / 60.0, &wx, p, p, &|_| 0.0);
+            for f in &lt.flashes {
+                if f.age == -f.leader {
+                    nf += 1;
+                    let foot = f.segs.iter().filter(|s| s.level == 0).map(|s| s.b).fold(f.segs[0].b, |a, b| if b.length() < a.length() { b } else { a });
+                    if f.kind == Kind::Ground && (foot - p).dot(e) > 2.0 * r {
+                        far += 1;
+                    }
+                }
+            }
+        }
+        assert!(nf > 300 && far > 2, "{nf} flashes, {far} strikes far out under the anvil in 10 minutes");
     }
 
     #[test]

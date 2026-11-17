@@ -372,13 +372,40 @@ pub fn analyse(e: &Echo, at: (f64, f64)) -> Radar {
     }
     cells.sort_by(|a, b| a.0.total_cmp(&b.0));
     cells.truncate(MAX_CELLS);
-    let cells = find_lines(cells, at);
+    let cells = find_supercells(find_lines(cells, at), at);
 
     Radar { cells: cells.into_iter().map(|c| c.1).collect(), deck: find_deck(e, (ax, ay)), cover, here, time: 0 }
 }
 
 /// A squall line is at least this long, km.
 const LINE_KM: f64 = 60.0;
+
+/// A supercell on the radar: a large lone cell with a very intense core (hail,
+/// 57 dBZ and up) and no other strong echo (40 dBZ) within `SUPER_KM` km. Its
+/// maturity becomes 2 (weather.rs CellKind::Supercell). (distance km, cell)
+/// in and out.
+const SUPER_DBZ: f32 = 57.0;
+const SUPER_KM: f64 = 50.0;
+fn find_supercells(mut cells: Vec<(f64, Cell)>, at: (f64, f64)) -> Vec<(f64, Cell)> {
+    let km = |c: &Cell| ((c.lon - at.1).to_radians() * 6371.0 * at.0.to_radians().cos(), (c.lat - at.0).to_radians() * 6371.0);
+    let pos: Vec<(f64, f64)> = cells.iter().map(|c| km(&c.1)).collect();
+    let big: Vec<bool> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, (_, c))| {
+            c.len == 0.0
+                && c.peak >= SUPER_DBZ
+                && c.rad >= 6.0
+                && cells.iter().enumerate().all(|(j, (_, o))| j == i || o.peak < 40.0 || (pos[i].0 - pos[j].0).hypot(pos[i].1 - pos[j].1) - o.len * 0.5 > SUPER_KM)
+        })
+        .collect();
+    for (c, b) in cells.iter_mut().zip(big) {
+        if b {
+            c.1.age = 2.0;
+        }
+    }
+    cells
+}
 
 /// Strong cells (45 dBZ and up) close together in a long, narrow row become
 /// one squall line (`Cell::len` > 0, its cells kept in `parts`). Chains of

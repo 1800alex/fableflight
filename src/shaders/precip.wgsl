@@ -104,7 +104,9 @@ fn rain_light(vd: vec3f, k: f32) -> vec3f {
 @vertex fn vs_rain(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> RainOut {
   var o: RainOut;
   o.clip = vec4f(2.0, 2.0, 2.0, 1.0);
-  let inten = G.rain[0].w;
+  // (Hail in the whole part, in fifteenths; main.rs.)
+  let inten = fract(G.rain[0].w);
+  let hail = floor(G.rain[0].w) / 15.0;
   let h0 = pcg(ii * 2654435761u + 7u);
   // The heavier the rain, the more drops (and the bigger): the count grows
   // faster than the intensity, the faintness makes up the rest.
@@ -125,10 +127,17 @@ fn rain_light(vd: vec3f, k: f32) -> vec3f {
   // Off screen: skip it (most drops are).
   let cp = G.view_proj * vec4f(P, 1.0);
   if (cp.w > 0.0 && any(abs(cp.xy) > vec2f(cp.w * 1.3 + 2.0))) { return o; }
-  let D = mix(0.0007, 0.004, u01(h4) * u01(h4)) * (0.6 + 0.6 * inten);
+  // In a supercell's core some of it is hail: stones a centimetre or two
+  // across, falling 15-25 m/s faster than the rain, white and opaque.
+  let stone = u01(pcg(h4 ^ 0x5bd1e995u)) < 0.4 * hail;
+  var D = mix(0.0007, 0.004, u01(h4) * u01(h4)) * (0.6 + 0.6 * inten);
   // Blurred along its motion relative to the camera over the exposure: at
   // flying speeds the drops rush at the camera as long streaks.
-  let v = G.rain[1].xyz;
+  var v = G.rain[1].xyz;
+  if (stone) {
+    D = mix(0.008, 0.025, u01(h3));
+    v -= G.up.xyz * mix(15.0, 25.0, u01(h2));
+  }
   let ls = length(v) * SHUTTER;
   let a = P - v * (SHUTTER * 0.5);
   let b = P + v * (SHUTTER * 0.5);
@@ -148,13 +157,13 @@ fn rain_light(vd: vec3f, k: f32) -> vec3f {
   // drop's size: a softer falloff than the physics, or all but the nearest
   // few vanish.)
   let blur = pow(0.03 / (ls + 0.03), 0.7);
-  let alpha = clamp(1.6 * sqrt(min(core / w * 1.6, 1.0)) * blur, 0.0, 0.25) * fade * mix(0.45, 1.0, inten);
+  let alpha = clamp(1.6 * sqrt(min(core / w * 1.6, 1.0)) * blur, 0.0, select(0.25, 0.6, stone)) * fade * mix(0.45, 1.0, inten);
   o.clip = ln.clip;
   o.q = vec3f(ln.q.xy, dist);
   o.p = vec3f(w * 0.5, ln.q.z, max(w * 0.5, 1.0));
   // (The drops catch a little more light than the haze of rain around them:
   // the brighter sky towards the horizon.)
-  o.col = vec4f(rain_light(P / max(dist, 1e-3), 2.5), alpha);
+  o.col = vec4f(rain_light(P / max(dist, 1e-3), select(2.5, 6.0, stone)), alpha);
   return o;
 }
 
@@ -183,7 +192,7 @@ struct VeilOut {
   var o: VeilOut;
   let uv = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
   o.clip = vec4f(uv * 2.0 - 1.0, 0.9999, 1.0);
-  let inten = G.rain[0].w;
+  let inten = fract(G.rain[0].w);
   o.col = vec4f(rain_light(-G.up.xyz, 1.0), VEIL_MAX * pow(inten, 0.8));
   // Under the rain deck the cloud pass draws its rain as a veil already (clouds.wgsl nimbo_rain).
   if (G.nimbo[0].w > 0.0) { o.col.a *= 1.0 - 0.5 * nimbo_area(-G.planet.xyz); }

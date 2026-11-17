@@ -78,15 +78,18 @@ pub struct Weather {
 /// What kind of convective cell: a shower (towering cumulus or a small
 /// cumulonimbus, no anvil, tops 4-7 km, a narrow light-to-moderate rain
 /// shaft, no lightning), an ordinary thunderstorm (anvil, occasional
-/// lightning) or a severe one (big, heavy rain, frequent lightning). The
-/// shaders know only a cell's radius, maturity and top height; a shower is a
-/// small young cell whose tower stops below the height where lightning starts
-/// (`LIGHTNING_TOP`, storm.rs).
+/// lightning) or a severe one (big, heavy rain, frequent lightning), or a
+/// supercell (an isolated giant with a rotating updraft, a 100 km anvil, hail
+/// and near-continuous lightning). The shaders know only a cell's radius,
+/// maturity and top height; a shower is a small young cell whose tower stops
+/// below the height where lightning starts (`LIGHTNING_TOP`, storm.rs); a
+/// supercell's maturity runs on past 1 (2 = a full one, `supercell`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CellKind {
     Shower,
     Thunder,
     Severe,
+    Supercell,
 }
 
 impl CellKind {
@@ -94,10 +97,32 @@ impl CellKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "shower" | "showers" | "sh" | "cu" | "tcu" => Some(Self::Shower),
             "thunder" | "ts" | "ordinary" | "storm" => Some(Self::Thunder),
-            "severe" | "supercell" | "cb" => Some(Self::Severe),
+            "severe" | "cb" => Some(Self::Severe),
+            "supercell" | "super" | "sc" => Some(Self::Supercell),
             _ => None,
         }
     }
+}
+
+/// How much of a supercell a cell is, 0..1 (its maturity past 1; common.wgsl
+/// `storm_super`).
+pub fn supercell(c: &[[f32; 4]; 2]) -> f64 {
+    (c[1][0] as f64 - 1.0).clamp(0.0, 1.0)
+}
+/// A supercell: its anvil height (m above sea level) and how far its
+/// overshooting top climbs above that (m). (The storm ceiling takes it in.)
+pub const SUPER_TOP: f32 = STORM_TOP + 300.0;
+pub const SUPER_OVERSHOOT: f32 = 2300.0;
+const _: () = assert!(SUPER_TOP + SUPER_OVERSHOOT <= STORM_TOP + 700.0 + STORM_OVERSHOOT + 300.0);
+/// A supercell's tower radius, km.
+pub const SUPER_R: f64 = 9.0;
+/// The cell for the shaders, centre `cen` (cloud space km), radius `rad` km,
+/// `on` 0..1 how far it has grown in (to 0.5 an ordinary storm growing, then a
+/// supercell).
+fn super_cell(cen: DVec3, rad: f64, on: f64, seed: f32) -> [[f32; 4]; 2] {
+    let s = smoothstep(0.5, 1.0, on) as f32;
+    let age = (2.0 * on).min(1.0) + s as f64;
+    [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, STORM_TOP + (SUPER_TOP - STORM_TOP) * s, STORM_OVERSHOOT * 0.6 + (SUPER_OVERSHOOT - STORM_OVERSHOOT * 0.6) * s, seed]]
 }
 
 /// How high a cell grows, as a share of base..anvil (common.wgsl `storm_top`).
@@ -191,6 +216,10 @@ const STORM_GRID: f64 = 40.0;
 const SQUALL_GRID: f64 = 400.0;
 /// A squall line's tower radius (km): its depth across is about 3x this.
 pub const SQUALL_R: f64 = 6.5;
+/// Share of candidate storm sites that hold a supercell on the stormiest days,
+/// and how far round one no other cell stands, km.
+const SUPER_P: f64 = 0.006;
+const SUPER_CLEAR: f64 = 50.0;
 /// Storm cells are found out to this distance from the camera, km.
 const STORM_RANGE: f64 = 260.0;
 
@@ -517,6 +546,10 @@ impl Weather {
         // Each placed storm gets its own seed (turret layout), so a line of them is not
         // one cloud repeated.
         let seed = (0.37 + dist_km * 0.1373 + bearing * 0.0619 + rad_km * 0.271).fract() as f32;
+        if kind == Some(CellKind::Supercell) {
+            self.placed.push(super_cell(cen, rad_km, 1.0, seed));
+            return;
+        }
         let (age, top, over) = match kind {
             Some(CellKind::Shower) => (0.3, shower_anvil(self.base() as f64, 6000.0, 0.3), 0.0),
             Some(CellKind::Thunder) => (0.75, STORM_TOP, 0.4 * STORM_OVERSHOOT * size as f32),
@@ -583,6 +616,11 @@ impl Weather {
                 out.push(((dist - 0.5 * c.len).max(0.0), squall_cell(c.at, rad, c.len * (0.6 + 0.4 * c.on), age.max(0.9 * c.on), c.top, c.seed as f64)));
                 continue;
             }
+            // An isolated, very intense, large echo: a supercell (radar.rs).
+            if c.age > 1.0 {
+                out.push((dist, super_cell(c.at, rad, 0.5 * age, c.seed)));
+                continue;
+            }
             // Weak echoes are showers; where the report has showers but no
             // thunder, all but the strongest (~47 dBZ and up) are.
             let shower = c.age < 0.4 || (self.live && self.showers_only && c.age < 0.8);
@@ -627,7 +665,31 @@ impl Weather {
                 out.push(((dist - 0.5 * len).max(0.0), squall_cell(cen, rad, len, on, top, unit(h2 >> 16))));
             });
         }
+        // Supercells: on the stormiest days, now and then one isolated giant
+        // (the cells around it keep their distance).
+        let mut supers: Vec<DVec3> = Vec::new();
+        let p_super = SUPER_P * smoothstep(0.7, 1.0, st) * smoothstep(0.3, 0.5, self.clouds as f64) * if self.live && self.showers_only { 0.0 } else { 1.0 };
+        if p_super > 0.0 {
+            sites(q, STORM_GRID, STORM_RANGE + SUPER_CLEAR, |cen, dist, h0| {
+                let hs = shash(h0 ^ 0x68e3_1da4);
+                let clear = lines.iter().map(|&(c, l2)| smoothstep(l2 + 30.0, l2 + 90.0, c.distance(cen))).fold(1.0, f64::min);
+                let on = smoothstep(unit(hs) - 0.25 * SUPER_P, unit(hs) + 0.25 * SUPER_P, p_super) * (1.0 - seen_at(cen)) * clear;
+                if on <= 0.0 {
+                    return;
+                }
+                supers.push(cen);
+                if dist <= STORM_RANGE {
+                    let rad = (SUPER_R - 1.0 + 2.0 * unit(hs >> 16)) * (0.6 + 0.4 * on);
+                    out.push((dist, super_cell(cen, rad, on, unit(shash(hs)) as f32 * 0.999)));
+                }
+            });
+        }
         sites(q, STORM_GRID, STORM_RANGE, |cen, dist, h0| {
+            // (A supercell stands here, or near enough to keep this one off.)
+            let lone = supers.iter().map(|s| smoothstep(0.5 * SUPER_CLEAR, SUPER_CLEAR, s.distance(cen))).fold(1.0, f64::min);
+            if lone <= 0.0 {
+                return;
+            }
             let h2 = shash(shash(h0));
             let region = value_noise(cen / 320.0 + DVec3::new(0.41, 0.07, 0.66));
             let prob = prob_amount * smoothstep(0.2, 0.6, region + self.storms as f64 * 0.25);
@@ -635,7 +697,7 @@ impl Weather {
             let r0 = unit(h0);
             // (A squall line takes the place of the cells round it.)
             let clear = lines.iter().map(|&(c, l2)| smoothstep(l2 + 30.0, l2 + 90.0, c.distance(cen))).fold(1.0, f64::min);
-            let on = smoothstep(r0 - 0.04, r0 + 0.04, prob) * (1.0 - seen_at(cen)) * clear;
+            let on = smoothstep(r0 - 0.04, r0 + 0.04, prob) * (1.0 - seen_at(cen)) * clear * lone;
             if on <= 0.0 {
                 return;
             }
@@ -1258,6 +1320,44 @@ mod tests {
         assert!(c.iter().any(|c| c[1][3].floor() == 110.0), "{c:?}");
         w.set_live_cells(&[(a, 6.0, 1.0, 0.0)], false);
         assert_eq!(w.live_cells.len(), 2, "a lone cell does not take over a line");
+    }
+
+    #[test]
+    fn supercells_rare_isolated_and_by_hand() {
+        // Placed by hand: maturity 2, the higher anvil and the biggest overshoot.
+        let cam = geo::lla_to_pos(0.72, -1.68, 500.0);
+        let mut w = Weather::new(0.3);
+        w.storms = 0.0;
+        w.place_storm(cam, 60.0, 270.0, SUPER_R, CellKind::parse("supercell"));
+        let c = w.storm_cells(cam);
+        assert!(c.len() == 1 && supercell(&c[0]) == 1.0 && c[0][1][1] == SUPER_TOP && c[0][1][2] == SUPER_OVERSHOOT, "{c:?}");
+        assert!(w.cloud_ceiling() >= SUPER_TOP + SUPER_OVERSHOOT);
+        // Only on the stormiest days, now and then, and with no other cell near it.
+        let supers = |st: f32| {
+            let mut w = Weather::new(0.55);
+            w.storms = st;
+            let mut n = 0;
+            for k in 0..40 {
+                let p = geo::lla_to_pos(0.3 + 0.05 * k as f64, -1.5 - 0.07 * k as f64, 500.0);
+                let cells = w.storm_cells(p);
+                for s in cells.iter().filter(|c| supercell(c) > 0.5) {
+                    let sc = DVec3::new(s[0][0] as f64, s[0][1] as f64, s[0][2] as f64);
+                    assert!(s[0][3] > 6.0, "{s:?}");
+                    assert!(cells.iter().filter(|c| supercell(c) == 0.0 && c[1][3] < 1.0).all(|c| DVec3::new(c[0][0] as f64, c[0][1] as f64, c[0][2] as f64).distance(sc) > 0.5 * SUPER_CLEAR), "a cell beside a supercell");
+                    n += 1;
+                }
+            }
+            n
+        };
+        let stormy = supers(1.0);
+        assert!((1..40).contains(&stormy), "{stormy} supercells seen from 40 places on the stormiest day");
+        assert_eq!(supers(0.6), 0);
+        // Live: an isolated, intense, large echo comes in as one.
+        let mut w = Weather::new(0.5);
+        let a = (cam.normalize() * 6371.0 + DVec3::X * 30.0).normalize() * 6371.0;
+        w.set_live_cells(&[(a, 8.0, 2.0, 0.0)], true);
+        let c = w.storm_cells(cam);
+        assert!(c.iter().any(|c| supercell(c) == 1.0), "{c:?}");
     }
 
     #[test]

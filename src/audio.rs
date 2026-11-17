@@ -95,8 +95,9 @@ pub struct Params {
     pub dist: f32,
     /// fire burning near the camera 0..1
     pub fire: f32,
-    /// rain falling where the camera is 0..1
+    /// rain falling where the camera is 0..1, and how much of it is hail 0..1
     pub rain: f32,
+    pub hail: f32,
     pub warn: Warn,
 }
 
@@ -1165,11 +1166,12 @@ struct Rain {
     roar: Bq,
     panel: [Bq; 2],
     drum: Bq,
+    knock: Bq,
 }
 
 impl Rain {
     fn new() -> Self {
-        Self { hiss: Bq::new(Bq::hp, 1500.0, 0.6), hiss2: Bq::new(Bq::lp, 9000.0, 0.6), roar: Bq::new(Bq::bp, 900.0, 0.5), panel: [Bq::new(Bq::ring, 2300.0, 6.0), Bq::new(Bq::ring, 4100.0, 5.0)], drum: Bq::new(Bq::ring, 420.0, 3.0) }
+        Self { hiss: Bq::new(Bq::hp, 1500.0, 0.6), hiss2: Bq::new(Bq::lp, 9000.0, 0.6), roar: Bq::new(Bq::bp, 900.0, 0.5), panel: [Bq::new(Bq::ring, 2300.0, 6.0), Bq::new(Bq::ring, 4100.0, 5.0)], drum: Bq::new(Bq::ring, 420.0, 3.0), knock: Bq::new(Bq::ring, 3100.0, 4.0) }
     }
     /// (outside, inside)
     fn sample(&mut self, p: &Params, rng: &mut Rng) -> (f32, f32) {
@@ -1180,7 +1182,15 @@ impl Rain {
         let v = p.airspeed.max(0.0);
         let n = rng.f();
         let hiss = self.hiss2.run(self.hiss.run(n));
-        let out = hiss * 0.09 * r.sqrt();
+        // Hail: hard stones clattering on the ground and the airframe, sparse
+        // sharp knocks over the hiss (louder and denser in the cabin, on the skin).
+        let hl = p.hail.clamp(0.0, 1.0);
+        let mut knock = 0.0;
+        if hl > 0.002 && rng.u() < (hl * (90.0 + 25.0 * v) * DT).min(1.0) {
+            knock = rng.range(0.4, 1.0) * if rng.u() < 0.15 { 2.5 } else { 1.0 };
+        }
+        let clack = self.knock.run(knock * (1.0 - p.cabin)) * 0.5 * hl.sqrt();
+        let out = hiss * 0.09 * r.sqrt() + clack;
         if p.cabin < 0.001 {
             return (out, 0.0);
         }
@@ -1190,6 +1200,7 @@ impl Rain {
         if rng.u() < (rate * DT).min(1.0) {
             hit = rng.range(0.2, 1.0) * if rng.u() < 0.1 { 2.0 } else { 1.0 };
         }
+        let hit = hit + knock * 3.0 * p.cabin;
         let tick = self.panel[0].run(hit) * 0.16 + self.panel[1].run(hit) * 0.1 + self.drum.run(hit) * 0.12;
         let roar = self.roar.run(n) * r * 0.05 * smooth(15.0, 90.0, v);
         (out, tick * r.sqrt() + roar + hiss * 0.05 * r)
@@ -1468,6 +1479,7 @@ impl Synth {
         sm(&mut p.dist, t.dist, 0.08);
         sm(&mut p.fire, t.fire, 0.3);
         sm(&mut p.rain, t.rain, 0.6);
+        sm(&mut p.hail, t.hail, 0.6);
         sm(&mut p.n1, t.n1, 0.12);
         sm(&mut p.burner, t.burner, 0.05);
         (p.jet, p.fighter, p.vne) = (t.jet, t.fighter, t.vne);

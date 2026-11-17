@@ -403,13 +403,17 @@ fn parse_args() -> Args {
             "--clouds" => a.clouds = num(&v, i).unwrap_or(0.5) as f32,
             "--storms" => a.storms = num(&v, i).map(|x| x as f32),
             "--storm-at" => {
-                // km,bearing[,radius km[,shower|thunder|severe]]: a convective cell that far
+                // km,bearing[,radius km[,shower|thunder|severe|supercell]]: a convective cell that far
                 // from the spawn, a mature cumulonimbus unless a kind says otherwise (repeatable)
                 let f: Vec<&str> = v.get(i + 1).map(|s| s.split(',').collect()).unwrap_or_default();
                 let p: Vec<f64> = f.iter().take(3).map_while(|x| x.parse().ok()).collect();
                 let kind = f.iter().skip(p.len()).find_map(|x| weather::CellKind::parse(x));
                 if p.len() >= 2 {
-                    let r = p.get(2).copied().unwrap_or(if kind == Some(weather::CellKind::Shower) { 1.8 } else { 6.0 });
+                    let r = p.get(2).copied().unwrap_or(match kind {
+                        Some(weather::CellKind::Shower) => 1.8,
+                        Some(weather::CellKind::Supercell) => weather::SUPER_R,
+                        _ => 6.0,
+                    });
                     a.storm_at.push((p[0], p[1], r, kind));
                 }
             }
@@ -741,8 +745,9 @@ struct Game {
     /// lightning, and the rain falling around the camera (storm.rs)
     lightning: storm::Lightning,
     rain_field: storm::RainField,
-    /// rain falling where the camera is, 0..1
+    /// rain falling where the camera is, 0..1, and how much of it is hail
     cam_rain: f32,
+    cam_hail: f32,
     /// how far the eye has opened up to the gloom under a storm, 0..1
     storm_adapt: f32,
     head_live: bool,
@@ -954,7 +959,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, storm_adapt: 0.0, plane,
+            start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -2190,6 +2195,7 @@ impl Game {
             dist: (cam - p.pos).length() as f32,
             fire,
             rain: if in_menu { 0.0 } else { self.cam_rain },
+            hail: if in_menu { 0.0 } else { self.cam_hail },
             warn: self.warn,
         };
         if let Some(a) = &self.audio {
@@ -2800,8 +2806,10 @@ impl Game {
         // Storms around the camera: the rain falling there, the lightning.
         if in_menu {
             self.cam_rain = 0.0;
+            self.cam_hail = 0.0;
         } else {
             self.cam_rain = self.wx.rain_at(cam, agl, self.time) as f32;
+            self.cam_hail = if self.cam_rain > 0.0 { storm::local(&self.wx, cam, agl, self.time).hail as f32 } else { 0.0 };
             let world = &self.world;
             let gnd = |p: DVec3| {
                 let (la, lo, _) = geo::pos_to_lla(p);
@@ -2984,7 +2992,9 @@ impl Game {
             let v = self.rain_field.rel;
             // Drops closer than this are inside the cockpit (or the camera's lens).
             let near_cut = if self.cam_mode == 1 && !self.crashed { 2.5 } else { 0.3 };
-            g.rain = [[o.x as f32, o.y as f32, o.z as f32, self.cam_rain], [v.x as f32, v.y as f32, v.z as f32, near_cut as f32]];
+            // (Hail rides along in the intensity's whole part, in sixteenths: precip.wgsl.)
+            let rain_w = self.cam_rain.min(0.999) + (self.cam_hail.clamp(0.0, 1.0) * 15.0).round();
+            g.rain = [[o.x as f32, o.y as f32, o.z as f32, rain_w], [v.x as f32, v.y as f32, v.z as f32, near_cut as f32]];
         }
         if !self.crashed && !in_menu {
             // The aircraft keeps pace with the camera, so its pixels are found
@@ -3198,7 +3208,7 @@ impl Game {
         let mut shot = match self.shots.first() {
             Some((t, _, _)) if self.real >= *t => {
                 // Logged with each scripted shot, for comparing builds.
-                log::info!("fps {:.1}  rain {:.2} (glass {:.2}, wet {:.2})  sigma {:.2} draft {:.1}", self.fps, self.cam_rain, self.wx.rain, self.glass.wet, self.plane.air.sigma_w, self.plane.air.draft);
+                log::info!("fps {:.1}  rain {:.2} (glass {:.2}, wet {:.2}, hail {:.2})  sigma {:.2} draft {:.1}", self.fps, self.cam_rain, self.wx.rain, self.glass.wet, self.cam_hail, self.plane.air.sigma_w, self.plane.air.draft);
                 Some(self.shots.remove(0).1)
             }
             _ => None,
