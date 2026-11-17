@@ -314,7 +314,7 @@ pub fn focus_ring(ctx: &egui::Context, col: Color32) {
         return;
     }
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("pad_focus")));
-    p.rect_stroke(rect.expand(2.0), 6.0, Stroke::new(2.0, col), egui::StrokeKind::Outside);
+    p.rect_stroke(rect.expand(2.0), crate::menu::R_WIDGET, Stroke::new(2.0, col), egui::StrokeKind::Outside);
 }
 
 /// At the end of a scroll area's contents: scroll a widget the gamepad has

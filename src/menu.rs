@@ -111,8 +111,12 @@ pub struct Menu {
     pub press: Option<(f64, f64)>,
     pub dragged: f64,
     pub starting: bool,
-    /// the controls list beside the start panel
-    pub show_controls: bool,
+    /// which start screen is up: the main menu, the globe, the aircraft or the settings
+    pub screen: Screen,
+    /// where the aircraft screen goes back to (the main menu or the globe)
+    pub air_back: Screen,
+    /// the aircraft looked at on the aircraft screen (index into `aircraft::list()`)
+    pub air_view: usize,
     spin: f64,
     /// the chosen spot is this airport, and how to start there
     pub airport: Option<u32>,
@@ -125,8 +129,8 @@ pub struct Menu {
     pub markers: Vec<(u32, f32, f32)>,
     /// which aircraft to fly (index into `aircraft::list()`)
     pub aircraft: usize,
-    /// the hangar (every aircraft, and more to download) while it is open
-    pub hangar: Option<crate::hangar_ui::Tab>,
+    /// the aircraft screen's page: the aircraft you have, or more to download
+    pub air_tab: crate::hangar_ui::Tab,
     /// the collection entry picked out on its download page, what its search has, and whether it lists the unflyable ones too
     pub hangar_sel: Option<String>,
     pub hangar_find: String,
@@ -136,6 +140,44 @@ pub struct Menu {
     pub cold: bool,
     /// payload, as a fraction of the most the aircraft takes (None: as it comes)
     pub payload: Option<f64>,
+}
+
+/// The screens of the start menu. The game boots into `Main`; `Fly` is the
+/// globe (where to start, the conditions, take-off).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Screen {
+    Main,
+    Fly,
+    Aircraft,
+    Settings,
+}
+
+impl Screen {
+    /// `--menu-screen main|fly|aircraft|settings`
+    pub fn parse(s: &str) -> Option<Screen> {
+        Some(match s.trim().to_lowercase().as_str() {
+            "main" | "menu" | "home" => Screen::Main,
+            "fly" | "globe" | "start" => Screen::Fly,
+            "aircraft" | "hangar" | "planes" => Screen::Aircraft,
+            "settings" | "options" => Screen::Settings,
+            _ => return None,
+        })
+    }
+}
+
+/// A longitude for the globe's first view that has the sun on it: the
+/// subsolar longitude at `utc` (hours), pulled up to 35° towards the nearest
+/// of a few land-rich views, so it opens on lit continents rather than the
+/// night side or open ocean.
+pub fn day_side_lon(utc: f64) -> f64 {
+    let wrap = |x: f64| (x + 180.0).rem_euclid(360.0) - 180.0;
+    let sub = wrap(-15.0 * (utc - 12.0));
+    // the Americas, Europe and Africa, India, East Asia
+    let land = [-95.0, -60.0, 15.0, 78.0, 115.0];
+    let d = land.iter().map(|l| wrap(l - sub)).min_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+    // (a little to the west of it: the afternoon side, the terminator on
+    // the eastern limb and the slow spin still on the day side for a while)
+    wrap(sub + d.clamp(-35.0, 35.0) - 15.0)
 }
 
 /// How to start at an airport chosen on the globe.
@@ -151,7 +193,7 @@ pub enum Start {
 
 impl Menu {
     pub fn new(lat: f64, lon: f64, hour: f64) -> Self {
-        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, show_controls: false, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, hangar: None, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
+        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, screen: Screen::Main, air_back: Screen::Main, air_view: 0, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, air_tab: crate::hangar_ui::Tab::Mine, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
     }
 
     pub fn look_at(&mut self, lat: f64, lon: f64, alt: f64) {
@@ -169,9 +211,10 @@ impl Menu {
 
     pub fn update(&mut self, dt: f64) {
         self.alt += (self.target_alt - self.alt) * (dt * 6.0).min(1.0);
-        // The globe drifts slowly until you touch it.
+        // The globe drifts slowly (0.3°/s, so the opening view stays on the
+        // day side for minutes) until you drag, zoom or pick on it.
         if self.spin > 0.0 && self.press.is_none() {
-            self.lon = (self.lon + dt * 2.0 * self.spin + 180.0).rem_euclid(360.0) - 180.0;
+            self.lon = (self.lon + dt * 0.3 * self.spin + 180.0).rem_euclid(360.0) - 180.0;
         }
     }
 
@@ -234,9 +277,22 @@ use crate::i18n::tr;
 use crate::padui::{self, Hint};
 use egui::{Color32, RichText, Stroke};
 
-pub const ACCENT: Color32 = Color32::from_rgb(255, 196, 64);
+/// The bold font family's name (loaded beside the regular one, see `load_fonts`).
+pub const BOLD: &str = "bold";
+
+/// A bold font of a size, for the main menu's titles.
+pub fn bold(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(BOLD.into()))
+}
+
+/// the UI accent: a warm aviation yellow
+pub const ACCENT: Color32 = Color32::from_rgb(245, 197, 24);
 /// dark text on the accent colour
-pub const ON_ACCENT: Color32 = Color32::from_rgb(24, 18, 4);
+pub const ON_ACCENT: Color32 = Color32::from_rgb(22, 17, 2);
+/// Corner radius of panels, windows and frames: very sharp, not quite square.
+pub const R_PANEL: u8 = 2;
+/// Corner radius of buttons, chips, text fields, sliders, checkboxes, scroll bars.
+pub const R_WIDGET: u8 = 2;
 pub const TEXT: Color32 = Color32::from_rgb(232, 235, 240);
 pub const DIM: Color32 = Color32::from_rgb(150, 158, 170);
 pub const PANEL: Color32 = Color32::from_rgba_premultiplied(9, 12, 17, 228);
@@ -252,16 +308,16 @@ pub enum Page {
     Radio,
     Weather,
     Game,
+    /// the settings screen (settings_ui.rs), over the paused game
     Settings,
-    Graphics,
+    /// the keyboard and gamepad reference
     Controls,
-    Bindings,
     Failures,
 }
 
 impl Page {
     pub const INFO: [Page; 4] = [Page::Flight, Page::Places, Page::Radio, Page::Weather];
-    pub const PAUSE: [Page; 6] = [Page::Game, Page::Settings, Page::Graphics, Page::Controls, Page::Bindings, Page::Failures];
+    pub const PAUSE: [Page; 4] = [Page::Game, Page::Settings, Page::Controls, Page::Failures];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -271,9 +327,7 @@ impl Page {
             Page::Weather => "Weather",
             Page::Game => "Game",
             Page::Settings => "Settings",
-            Page::Graphics => "Graphics",
             Page::Controls => "Controls",
-            Page::Bindings => "Bindings",
             Page::Failures => "Failures",
         }
     }
@@ -374,7 +428,7 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
 ]),
 ];
 
-/// The one look shared by every panel: dark glass, amber accent, roomy widgets.
+/// The one look shared by every panel: dark glass, yellow accent, roomy widgets.
 pub fn apply_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.all_styles_mut(|s| {
@@ -395,7 +449,8 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.dark_mode = true;
         v.window_fill = PANEL;
         v.panel_fill = PANEL;
-        v.window_corner_radius = 10.into();
+        v.window_corner_radius = R_PANEL.into();
+        v.menu_corner_radius = R_PANEL.into();
         v.window_stroke = Stroke::new(1.0, Color32::from_white_alpha(22));
         v.extreme_bg_color = Color32::from_rgb(16, 20, 27);
         v.faint_bg_color = Color32::from_white_alpha(6);
@@ -416,7 +471,7 @@ pub fn apply_theme(ctx: &egui::Context) {
             st.bg_fill = bg;
             st.weak_bg_fill = bg;
             st.fg_stroke = Stroke::new(1.5, fg);
-            st.corner_radius = 6.into();
+            st.corner_radius = R_WIDGET.into();
         }
         w.inactive.bg_stroke = Stroke::NONE;
         w.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
@@ -426,7 +481,7 @@ pub fn apply_theme(ctx: &egui::Context) {
 
 /// A panel frame in the shared style.
 pub fn panel() -> egui::Frame {
-    egui::Frame::new().fill(PANEL).corner_radius(12.0).inner_margin(20.0).stroke(Stroke::new(1.0, Color32::from_white_alpha(18))).shadow(egui::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(110) })
+    egui::Frame::new().fill(PANEL).corner_radius(R_PANEL).inner_margin(20.0).stroke(Stroke::new(1.0, Color32::from_white_alpha(18))).shadow(egui::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(110) })
 }
 
 /// A full-width menu button; the primary one is filled with the accent
@@ -447,7 +502,7 @@ pub fn wide_button(ui: &mut egui::Ui, text: &str, hint: Hint, primary: bool, ena
     if let Hint::Text(hint) = hint {
         job.append(&format!("   {hint}"), 0.0, egui::TextFormat { font_id: egui::FontId::proportional(12.0), color: hc, ..Default::default() });
     }
-    let btn = egui::Button::new(job).fill(fill).corner_radius(8.0).min_size(egui::vec2(w, if primary { 42.0 } else { 34.0 }));
+    let btn = egui::Button::new(job).fill(fill).corner_radius(R_WIDGET).min_size(egui::vec2(w, if primary { 42.0 } else { 34.0 }));
     let resp = ui.add_enabled(enabled, btn);
     if let Hint::Pad(spec) = hint {
         // The buttons, right-aligned in the button.
@@ -476,7 +531,7 @@ pub fn section(ui: &mut egui::Ui, id: &str, title: &str, summary: &str, open: bo
     let k = state.openness(ui.ctx());
     let lit = resp.hovered() || resp.has_focus();
     let p = ui.painter();
-    p.rect_filled(rect, 8.0, Color32::from_white_alpha(if lit { 16 } else { 7 }));
+    p.rect_filled(rect, R_WIDGET, Color32::from_white_alpha(if lit { 16 } else { 7 }));
     let title_col = if k > 0.5 { ACCENT } else if lit { Color32::WHITE } else { TEXT };
     p.text(rect.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(15.0), title_col);
     if k < 1.0 && !summary.is_empty() {
@@ -515,7 +570,7 @@ pub fn heading(ui: &mut egui::Ui, s: &str) {
 
 /// One `keys … action` row of the controls list.
 pub fn key_row(ui: &mut egui::Ui, keys: &'static str, what: &'static str) {
-    egui::Frame::new().fill(Color32::from_rgb(38, 45, 56)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 0)).show(ui, |ui| {
+    egui::Frame::new().fill(Color32::from_rgb(38, 45, 56)).corner_radius(R_WIDGET).inner_margin(egui::Margin::symmetric(6, 0)).show(ui, |ui| {
         ui.label(RichText::new(tr(keys)).monospace().size(12.0).color(Color32::WHITE));
     });
     // Truncate the description so a long one can't spill into the next column.
@@ -563,7 +618,7 @@ pub const PAD_MENUS: &[(&str, &[(&str, &str)])] = &[
         ("LT / RT", "zoom out / in"),
         ("X", "start at the crosshair"),
         ("Menu", "take off"),
-        ("View", "settings and this controls list"),
+        ("B", "back to the main menu"),
     ]),
 ];
 
@@ -663,4 +718,69 @@ pub fn hhmm(h: f64) -> String {
 /// "37.8085°N  122.4650°W"
 pub fn latlon(lat: f64, lon: f64) -> String {
     format!("{:.4}°{}  {:.4}°{}", lat.abs(), if lat >= 0.0 { 'N' } else { 'S' }, lon.abs(), if lon >= 0.0 { 'E' } else { 'W' })
+}
+
+/// A big left-aligned button of the full-screen pause menu: its text, a hint
+/// (key or gamepad buttons) at the right, the primary one in the accent
+/// colour, the chosen page's marked with an accent bar.
+pub fn big_button(ui: &mut egui::Ui, text: &str, hint: Hint, primary: bool, chosen: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 50.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, chosen, text));
+    let lit = resp.hovered() || resp.has_focus();
+    let p = ui.painter();
+    let (fill, col) = if primary {
+        (if lit { Color32::from_rgb(255, 212, 60) } else { ACCENT }, ON_ACCENT)
+    } else if chosen {
+        (Color32::from_rgba_premultiplied(44, 52, 64, 235), Color32::WHITE)
+    } else if lit {
+        (Color32::from_rgba_premultiplied(40, 47, 58, 230), Color32::WHITE)
+    } else {
+        (Color32::from_rgba_premultiplied(16, 20, 26, 200), TEXT)
+    };
+    p.rect_filled(rect, R_WIDGET, fill);
+    if chosen || (lit && !primary) {
+        p.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 0.0, if chosen { ACCENT } else { ACCENT.gamma_multiply(0.5) });
+    }
+    p.text(rect.left_center() + egui::vec2(20.0, 0.0), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(if primary { 19.0 } else { 17.5 }), col);
+    let hc = if primary { ON_ACCENT.gamma_multiply(0.7) } else { DIM };
+    match hint {
+        Hint::Text(h) => {
+            p.text(rect.right_center() - egui::vec2(16.0, 0.0), egui::Align2::RIGHT_CENTER, h, egui::FontId::proportional(12.5), hc);
+        }
+        Hint::Pad(spec) => {
+            let h = 20.0;
+            let x = rect.right() - 16.0 - padui::spec_width(p, spec, h);
+            padui::paint_spec(p, x, rect.center().y, spec, h, hc);
+        }
+        Hint::None => {}
+    }
+    resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screens_parse() {
+        assert_eq!(Screen::parse("main"), Some(Screen::Main));
+        assert_eq!(Screen::parse("Fly"), Some(Screen::Fly));
+        assert_eq!(Screen::parse("globe"), Some(Screen::Fly));
+        assert_eq!(Screen::parse("aircraft"), Some(Screen::Aircraft));
+        assert_eq!(Screen::parse("settings"), Some(Screen::Settings));
+        assert_eq!(Screen::parse("nowhere"), None);
+    }
+
+    #[test]
+    fn first_globe_view_is_on_the_day_side() {
+        for h in 0..96 {
+            let utc = h as f64 * 0.25;
+            let sub = -15.0 * (utc - 12.0);
+            let lon = day_side_lon(utc);
+            assert!((-180.0..180.0).contains(&lon));
+            // well inside the lit half (90° from the subsolar point)
+            let d = ((lon - sub + 540.0).rem_euclid(360.0) - 180.0).abs();
+            assert!(d <= 50.0, "utc {utc}: lon {lon} is {d}° from the subsolar point");
+        }
+    }
 }

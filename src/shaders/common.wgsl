@@ -134,6 +134,9 @@ struct Globals {
 // Light rising off the towns around the camera (skyglow.rs): the night-lights map
 // averaged over 1.2 km cells, then blurred for the light reaching ~1.5, 4.5, 15 km up.
 @group(0) @binding(19) var t_glow: texture_2d<f32>;
+// The start screen globe's cloud map (globeclouds.rs): cloud cover from an
+// infrared composite, equirectangular, 180°W at u = 0, 90°N at v = 0.
+@group(0) @binding(20) var t_gclouds: texture_2d<f32>;
 
 // GPU particles (explosions, smoke, dust, spray) and their simulation constants.
 struct Particle {
@@ -1694,6 +1697,12 @@ fn photo_hides(P: vec3f, px: vec2f) -> bool {
   return photo_covered(P) && photo_keep(P, px) && !photo_cut_at(P, false);
 }
 
+// The start screen's globe look (sky.wgsl `globe_surface`), 0..1 with the
+// camera's height: below GLOBE_LO the start screen draws the ordinary flight
+// scene (a picked spot seen close up), from GLOBE_HI the planet from orbit.
+const GLOBE_LO = 150000.0;
+const GLOBE_HI = 800000.0;
+fn globe_k() -> f32 { return select(0.0, smoothstep(GLOBE_LO, GLOBE_HI, G.up.w), G.start.x > 0.0); }
 fn night_at(upn: vec3f) -> f32 { return 1.0 - smoothstep(-0.08, 0.1, dot(upn, G.sun_dir.xyz)); }
 // Moonlight arriving at a point (dimmed by the atmosphere near the horizon and
 // by the cloud deck as a whole).
