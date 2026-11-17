@@ -978,6 +978,9 @@ struct Game {
     toolbar_t: f64,
     /// a weapon's fireball for the renderer's light: position, power, when
     weapon_flash: Option<(DVec3, f32, f64)>,
+    /// aircraft shot down and still falling: they burn on the way down and
+    /// blow up again where they hit the ground
+    kills: Vec<Kill>,
     damage_spec: Option<String>,
     /// group wreck meshes have been cut down and need restoring on respawn
     wreck_dirty: bool,
@@ -1219,7 +1222,7 @@ impl Game {
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
-            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), toolbar_t: -100.0, weapon_flash: None, damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
+            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), toolbar_t: -100.0, weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
             start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
@@ -1581,6 +1584,7 @@ impl Game {
         self.gauges = gauges::Gauges::new(&self.plane, self.frame ^ 0x9e37);
         self.weapons.reset(self.spec, &self.model.pieces);
         self.weapon_flash = None;
+        self.kills.clear();
     }
 
     /// On the ground, at rest, waiting for the terrain under it to load.
@@ -2947,11 +2951,24 @@ impl Game {
                 self.blast_fx(pos, power, size, femit);
                 if let Some(key) = target {
                     let label = self.weapons.target_view.as_ref().map(|v| v.label.clone()).unwrap_or_default();
+                    // Where it was and how it was moving, before it leaves the traffic.
+                    let was = match &key {
+                        weapons::TargetKey::Live(hex) => self.live.planes.iter().find(|p| &p.hex == hex).map(|p| (p.pos, p.vel)),
+                        weapons::TargetKey::Airport { .. } => self.world.air_targets(pos).into_iter().find(|t| t.key == key).map(|t| (t.pos, t.vel)),
+                    };
                     let hit = match &key {
                         weapons::TargetKey::Live(hex) => self.live.down(hex),
                         weapons::TargetKey::Airport { .. } => self.world.down_air_target(&key),
                     };
                     if hit {
+                        let (at, vel) = was.unwrap_or((pos, DVec3::ZERO));
+                        let span = airmodels::TYPES[(size as usize).min(4)].span;
+                        self.kill_fx(at, vel, span, femit);
+                        if let Some(a) = &self.audio {
+                            a.boom((power * 1.5 * (span / 20.0).sqrt()).min(4.0) * (0.2 + 0.8 * near));
+                        }
+                        self.weapon_flash = Some((at, power * (span / 11.0).sqrt() * 2.0, self.real));
+                        self.kills.push(Kill { key, pos: at, vel, span, t: 0.0, acc: 0.0 });
                         let msg = if label.is_empty() { t!("SPLASH", "ABATTU").to_string() } else { t!("SPLASH  {}", "ABATTU  {}", label) };
                         self.flash.push((msg, self.real));
                     }
@@ -3015,6 +3032,149 @@ impl Game {
                 ..Default::default()
             }));
         }
+    }
+
+    /// An aircraft blowing up in the air: its fuel going up in one fireball
+    /// sized to the airframe (`span`, m), with burning wreckage thrown out
+    /// along its line of flight and a pall of black smoke left hanging.
+    fn kill_fx(&mut self, at: DVec3, vel: DVec3, span: f32, femit: &mut Vec<(DVec3, render::Particle)>) {
+        self.anchor_fx(at);
+        let up = at.normalize().as_vec3();
+        // Linear size from a light single (11 m span) up to a wide-body.
+        let s = (span / 11.0).clamp(0.8, 6.0);
+        let carry = vel.as_vec3() * 0.35;
+        let r = &mut self.rng;
+        femit.push((at, render::Particle { life: 0.45, size0: 18.0 * s, size1: 70.0 * s, kind: crash::FLASH, alpha: 2.5, ..Default::default() }));
+        let n = (40.0 + 14.0 * s) as usize;
+        for _ in 0..n {
+            let d = r.dir();
+            let off = d * r.range(0.0, 0.4) * span;
+            femit.push((at + off.as_dvec3(), render::Particle {
+                vel: (carry + d * r.range(10.0, 32.0) * s.sqrt() + up * r.range(2.0, 8.0)).into(),
+                life: r.range(2.5, 5.0) * s.sqrt(),
+                size0: r.range(3.0, 6.0) * s,
+                size1: r.range(12.0, 26.0) * s,
+                temp: r.range(2.4, 3.4),
+                kind: crash::GAS,
+                drag: r.range(1.0, 1.8),
+                buoy: r.range(5.0, 10.0),
+                seed: r.f(),
+                alpha: r.range(0.8, 1.0),
+                ..Default::default()
+            }));
+        }
+        for _ in 0..(50.0 + 20.0 * s) as usize {
+            let d = r.dir();
+            femit.push((at, render::Particle {
+                vel: (vel.as_vec3() * 0.6 + d * r.range(25.0, 110.0) * s.sqrt()).into(),
+                life: r.range(1.5, 4.5),
+                size0: r.range(0.1, 0.3) * s.sqrt(),
+                size1: 0.05,
+                kind: crash::SPARK,
+                drag: r.range(0.1, 0.5),
+                seed: r.f(),
+                alpha: r.range(0.7, 1.0),
+                ..Default::default()
+            }));
+        }
+        for _ in 0..(20.0 + 8.0 * s) as usize {
+            let d = r.dir();
+            femit.push((at + (d * r.range(0.0, 0.5) * span).as_dvec3(), render::Particle {
+                vel: (carry * 0.4 + d * r.range(2.0, 9.0) * s.sqrt() + up * r.range(0.5, 3.0)).into(),
+                life: r.range(10.0, 20.0),
+                size0: r.range(4.0, 8.0) * s,
+                size1: r.range(20.0, 40.0) * s,
+                temp: 0.05,
+                kind: crash::GAS,
+                drag: r.range(0.8, 1.4),
+                buoy: r.range(1.0, 3.0),
+                seed: r.f(),
+                alpha: r.range(0.45, 0.7),
+                ..Default::default()
+            }));
+        }
+    }
+
+    /// Shot-down aircraft on their way down: a fire and smoke trail behind
+    /// each, and a second explosion where it hits the ground (or the sea).
+    fn step_kills(&mut self, dt: f64, femit: &mut Vec<(DVec3, render::Particle)>) {
+        let mut kills = std::mem::take(&mut self.kills);
+        kills.retain_mut(|k| {
+            k.t += dt;
+            match &k.key {
+                weapons::TargetKey::Live(hex) => match self.live.planes.iter().find(|p| &p.hex == hex) {
+                    // The live feed tumbles it down itself.
+                    Some(p) => {
+                        k.pos = p.pos;
+                        k.vel = p.vel;
+                    }
+                    None => return false,
+                },
+                _ => {
+                    let down = k.pos.normalize();
+                    k.vel = (k.vel - down * 9.81 * dt) * (-dt * 0.15).exp();
+                    k.pos += k.vel * dt;
+                }
+            }
+            let (la, lo, h) = geo::pos_to_lla(k.pos);
+            let ground = if h < 0.0 { Some(0.0) } else { self.world.ground(la, lo).map(|g| g.h).filter(|g| h < g + 2.0) };
+            if let Some(g) = ground {
+                let at = geo::lla_to_pos(la, lo, g.max(0.0) + 2.0);
+                self.kill_fx(at, DVec3::ZERO, k.span * 0.8, femit);
+                if let Some(a) = &self.audio {
+                    let near = 1.0 / (1.0 + ((self.cam_pos - at).length() as f32 / 500.0).powi(2));
+                    a.boom((1.5 * (k.span / 20.0).sqrt()).min(3.0) * (0.2 + 0.8 * near));
+                }
+                self.weapon_flash = Some((at, 2.0 * (k.span / 11.0).sqrt(), self.real));
+                if let weapons::TargetKey::Live(hex) = &k.key {
+                    self.live.remove(hex);
+                }
+                return false;
+            }
+            if k.t > 60.0 {
+                return false;
+            }
+            // The trail: a burning fuel fire close behind, black smoke after.
+            let s = (k.span / 11.0).clamp(0.8, 6.0);
+            let burn = (1.0 - k.t as f32 / 50.0).max(0.3);
+            k.acc += dt * 30.0;
+            self.anchor_fx(k.pos);
+            let r = &mut self.rng;
+            while k.acc >= 1.0 {
+                k.acc -= 1.0;
+                let back = k.pos - k.vel * dt * r.f() as f64;
+                femit.push((back, render::Particle {
+                    vel: (k.vel.as_vec3() * 0.15 + r.dir() * 2.0 * s.sqrt()).into(),
+                    life: r.range(0.6, 1.4),
+                    size0: r.range(1.5, 3.0) * s * burn,
+                    size1: r.range(4.0, 8.0) * s * burn,
+                    temp: r.range(2.0, 3.0),
+                    kind: crash::GAS,
+                    drag: 2.0,
+                    buoy: 4.0,
+                    seed: r.f(),
+                    alpha: 0.9,
+                    ..Default::default()
+                }));
+                femit.push((back, render::Particle {
+                    vel: (k.vel.as_vec3() * 0.05 + r.dir() * 1.5).into(),
+                    life: r.range(8.0, 16.0),
+                    size0: r.range(2.0, 4.0) * s,
+                    size1: r.range(10.0, 22.0) * s,
+                    temp: 0.05,
+                    kind: crash::GAS,
+                    drag: 1.5,
+                    buoy: r.range(0.5, 1.5),
+                    seed: r.f(),
+                    alpha: r.range(0.4, 0.6),
+                    ..Default::default()
+                }));
+            }
+            true
+        });
+        // Anything that went down this step was added while we held the list.
+        kills.append(&mut self.kills);
+        self.kills = kills;
     }
 
     /// Knock a building down, with any parts standing on it.
@@ -3619,6 +3779,9 @@ impl Game {
                     break;
                 }
             }
+        }
+        if dt > 0.0 && !self.kills.is_empty() {
+            self.step_kills(dt, &mut femit);
         }
         if dt > 0.0 {
             self.destr.update(dt as f32, &self.world, &mut femit);
@@ -4356,11 +4519,13 @@ impl Game {
         }
         self.live.step(&self.src, (!in_menu).then_some(self.plane.pos));
         if !in_menu {
-            // A downed aircraft that has reached the ground is gone.
+            // A downed aircraft that has reached the ground is gone (see
+            // `step_kills`); one that outlived its kill entry goes here.
             let mut gone = Vec::new();
             for p in self.live.planes.iter().filter(|p| p.downed > 0.0) {
                 let (la, lo, h) = geo::pos_to_lla(p.pos);
-                if h < 0.0 || self.world.ground(la, lo).is_some_and(|g| h < g.h + 2.0) {
+                let tracked = self.kills.iter().any(|k| matches!(&k.key, weapons::TargetKey::Live(x) if *x == p.hex));
+                if !tracked && (h < 0.0 || self.world.ground(la, lo).is_some_and(|g| h < g.h + 2.0)) {
                     gone.push(p.hex.clone());
                 }
             }
@@ -6579,4 +6744,16 @@ fn open_gamepads() -> Option<gilrs::Gilrs> {
         log::info!("gamepad: {} mapping {:?}", p.os_name(), p.mapping_source());
     }
     Some(g)
+}
+
+/// An aircraft shot down, on its way to the ground.
+struct Kill {
+    key: weapons::TargetKey,
+    pos: DVec3,
+    vel: DVec3,
+    /// its wingspan (m), which sizes the fire and the explosions
+    span: f32,
+    /// seconds since the hit, and the trail particles owed
+    t: f64,
+    acc: f64,
 }
