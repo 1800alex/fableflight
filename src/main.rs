@@ -1979,7 +1979,8 @@ impl Game {
             "prop_up" => format!("{:.0} RPM", 1800.0 + 900.0 * p.propeller),
             "cowl_open" => format!("{:.0} %", p.cowl_flaps * 100.0),
             "landing_lights" => on_off(p.landing_lights).into(),
-            "fuel_valve" => if p.fuel_valve { "BOTH" } else { "OFF" }.into(),
+            // (The Robin's selector has no BOTH: it feeds from one tank at a time.)
+            "fuel_valve" => if !p.fuel_valve { "OFF" } else if std::ptr::eq(self.spec, &aircraft::dr400::SPEC) { "MAIN" } else { "BOTH" }.into(),
             "nav_next" => self.radios.nav.as_ref().map(|s| format!("{} {}", s.freq_text(), s.label())).unwrap_or_else(|| "OFF".into()),
             "adf_next" => self.radios.adf.as_ref().map(|s| format!("{} {}", s.freq_text(), s.label())).unwrap_or_else(|| "OFF".into()),
             "baro_qnh" => format!("{:.0} hPa", self.radios.setting(self.wx.qnh)),

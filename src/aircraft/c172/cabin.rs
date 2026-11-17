@@ -34,6 +34,8 @@ pub mod gauge {
     pub const TRIM_SCALE: f32 = 31.0;
     pub const FLAP_SCALE: f32 = 32.0;
     pub const FUEL_SEL: f32 = 19.0;
+    /// The DR 400's selector plate: MAIN, LEFT, RIGHT, OFF (no BOTH).
+    pub const FUEL_SEL_DR400: f32 = 33.0;
     pub const OAT: f32 = 20.0;
     /// (21 is the Hornet's brake accumulator pressure.) A jet fighter's engine
     /// instruments (the Phantom's): engine speed in percent, exhaust gas
@@ -1003,7 +1005,6 @@ pub static HOTSPOTS: &[Hotspot] = &[
     Hotspot { at: [0.07, 0.01, PANEL_Z], r: 0.07, click: Some("nav_display"), hold: None, wheel: Some(("nav_next", "nav_prev")), piece: None },
     Hotspot { at: [-0.405, -0.205, PANEL_Z + 0.0065], r: 0.014, click: Some("landing_lights"), hold: None, wheel: None, piece: Some("landing light switch") },
     Hotspot { at: [0.0, FLOOR_Y + 0.016, -0.98], r: 0.04, click: Some("fuel_valve"), hold: None, wheel: None, piece: Some("fuel selector") },
-    Hotspot { at: [-0.40, 0.035, -1.048], r: 0.011, click: None, hold: Some("boost"), wheel: None, piece: Some("yoke") },
 ];
 
 // ---------------------------------------------------------------- glass

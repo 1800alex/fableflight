@@ -2,13 +2,36 @@
 //! running forward under the panel to the rudder pedals at the firewall;
 //! the anthracite panel under a padded black glareshield (flight
 //! instruments on the left, the radio stack in the middle, engine gauges,
-//! clock and breakers to the right); the centre console under it with the
-//! throttle and mixture levers, the fuel selector and the parking brake;
-//! the trim wheel and the handbrake-style flap lever on the tunnel between
-//! the front seats; a stick each; contoured seats in velour and leatherette
-//! with their belts, the rear bench and the baggage space behind it; vinyl
-//! side panels with armrests, map pockets and air vents; and the canopy, a
-//! fixed windscreen and the bubble that slides forward over it on its frame.
+//! clock and breakers to the right); two push-pull throttles under the
+//! panel, one at each front seat's left hand; the centre console under it
+//! with the parking brake pull, the trim repeater and mixture lever, the
+//! fuel selector and the starter button; the trim wheel and the
+//! handbrake-style flap lever on the tunnel between the front seats; a
+//! stick each; contoured seats in velour and leatherette with their belts,
+//! the rear bench and the baggage space behind it; vinyl side panels with
+//! armrests, map pockets and air vents; and the canopy, a fixed windscreen
+//! and the bubble that slides forward over it on its frame.
+//!
+//! The controls follow the DR 400/180 flight manual (Avions Pierre Robin,
+//! edition 20, April 1992, serials 2062 to 2215):
+//! <https://www.aeroclubduplandedieu.fr/wordpress/wp-content/uploads/2021/11/MANUEL-DE-VOL-DR400-180-NS2062-a-2215.pdf>
+//! - p. 1.10–1.11, the panel key: throttles (40) at the panel's lower left
+//!   and left of the radios; magneto selector (35) and battery/alternator
+//!   switches (31) lower left; on the console, parking brake (47) at the
+//!   top, trim tab repeater (46), mixture (42) with its friction knob (49),
+//!   fuel selector (43) and starter push button (44); trim wheel (45) and
+//!   flap lever (48) behind it.
+//! - p. 1.08–1.09: a main tank and two wing tanks, one selected at a time
+//!   (no BOTH). p. 1.05: a separate brake circuit per main wheel (toe brakes).
+//! - p. 4.06: start with the magnetos on L, then the starter, then L+R;
+//!   mixture full rich is up. p. 4.14: the parking brake is set by holding
+//!   both pedals and pulling the control up; it is released by pushing.
+//!
+//! Simplified: the magnetos are OFF/BOTH, the tanks are pooled (the
+//! selector is open at MAIN or shut), the battery and alternator share one
+//! master. Carburettor heat (41), the electric fuel pump (32) and the
+//! friction knob are drawn but do nothing. Exact knob shapes and placard
+//! wording are estimates from the manual's line drawing.
 use super::*;
 use crate::aircraft::Hotspot;
 use crate::aircraft::c172::cabin::{gauge, rect, strap};
@@ -77,14 +100,21 @@ const fn at(x: f32, y: f32, z: f32) -> [f32; 3] {
     [x, y, z + DZ]
 }
 pub static HOTSPOTS: &[Hotspot] = &[
-    // The key: a click turns the magnetos on or off; hold it to crank.
-    Hotspot { at: at(-0.44, -0.17, PANEL_Z + 0.025), r: 0.022, click: Some("ignition"), hold: Some("starter"), wheel: None, piece: Some("ignition key") },
+    // The magneto selector (35): a click turns the magnetos on or off. The
+    // engine is cranked with its own push button (44), on the console.
+    Hotspot { at: at(-0.44, -0.17, PANEL_Z + 0.025), r: 0.022, click: Some("ignition"), hold: None, wheel: None, piece: Some("ignition key") },
     Hotspot { at: at(-0.37, -0.19, PANEL_Z + 0.006), r: 0.013, click: Some("master"), hold: None, wheel: None, piece: Some("master switch") },
-    // The throttle and the mixture, side by side in the quadrant: the wheel moves them.
-    Hotspot { at: at(-0.025, -0.245, -0.957), r: 0.022, click: None, hold: None, wheel: Some(("throttle_up", "throttle_down")), piece: Some("throttle") },
-    Hotspot { at: at(0.025, -0.236, -0.978), r: 0.02, click: None, hold: None, wheel: Some(("mixture_rich", "mixture_lean")), piece: Some("mixture lever") },
-    Hotspot { at: at(0.0, -0.391, -0.947), r: 0.035, click: Some("fuel_valve"), hold: None, wheel: None, piece: Some("fuel selector") },
-    Hotspot { at: at(0.0, -0.429, -0.889), r: 0.025, click: Some("parking_brake"), hold: None, wheel: None, piece: Some("parking brake") },
+    // The two throttles (40), under the panel at each front seat's left
+    // hand (both pieces slide together, so either pose carries both targets).
+    Hotspot { at: at(THROTTLES[0].x, THROTTLES[0].y, PANEL_Z + 0.034), r: 0.021, click: None, hold: None, wheel: Some(("throttle_up", "throttle_down")), piece: Some("throttle") },
+    Hotspot { at: at(THROTTLES[1].x, THROTTLES[1].y, PANEL_Z + 0.034), r: 0.021, click: None, hold: None, wheel: Some(("throttle_up", "throttle_down")), piece: Some("throttle") },
+    // The console, top to bottom: the parking brake pull (47), the mixture
+    // lever (42) beside the trim repeater (46), then the fuel selector (43)
+    // and the starter button (44). (Positions: `con_face`, worked out.)
+    Hotspot { at: at(0.0, -0.247, -1.033), r: 0.024, click: Some("parking_brake"), hold: None, wheel: None, piece: Some("parking brake") },
+    Hotspot { at: at(0.025, -0.261, -0.955), r: 0.02, click: None, hold: None, wheel: Some(("mixture_rich", "mixture_lean")), piece: Some("mixture lever") },
+    Hotspot { at: at(-0.02, -0.423, -0.921), r: 0.03, click: Some("fuel_valve"), hold: None, wheel: None, piece: None },
+    Hotspot { at: at(0.052, -0.426, -0.924), r: 0.013, click: None, hold: Some("starter"), wheel: None, piece: None },
     // The trim wheel in the tunnel (rolled forward, nose down) and the flap lever between the seats.
     Hotspot { at: at(0.0, -0.37, -0.66), r: 0.04, click: None, hold: None, wheel: Some(("trim_down", "trim_up")), piece: Some("trim wheel") },
     Hotspot { at: at(0.0, -0.35, -0.51), r: 0.03, click: None, hold: None, wheel: Some(("flaps_up", "flaps_down")), piece: Some("flap lever") },
@@ -94,12 +124,22 @@ pub static HOTSPOTS: &[Hotspot] = &[
     Hotspot { at: at(0.0, 0.42, -0.765), r: 0.045, click: Some("canopy"), hold: None, wheel: None, piece: Some("canopy frame") },
 ];
 
-/// The magneto key, the master switch, the mixture lever, the fuel
-/// selector's handle and the parking brake: moving pieces, which the mouse
-/// works (`HOTSPOTS`).
+/// The console's slotted plate (trim repeater and mixture), as `con_face`'s
+/// s; the fuel selector and the starter button below it.
+const QUAD_S: f32 = 0.30;
+const FUEL_S: f32 = 0.67;
+/// The two throttle knobs' centres on the panel (x, y), at full power: the
+/// pilot's at the panel's lower left corner, the right seat's left of the
+/// radios (flight manual p. 1.10, item 40).
+const THROTTLES: [Vec2; 2] = [Vec2::new(-0.475, -0.14), Vec2::new(0.0, -0.12)];
+
+/// The magneto selector, the master switch, the throttles, the mixture
+/// lever, the fuel selector's handle, the starter button and the parking
+/// brake: moving pieces, which the mouse works (`HOTSPOTS`).
 fn switches(b: &mut Builder) {
     let f = PANEL_Z + 0.0005;
-    // The key: OFF, then BOTH a quarter turn on, START past it (sprung back).
+    // The magneto selector, a key switch: OFF, then BOTH a quarter turn on.
+    // (L and R are not simulated; there is no START: see the button.)
     let mut k = Mesh::default();
     let kc = Vec3::new(-0.44, -0.17, f);
     k.rbox(&mt(mat::STEEL, 0.6, 0.55, 0.4), kc + Vec3::Z * 0.014, Vec3::new(0.003, 0.009, 0.008), 0.0015, Quat::IDENTITY);
@@ -110,22 +150,42 @@ fn switches(b: &mut Builder) {
     let mc = Vec3::new(-0.37, -0.19, f + 0.006);
     r.rbox(&RED, mc, Vec3::new(0.0062, 0.011, 0.004), 0.002, Quat::IDENTITY);
     b.add("master switch", G_FUSE, r, Anim::hinge(Drive::new(Input::Master, -0.36).offset(0.18)), mc - Vec3::Z * 0.004, Vec3::X, None);
-    // The mixture lever, in the quadrant's right slot: forward is rich.
-    let (q, rot) = con_face(0.0, 0.20);
+    // The throttles: push-pull handles out of the panel's lower edge, pushed
+    // in for power. Both work the one engine control.
+    for c in THROTTLES {
+        let mut t = Mesh::default();
+        let p = Vec3::new(c.x, c.y, PANEL_Z);
+        t.tube(&CHROME, &[p - Vec3::Z * 0.09, p + Vec3::Z * 0.02], &|_| 0.0045, 10, false);
+        t.lathe(&KNOB, p + Vec3::Z * 0.02, Vec3::Z, &[[0.0045, 0.0], [0.016, 0.005], [0.019, 0.016], [0.017, 0.026], [0.0, 0.029]], 20, true);
+        b.add("throttle", G_FUSE, t, Anim::slide(Drive::new(Input::Throttle, -0.06).offset(0.06), Vec3::Z), p, Vec3::Z, None);
+    }
+    // The mixture lever, in the plate's right slot: up (forward) is rich.
+    let (q, rot) = con_face(0.0, QUAD_S);
     let n = rot * Vec3::Z;
     let mx = q + rot * Vec3::new(0.025, 0.02, 0.0);
     let mut x = Mesh::default();
     x.tube(&CHROME, &[mx - n * 0.02, mx + n * 0.075], &|_| 0.0042, 10, false);
     x.lathe(&RED.pat(pat::KNURL), mx + n * 0.075, n, &[[0.0042, 0.0], [0.012, 0.004], [0.013, 0.016], [0.011, 0.02], [0.0, 0.021]], 18, true);
     b.add("mixture lever", G_FUSE, x, Anim::slide(Drive::new(Input::Mixture, 0.05).offset(-0.05), rot * Vec3::Y), mx, n, None);
-    // The fuel selector's handle: along the tank line open, across it shut.
-    let (fs, rot) = con_face(0.0, 0.55);
+    // The fuel selector's pointer handle: up at MAIN open, down at OFF.
+    // (The tanks are pooled in the simulator: LEFT and RIGHT are not used.)
+    let (fs, rot) = con_face(-0.02, FUEL_S);
     let n = rot * Vec3::Z;
+    let up = rot * Vec3::Y;
     let mut h = Mesh::default();
-    h.rbox(&RED, fs + n * 0.012, Vec3::new(0.009, 0.036, 0.008), 0.004, rot);
-    b.add("fuel selector", G_FUSE, h, Anim::hinge(Drive::new(Input::FuelValve, FRAC_PI_2).offset(-FRAC_PI_2)), fs, n, None);
-    // The parking brake: pulled out to set (high on the console, clear of the tunnel).
-    let (pb, rot) = con_face(0.0, 0.74);
+    h.rbox(&RED, fs + n * 0.012 + up * 0.012, Vec3::new(0.007, 0.022, 0.008), 0.004, rot);
+    h.lathe(&RED, fs + n * 0.004, n, &[[0.011, 0.0], [0.011, 0.012], [0.0, 0.014]], 16, true);
+    b.add("fuel selector", G_FUSE, h, Anim::hinge(Drive::new(Input::FuelValve, PI).offset(-PI)), fs, n, None);
+    // The starter: a black push button beside the selector, held to crank.
+    let (sb, rot) = con_face(0.052, FUEL_S);
+    let n = rot * Vec3::Z;
+    let mut s = Mesh::default();
+    s.lathe(&CHROME, sb, n, &[[0.013, 0.0], [0.013, 0.003], [0.011, 0.004]], 18, false);
+    s.lathe(&BLACK, sb, n, &[[0.0085, 0.0], [0.0085, 0.008], [0.007, 0.0095], [0.0, 0.0095]], 16, true);
+    b.fixed("starter button", G_FUSE, s);
+    // The parking brake: a pull at the top of the console, under the panel;
+    // set by holding both toe brakes and pulling it out (p. 4.14).
+    let (pb, rot) = con_face(0.0, 0.07);
     let n = rot * Vec3::Z;
     let mut p = Mesh::default();
     p.tube(&CHROME, &[pb - n * 0.01, pb + n * 0.03], &|_| 0.0035, 8, false);
@@ -479,25 +539,32 @@ fn console(m: &mut Mesh) {
     // The tunnel running aft between the seats, carpeted.
     m.rbox(&CARPET.pat(pat::CARPET), Vec3::new(0.0, FLOOR_Y + 0.06, -0.52), Vec3::new(0.07, 0.06, 0.34), 0.02, Quat::IDENTITY);
 
-    // The throttle quadrant: two slots, the mixture lever (red) on the right.
-    let (q, rot) = con_face(0.0, 0.20);
+    // The console as the flight manual draws it (p. 1.10), top to bottom:
+    // the parking brake pull (47; a moving piece, `switches`) and its label;
+    // a slotted plate with the elevator trim tab's position repeater (46) on
+    // the left and the mixture lever (42, red) on the right; then the fuel
+    // selector (43) beside the starter's push button (44).
+    let (pb, rot) = con_face(0.0, 0.07);
+    label(m, pb + rot * Vec3::new(0.0, -0.022, 0.0), 0.02, 0.0045, rot);
+    let (q, rot) = con_face(0.0, QUAD_S);
     m.rbox(&BLACK, q, Vec3::new(0.058, 0.055, 0.002), 0.004, rot);
     for x in [-0.025f32, 0.025] {
         m.rbox(&mt(mat::BLACK, 0.004, 0.004, 0.004), q + rot * Vec3::new(x, 0.0, 0.0012), Vec3::new(0.0045, 0.042, 0.001), 0.001, rot);
     }
+    // The repeater: nose down at the top, its pointer following the trim.
+    rect(m, &mt(mat::GAUGE, 0.02, 0.02, 0.02).x(gauge::TRIM_SCALE), q + rot * Vec3::new(-0.025, 0.0, 0.0026), rot * Vec3::X, rot * Vec3::Y, 0.009, 0.04);
     label(m, q + rot * Vec3::new(-0.048, 0.03, 0.0022), 0.006, 0.012, rot);
     label(m, q + rot * Vec3::new(-0.048, -0.03, 0.0022), 0.006, 0.012, rot);
-    // The fuel selector (main tank, wings, off) and the parking brake handle.
-    let (fs, rot) = con_face(0.0, 0.55);
+    // The fuel selector's plate: MAIN (the fuselage tank), LEFT, RIGHT, OFF.
+    let (fs, rot) = con_face(-0.02, FUEL_S);
     let n = rot * Vec3::Z;
-    m.lathe(&CHROME, fs, n, &[[0.05, 0.0], [0.05, 0.003], [0.048, 0.004]], 32, false);
-    m.disc(&FACE.x(gauge::FUEL_SEL), fs + n * 0.0035, n, rot * Vec3::Y, 0.046, 32);
-    m.lathe(&CHROME, fs + n * 0.004, n, &[[0.008, 0.0], [0.008, 0.008], [0.0, 0.009]], 12, false);
-    let (pb, rot) = con_face(0.0, 0.74);
-    label(m, pb + rot * Vec3::new(0.0, 0.018, 0.0), 0.02, 0.0045, rot);
-    for (x, y) in [(-0.06f32, 0.06f32), (0.06, 0.06), (-0.06, -0.06), (0.06, -0.06)] {
-        let (p, r) = con_face(x, 0.45 + y * 1.2);
-        m.screw(&SCREW_BLACK, p, r * Vec3::Z, 0.0025, x + y * 3.0);
+    m.lathe(&CHROME, fs, n, &[[0.037, 0.0], [0.037, 0.003], [0.035, 0.004]], 32, false);
+    m.disc(&FACE.x(gauge::FUEL_SEL_DR400), fs + n * 0.0035, n, rot * Vec3::Y, 0.034, 32);
+    let (sb, rot) = con_face(0.052, FUEL_S);
+    label(m, sb + rot * Vec3::new(0.0, -0.022, 0.0), 0.014, 0.004, rot);
+    for (x, s) in [(-0.065f32, 0.14f32), (0.065, 0.14), (-0.065, 0.86), (0.065, 0.86)] {
+        let (p, r) = con_face(x, s);
+        m.screw(&SCREW_BLACK, p, r * Vec3::Z, 0.0025, x + s * 3.0);
     }
 
     // The trim wheel's slot on the tunnel, with its nose-up / nose-down scale.
@@ -692,14 +759,7 @@ fn controls(b: &mut Builder) {
             b.add("pedal", G_FUSE, p, Anim::hinge(Drive::new(Input::Yaw, -dx.signum() * 0.18)), pv, Vec3::X, None);
         }
     }
-    // The throttle, in the quadrant's left slot (forward for power).
-    let mut t = Mesh::default();
-    let (q, rot) = con_face(-0.025, 0.20);
-    let n = rot * Vec3::Z;
-    let tp = q - n * 0.05;
-    t.tube(&CHROME, &[tp, tp + n * 0.13], &|_| 0.0045, 10, false);
-    t.lathe(&KNOB, tp + n * 0.13, n, &[[0.0045, 0.0], [0.014, 0.004], [0.019, 0.016], [0.018, 0.028], [0.010, 0.036], [0.0, 0.038]], 20, true);
-    b.add("throttle", G_FUSE, t, Anim::hinge(Drive::new(Input::Throttle, -0.5).offset(0.25)), tp, Vec3::X, None);
+    // (The throttles are under the panel: `switches`.)
     // The pitch trim wheel, half sunk in the tunnel.
     let mut w = Mesh::default();
     let wc = Vec3::new(0.0, FLOOR_Y + 0.085, -0.66);

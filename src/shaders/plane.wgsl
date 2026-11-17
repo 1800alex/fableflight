@@ -1401,6 +1401,14 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       ink = max(ink, str_at(uv, vec2f(0.0,-0.65), S_OFF, 0.17, px, 0.0));
       hub = false;
     }
+    case 33u: { // the DR 400's fuel selector plate: the handle points at a tank, or OFF
+      ink = 1.0 - smoothstep(0.0, px, abs(r - 0.88) - 0.02);
+      ink = max(ink, str_at(uv, vec2f(0.0, 0.6), S_MAIN, 0.17, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(-0.5, 0.0), S_LEFT, 0.15, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(0.5, 0.0), S_RIGHT, 0.15, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(0.0, -0.62), S_OFF, 0.17, px, 0.0));
+      hub = false;
+    }
     default: {}
   }
   // The dial, drawn once whatever the instrument.
