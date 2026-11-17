@@ -345,6 +345,8 @@ struct Args {
     /// fuel to start with (fraction of full tanks), and the engine off on the ground
     fuel: Option<f64>,
     cold: bool,
+    /// --arcade: arcade mode for this run
+    arcade: bool,
     /// the AI copilot's loopback control service (on unless --no-mcp)
     mcp: bool,
     mcp_port: u16,
@@ -422,6 +424,7 @@ fn parse_args() -> Args {
         strikes: Vec::new(),
         fuel: None,
         cold: false,
+        arcade: false,
         mcp: true,
         mcp_port: mcp::rpc::DEFAULT_PORT,
     };
@@ -662,6 +665,10 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--fuel" => a.fuel = num(&v, i).map(|f| f.clamp(0.0, 1.0)),
+            "--arcade" => {
+                a.arcade = true;
+                used = 1;
+            }
             "--cold" => {
                 a.cold = true;
                 used = 1;
@@ -874,6 +881,8 @@ struct Game {
     show_hud: bool,
     /// the HUD in the cockpit view (see `hud_on`)
     hud_cockpit: bool,
+    /// arcade mode (settings.rs): the fun features on
+    arcade: bool,
     goto_open: bool,
     goto_text: String,
     goto_rx: Option<std::sync::mpsc::Receiver<Option<(f64, f64, f64, String)>>>,
@@ -1213,7 +1222,7 @@ impl Game {
             minimap: minimap::Minimap::new(&prefs),
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
-            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, goto_open: false, goto_text: String::new(), goto_rx: None,
+            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
@@ -1552,6 +1561,25 @@ impl Game {
         self.respawn_at(lat, lon, alt, heading, self.spec.cruise);
     }
 
+    /// The aircraft's missiles can be used: it has some, in arcade mode.
+    fn missiles_ok(&self) -> bool {
+        self.arcade && self.weapons.has_weapons()
+    }
+
+    fn missiles_refusal(&self) -> &'static str {
+        if self.weapons.has_weapons() {
+            t!("Missiles are for arcade mode (Settings › General)", "Les missiles sont réservés au mode arcade (Réglages › Général)")
+        } else {
+            t!("No missiles on this aircraft", "Pas de missiles sur cet avion")
+        }
+    }
+
+    /// Says that `what` is arcade mode's.
+    fn arcade_only(&mut self, what: &str) {
+        self.status = t!("{} is for arcade mode (Settings › General)", "{} : réservé au mode arcade (Réglages › Général)", what);
+        self.status_until = self.real + 3.0;
+    }
+
     fn respawn_at(&mut self, lat: f64, lon: f64, alt: f64, heading: f64, speed: f64) {
         self.hold_spot = None;
         self.parking_brake = false;
@@ -1763,7 +1791,8 @@ impl Game {
             yaw: ax(k(KeyCode::KeyE), k(KeyCode::KeyQ)),
             throttle: ax(k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight), k(KeyCode::ControlLeft) || k(KeyCode::ControlRight)),
             brake: k(KeyCode::KeyB),
-            boost: k(KeyCode::Space),
+            // (The game's own boost is arcade mode's; real afterburners always work.)
+            boost: k(KeyCode::Space) && (self.arcade || self.spec.real_boost()),
             reverse: k(KeyCode::KeyZ),
             throttle_set: None,
             starter: k(KeyCode::KeyO),
@@ -2009,7 +2038,7 @@ impl Game {
             self.pad_y_combo = true;
         }
         if released.contains(&Button::North) {
-            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && !self.crashed && self.mode == Mode::Fly && !self.pause_open && self.weapons.has_weapons() && self.weapons.lock >= 1.0 {
+            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && !self.crashed && self.mode == Mode::Fly && !self.pause_open && self.missiles_ok() && self.weapons.lock >= 1.0 {
                 self.weapons.request_fire();
             }
             self.pad_y = false;
@@ -2430,8 +2459,8 @@ impl Game {
             (Nav::Panel, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) => {}
             // Y and the d-pad: master arm and target lock.
             (Nav::Off, Button::DPadLeft) if modifier => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     let on = self.weapons.toggle_arm();
                     self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
@@ -2439,8 +2468,8 @@ impl Game {
                 self.status_until = self.real + 3.0;
             }
             (Nav::Off, Button::DPadRight) if modifier => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     self.weapons.request_cycle();
                 }
@@ -2568,7 +2597,8 @@ impl Game {
             KeyCode::Escape if self.show_help => self.show_help = false,
             KeyCode::Escape if self.wx.open => self.wx.open = false,
             KeyCode::Escape => self.set_pause_menu(true),
-            KeyCode::KeyR => self.respawn_here(),
+            KeyCode::KeyR if self.arcade || self.crashed => self.respawn_here(),
+            KeyCode::KeyR => self.arcade_only(t!("Respawning in flight", "La réapparition en vol")),
             KeyCode::KeyC => self.next_view(),
             KeyCode::KeyF if !self.crashed => self.plane.set_flaps(1),
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
@@ -2589,8 +2619,8 @@ impl Game {
             KeyCode::Backspace if !self.crashed => self.plane.stage_sep(),
             KeyCode::Digit2 if !self.crashed => self.plane.toggle_autoland(),
             KeyCode::Digit3 if !self.crashed => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     let on = self.weapons.toggle_arm();
                     self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
@@ -2598,16 +2628,16 @@ impl Game {
                 self.status_until = self.real + 3.0;
             }
             KeyCode::Digit4 if !self.crashed => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     self.weapons.request_cycle();
                 }
                 self.status_until = self.real + 3.0;
             }
             KeyCode::Digit5 if !self.crashed => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     self.weapons.request_fire();
                 }
@@ -2617,6 +2647,7 @@ impl Game {
                 self.goto_open = true;
                 self.goto_text.clear();
             }
+            KeyCode::KeyT | KeyCode::KeyY | KeyCode::KeyN | KeyCode::KeyM if !self.arcade => self.arcade_only(t!("The weather and time keys", "Les touches météo et heure")),
             KeyCode::KeyT | KeyCode::KeyY => {
                 // Setting the time by hand leaves real time.
                 self.wx.real_time = false;
@@ -3269,7 +3300,7 @@ impl Game {
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone() }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone() }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
@@ -3465,7 +3496,7 @@ impl Game {
         let mut femit: Vec<(DVec3, render::Particle)> = Vec::new();
         let (mut scrape_n, mut steps) = (0usize, 0usize);
         if !self.crashed && !in_menu {
-            let weapon_targets = if !self.weapons.has_weapons() {
+            let weapon_targets = if !self.missiles_ok() {
                 Vec::new()
             } else {
                 let mut t = self.live.targets();

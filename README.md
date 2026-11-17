@@ -34,6 +34,13 @@ running
 cargo run --release
 ```
 
+# Arcade mode
+FableFlight is a simulator first: by default, the aircraft fly as they really do. **Arcade mode** (Settings › General, or `--arcade` for one run) turns on the game's fun features:
+- the F/A-18's Sidewinders (master arm, lock and fire on keys 3, 4 and 5);
+- boost on aircraft that have none in reality: the piston singles and the 747. Real afterburners and reheat (F/A-18, F-4, F-22, SR-71, Concorde) work in both modes;
+- respawning in flight at any time with R. In simulation mode R only works after a crash;
+- the weather and time keys in flight: T/Y for the time, N/M for the clouds. The weather panel and Go to work in both modes.
+
 # Language
 The interface is in English or French. It follows the system language, can be changed in Settings (start screen or pause menu), and is remembered. For one run: `cargo run --release -- --lang fr`.
 

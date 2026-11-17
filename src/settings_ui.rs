@@ -60,7 +60,7 @@ impl Section {
 
     fn blurb(self) -> &'static str {
         match self {
-            Section::General => t!("Language, the HUD, the minimap and live traffic.", "Langue, HUD, mini-carte et trafic réel."),
+            Section::General => t!("Language, the HUD, the minimap, live traffic and arcade mode.", "Langue, HUD, mini-carte, trafic réel et mode arcade."),
             Section::Graphics => t!("How hard the renderer works. Changes apply at once.", "L'effort demandé au rendu. Les changements s'appliquent aussitôt."),
             Section::Sound => t!("Engine, wind, warnings and the world around you.", "Moteur, vent, alarmes et le monde autour de vous."),
             Section::Camera => t!("Where the camera starts and how wide the cockpit view is.", "Le point de vue de départ et l'ouverture de la vue cockpit."),
@@ -354,6 +354,11 @@ impl Game {
             });
             row(ui, t!("Landing guidance", "Aide à l’atterrissage"), t!("approach arrows and tunnel", "flèches et tunnel d’approche"), |ui| {
                 menu::switch(ui, &mut self.minimap.landing_guidance);
+            });
+        });
+        card(ui, t!("Mode", "Mode"), |ui| {
+            row(ui, t!("Arcade mode", "Mode arcade"), t!("missiles, boost on any aircraft, respawn at will, weather and time keys", "missiles, boost sur tous les avions, réapparition à volonté, touches météo et heure"), |ui| {
+                menu::switch(ui, &mut self.arcade);
             });
         });
         card(ui, t!("Air traffic", "Trafic aérien"), |ui| {
