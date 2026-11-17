@@ -92,7 +92,7 @@ use render::{DrawObj, Frame, Globals, PSim, Renderer};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -3561,12 +3561,12 @@ impl Game {
             let horiz = |a: f64| e * a.cos() + n * a.sin();
             // Keep a clear view: swing round, or rise a little, to see past
             // whatever building stands in the way.
-            if self.real - self.cam_clear_t > 0.25 {
+            if self.real - self.cam_clear_t > 0.4 {
                 self.cam_clear_t = self.real;
                 let look = centre + u * 6.0;
                 let clear = |from: DVec3| {
-                    !(0..18).any(|k| {
-                        let p = from + (look - from) * (k as f64 / 20.0);
+                    !(0..12).any(|k| {
+                        let p = from + (look - from) * (k as f64 / 12.0);
                         let (la, lo, h) = geo::pos_to_lla(p);
                         self.world.building(la, lo).is_some_and(|b| h < b.top + 3.0 && h > b.base - 2.0)
                             // (under the 3D tiles the buildings are the mesh, the ground's top)
@@ -3576,8 +3576,8 @@ impl Game {
                 // Only move when the view is blocked, and then stay a while.
                 if !clear(centre + horiz(a) * dist + u * (rise + dist * self.cam_rise)) && self.real > self.cam_hold {
                     let mut best = (0.0, 0.4);
-                    'search: for off in [0.0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4, 1.75, -1.75, 2.1, -2.1] {
-                        for k in [0.0, 0.15, 0.3] {
+                    'search: for off in [0.0, 0.55, -0.55, 1.1, -1.1, 1.65, -1.65] {
+                        for k in [0.0, 0.25] {
                             if clear(centre + horiz(a + off) * dist + u * (rise + dist * k)) {
                                 best = (off, k);
                                 break 'search;
@@ -6015,9 +6015,14 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(g) = &self.game {
             g.window.request_redraw();
+            if g.gfx.fps_cap > 0 {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_secs_f64(1.0 / g.gfx.fps_cap as f64)));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
         }
     }
 }
