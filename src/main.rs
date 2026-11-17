@@ -4,6 +4,7 @@ mod airmodels;
 mod airports;
 mod approach;
 mod audio;
+mod autopilot;
 mod buildings;
 mod aircraft;
 mod cockpit;
@@ -292,6 +293,8 @@ struct Args {
     crash_at: Option<f64>,
     /// from this many seconds on, full throttle with the boost key held (the afterburners), for scripted screenshots and recordings
     boost_at: Option<f64>,
+    /// --ap mode@secs: an autopilot button pressed then (ap, hdg, nav, apr, alt, vs), for scripted tests
+    ap_script: Vec<(f64, String)>,
     /// a rocket drops its booster after this many seconds, likewise
     stage_at: Option<f64>,
     /// a rocket burns this engine group (0 all) once it is let go, or starts as the ship alone coming back
@@ -359,6 +362,8 @@ struct Args {
     /// fuel to start with (fraction of full tanks), and the engine off on the ground
     fuel: Option<f64>,
     cold: bool,
+    /// --arcade: arcade mode for this run
+    arcade: bool,
     /// the AI copilot's loopback control service (on unless --no-mcp)
     mcp: bool,
     mcp_port: u16,
@@ -402,6 +407,7 @@ fn parse_args() -> Args {
         cursor: None,
         clicks: Vec::new(),
         boost_at: None,
+        ap_script: Vec::new(),
         stage_at: None,
         engines: None,
         ship: false,
@@ -438,6 +444,7 @@ fn parse_args() -> Args {
         strikes: Vec::new(),
         fuel: None,
         cold: false,
+        arcade: false,
         mcp: true,
         mcp_port: mcp::rpc::DEFAULT_PORT,
     };
@@ -584,6 +591,11 @@ fn parse_args() -> Args {
             "--imagery" => a.imagery = v.get(i + 1).cloned().unwrap_or(a.imagery.clone()),
             "--crash-at" => a.crash_at = num(&v, i),
             "--boost-at" => a.boost_at = num(&v, i),
+            "--ap" => {
+                if let Some((m, t)) = v.get(i + 1).and_then(|s| s.split_once('@')) {
+                    a.ap_script.push((t.parse().unwrap_or(0.0), m.to_ascii_lowercase()));
+                }
+            }
             "--stage-at" => a.stage_at = num(&v, i),
             "--engines" => a.engines = num(&v, i).map(|k| k as usize),
             "--ship" => {
@@ -700,6 +712,10 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--fuel" => a.fuel = num(&v, i).map(|f| f.clamp(0.0, 1.0)),
+            "--arcade" => {
+                a.arcade = true;
+                used = 1;
+            }
             "--cold" => {
                 a.cold = true;
                 used = 1;
@@ -927,6 +943,8 @@ struct Game {
     show_hud: bool,
     /// the HUD in the cockpit view (see `hud_on`)
     hud_cockpit: bool,
+    /// arcade mode (settings.rs): the fun features on
+    arcade: bool,
     goto_open: bool,
     goto_text: String,
     goto_rx: Option<std::sync::mpsc::Receiver<Option<(f64, f64, f64, String)>>>,
@@ -944,6 +962,10 @@ struct Game {
     pad_id: Option<gilrs::GamepadId>,
     /// pads already given the Xbox layout (so a pad it does not take on is not reopened forever)
     pad_fixed: Vec<[u8; 16]>,
+    /// the autopilot (autopilot.rs), and when it last let go (its warning)
+    ap: autopilot::Autopilot,
+    ap_off_t: f64,
+    ap_script: Vec<(f64, String)>,
     /// gamepad input for the menus: key events for the next UI pass, a focus
     /// move out of a text box, a d-pad direction held (and when it repeats),
     /// and a request to pick out the screen's first choice
@@ -1029,6 +1051,9 @@ struct Game {
     toolbar_t: f64,
     /// a weapon's fireball for the renderer's light: position, power, when
     weapon_flash: Option<(DVec3, f32, f64)>,
+    /// aircraft shot down and still falling: they burn on the way down and
+    /// blow up again where they hit the ground
+    kills: Vec<Kill>,
     damage_spec: Option<String>,
     /// group wreck meshes have been cut down and need restoring on respawn
     wreck_dirty: bool,
@@ -1265,13 +1290,13 @@ impl Game {
             minimap: minimap::Minimap::new(&prefs),
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
-            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, goto_open: false, goto_text: String::new(), goto_rx: None,
-            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
+            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
+            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
-            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), toolbar_t: -100.0, weapon_flash: None, damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
+            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), toolbar_t: -100.0, weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
             start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
@@ -1615,8 +1640,28 @@ impl Game {
         self.respawn_at(lat, lon, alt, heading, self.spec.cruise);
     }
 
+    /// The aircraft's missiles can be used: it has some, in arcade mode.
+    fn missiles_ok(&self) -> bool {
+        self.arcade && self.weapons.has_weapons()
+    }
+
+    fn missiles_refusal(&self) -> &'static str {
+        if self.weapons.has_weapons() {
+            t!("Missiles are for arcade mode (Settings › General)", "Les missiles sont réservés au mode arcade (Réglages › Général)")
+        } else {
+            t!("No missiles on this aircraft", "Pas de missiles sur cet avion")
+        }
+    }
+
+    /// Says that `what` is arcade mode's.
+    fn arcade_only(&mut self, what: &str) {
+        self.status = t!("{} is for arcade mode (Settings › General)", "{} : réservé au mode arcade (Réglages › Général)", what);
+        self.status_until = self.real + 3.0;
+    }
+
     fn respawn_at(&mut self, lat: f64, lon: f64, alt: f64, heading: f64, speed: f64) {
         self.cancel_cockpit_input();
+        self.ap.disengage();
         self.hold_spot = None;
         self.plane.parking_brake = false;
         self.mcp_throttle = None;
@@ -1645,6 +1690,7 @@ impl Game {
         self.gauges = gauges::Gauges::new(&self.plane, self.frame ^ 0x9e37);
         self.weapons.reset(self.spec, &self.model.pieces);
         self.weapon_flash = None;
+        self.kills.clear();
     }
 
     /// On the ground, at rest, waiting for the terrain under it to load.
@@ -2019,7 +2065,8 @@ impl Game {
             brake: k(KeyCode::KeyB),
             brake_left: if self.hot_press.is_some_and(|(i, _, _)| self.spec.hotspots[i].hold == Some("brake_left")) { 1.0 } else { 0.0 },
             brake_right: if self.hot_press.is_some_and(|(i, _, _)| self.spec.hotspots[i].hold == Some("brake_right")) { 1.0 } else { 0.0 },
-            boost: k(KeyCode::Space),
+            // (The game's own boost is arcade mode's; real afterburners always work.)
+            boost: k(KeyCode::Space) && (self.arcade || self.spec.real_boost()),
             reverse: k(KeyCode::KeyZ),
             throttle_set: None,
             starter: k(KeyCode::KeyO),
@@ -2038,6 +2085,7 @@ impl Game {
         }
         self.gamepad(dt, &mut c);
         self.joystick(&mut c);
+        self.autopilot(dt, &mut c);
         c.brake |= self.plane.parking_brake;
         if let Some(t) = self.crash_at {
             if self.real > t && !self.crashed {
@@ -2267,7 +2315,7 @@ impl Game {
             self.pad_y_combo = true;
         }
         if released.contains(&Button::North) {
-            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && !self.crashed && self.mode == Mode::Fly && !self.pause_open && self.weapons.has_weapons() && self.weapons.lock >= 1.0 {
+            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && !self.crashed && self.mode == Mode::Fly && !self.pause_open && self.missiles_ok() && self.weapons.lock >= 1.0 {
                 self.weapons.request_fire();
             }
             self.pad_y = false;
@@ -2380,6 +2428,233 @@ impl Game {
 
     /// The flight panel's radios: NAV 1 (VOR or ILS) and the ADF tuned from
     /// the stations around, the OBS, and the altimeter setting.
+    /// The autopilot flies, if engaged: its stick and throttle replace the
+    /// pilot's (whose small inputs add to them; a firm one disconnects it).
+    fn autopilot(&mut self, dt: f64, c: &mut Controls) {
+        // (Scripted presses: --ap.)
+        while let Some(k) = self.ap_script.iter().position(|(t, _)| self.real >= *t) {
+            let (_, m) = self.ap_script.remove(k);
+            match m.as_str() {
+                "ap" => self.ap_toggle(),
+                "hdg" => self.ap_lat(autopilot::Lat::Hdg),
+                "nav" => self.ap_lat(autopilot::Lat::Nav),
+                "apr" => self.ap_lat(autopilot::Lat::Apr),
+                "alt" => self.ap_vert(autopilot::Vert::Alt),
+                "vs" => self.ap_vert(autopilot::Vert::Vs),
+                "at" => self.ap.at = !self.ap.at,
+                _ => {}
+            }
+        }
+        if !self.ap.on || dt <= 0.0 || self.mode != Mode::Fly || self.pause_open {
+            return;
+        }
+        if self.crashed {
+            self.ap_disconnect(None);
+            return;
+        }
+        let s = autopilot::State::of(&self.plane);
+        let r = {
+            let nav = self.radios.nav.as_ref().map(|st| autopilot::Nav { st, reading: nav::nav_reading(st, self.radios.obs, self.plane.pos), obs: self.radios.obs });
+            self.ap.step(&s, &self.plane, nav.as_ref(), (c.pitch, c.roll), dt)
+        };
+        match r {
+            Ok(o) => {
+                c.pitch = o.pitch;
+                c.roll = o.roll;
+                if let Some(t) = o.throttle_set {
+                    // The throttle keys take the power back from the autothrottle.
+                    if c.throttle != 0.0 {
+                        self.ap.at = false;
+                    } else {
+                        c.throttle_set = Some(t);
+                    }
+                }
+            }
+            Err(why) => self.ap_disconnect(Some(why)),
+        }
+    }
+
+    fn ap_disconnect(&mut self, why: Option<autopilot::Off>) {
+        use autopilot::Off;
+        self.ap.disengage();
+        self.ap_off_t = self.real;
+        log::info!("autopilot off: {why:?}");
+        self.status = match why {
+            Some(Off::Pilot) | None => t!("Autopilot off", "Pilote automatique coupé").into(),
+            Some(Off::Ground) => t!("Autopilot off: on the ground", "Pilote automatique coupé : au sol").into(),
+            Some(Off::Stall) => t!("Autopilot off: stall", "Pilote automatique coupé : décrochage").into(),
+            Some(Off::Attitude) => t!("Autopilot off: unusual attitude", "Pilote automatique coupé : assiette inhabituelle").into(),
+        };
+        self.status_until = self.real + 4.0;
+    }
+
+    /// F5: the autopilot on (holding the heading and altitude of the
+    /// moment, unless modes were picked beforehand) or off.
+    fn ap_toggle(&mut self) {
+        if self.ap.on {
+            self.ap_disconnect(None);
+            return;
+        }
+        if self.plane.on_ground || self.crashed || self.spec.rocket().is_some() {
+            self.status = t!("The autopilot works in flight", "Le pilote automatique ne fonctionne qu'en vol").into();
+            self.status_until = self.real + 3.0;
+            return;
+        }
+        let s = autopilot::State::of(&self.plane);
+        if self.ap.alt == 0.0 {
+            self.ap.sync(&s);
+        }
+        if self.ap.lat == autopilot::Lat::Roll {
+            self.ap.set_lat(autopilot::Lat::Hdg, &s);
+            self.ap.hdg = s.hdg.round();
+        }
+        if self.ap.vert == autopilot::Vert::Pitch {
+            self.ap.set_vert(autopilot::Vert::Alt, &s);
+        }
+        self.ap.engage(&s);
+        log::info!("autopilot on: {:?} {:?}", self.ap.lat, self.ap.vert);
+        self.status = t!("Autopilot on", "Pilote automatique engagé").into();
+        self.status_until = self.real + 2.0;
+    }
+
+    /// A lateral mode button: picks it (and engages the autopilot), or, pressed again, back to HDG.
+    fn ap_lat(&mut self, m: autopilot::Lat) {
+        let s = autopilot::State::of(&self.plane);
+        let m = if self.ap.on && self.ap.lat == m && m != autopilot::Lat::Hdg { autopilot::Lat::Hdg } else { m };
+        // (Off, nothing set yet: the heading and altitude of the moment.)
+        if !self.ap.on && self.ap.alt == 0.0 {
+            self.ap.sync(&s);
+        }
+        // NAV and APR stay armed, flying the heading bug, until NAV 1 has the course.
+        if matches!(m, autopilot::Lat::Nav | autopilot::Lat::Apr) && self.radios.nav.is_none() {
+            self.status = t!("Armed: tune NAV 1 (Radio page)", "Armé : accordez la NAV 1 (page Radios)").into();
+            self.status_until = self.real + 3.0;
+        }
+        self.ap.set_lat(m, &s);
+        if !self.ap.on {
+            self.ap_toggle();
+        }
+    }
+
+    fn ap_vert(&mut self, m: autopilot::Vert) {
+        let s = autopilot::State::of(&self.plane);
+        if !self.ap.on && self.ap.alt == 0.0 {
+            self.ap.sync(&s);
+        }
+        if m == autopilot::Vert::Vs && self.ap.vert == autopilot::Vert::Vs {
+            self.ap.set_vert(autopilot::Vert::Alt, &s);
+        } else {
+            self.ap.set_vert(m, &s);
+        }
+        if !self.ap.on {
+            self.ap_toggle();
+        }
+    }
+
+    /// The flight panel's Autopilot page: the mode buttons and the settings.
+    fn autopilot_page(&mut self, ui: &mut egui::Ui) {
+        use autopilot::{Lat, Vert};
+        use egui::RichText;
+        use menu::{ACCENT, DIM};
+        let s = autopilot::State::of(&self.plane);
+        let (on, armed) = self.ap.annunciation();
+        let green = egui::Color32::from_rgb(120, 230, 140);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(if self.ap.on { "AP" } else { "AP OFF" }).monospace().size(14.0).strong().color(if self.ap.on { green } else { DIM }));
+            if self.ap.on {
+                for m in &on {
+                    ui.label(RichText::new(m).monospace().size(14.0).color(green));
+                }
+                for m in &armed {
+                    ui.label(RichText::new(m).monospace().size(14.0).color(DIM));
+                }
+            }
+        });
+        ui.add_space(4.0);
+        let btn = |ui: &mut egui::Ui, label: &str, lit: bool| ui.add(egui::Button::new(RichText::new(label).monospace().size(13.0).color(if lit { egui::Color32::BLACK } else { egui::Color32::WHITE })).fill(if lit { green } else { egui::Color32::from_gray(45) }).min_size(egui::vec2(52.0, 26.0))).clicked();
+        let mut lat = None;
+        let mut vert = None;
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            toggle = btn(ui, "AP", self.ap.on);
+            for (m, n) in [(Lat::Hdg, "HDG"), (Lat::Nav, "NAV"), (Lat::Apr, "APR")] {
+                if btn(ui, n, self.ap.on && self.ap.lat == m) {
+                    lat = Some(m);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            for (m, n) in [(Vert::Alt, "ALT"), (Vert::Vs, "VS")] {
+                if btn(ui, n, self.ap.on && (self.ap.vert == m || (m == Vert::Alt && self.ap.vert == Vert::Gs && false))) {
+                    vert = Some(m);
+                }
+            }
+            if btn(ui, "AT", self.ap.at) {
+                self.ap.at = !self.ap.at;
+                if self.ap.at && self.ap.spd <= 0.0 {
+                    self.ap.spd = s.ias;
+                }
+            }
+        });
+        if toggle {
+            self.ap_toggle();
+        }
+        if let Some(m) = lat {
+            self.ap_lat(m);
+        }
+        if let Some(m) = vert {
+            self.ap_vert(m);
+        }
+        ui.add_space(6.0);
+        // The settings: −/+ and SYNC to the aircraft's own.
+        let row = |ui: &mut egui::Ui, name: &str, value: String, minus: &mut bool, plus: &mut bool, sync: &mut bool| {
+            ui.horizontal(|ui| {
+                ui.add_sized([44.0, 22.0], egui::Label::new(RichText::new(name).monospace().color(DIM)));
+                *minus = hold_repeat(&ui.add_sized([28.0, 22.0], egui::Button::new("−")));
+                ui.add_sized([86.0, 22.0], egui::Label::new(RichText::new(value).monospace().size(14.0).color(ACCENT)));
+                *plus = hold_repeat(&ui.add_sized([28.0, 22.0], egui::Button::new("+")));
+                *sync = ui.small_button("SYNC").clicked();
+            });
+        };
+        let (mut m, mut p, mut y) = (false, false, false);
+        row(ui, "HDG", format!("{:03.0}°", self.ap.hdg.rem_euclid(360.0)), &mut m, &mut p, &mut y);
+        if m || p {
+            self.ap.hdg = (self.ap.hdg + if p { 5.0 } else { -5.0 }).rem_euclid(360.0);
+        }
+        if y {
+            self.ap.hdg = s.hdg.round();
+        }
+        let (mut m, mut p, mut y) = (false, false, false);
+        row(ui, "ALT", format!("{:.0} ft", self.ap.alt * 3.28084), &mut m, &mut p, &mut y);
+        if m || p {
+            self.ap.alt = (((self.ap.alt * 3.28084 / 100.0).round() * 100.0 + if p { 100.0 } else { -100.0 }).max(0.0)) / 3.28084;
+        }
+        if y {
+            self.ap.alt = (s.alt * 3.28084 / 100.0).round() * 100.0 / 3.28084;
+        }
+        let (mut m, mut p, mut y) = (false, false, false);
+        row(ui, "VS", format!("{:+.0} fpm", self.ap.vs * 196.85), &mut m, &mut p, &mut y);
+        if m || p {
+            self.ap.vs = ((self.ap.vs * 196.85 / 100.0).round() * 100.0 + if p { 100.0 } else { -100.0 }).clamp(-4000.0, 4000.0) / 196.85;
+        }
+        if y {
+            self.ap.vs = (s.vs * 196.85 / 100.0).round() * 100.0 / 196.85;
+        }
+        let (mut m, mut p, mut y) = (false, false, false);
+        row(ui, "SPD", format!("{:.0} kt", self.ap.spd * 1.943_84), &mut m, &mut p, &mut y);
+        if m || p {
+            self.ap.spd = ((self.ap.spd * 1.943_84).round() + if p { 5.0 } else { -5.0 }).max(40.0) / 1.943_84;
+        }
+        if y {
+            self.ap.spd = s.ias;
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new(t!(
+            "F5 autopilot on/off · 7 HDG · 8 NAV · 9 APR (ILS) · 0 ALT · − / = heading bug · ; / ' altitude. NAV and APR follow NAV 1 (Radio page). A firm push on the controls disconnects it.",
+            "F5 pilote automatique · 7 HDG · 8 NAV · 9 APR (ILS) · 0 ALT · − / = consigne de cap · ; / ' altitude. NAV et APR suivent la NAV 1 (page Radios). Une action franche sur les commandes le déconnecte."
+        )).size(11.5).color(DIM));
+    }
+
     fn radio_page(&mut self, ui: &mut egui::Ui) {
         use egui::RichText;
         use menu::{ACCENT, DIM, TEXT};
@@ -2742,8 +3017,8 @@ impl Game {
             (Nav::Panel, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) => {}
             // Y and the d-pad: master arm and target lock.
             (Nav::Off, Button::DPadLeft) if modifier => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     let on = self.weapons.toggle_arm();
                     self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
@@ -2751,8 +3026,8 @@ impl Game {
                 self.status_until = self.real + 3.0;
             }
             (Nav::Off, Button::DPadRight) if modifier => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     self.weapons.request_cycle();
                 }
@@ -2880,7 +3155,8 @@ impl Game {
             KeyCode::Escape if self.show_help => self.show_help = false,
             KeyCode::Escape if self.wx.open => self.wx.open = false,
             KeyCode::Escape => self.set_pause_menu(true),
-            KeyCode::KeyR => self.respawn_here(),
+            KeyCode::KeyR if self.arcade || self.crashed => self.respawn_here(),
+            KeyCode::KeyR => self.arcade_only(t!("Respawning in flight", "La réapparition en vol")),
             KeyCode::KeyC => self.next_view(),
             KeyCode::KeyF if !self.crashed => self.plane.set_flaps(1),
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
@@ -2901,8 +3177,8 @@ impl Game {
             KeyCode::Backspace if !self.crashed => self.plane.stage_sep(),
             KeyCode::Digit2 if !self.crashed => self.plane.toggle_autoland(),
             KeyCode::Digit3 if !self.crashed => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     let on = self.weapons.toggle_arm();
                     self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
@@ -2910,16 +3186,16 @@ impl Game {
                 self.status_until = self.real + 3.0;
             }
             KeyCode::Digit4 if !self.crashed => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     self.weapons.request_cycle();
                 }
                 self.status_until = self.real + 3.0;
             }
             KeyCode::Digit5 if !self.crashed => {
-                if !self.weapons.has_weapons() {
-                    self.status = t!("No missiles on this aircraft", "Pas de missiles sur cet avion").into();
+                if !self.missiles_ok() {
+                    self.status = self.missiles_refusal().into();
                 } else {
                     self.weapons.request_fire();
                 }
@@ -2929,6 +3205,7 @@ impl Game {
                 self.goto_open = true;
                 self.goto_text.clear();
             }
+            KeyCode::KeyT | KeyCode::KeyY | KeyCode::KeyN | KeyCode::KeyM if !self.arcade => self.arcade_only(t!("The weather and time keys", "Les touches météo et heure")),
             KeyCode::KeyT | KeyCode::KeyY => {
                 // Setting the time by hand leaves real time.
                 self.wx.real_time = false;
@@ -2981,6 +3258,23 @@ impl Game {
             KeyCode::Period => {
                 self.plane.parking_brake = !self.plane.parking_brake;
                 self.status = if self.plane.parking_brake { t!("Parking brake set", "Frein de parc serré") } else { t!("Parking brake released", "Frein de parc desserré") }.into();
+                self.status_until = self.real + 2.0;
+            }
+            KeyCode::F5 if !self.crashed => self.ap_toggle(),
+            KeyCode::Digit7 if !self.crashed => self.ap_lat(autopilot::Lat::Hdg),
+            KeyCode::Digit8 if !self.crashed => self.ap_lat(autopilot::Lat::Nav),
+            KeyCode::Digit9 if !self.crashed => self.ap_lat(autopilot::Lat::Apr),
+            KeyCode::Digit0 if !self.crashed => self.ap_vert(autopilot::Vert::Alt),
+            KeyCode::Minus | KeyCode::Equal => {
+                let d = if code == KeyCode::Minus { -5.0 } else { 5.0 };
+                self.ap.hdg = (self.ap.hdg + d).rem_euclid(360.0);
+                self.status = t!("Heading bug {:03.0}°", "Consigne de cap {:03.0}°", self.ap.hdg);
+                self.status_until = self.real + 2.0;
+            }
+            KeyCode::Semicolon | KeyCode::Quote => {
+                let d = if code == KeyCode::Semicolon { -100.0 } else { 100.0 };
+                self.ap.alt = (((self.ap.alt * 3.28084 / 100.0).round() * 100.0 + d).max(0.0)) / 3.28084;
+                self.status = t!("Altitude preselect {:.0} ft", "Altitude présélectionnée {:.0} ft", self.ap.alt * 3.28084);
                 self.status_until = self.real + 2.0;
             }
             KeyCode::KeyK if !self.crashed => {
@@ -3260,11 +3554,24 @@ impl Game {
                 self.blast_fx(pos, power, size, femit);
                 if let Some(key) = target {
                     let label = self.weapons.target_view.as_ref().map(|v| v.label.clone()).unwrap_or_default();
+                    // Where it was and how it was moving, before it leaves the traffic.
+                    let was = match &key {
+                        weapons::TargetKey::Live(hex) => self.live.planes.iter().find(|p| &p.hex == hex).map(|p| (p.pos, p.vel)),
+                        weapons::TargetKey::Airport { .. } => self.world.air_targets(pos).into_iter().find(|t| t.key == key).map(|t| (t.pos, t.vel)),
+                    };
                     let hit = match &key {
                         weapons::TargetKey::Live(hex) => self.live.down(hex),
                         weapons::TargetKey::Airport { .. } => self.world.down_air_target(&key),
                     };
                     if hit {
+                        let (at, vel) = was.unwrap_or((pos, DVec3::ZERO));
+                        let span = airmodels::TYPES[(size as usize).min(4)].span;
+                        self.kill_fx(at, vel, span, femit);
+                        if let Some(a) = &self.audio {
+                            a.boom((power * 1.5 * (span / 20.0).sqrt()).min(4.0) * (0.2 + 0.8 * near));
+                        }
+                        self.weapon_flash = Some((at, power * (span / 11.0).sqrt() * 2.0, self.real));
+                        self.kills.push(Kill { key, pos: at, vel, span, t: 0.0, acc: 0.0 });
                         let msg = if label.is_empty() { t!("SPLASH", "ABATTU").to_string() } else { t!("SPLASH  {}", "ABATTU  {}", label) };
                         self.flash.push((msg, self.real));
                     }
@@ -3328,6 +3635,149 @@ impl Game {
                 ..Default::default()
             }));
         }
+    }
+
+    /// An aircraft blowing up in the air: its fuel going up in one fireball
+    /// sized to the airframe (`span`, m), with burning wreckage thrown out
+    /// along its line of flight and a pall of black smoke left hanging.
+    fn kill_fx(&mut self, at: DVec3, vel: DVec3, span: f32, femit: &mut Vec<(DVec3, render::Particle)>) {
+        self.anchor_fx(at);
+        let up = at.normalize().as_vec3();
+        // Linear size from a light single (11 m span) up to a wide-body.
+        let s = (span / 11.0).clamp(0.8, 6.0);
+        let carry = vel.as_vec3() * 0.35;
+        let r = &mut self.rng;
+        femit.push((at, render::Particle { life: 0.45, size0: 18.0 * s, size1: 70.0 * s, kind: crash::FLASH, alpha: 2.5, ..Default::default() }));
+        let n = (40.0 + 14.0 * s) as usize;
+        for _ in 0..n {
+            let d = r.dir();
+            let off = d * r.range(0.0, 0.4) * span;
+            femit.push((at + off.as_dvec3(), render::Particle {
+                vel: (carry + d * r.range(10.0, 32.0) * s.sqrt() + up * r.range(2.0, 8.0)).into(),
+                life: r.range(2.5, 5.0) * s.sqrt(),
+                size0: r.range(3.0, 6.0) * s,
+                size1: r.range(12.0, 26.0) * s,
+                temp: r.range(2.4, 3.4),
+                kind: crash::GAS,
+                drag: r.range(1.0, 1.8),
+                buoy: r.range(5.0, 10.0),
+                seed: r.f(),
+                alpha: r.range(0.8, 1.0),
+                ..Default::default()
+            }));
+        }
+        for _ in 0..(50.0 + 20.0 * s) as usize {
+            let d = r.dir();
+            femit.push((at, render::Particle {
+                vel: (vel.as_vec3() * 0.6 + d * r.range(25.0, 110.0) * s.sqrt()).into(),
+                life: r.range(1.5, 4.5),
+                size0: r.range(0.1, 0.3) * s.sqrt(),
+                size1: 0.05,
+                kind: crash::SPARK,
+                drag: r.range(0.1, 0.5),
+                seed: r.f(),
+                alpha: r.range(0.7, 1.0),
+                ..Default::default()
+            }));
+        }
+        for _ in 0..(20.0 + 8.0 * s) as usize {
+            let d = r.dir();
+            femit.push((at + (d * r.range(0.0, 0.5) * span).as_dvec3(), render::Particle {
+                vel: (carry * 0.4 + d * r.range(2.0, 9.0) * s.sqrt() + up * r.range(0.5, 3.0)).into(),
+                life: r.range(10.0, 20.0),
+                size0: r.range(4.0, 8.0) * s,
+                size1: r.range(20.0, 40.0) * s,
+                temp: 0.05,
+                kind: crash::GAS,
+                drag: r.range(0.8, 1.4),
+                buoy: r.range(1.0, 3.0),
+                seed: r.f(),
+                alpha: r.range(0.45, 0.7),
+                ..Default::default()
+            }));
+        }
+    }
+
+    /// Shot-down aircraft on their way down: a fire and smoke trail behind
+    /// each, and a second explosion where it hits the ground (or the sea).
+    fn step_kills(&mut self, dt: f64, femit: &mut Vec<(DVec3, render::Particle)>) {
+        let mut kills = std::mem::take(&mut self.kills);
+        kills.retain_mut(|k| {
+            k.t += dt;
+            match &k.key {
+                weapons::TargetKey::Live(hex) => match self.live.planes.iter().find(|p| &p.hex == hex) {
+                    // The live feed tumbles it down itself.
+                    Some(p) => {
+                        k.pos = p.pos;
+                        k.vel = p.vel;
+                    }
+                    None => return false,
+                },
+                _ => {
+                    let down = k.pos.normalize();
+                    k.vel = (k.vel - down * 9.81 * dt) * (-dt * 0.15).exp();
+                    k.pos += k.vel * dt;
+                }
+            }
+            let (la, lo, h) = geo::pos_to_lla(k.pos);
+            let ground = if h < 0.0 { Some(0.0) } else { self.world.ground(la, lo).map(|g| g.h).filter(|g| h < g + 2.0) };
+            if let Some(g) = ground {
+                let at = geo::lla_to_pos(la, lo, g.max(0.0) + 2.0);
+                self.kill_fx(at, DVec3::ZERO, k.span * 0.8, femit);
+                if let Some(a) = &self.audio {
+                    let near = 1.0 / (1.0 + ((self.cam_pos - at).length() as f32 / 500.0).powi(2));
+                    a.boom((1.5 * (k.span / 20.0).sqrt()).min(3.0) * (0.2 + 0.8 * near));
+                }
+                self.weapon_flash = Some((at, 2.0 * (k.span / 11.0).sqrt(), self.real));
+                if let weapons::TargetKey::Live(hex) = &k.key {
+                    self.live.remove(hex);
+                }
+                return false;
+            }
+            if k.t > 60.0 {
+                return false;
+            }
+            // The trail: a burning fuel fire close behind, black smoke after.
+            let s = (k.span / 11.0).clamp(0.8, 6.0);
+            let burn = (1.0 - k.t as f32 / 50.0).max(0.3);
+            k.acc += dt * 30.0;
+            self.anchor_fx(k.pos);
+            let r = &mut self.rng;
+            while k.acc >= 1.0 {
+                k.acc -= 1.0;
+                let back = k.pos - k.vel * dt * r.f() as f64;
+                femit.push((back, render::Particle {
+                    vel: (k.vel.as_vec3() * 0.15 + r.dir() * 2.0 * s.sqrt()).into(),
+                    life: r.range(0.6, 1.4),
+                    size0: r.range(1.5, 3.0) * s * burn,
+                    size1: r.range(4.0, 8.0) * s * burn,
+                    temp: r.range(2.0, 3.0),
+                    kind: crash::GAS,
+                    drag: 2.0,
+                    buoy: 4.0,
+                    seed: r.f(),
+                    alpha: 0.9,
+                    ..Default::default()
+                }));
+                femit.push((back, render::Particle {
+                    vel: (k.vel.as_vec3() * 0.05 + r.dir() * 1.5).into(),
+                    life: r.range(8.0, 16.0),
+                    size0: r.range(2.0, 4.0) * s,
+                    size1: r.range(10.0, 22.0) * s,
+                    temp: 0.05,
+                    kind: crash::GAS,
+                    drag: 1.5,
+                    buoy: r.range(0.5, 1.5),
+                    seed: r.f(),
+                    alpha: r.range(0.4, 0.6),
+                    ..Default::default()
+                }));
+            }
+            true
+        });
+        // Anything that went down this step was added while we held the list.
+        kills.append(&mut self.kills);
+        self.kills = kills;
     }
 
     /// Knock a building down, with any parts standing on it.
@@ -3498,6 +3948,7 @@ impl Game {
         let live = !self.crashed && !in_menu && dt > 0.0;
         if live {
             self.warn.seeker = self.weapons.seeker_tone;
+            self.warn.ap_off = self.real - self.ap_off_t < 1.5;
         }
         let p = &self.plane;
         let up = p.pos.normalize();
@@ -3582,7 +4033,7 @@ impl Game {
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone() }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone() }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
@@ -3779,7 +4230,7 @@ impl Game {
         let mut femit: Vec<(DVec3, render::Particle)> = Vec::new();
         let (mut scrape_n, mut steps) = (0usize, 0usize);
         if !self.crashed && !in_menu {
-            let weapon_targets = if !self.weapons.has_weapons() {
+            let weapon_targets = if !self.missiles_ok() {
                 Vec::new()
             } else {
                 let mut t = self.live.targets();
@@ -3933,6 +4384,9 @@ impl Game {
                     break;
                 }
             }
+        }
+        if dt > 0.0 && !self.kills.is_empty() {
+            self.step_kills(dt, &mut femit);
         }
         if dt > 0.0 {
             self.destr.update(dt as f32, &self.world, &mut femit);
@@ -4671,11 +5125,13 @@ impl Game {
         }
         self.live.step(&self.src, (!in_menu).then_some(self.plane.pos));
         if !in_menu {
-            // A downed aircraft that has reached the ground is gone.
+            // A downed aircraft that has reached the ground is gone (see
+            // `step_kills`); one that outlived its kill entry goes here.
             let mut gone = Vec::new();
             for p in self.live.planes.iter().filter(|p| p.downed > 0.0) {
                 let (la, lo, h) = geo::pos_to_lla(p.pos);
-                if h < 0.0 || self.world.ground(la, lo).is_some_and(|g| h < g.h + 2.0) {
+                let tracked = self.kills.iter().any(|k| matches!(&k.key, weapons::TargetKey::Live(x) if *x == p.hex));
+                if !tracked && (h < 0.0 || self.world.ground(la, lo).is_some_and(|g| h < g.h + 2.0)) {
                     gone.push(p.hex.clone());
                 }
             }
@@ -4726,7 +5182,7 @@ impl Game {
         g.cut = pf.cut;
         g.cut_v = pf.cut_v;
         casc_vp[render::MASK_SLOT] = g.photo_vp;
-        let (tiles, details, near) = self.world.draw_lists(cam, focus_abs, CASC);
+        let (tiles, tess, details, near) = self.world.draw_lists(cam, focus_abs, CASC);
         let cover = self.world.light_cover(cam);
         // The shore distance field: a step of its rebuild this frame.
         let sf = self.shore.frame(cam);
@@ -4775,7 +5231,7 @@ impl Game {
             self.lightning.segments(cam, dt, &mut bolts);
         }
         let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
-        self.r.render(Frame { rain_drops, bolts, g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px });
+        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
@@ -5526,6 +5982,7 @@ impl Game {
                             });
                         }
                         Page::Radio => self.radio_page(ui),
+                        Page::Autopilot => self.autopilot_page(ui),
                         Page::Weather => {
                             ui.spacing_mut().slider_width = 140.0;
                             self.wx.controls(ui, &mut self.utc, &mut self.doy, lon, false);
@@ -6906,4 +7363,49 @@ fn open_gamepads() -> Option<gilrs::Gilrs> {
         log::info!("gamepad: {} mapping {:?}", p.os_name(), p.mapping_source());
     }
     Some(g)
+}
+
+/// A button that steps once when pressed, then repeats while held
+/// (after 0.4 s, ten steps a second, speeding to twenty-five after 2 s).
+fn hold_repeat(r: &egui::Response) -> bool {
+    let id = r.id.with("hold_repeat");
+    // Keep holding while the primary button stays down over the button —
+    // egui's own press tracking drops out after a long press.
+    let held_on = r.ctx.input(|i| {
+        i.pointer.primary_down() && i.pointer.interact_pos().is_some_and(|p| r.rect.contains(p))
+    });
+    let started = r.ctx.data(|d| d.get_temp::<(f64, u32)>(id).is_some());
+    if !(r.is_pointer_button_down_on() || (started && held_on)) {
+        r.ctx.data_mut(|d| d.remove::<(f64, u32)>(id));
+        return false;
+    }
+    r.ctx.request_repaint();
+    let t = r.ctx.input(|i| i.time);
+    let (start, fired) = r.ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || (t, 0u32)));
+    let held = t - start;
+    let due = if held < 0.4 {
+        1
+    } else if held < 2.0 {
+        1 + ((held - 0.4) / 0.1) as u32
+    } else {
+        17 + ((held - 2.0) / 0.04) as u32
+    };
+    if due > fired {
+        r.ctx.data_mut(|d| d.insert_temp(id, (start, fired + 1)));
+        true
+    } else {
+        false
+    }
+}
+
+/// An aircraft shot down, on its way to the ground.
+struct Kill {
+    key: weapons::TargetKey,
+    pos: DVec3,
+    vel: DVec3,
+    /// its wingspan (m), which sizes the fire and the explosions
+    span: f32,
+    /// seconds since the hit, and the trail particles owed
+    t: f64,
+    acc: f64,
 }

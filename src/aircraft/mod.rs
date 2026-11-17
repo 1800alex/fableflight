@@ -595,6 +595,11 @@ impl Spec {
     pub fn is_jet(&self) -> bool {
         matches!(self.engine, Engine::Fan(_))
     }
+    /// It has a real afterburner or reheat (the boost key works in every
+    /// mode); otherwise boost is the game's own, for arcade mode only.
+    pub fn real_boost(&self) -> bool {
+        matches!(&self.engine, Engine::Fan(f) if f.boost >= 1.2)
+    }
     pub fn rocket(&self) -> Option<&Rocket> {
         match &self.engine {
             Engine::Rocket(r) => Some(r),
@@ -660,5 +665,20 @@ mod hotspot_tests {
             // Looking out ahead, at the horizon: nothing.
             assert_eq!(pick(s.hotspots, s.eye, Vec3::new(0.0, 0.05, -1.0).normalize()), None, "{}", s.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod boost_tests {
+    use super::*;
+
+    /// Real afterburners and reheat work in every mode; the game's own boost
+    /// (pistons, the 747) is arcade mode's.
+    #[test]
+    fn real_afterburners() {
+        let real: Vec<&str> = BUILTIN.iter().filter(|s| s.real_boost()).map(|s| s.keys[0]).collect();
+        let want: Vec<&str> = BUILTIN.iter().map(|s| s.keys[0]).filter(|k| ["fa18", "f4", "f22", "sr71", "concorde"].iter().any(|w| k.contains(w))).collect();
+        assert_eq!(real, want, "keys: {:?}", BUILTIN.iter().map(|s| s.keys[0]).collect::<Vec<_>>());
+        assert!(!c172::SPEC.real_boost() && !b747::SPEC.real_boost());
     }
 }
