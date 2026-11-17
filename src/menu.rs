@@ -1,6 +1,6 @@
 //! Main menu: the planet itself is the map. Spin it, zoom in, click where
 //! you want to start.
-use crate::geo;
+use crate::{geo, t};
 use glam::DVec3;
 
 /// (name, latitude, longitude, tier). Tier 1 is always labelled, tier 2 once zoomed in a little.
@@ -123,8 +123,19 @@ pub struct Menu {
     pub start_agl: f64,
     /// airport markers drawn on the globe last frame: (index, x, y in physical pixels)
     pub markers: Vec<(u32, f32, f32)>,
-    /// which aircraft to fly (index into `aircraft::ALL`)
+    /// which aircraft to fly (index into `aircraft::list()`)
     pub aircraft: usize,
+    /// the hangar (every aircraft, and more to download) while it is open
+    pub hangar: Option<crate::hangar_ui::Tab>,
+    /// the collection entry picked out on its download page, what its search has, and whether it lists the unflyable ones too
+    pub hangar_sel: Option<String>,
+    pub hangar_find: String,
+    pub hangar_all: bool,
+    /// fuel to start with (fraction of full tanks), and an engine left off for a start on the ground
+    pub fuel: f64,
+    pub cold: bool,
+    /// payload, as a fraction of the most the aircraft takes (None: as it comes)
+    pub payload: Option<f64>,
 }
 
 /// How to start at an airport chosen on the globe.
@@ -140,7 +151,7 @@ pub enum Start {
 
 impl Menu {
     pub fn new(lat: f64, lon: f64, hour: f64) -> Self {
-        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, show_controls: false, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0 }
+        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, show_controls: false, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, hangar: None, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
     }
 
     pub fn look_at(&mut self, lat: f64, lon: f64, alt: f64) {
@@ -238,28 +249,32 @@ pub const GLASS: Color32 = Color32::from_rgba_premultiplied(5, 8, 12, 140);
 pub enum Page {
     Flight,
     Places,
+    Radio,
     Weather,
     Game,
     Settings,
     Graphics,
     Controls,
     Bindings,
+    Failures,
 }
 
 impl Page {
-    pub const INFO: [Page; 3] = [Page::Flight, Page::Places, Page::Weather];
-    pub const PAUSE: [Page; 5] = [Page::Game, Page::Settings, Page::Graphics, Page::Controls, Page::Bindings];
+    pub const INFO: [Page; 4] = [Page::Flight, Page::Places, Page::Radio, Page::Weather];
+    pub const PAUSE: [Page; 6] = [Page::Game, Page::Settings, Page::Graphics, Page::Controls, Page::Bindings, Page::Failures];
 
     pub fn name(self) -> &'static str {
         match self {
             Page::Flight => "Flight",
             Page::Places => "Go to",
+            Page::Radio => "Radio",
             Page::Weather => "Weather",
             Page::Game => "Game",
             Page::Settings => "Settings",
             Page::Graphics => "Graphics",
             Page::Controls => "Controls",
             Page::Bindings => "Bindings",
+            Page::Failures => "Failures",
         }
     }
 
@@ -303,9 +318,18 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("F / V", "flaps down / up a notch"),
         ("L", "landing gear down / up"),
         ("/", "speedbrake (airliners)"),
+        ("6", "slide the canopy open / shut (Robin)"),
         ("Z", "thrust reversers, on the ground (hold)"),
         ("K", "set the heading indicator to the compass"),
         ("Num 7 / Num 1", "trim nose down / up"),
+        ("F4", "start / stop the engine (automatic)"),
+        ("Ins", "battery master switch"),
+        ("I", "magnetos on / off (jets: fuel controls)"),
+        ("O", "starter (hold; jets: engage)"),
+        ("Page Up / Down", "mixture richer / leaner"),
+        ("J", "navigation instruments (VOR, ILS, ADF)"),
+        ("[ / ]", "OBS course left / right"),
+        ("X", "altimeter to the QNH"),
         (".", "parking brake"),
     ]),
     ("VIEW", &[
@@ -313,6 +337,7 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("Mouse drag", "look around"),
         ("Mouse wheel", "camera distance / cockpit zoom"),
         ("H", "hide / show the HUD"),
+        ("`", "hide / show the minimap"),
         ("F12", "screenshot"),
     ]),
     ("WORLD", &[
@@ -493,14 +518,15 @@ pub fn key_row(ui: &mut egui::Ui, keys: &'static str, what: &'static str) {
     egui::Frame::new().fill(Color32::from_rgb(38, 45, 56)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 0)).show(ui, |ui| {
         ui.label(RichText::new(tr(keys)).monospace().size(12.0).color(Color32::WHITE));
     });
-    ui.label(RichText::new(tr(what)).size(13.0).color(TEXT));
+    // Truncate the description so a long one can't spill into the next column.
+    ui.add(egui::Label::new(RichText::new(tr(what)).size(13.0).color(TEXT)).truncate());
     ui.end_row();
 }
 
 /// One `buttons … action` row of the gamepad controls list.
 pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &'static str) {
     padui::glyphs(ui, spec, 20.0);
-    ui.label(RichText::new(tr(what)).size(13.0).color(TEXT));
+    ui.add(egui::Label::new(RichText::new(tr(what)).size(13.0).color(TEXT)).truncate());
     ui.end_row();
 }
 
@@ -564,21 +590,68 @@ pub fn controls_list(ui: &mut egui::Ui) {
         });
         return;
     }
-    let half = (CONTROLS.len() + 1) / 2;
+    let count = (CONTROLS.len() + 1) / 2;
+    let col_w = (ui.available_width() - 8.0) / 2.0;
     ui.columns(2, |cols| {
         for (c, ui) in cols.iter_mut().enumerate() {
-            let range = if c == 0 { 0..half } else { half..CONTROLS.len() };
+            ui.set_max_width(col_w);
+            let range = if c == 0 { 0..count } else { count..CONTROLS.len() };
             for (title, rows) in &CONTROLS[range] {
                 heading(ui, tr(title));
-                egui::Grid::new(("keys", *title)).num_columns(2).min_row_height(19.0).spacing([10.0, 3.0]).show(ui, |ui| {
-                    for (k, w) in rows.iter() {
-                        key_row(ui, k, w);
-                    }
-                });
+                egui::Grid::new(("keys", *title))
+                    .num_columns(2)
+                    .min_row_height(19.0)
+                    .spacing([10.0, 3.0])
+                    .show(ui, |ui| {
+                        for (k, w) in rows.iter() {
+                            key_row(ui, k, w);
+                        }
+                    });
                 ui.add_space(4.0);
             }
         }
     });
+}
+
+/// North stays at the top; headings increase clockwise, as in the flight model.
+pub fn heading_compass(ui: &mut egui::Ui, heading: &mut f64) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(116.0, 116.0), egui::Sense::click_and_drag());
+    let center = rect.center();
+    if (response.clicked() || response.dragged()) && ui.is_enabled() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let delta = pointer - center;
+            if delta.length_sq() > 36.0 {
+                let degrees = (delta.x as f64).atan2(-delta.y as f64).to_degrees();
+                *heading = degrees.round().rem_euclid(360.0).to_radians();
+            }
+        }
+    }
+    response.on_hover_text(t!("Click or drag to choose your heading", "Cliquez ou glissez pour choisir le cap"));
+    let painter = ui.painter();
+    painter.circle_filled(center, 39.0, Color32::from_rgb(20, 26, 33));
+    painter.circle_stroke(center, 39.0, egui::Stroke::new(1.0, DIM));
+    for i in 0..24 {
+        let angle = i as f32 * std::f32::consts::TAU / 24.0;
+        let direction = egui::vec2(angle.sin(), -angle.cos());
+        let inner = if i % 6 == 0 { 31.0 } else { 35.0 };
+        painter.line_segment([center + direction * inner, center + direction * 39.0], egui::Stroke::new(1.0, DIM));
+    }
+    for (label, offset) in [
+        ("N", egui::vec2(0.0, -49.0)),
+        ("E", egui::vec2(49.0, 0.0)),
+        ("S", egui::vec2(0.0, 49.0)),
+        (t!("W", "O"), egui::vec2(-49.0, 0.0)),
+    ] {
+        painter.text(center + offset, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), if label == "N" { ACCENT } else { TEXT });
+    }
+    let direction = egui::vec2(heading.sin() as f32, -heading.cos() as f32);
+    let side = egui::vec2(-direction.y, direction.x);
+    painter.line_segment([center - direction * 21.0, center + direction * 20.0], egui::Stroke::new(3.0, ACCENT));
+    painter.add(egui::Shape::convex_polygon(
+        vec![center + direction * 31.0, center + direction * 15.0 + side * 7.0, center + direction * 15.0 - side * 7.0],
+        ACCENT, egui::Stroke::NONE,
+    ));
+    painter.circle_filled(center, 3.5, ACCENT);
 }
 
 /// "hh:mm" for an hour of the day.

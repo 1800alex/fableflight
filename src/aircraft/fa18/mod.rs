@@ -24,7 +24,7 @@ use crate::render::PartVertex;
 use std::collections::HashMap;
 use std::io::Read;
 
-mod pit;
+pub(crate) mod pit;
 
 const KT: f64 = 1.0 / 1.94384;
 
@@ -102,12 +102,12 @@ const EYE: Vec3 = Vec3::new(0.0, 1.0, -4.55);
 
 // ---------------------------------------------------------------- the model
 
-struct Obj {
-    pivot: Vec3,
-    axis: Vec3,
+pub(crate) struct Obj {
+    pub(crate) pivot: Vec3,
+    pub(crate) axis: Vec3,
     /// the gear legs: how far they turn to stow (rad)
-    angle: f32,
-    mesh: Mesh,
+    pub(crate) angle: f32,
+    pub(crate) mesh: Mesh,
 }
 
 struct Reader<'a> {
@@ -131,13 +131,13 @@ impl Reader<'_> {
     }
 }
 
-/// The pieces exported from Blender, by name.
-fn load() -> HashMap<String, Obj> {
+/// The pieces exported from Blender (a gzipped model file of `what`), by name.
+pub(crate) fn load(gz: &[u8], what: &str) -> HashMap<String, Obj> {
     let mut raw = Vec::new();
-    flate2::read::GzDecoder::new(&include_bytes!("../../../assets/fa18.bin.gz")[..]).read_to_end(&mut raw).expect("fa18 model");
+    flate2::read::GzDecoder::new(gz).read_to_end(&mut raw).unwrap_or_else(|_| panic!("{what} model"));
     let mut r = Reader { b: &raw, at: 0 };
-    assert_eq!(r.take(4), b"FFAC", "fa18 model: not a model file");
-    assert_eq!(r.u32(), 1, "fa18 model: unknown version");
+    assert_eq!(r.take(4), b"FFAC", "{what} model: not a model file");
+    assert_eq!(r.u32(), 1, "{what} model: unknown version");
     let n = r.u32();
     let mut out = HashMap::new();
     for _ in 0..n {
@@ -187,6 +187,8 @@ const PIECES: &[(&str, usize, Role, Option<&str>)] = &[
     ("right aileron", G_RWING, Role::Aileron(1), None),
     ("left tip rail", G_LWING, Role::Other, None),
     ("right tip rail", G_RWING, Role::Other, None),
+    ("left sidewinder", G_LWING, Role::Other, None),
+    ("right sidewinder", G_RWING, Role::Other, None),
     ("left nav light", G_LWING, Role::Other, None),
     ("right nav light", G_RWING, Role::Other, None),
     ("left stabilator", G_TAIL, Role::Elevator, None),
@@ -260,7 +262,7 @@ fn anim(name: &str, stow: f32) -> Anim {
 }
 
 pub fn build() -> Model {
-    let objs = load();
+    let objs = load(include_bytes!("../../../assets/fa18.bin.gz"), "fa18");
     let mut b = Builder::default();
     let mut at: HashMap<&str, usize> = HashMap::new();
     for &(name, group, role, parent) in PIECES {
@@ -319,12 +321,21 @@ const fn main_leg(x: f64, name: &'static str, kick: f64) -> Leg {
     }
 }
 
+/// Its two wingtip Sidewinders (the pieces split out of the tip rails).
+pub static MISSILES: [MissileStation; 2] = [
+    MissileStation { piece: "left sidewinder", side: 0, name: "L WINGTIP" },
+    MissileStation { piece: "right sidewinder", side: 1, name: "R WINGTIP" },
+];
+
 pub static SPEC: Spec = Spec {
     id: 2,
     name: "F/A-18C Hornet",
     keys: &["fa18", "f18", "fa-18", "f/a-18", "hornet"],
-    blurb: "Twin-engine carrier fighter, 15.5 t. Fly-by-wire holds it to 7.5 g; Space for afterburner, / speedbrake. 135 kt approach.",
+    origin: None,
+    ext: None,
+    blurb: "Twin-engine carrier fighter, 15.5 t. Fly-by-wire holds it to 7.5 g; Space for afterburner, / speedbrake. 135 kt approach. 3 master arm, 4 lock, 5 fire.",
     still: include_bytes!("../../../assets/aircraft/fa18.png"),
+    paint: Some(Paint { jpg: include_bytes!("../../../assets/fa18_paint.jpg"), views: 3, span: 13.2, length: 19.8, centre: [0.4, 1.0], relief: 1.0, sheen: 0.0 }),
     build,
     groups: [("fuselage", 6_500.0), ("tail", 900.0), ("left wing", 1_200.0), ("right wing", 1_200.0), ("nose section", 900.0), ("radome", 60.0), ("gear", 500.0)],
     span: W_X1,
@@ -345,6 +356,7 @@ pub static SPEC: Spec = Spec {
         stab_tip: DVec3::new(3.25, -0.2, 7.6),
     },
     eye: EYE,
+    eye2: None,
     sees_inside: pit::sees_inside,
     contacts: &[
         ([0.0, -0.03, -8.9], Part::Nose),
@@ -404,6 +416,14 @@ pub static SPEC: Spec = Spec {
     hole: Hole { fus: [1.1, 0.72, -0.05, 0.4], wing: [0.12, -W_ANH, 0.10, 0.04], stab: [-0.15, 0.06, 3.3], fin: [0.25, 2.6, 0.06, 0.025], pods: [[0.0; 3]; 2] },
     // About 15.5 t: full internal fuel and a pair of Sidewinders (empty 10.4 t, maximum 23.4 t).
     mass: 15_500.0,
+    // 4,900 kg inside; two F404s: about 0.2 kg/s idling, 2.4 at military power, 12 in full afterburner
+    fuel_kg: 4_900.0,
+    fuel_flow: [0.2, 2.4, 12.0],
+    // (Its pilot is all the payload there is.)
+    payload: [100.0, 100.0, 0.0],
+    mac: 3.51,
+    cg: [0.22, 0.16, 0.30],
+    fuel_arm: 0.4,
     // Pitch, yaw, roll (NASA's F/A-18 HARV simulation data).
     inertia: DVec3::new(165.7e3, 205.1e3, 31.2e3),
     wing_area: 37.16,
@@ -424,16 +444,20 @@ pub static SPEC: Spec = Spec {
     cd_wave: 0.032,
     spoiler_cd: 0.045,
     spoiler_cl: 0.0,
+    chute: None,
     // Flaps: up, half, full.
     flaps: &[0.0, 30.0, 45.0],
     vfe: &[1e9, 250.0 * KT, 230.0 * KT],
     flap_rate: 0.3,
     slats_at: 1,
+    lever: None,
     gear_rate: 1.0 / 5.0,
     // 750 kt, Mach 1.8.
     vne: 750.0 * KT,
     mmo: 1.8,
     flutter_v: 820.0 * KT,
+    inlet_mach: 0.0,
+    dry_mach: 0.0,
     g_limit: 9.0,
     g_break: 12.5,
     fbw_g: 7.5,
@@ -441,7 +465,7 @@ pub static SPEC: Spec = Spec {
     steer_fade: 15.0,
     // Two F404-GE-402s: 79.2 kN each in afterburner (Space); the dry figure is a
     // little under the book 48.9 kN so it does not supercruise down low.
-    engine: Engine::Fan(Fan { n: 2, thrust: 44_000.0, idle: 0.62, idle_thrust: 0.06, n1_rpm: 13_200.0, spool_up: 1.0, spool_down: 0.8, reverse: 0.0, reverser_time: 1.0, boost: 1.8, mach_lapse: [0.25, 0.45] }),
+    engine: Engine::Fan(Fan { n: 2, thrust: 44_000.0, idle: 0.62, idle_thrust: 0.06, n1_rpm: 13_200.0, spool_up: 1.0, spool_down: 0.8, reverse: 0.0, reverser_time: 1.0, boost: 1.8, mach_lapse: [0.25, 0.45], nozzle_z: 8.0 }),
     handling: Handling {
         q_ref: 8_000.0,
         a_max: 3.5,
@@ -491,6 +515,14 @@ mod tests {
         assert!((len - 17.07).abs() < 0.3, "{len}");
         assert!((span - 12.31).abs() < 0.3, "{span}");
         assert!((top - 4.66).abs() < 0.3, "{top}");
+    }
+
+    #[test]
+    fn missile_pieces_are_in_the_model() {
+        let m = build();
+        for st in &MISSILES {
+            assert!(m.pieces.iter().any(|p| p.name == st.piece), "missing {}", st.piece);
+        }
     }
 
     #[test]

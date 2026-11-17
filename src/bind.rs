@@ -117,11 +117,29 @@ pub const ACTIONS: &[Action] = &[
     act("flaps_up", KeyCode::KeyV, "Flaps up a notch", "Volets : rentrer d'un cran"),
     act("gear", KeyCode::KeyL, "Landing gear", "Train d'atterrissage"),
     act("speedbrake", KeyCode::Slash, "Speedbrake", "Aérofreins"),
+    act("canopy", KeyCode::Digit6, "Canopy open / shut", "Verrière : ouvrir / fermer"),
     act("reversers", KeyCode::KeyZ, "Thrust reversers (hold)", "Inverseurs de poussée (maintenir)"),
     act("boost", KeyCode::Space, "Boost / afterburner", "Boost / postcombustion"),
+    act("engines", KeyCode::Digit1, "Rocket: which engines burn", "Fusée : choix des moteurs allumés"),
+    act("stage", KeyCode::Backspace, "Rocket: drop the booster", "Fusée : larguer le booster"),
+    act("autoland", KeyCode::Digit2, "Rocket: the ship lands itself", "Fusée : atterrissage automatique du vaisseau"),
+    act("master_arm", KeyCode::Digit3, "Master arm", "Armement maître"),
+    act("target_lock", KeyCode::Digit4, "Lock / cycle target", "Verrouiller / changer de cible"),
+    act("fire_missile", KeyCode::Digit5, "Fire missile", "Tirer un missile"),
+    act("engine_auto", KeyCode::F4, "Start / stop the engine", "Démarrer / couper le moteur"),
+    act("master", KeyCode::Insert, "Battery master switch", "Batterie (interrupteur général)"),
+    act("ignition", KeyCode::KeyI, "Magnetos (jets: fuel controls)", "Magnétos (jets : robinets carburant)"),
+    act("starter", KeyCode::KeyO, "Starter", "Démarreur"),
+    act("mixture_rich", KeyCode::PageUp, "Mixture richer", "Mélange plus riche"),
+    act("mixture_lean", KeyCode::PageDown, "Mixture leaner", "Mélange plus pauvre"),
+    act("nav_display", KeyCode::KeyJ, "Navigation instruments", "Instruments de navigation"),
+    act("obs_left", KeyCode::BracketLeft, "OBS course left", "OBS : course à gauche"),
+    act("obs_right", KeyCode::BracketRight, "OBS course right", "OBS : course à droite"),
+    act("baro_qnh", KeyCode::KeyX, "Altimeter to the QNH", "Caler l'altimètre au QNH"),
     act("heading_sync", KeyCode::KeyK, "Heading indicator to compass", "Recaler le conservateur de cap"),
     act("camera", KeyCode::KeyC, "Chase / cockpit camera", "Caméra extérieure / cockpit"),
     act("hud", KeyCode::KeyH, "Hide / show the HUD", "Masquer / afficher le HUD"),
+    act("minimap", KeyCode::Backquote, "Hide / show the minimap", "Masquer / afficher la mini-carte"),
     act("goto", KeyCode::KeyG, "Go to a place", "Aller à un lieu"),
     act("respawn", KeyCode::KeyR, "Respawn in the air", "Réapparaître en vol"),
     act("pause", KeyCode::KeyP, "Pause without the menu", "Pause sans le menu"),
@@ -581,6 +599,7 @@ pub fn key_name(k: KeyCode) -> String {
         KeyCode::Quote => "'",
         KeyCode::Minus => "-",
         KeyCode::Equal => "=",
+        KeyCode::Backquote => "`",
         KeyCode::ArrowUp => "↑",
         KeyCode::ArrowDown => "↓",
         KeyCode::ArrowLeft => "←",
@@ -598,20 +617,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canopy_and_master_arm_rebind_independently() {
+        let mut b = Bindings::default();
+        let canopy = action("canopy").unwrap();
+        let arm = action("master_arm").unwrap();
+        assert_ne!(b.key_of(canopy), b.key_of(arm));
+        b.set_key("canopy", KeyCode::Digit7);
+        assert_eq!(b.map_key(KeyCode::Digit7), Some(canopy.key));
+        assert_eq!(b.key_of(arm), Some(arm.key));
+        assert_eq!(b.map_key(arm.key), Some(arm.key));
+        b.set_key("master_arm", KeyCode::Digit8);
+        assert_eq!(b.map_key(KeyCode::Digit8), Some(arm.key));
+        assert_eq!(b.map_key(KeyCode::Digit7), Some(canopy.key));
+    }
+
+    #[test]
     fn moving_keys() {
         let mut b = Bindings::default();
         let pitch_down = action("pitch_down").unwrap();
         let pitch_up = action("pitch_up").unwrap();
         assert_eq!(b.map_key(KeyCode::KeyW), Some(KeyCode::KeyW));
-        // Pitch down onto I: I now pitches down, W does nothing.
-        b.set_key("pitch_down", KeyCode::KeyI);
-        assert_eq!(b.map_key(KeyCode::KeyI), Some(KeyCode::KeyW));
+        // Pitch down onto 7: 7 now pitches down, W does nothing.
+        b.set_key("pitch_down", KeyCode::Digit7);
+        assert_eq!(b.map_key(KeyCode::Digit7), Some(KeyCode::KeyW));
         assert_eq!(b.map_key(KeyCode::KeyW), None);
         // Pitch down onto S takes it from pitch up, which is left without a key.
         b.set_key("pitch_down", KeyCode::KeyS);
         assert_eq!(b.map_key(KeyCode::KeyS), Some(KeyCode::KeyW));
         assert_eq!(b.key_of(pitch_up), None);
-        assert_eq!(b.map_key(KeyCode::KeyI), Some(KeyCode::KeyI));
+        assert_eq!(b.map_key(KeyCode::Digit7), Some(KeyCode::Digit7));
         // Back to the defaults.
         b.reset_key("pitch_down");
         b.reset_key("pitch_up");

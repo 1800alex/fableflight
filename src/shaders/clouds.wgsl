@@ -77,6 +77,14 @@ fn alto_range(oc: vec3f, rd: vec3f) -> vec2f {
 }
 // Premultiplied colour and transmittance of the layer between t0 and t1, lit as the
 // cumulus are (same phase function and multiple-scattering octaves).
+// The towns' light on a cloud at p (planet-relative), from below: the clouds
+// over a city glow orange, brightest underneath.
+fn city_amb(p: vec3f) -> vec3f {
+  if (!glow_on()) { return vec3f(0.0); }
+  // Light scattered many times inside the cloud comes out paler than it went in.
+  let c = city_up(p + G.planet.xyz, length(p) - G.planet.w - G.glow_e.w);
+  return mix(c, vec3f(luma(c)), 0.3) * (0.75 / PI);
+}
 fn alto_march(oc: vec3f, rd: vec3f, t0: f32, t1: f32, a: f32, jit: f32, cs: f32, sky_amb: vec3f, gnd_amb: vec3f) -> vec4f {
   var T = 1.0;
   var L = vec3f(0.0);
@@ -449,8 +457,6 @@ fn depth_match(a: f32, b: f32) -> f32 {
   var gnd_amb = vec3f(0.11, 0.11, 0.1) * sun_trans(0.0, mu0) * max(mu0, 0.0) * G.sun_dir.w / PI * mix(1.0, 0.45, G.cloud.x);
   // Under a storm the ground below is in its shade: little sunlight comes back up.
   gnd_amb *= 1.0 - 0.9 * G.stormfx.w;
-  // At night the cloud bases catch the city's glow from below.
-  gnd_amb += SKYGLOW * 0.0045 * G.misc.y * (1.0 - smoothstep(-0.2, 0.05, mu0));
 
   // Only rays that pass near a storm cell march up to the storm ceiling (and down
   // to the wall and shelf clouds under the base) and look the storms up; the rest
@@ -569,7 +575,7 @@ fn depth_match(a: f32, b: f32) -> f32 {
       slook -= dt;
       if (alto_on && ts > atm_) {
         alto_on = false;
-        let la = alto_march(oc, rd, ar.x, ar.y, aamt, jit, cs, sky_amb, gnd_amb);
+        let la = alto_march(oc, rd, ar.x, ar.y, aamt, jit, cs, sky_amb, gnd_amb + city_amb(oc + rd * atm_));
         L += T * la.rgb;
         let wa = T * (1.0 - la.a);
         tw += atm_ * wa;
@@ -836,7 +842,11 @@ fn depth_match(a: f32, b: f32) -> f32 {
       // read as a dark plate on a stem).
       occ = mix(occ, max(occ, 0.6), anv);
       // (The ground under a storm is in its shade: its base gets little bounce.)
-      var amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn * (1.0 - 0.7 * anv)) * (1.0 - 0.7 * wx.cb)) * mix(0.5, 1.0, powder);
+      // The towns' light from below (not dimmed by the storm's shade, as the
+      // sunlit ground's bounce is).
+      var cg = vec3f(0.0);
+      if (glow_on()) { cg = city_amb(p); }
+      var amb = (sky_amb * mix(0.25, 0.95, hn) * occ + gnd_amb * mix(1.0, 0.25, hn * (1.0 - 0.7 * anv)) * (1.0 - 0.7 * wx.cb) + cg * (mix(1.0, 0.25, hn * (1.0 - 0.7 * anv)) + (1.0 - hn) * 0.5)) * mix(0.5, 1.0, powder);
       let moonc = moon_light(upn, hl);
       var S = ((sunc + moonc) * ms * MS_GAIN * powder + amb) * d * SIGMA;
       // Deep in the rain deck (and on its base) the light is what diffuses down
@@ -877,7 +887,7 @@ fn depth_match(a: f32, b: f32) -> f32 {
     }
   }
   if (alto_on && T > 0.004) {
-    let la = alto_march(oc, rd, ar.x, ar.y, aamt, jit, cs, sky_amb, gnd_amb);
+    let la = alto_march(oc, rd, ar.x, ar.y, aamt, jit, cs, sky_amb, gnd_amb + city_amb(oc + rd * atm_));
     L += T * la.rgb;
     let wa = T * (1.0 - la.a);
     tw += atm_ * wa;

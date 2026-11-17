@@ -9,18 +9,60 @@
 //! the centre of gravity.
 pub mod b747;
 pub mod c172;
+pub mod concorde;
+pub mod dr400;
+pub mod f22;
+pub mod f4;
 pub mod fa18;
+pub mod sr71;
+pub mod starship;
 
 use crate::airframe::{Model, Sect};
 use glam::{DVec3, Vec3};
 
-/// Every type, in the order the menu lists them.
-pub static ALL: [&Spec; 3] = [&c172::SPEC, &b747::SPEC, &fa18::SPEC];
+/// The types built into the game, in the order the menu lists them.
+pub static BUILTIN: [&Spec; 9] = [&c172::SPEC, &dr400::SPEC, &b747::SPEC, &fa18::SPEC, &f4::SPEC, &f22::SPEC, &starship::SPEC, &concorde::SPEC, &sr71::SPEC];
 
-/// A type by its short name (`c172`, `747`, ...), as typed on the command line.
+/// Types added while the game runs: JSBSim aircraft the player downloaded
+/// (see hangar.rs), each flying with a stand-in from `BUILTIN` as its body.
+static EXTRA: parking_lot::RwLock<Vec<&'static Spec>> = parking_lot::RwLock::new(Vec::new());
+
+/// Every type: the built-in ones, then the downloaded ones.
+pub fn list() -> Vec<&'static Spec> {
+    BUILTIN.iter().copied().chain(EXTRA.read().iter().copied()).collect()
+}
+
+/// Adds a type (leaked: types live for the whole run), or replaces the one
+/// answering to the same first key.
+pub fn register(spec: Spec) -> &'static Spec {
+    let s: &'static Spec = Box::leak(Box::new(spec));
+    let mut x = EXTRA.write();
+    match x.iter().position(|o| o.keys.first() == s.keys.first()) {
+        Some(i) => x[i] = s,
+        None => x.push(s),
+    }
+    s
+}
+
+/// Takes a downloaded type off the list (its memory stays: a flight may still use it).
+pub fn unregister(key: &str) {
+    EXTRA.write().retain(|o| o.keys.first() != Some(&key));
+}
+
+/// Where a type sits in `list()` (0 when it is gone).
+pub fn index_of(spec: &Spec) -> usize {
+    list().iter().position(|s| std::ptr::eq(*s, spec)).unwrap_or(0)
+}
+
+/// The type at an index of `list()`, the first when out of range.
+pub fn nth(i: usize) -> &'static Spec {
+    list().get(i).copied().unwrap_or(BUILTIN[0])
+}
+
+/// A type by its short name (`c172`, `747`, `jsbsim:p51d`...), as typed on the command line.
 pub fn by_key(key: &str) -> Option<&'static Spec> {
     let k = key.to_ascii_lowercase();
-    ALL.iter().copied().find(|s| s.keys.iter().any(|x| *x == k))
+    list().into_iter().find(|s| s.keys.iter().any(|x| x.to_ascii_lowercase() == k))
 }
 
 /// The most landing gear legs any type has.
@@ -52,6 +94,7 @@ pub enum Part {
 
 /// One landing gear leg: where its tyres meet the ground fully extended
 /// (body frame), and how it carries, steers and brakes the aircraft.
+#[derive(Clone)]
 pub struct Leg {
     pub at: DVec3,
     pub wheel_r: f64,
@@ -79,6 +122,7 @@ pub struct Leg {
 }
 
 /// How the airframe itself slides along the ground once it is down on it.
+#[derive(Clone)]
 pub struct Hull {
     pub k: f64,
     pub c: f64,
@@ -88,6 +132,7 @@ pub struct Hull {
 }
 
 /// Where the tail surfaces are, for breaking them and for what still touches the ground.
+#[derive(Clone)]
 pub struct Tail {
     /// height of the fin's root and how tall it is above that; the same for the rudder
     pub fin_y0: f32,
@@ -106,6 +151,7 @@ pub struct Tail {
 }
 
 /// A piston engine turning a fixed-pitch propeller.
+#[derive(Clone)]
 pub struct Piston {
     /// rated power (W) at rated revs (rad/s)
     pub power: f64,
@@ -129,6 +175,7 @@ pub struct Piston {
 }
 
 /// High-bypass turbofans.
+#[derive(Clone)]
 pub struct Fan {
     pub n: usize,
     /// sea-level static thrust of each (N)
@@ -149,16 +196,59 @@ pub struct Fan {
     /// thrust lapse with Mach number m: 1 - a m + b m² (a high-bypass fan loses thrust
     /// as it speeds up; a low-bypass afterburning engine gains it from the ram air)
     pub mach_lapse: [f64; 2],
+    /// station of the nozzle exits (body z), where the afterburners' light comes from
+    pub nozzle_z: f64,
 }
 
+/// One stage of a rocket. Stations are body z (the nose is at -z).
+#[derive(Clone)]
+pub struct Stage {
+    pub name: &'static str,
+    /// empty and propellant masses (kg)
+    pub dry: f64,
+    pub prop: f64,
+    /// thrust of all its engines together at sea level (N), and how many there are
+    pub thrust: f64,
+    pub n: u32,
+    /// specific impulse at sea level and in a vacuum (s): thrust grows as the air thins
+    pub isp: [f64; 2],
+    /// the sets of engines that can be lit: name, how many burn, how many of those gimbal
+    pub groups: &'static [(&'static str, u32, u32)],
+    /// its forward end and its engines' exit plane
+    pub z: [f64; 2],
+    /// where the air's side force acts on it when it flies alone, as a fraction of its length from the front
+    pub cp: f64,
+    /// side force its control surfaces (grid fins, flaps) give per Pa of dynamic pressure at full deflection (N/Pa)
+    pub fins: f64,
+    /// dynamic pressure x the sine of the angle of attack (Pa) that breaks it up
+    pub q_alpha: f64,
+}
+
+/// A liquid-fuelled rocket of two stages: the first (a booster) carries the
+/// second until it is dropped (`Plane::stage`), see plane/rocket.rs.
+#[derive(Clone)]
+pub struct Rocket {
+    pub stages: [Stage; 2],
+    pub radius: f64,
+    /// the lowest the engines throttle to (fraction of full thrust), and how far they gimbal (rad)
+    pub throttle_min: f64,
+    pub gimbal: f64,
+    /// the second stage's flaps, the forward pair and the aft: the area of
+    /// each (m²), how far out it is and its station (body x, z)
+    pub flaps: [[f64; 3]; 2],
+}
+
+#[derive(Clone)]
 pub enum Engine {
     Piston(Piston),
     Fan(Fan),
+    Rocket(Rocket),
 }
 
 /// The handling: angular accelerations straight from dynamic pressure (see
 /// `Plane::step`). `q_ref` is the dynamic pressure (Pa) at which control
 /// authority is "1"; `damp_v` turns rotation rates into damping.
+#[derive(Clone)]
 pub struct Handling {
     pub q_ref: f64,
     pub a_max: f64,
@@ -193,6 +283,7 @@ pub struct Handling {
 
 /// The head-on outline of the hole it punches through a building (m, body
 /// frame seen from ahead), see `destruct::Hitter`.
+#[derive(Clone)]
 pub struct Hole {
     /// fuselage half width and half height, its centre's height, corner radius
     pub fus: [f32; 4],
@@ -206,13 +297,82 @@ pub struct Hole {
     pub pods: [[f32; 3]; 2],
 }
 
+/// What a flap lever works on a type with no flaps: Concorde's nose and visor.
+/// (To the flight and damage models they are still its flaps: the notches, the
+/// speeds they are good for, the two flap roles.)
+#[derive(Clone)]
+pub struct Lever {
+    /// what it is called, and each notch (English, French)
+    pub name: [&'static str; 2],
+    pub notches: &'static [[&'static str; 2]],
+    /// the pieces with the left and the right flap role, as the damage messages name them
+    pub parts: [&'static str; 2],
+}
+
+impl Lever {
+    pub fn notch(&self, k: u8) -> &'static str {
+        self.notches.get(k as usize).map_or("", |n| n[crate::i18n::is_fr() as usize])
+    }
+}
+
+/// A braking parachute, streamed on landing with the speedbrake key and let
+/// go with it again: it is used once.
+#[derive(Clone)]
+pub struct Chute {
+    /// its drag area (m²: drag coefficient times canopy area)
+    pub cda: f64,
+    /// the fastest it may be streamed at (m/s indicated; faster tears it away),
+    /// and the speed it is let go at by itself, before it drags on the runway
+    pub v_max: f64,
+    pub v_min: f64,
+}
+
+#[derive(Clone)]
 pub enum Sound {
     Piston,
     Jet,
     /// a pair of afterburning engines, from recordings (audio.rs `Fighter`)
     Fighter,
+    /// a pair of afterburning turbojets: the fighter's recordings played lower and rougher, with the J79's howl
+    Turbojet,
+    /// a cluster of rocket engines (audio.rs `Rocket`)
+    Rocket,
 }
 
+/// A heat-seeking missile on a hardpoint: the model piece that is the loaded
+/// missile (the game hides it when fired and draws it as the projectile), the
+/// wing it hangs from (0 left, 1 right), and what the HUD calls it.
+#[derive(Clone, Copy, Debug)]
+pub struct MissileStation {
+    pub piece: &'static str,
+    pub side: usize,
+    pub name: &'static str,
+}
+
+/// A painted skin: pictures of the aircraft seen from straight above, from
+/// below and from its left side (and from its right, if `views` is 4;
+/// otherwise the left one serves both sides, mirrored), side by side in one
+/// JPEG, each nose up. plane.wgsl projects them back onto the skin
+/// (`hornet_paint`). `span` x `length` (m) is the rectangle each picture
+/// covers, GUIDE_SPAN and GUIDE_LEN in the type's Blender script; `centre`
+/// the station ahead of the datum and the height above it at the middle of
+/// the pictures (GUIDE_Y, GUIDE_Z).
+#[derive(Clone)]
+pub struct Paint {
+    pub jpg: &'static [u8],
+    pub views: u32,
+    pub span: f64,
+    pub length: f64,
+    pub centre: [f64; 2],
+    /// how much relief the picture's lines stand for (1: a line as dark as it
+    /// looks is that deep; more for a dark paint, whose seams hardly differ
+    /// from it in brightness), and how much its sheen varies with its tone
+    /// (0: not at all)
+    pub relief: f32,
+    pub sheen: f32,
+}
+
+#[derive(Clone)]
 pub struct Spec {
     /// what plane.wgsl knows it by (its paint scheme, windows, panel lines)
     pub id: u32,
@@ -220,9 +380,16 @@ pub struct Spec {
     /// names it answers to on the command line
     pub keys: &'static [&'static str],
     pub blurb: &'static str,
+    /// where it comes from when it is not one of ours: a JSBSim aircraft
+    /// flown with our flight model, drawn as one of ours (see hangar.rs)
+    pub origin: Option<&'static Origin>,
+    /// its own 3D model (a FlightGear aircraft's, see fgmodel.rs), built instead of `build`
+    pub ext: Option<&'static crate::fgmodel::Ext>,
     /// its picture in the start screen's aircraft window: a PNG with alpha,
     /// 680 x 392 (the window's 340 x 196 at twice the size, for hi-dpi)
     pub still: &'static [u8],
+    /// its painted skin (airframe `pat` 17), if it has one
+    pub paint: Option<Paint>,
     pub build: fn() -> Model,
     /// the breakable groups (see airframe::G_*): name, mass (kg)
     pub groups: [(&'static str, f32); 7],
@@ -240,6 +407,8 @@ pub struct Spec {
     pub tail: Tail,
     /// the pilot's eye
     pub eye: Vec3,
+    /// the eye in its other cockpit, if it has two (the view key goes round: outside, front seat, back seat)
+    pub eye2: Option<Vec3>,
     /// does a view from the eye along this direction see the cabin (rather than out a window)?
     pub sees_inside: fn(Vec3, Vec3) -> bool,
     /// points of the fuselage that can touch the ground, and of the tail cone
@@ -255,7 +424,21 @@ pub struct Spec {
     pub hole: Hole,
 
     // ---- mass and aerodynamics
+    /// mass with the tanks half full (kg); the fuel on board adds or takes away from it
     pub mass: f64,
+    /// usable fuel with the tanks full (kg), and what the engines burn
+    /// together (kg/s): idling, at full dry power, and with the boost (afterburners)
+    pub fuel_kg: f64,
+    pub fuel_flow: [f64; 3],
+    /// payload (crew, passengers, baggage, kg): what `mass` includes, the most
+    /// it may carry, and how far aft of the reference CG more of it sits (m)
+    pub payload: [f64; 3],
+    /// balance: the mean aerodynamic chord (m); the centre of gravity at
+    /// `mass` and its forward and aft limits (fractions of it); how far aft of
+    /// the reference CG the fuel sits (m)
+    pub mac: f64,
+    pub cg: [f64; 3],
+    pub fuel_arm: f64,
     /// pitch, yaw, roll (kg m²)
     pub inertia: DVec3,
     pub wing_area: f64,
@@ -284,6 +467,8 @@ pub struct Spec {
     /// spoilers fully up: the drag they add and the lift they dump
     pub spoiler_cd: f64,
     pub spoiler_cl: f64,
+    /// a braking parachute on the speedbrake key, for a type with no speedbrake
+    pub chute: Option<Chute>,
     /// flap lever notches (degrees) and the fastest each may be out at (m/s indicated)
     pub flaps: &'static [f64],
     pub vfe: &'static [f64],
@@ -291,11 +476,23 @@ pub struct Spec {
     pub flap_rate: f64,
     /// from which notch the leading-edge devices are out (0: it has none)
     pub slats_at: u8,
+    /// what the flap lever works, when that is not flaps (None: flaps)
+    pub lever: Option<Lever>,
+    /// how fast the gear goes up or down (fraction per second; 0: fixed gear)
     pub gear_rate: f64,
     /// never-exceed speed (m/s indicated) and Mach limit (0: none); flutter sets in at `flutter_v`
     pub vne: f64,
     pub mmo: f64,
     pub flutter_v: f64,
+    /// a turbo-ramjet's design Mach number (0: an ordinary engine): past it the
+    /// inlets choke and the thrust falls away, and its afterburners' fuel is
+    /// metered to the air they get, lapsing with height as the thrust does
+    /// (other afterburners burn at their sea-level rate wherever they are)
+    pub inlet_mach: f64,
+    /// the Mach number by which its thrust without the afterburners has all
+    /// but gone (0: dry and afterburning thrust lapse alike): a turbojet built
+    /// to cruise in afterburner, whose core does less and less past Mach 2
+    pub dry_mach: f64,
     /// load where the spar starts to fatigue, and where it snaps
     pub g_limit: f32,
     pub g_break: f32,
@@ -317,6 +514,15 @@ pub struct Spec {
     pub sound: Sound,
 }
 
+/// A downloaded JSBSim aircraft behind a `Spec`.
+pub struct Origin {
+    /// the license its files state (or the collection's, when they state none), and who made it
+    pub license: String,
+    pub author: String,
+    /// the built-in type whose body, cockpit and paint it borrows
+    pub body: &'static str,
+}
+
 impl std::fmt::Debug for Spec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name)
@@ -324,8 +530,24 @@ impl std::fmt::Debug for Spec {
 }
 
 impl Spec {
+    /// The heat-seeking missiles it carries, if any. (Only the Hornet has
+    /// them modelled; other types get an empty list.)
+    pub fn missiles(&self) -> &'static [MissileStation] {
+        if self.keys.contains(&"fa18") { &fa18::MISSILES } else { &[] }
+    }
+
+    /// Gear that never retracts (no fold rate): always down, the gear key does nothing.
+    pub fn fixed_gear(&self) -> bool {
+        self.gear_rate == 0.0 && self.rocket().is_none()
+    }
     pub fn is_jet(&self) -> bool {
         matches!(self.engine, Engine::Fan(_))
+    }
+    pub fn rocket(&self) -> Option<&Rocket> {
+        match &self.engine {
+            Engine::Rocket(r) => Some(r),
+            _ => None,
+        }
     }
     /// The flap notch fraction (of full travel) for a lever notch.
     pub fn flap_frac(&self, notch: u8) -> f64 {

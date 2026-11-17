@@ -1465,7 +1465,10 @@ pub static SPEC: Spec = Spec {
     name: "Boeing 747-400",
     keys: &["747", "b747", "747-400", "jumbo"],
     blurb: "Four-engine wide-body airliner, 290 t. Heavy and slow to answer the controls; Mach 0.85 cruise, 150 kt approach. / speedbrake, Z reversers.",
+    origin: None,
+    ext: None,
     still: include_bytes!("../../../assets/aircraft/747.png"),
+    paint: None,
     build,
     groups: [("fuselage", 120_000.0), ("tail", 12_000.0), ("left wing", 40_000.0), ("right wing", 40_000.0), ("flight deck", 8_000.0), ("radome", 300.0), ("gear", 14_000.0)],
     span: SPAN,
@@ -1489,6 +1492,7 @@ pub static SPEC: Spec = Spec {
         stab_tip: DVec3::new(STAB_SPAN as f64 - 0.1, by(7.65 + 0.1228 * (STAB_SPAN - 3.4)) as f64, bz(68.7) as f64),
     },
     eye: EYE,
+    eye2: None,
     sees_inside: deck::sees_inside,
     contacts: &[
         ([0.0, 0.3, -31.62], Part::Nose),
@@ -1554,6 +1558,13 @@ pub static SPEC: Spec = Spec {
     hole: Hole { fus: [3.25, 4.1, 1.0, 2.5], wing: [-1.3, 0.093, 0.9, 0.25], stab: [3.0, 0.35, 11.1], fin: [4.2, 10.16, 0.6, 0.2], pods: [[11.68, -2.5, 1.3], [21.0, -1.58, 1.3]] },
     // A mid-weight: about 290 t (maximum takeoff weight is 396.9 t, landing 285.8 t).
     mass: 290_000.0,
+    // 216,840 l of Jet A; four CF6s: about 600 kg/h each idling, 10 t/h each at take-off thrust
+    fuel_kg: 174_000.0,
+    fuel_flow: [0.65, 11.0, 12.0],
+    payload: [40_000.0, 110_000.0, 0.5],
+    mac: 8.32,
+    cg: [0.24, 0.11, 0.33],
+    fuel_arm: 1.0,
     // Pitch, yaw, roll (Heffley & Jewell, the 747 at 288 t).
     inertia: DVec3::new(44.9e6, 67.4e6, 24.7e6),
     wing_area: 541.2,
@@ -1573,15 +1584,19 @@ pub static SPEC: Spec = Spec {
     cd_wave: 0.0,
     spoiler_cd: 0.06,
     spoiler_cl: 0.45,
+    chute: None,
     flaps: &[0.0, 1.0, 5.0, 10.0, 20.0, 25.0, 30.0],
     vfe: &[1e9, 280.0 * KT, 260.0 * KT, 240.0 * KT, 230.0 * KT, 205.0 * KT, 180.0 * KT],
     flap_rate: 1.0 / 40.0,
     slats_at: 1,
+    lever: None,
     gear_rate: 1.0 / 16.0,
     // VMO 365 kt, MMO 0.92.
     vne: 365.0 * KT,
     mmo: 0.92,
     flutter_v: 420.0 * KT,
+    inlet_mach: 0.0,
+    dry_mach: 0.0,
     // Limit load 2.5 g, ultimate 3.75 g.
     g_limit: 2.6,
     g_break: 3.8,
@@ -1589,7 +1604,7 @@ pub static SPEC: Spec = Spec {
     steer_max: 1.0,
     steer_fade: 12.0,
     // Four PW4056s, 252 kN (56,750 lbf) each.
-    engine: Engine::Fan(Fan { n: 4, thrust: 252_000.0, idle: 0.25, idle_thrust: 0.035, n1_rpm: 3600.0, spool_up: 0.6, spool_down: 0.5, reverse: 0.35, reverser_time: 2.0, boost: 1.08, mach_lapse: [0.78, 0.38] }),
+    engine: Engine::Fan(Fan { n: 4, thrust: 252_000.0, idle: 0.25, idle_thrust: 0.035, n1_rpm: 3600.0, spool_up: 0.6, spool_down: 0.5, reverse: 0.35, reverser_time: 2.0, boost: 1.08, mach_lapse: [0.78, 0.38], nozzle_z: 0.0 }),
     handling: Handling {
         q_ref: 11_000.0,
         a_max: 1.6,
