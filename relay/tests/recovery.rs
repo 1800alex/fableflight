@@ -24,9 +24,8 @@ impl Drop for Relay {
 fn relay(port: u16, name: &str, hub: Option<u16>) -> Relay {
     let mut c = Command::new(env!("CARGO_BIN_EXE_fableflight-relay"));
     c.env("FFMP_PORT", port.to_string()).env("FFMP_HTTP_PORT", "0").env("FFMP_NAME", name).env("FFMP_PEER_SECRET", SECRET);
-    if let Some(h) = hub {
-        c.env("FFMP_HUB", format!("127.0.0.1:{h}"));
-    }
+    // (Not the real network's main relays.)
+    c.env("FFMP_HUB", hub.map_or("none".to_string(), |h| format!("127.0.0.1:{h}")));
     Relay(c.stdout(std::process::Stdio::null()).spawn().expect("relay binary"))
 }
 fn free_port() -> u16 {

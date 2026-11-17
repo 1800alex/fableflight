@@ -18,6 +18,12 @@
 pub const MAGIC: [u8; 4] = *b"FFMP";
 pub const VERSION: u8 = 1;
 pub const DEFAULT_PORT: u16 = 7480;
+/// The network's main relays (`host[:port]`), for redundancy: every relay
+/// with the network's secret makes itself known to all of them (skipping
+/// itself), so that it stays in the network while any one is up. The game
+/// reads its server list from the same hosts (`mp::DIRECTORY_URLS`).
+#[allow(dead_code)] // (the relay's; the game checks its list URLs against it)
+pub const MAIN_RELAYS: &[&str] = &["fableflight.danux.be", "fableflight.rolandiscool.com"];
 /// the longest name, in bytes (UTF-8, printable)
 pub const NAME_MAX: usize = 24;
 /// a Hello is at least this long (see the module notes)

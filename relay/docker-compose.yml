@@ -21,8 +21,11 @@ services:
       # Where players reach this relay, as the game's server list shows it.
       FFMP_PUBLIC: ""
       # Federation: the network's shared secret (16+ characters, the same on
-      # every relay), and its main relay: this one makes itself known there and
-      # finds all the others. (On the main relay itself, leave FFMP_HUB empty.)
+      # every relay). This relay makes itself known to every main relay (the
+      # built-in list: fableflight.danux.be, fableflight.rolandiscool.com) and
+      # finds all the others; it stays in the network while any one is up.
+      # Leave FFMP_HUB empty for that list (a main relay skips itself), or set
+      # other main relays (host[:port], comma-separated), or "none".
       FFMP_PEER_SECRET: ""
       FFMP_HUB: ""
       # Other relays to reach directly, if any (host[:port], comma-separated).

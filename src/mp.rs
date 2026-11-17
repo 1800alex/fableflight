@@ -217,7 +217,7 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
 /// Where the list of the network's servers is read from, tried in turn (a
 /// relay's `/servers.json`, see relay/; any relay serves the whole network's).
 /// When none answers, the last list received (kept on disk) stands in, and
-/// its servers are asked directly.
+/// its servers are asked directly. One per main relay (`proto::MAIN_RELAYS`).
 pub const DIRECTORY_URLS: &[&str] = &["https://fableflight.danux.be/servers.json", "https://fableflight.rolandiscool.com/servers.json"];
 
 /// A server of the network, as the list gives it and as we hear it.
@@ -467,6 +467,12 @@ mod tests {
         assert!((at(1, &p, 1.05).unwrap().pos.y - 2.5).abs() < 1e-6, "halfway");
         assert!((at(1, &p, 1.3).unwrap().pos.y - 15.0).abs() < 1e-6, "flown on at 50 m/s");
         assert!((at(1, &p, 9.0).unwrap().pos.y - 55.0).abs() < 1e-6, "for a second at most");
+    }
+
+    #[test]
+    fn the_server_list_comes_from_every_main_relay() {
+        let want: Vec<String> = proto::MAIN_RELAYS.iter().map(|h| format!("https://{}/servers.json", h.split(':').next().unwrap())).collect();
+        assert_eq!(DIRECTORY_URLS, want, "one list URL per main relay (mp_proto::MAIN_RELAYS)");
     }
 
     #[test]
