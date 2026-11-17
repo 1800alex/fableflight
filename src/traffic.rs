@@ -107,6 +107,7 @@ pub struct Mover {
     pitch: f32,
     gear: bool,
     stand: usize,
+    #[allow(dead_code)]
     rwy: (usize, usize),
     /// where along the path to stop until the runway is free
     hold_s: f32,

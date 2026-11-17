@@ -69,6 +69,10 @@ pub struct Plane {
     gust_b: DVec3,
     rot_a: DVec3,
     rot_b: DVec3,
+    /// small eddies (sharp jolts), and the slow level that gathers the
+    /// turbulence into bursts
+    gust_s: DVec3,
+    burst: f64,
     /// the pilot's head swaying on its neck as the airframe is shaken (body frame, m)
     pub head: DVec3,
     /// specific force (what an accelerometer reads: everything but gravity), body frame, m/s²
@@ -240,6 +244,8 @@ impl Plane {
             gust_b: DVec3::ZERO,
             rot_a: DVec3::ZERO,
             rot_b: DVec3::ZERO,
+            gust_s: DVec3::ZERO,
+            burst: 0.0,
             head: DVec3::ZERO,
             sf: DVec3::new(0.0, 9.81, 0.0),
             head_v: DVec3::ZERO,
@@ -1102,15 +1108,34 @@ impl Plane {
     fn turbulence(&mut self, dt: f64, v: f64, upw: DVec3) {
         let air = self.air;
         let vt = v.max(12.0);
+        // Bursts: a slow random level (patches a kilometre or two long) scales
+        // the eddies up and down, lognormal with the mean variance unchanged:
+        // quiet stretches, then a run of hard jolts. Rougher air is patchier.
+        let eb = (-vt * dt / 1200.0).exp();
+        let nb = self.gauss();
+        self.burst = self.burst * eb + (1.0 - eb * eb).sqrt() * nb;
+        let a = 0.3 + 0.2 * smooth(1.0, 5.0, air.sigma_w);
+        let m = (a * self.burst - a * a).exp().min(3.0);
+        // Two scales of eddy: the big ones (hundreds of metres: slow heaves
+        // the aircraft rides up and down) and small ones a few tens of metres
+        // across that it cannot follow (sharp jolts). The small ones carry a
+        // third of the variance and come and go with the bursts the most.
         let len = DVec3::new(air.len_h, air.len_h, air.len_w);
         let sig = DVec3::new(air.sigma_h, air.sigma_h, air.sigma_w);
+        let one = DVec3::ONE;
         let n = DVec3::new(self.gauss(), self.gauss(), self.gauss());
         let e1 = (-vt * dt / len).exp();
         let e2 = (-vt * dt * 4.0 / len).exp();
-        let one = DVec3::ONE;
-        self.gust_a = self.gust_a * e1 + sig * (one - e1 * e1).max(DVec3::ZERO).sqrt() * n;
+        let big = sig * (0.8 * (0.4 + 0.6 * m));
+        self.gust_a = self.gust_a * e1 + big * (one - e1 * e1).max(DVec3::ZERO).sqrt() * n;
         self.gust_b = self.gust_b * e2 + self.gust_a * (one - e2);
-        let g = self.gust_b * 1.118;
+        let ls = (len / 10.0).clamp(DVec3::splat(6.0), DVec3::splat(45.0));
+        let es = (-vt * dt / ls).exp();
+        let n = DVec3::new(self.gauss(), self.gauss(), self.gauss());
+        self.gust_s = self.gust_s * es + sig * (0.6 * m) * (one - es * es).max(DVec3::ZERO).sqrt() * n;
+        // (A big airframe spans many of the small ones and averages them out.)
+        let span = (ls / (ls + DVec3::splat(0.5 * self.spec.b))).powf(0.5);
+        let g = self.gust_b * 1.118 + self.gust_s * span;
         // Along and across the flight path, and up.
         let air_v = self.vel - self.wind;
         let mut along = air_v - upw * air_v.dot(upw);
@@ -1126,7 +1151,8 @@ impl Plane {
         // a big aircraft averages more of them out.
         let lr = self.spec.b * 2.5;
         let big = (11.0 / self.spec.b).sqrt();
-        let sr = DVec3::new(0.012 * air.sigma_w, 0.020 * air.sigma_h, 0.03 * air.sigma_w) * big;
+        // (In bursts, roll upsets too.)
+        let sr = DVec3::new(0.018 * air.sigma_w, 0.020 * air.sigma_h, 0.03 * air.sigma_w) * big * m;
         let n = DVec3::new(self.gauss(), self.gauss(), self.gauss());
         let e1 = (-vt * dt / lr).exp();
         let e2 = (-vt * dt * 4.0 / lr).exp();
@@ -3622,7 +3648,7 @@ mod tests {
         let mut spread = Vec::new();
         for sigma in [0.0, 1.5, 4.0] {
             let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
-            p.air = Air { sigma_w: sigma, sigma_h: sigma, len_w: 300.0, len_h: 300.0, draft: 0.0 };
+            p.air = Air { sigma_w: sigma, sigma_h: sigma, len_w: 300.0, len_h: 300.0, draft: 0.0, ..Default::default() };
             let dt = 1.0 / 180.0;
             let (mut s, mut s2, mut n, mut bank) = (0.0, 0.0, 0.0, 0.0f64);
             for i in 0..(60.0 / dt) as usize {
@@ -3642,6 +3668,97 @@ mod tests {
             spread.push(sd);
         }
         assert!(spread[0] < 0.02 && spread[1] > 0.05 && spread[2] > spread[1] * 1.8, "{spread:?}");
+    }
+
+    /// Straight and level passes through each kind of weather, a pilot holding
+    /// the wings level and the pitch attitude (as you do in turbulence), the air
+    /// fed in as main.rs does. Prints peak storm sigma, drafts, g, height and
+    /// bank excursions. `cargo test --release storm_passes -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn storm_passes() {
+        use crate::weather::{CellKind, Weather};
+        let w = empty_world();
+        let (lat, lon) = (41.2f64.to_radians(), -96.0f64.to_radians());
+        let p0 = geo::lla_to_pos(lat, lon, 0.0);
+        // (name, spec, alt, setup, distance flown m)
+        type Setup = fn(&mut Weather, DVec3);
+        let cases: Vec<(&str, &'static Spec, f64, Setup, f64)> = vec![
+            ("clear", C172, 2500.0, |_, _| {}, 15000.0),
+            ("deck 0.4", C172, 1000.0, |wx, p| { wx.rain_set = Some(0.4); for _ in 0..600 { wx.step_deck(1.0, p, Some(0.0)); } }, 15000.0),
+            ("deck 1.0 in", C172, 1500.0, |wx, p| { wx.rain_set = Some(1.0); for _ in 0..600 { wx.step_deck(1.0, p, Some(0.0)); } }, 15000.0),
+            ("shower", C172, 2500.0, |wx, p| wx.place_storm(p, 6.0, 270.0, 1.8, Some(CellKind::Shower)), 12000.0),
+            ("shower low", C172, 800.0, |wx, p| wx.place_storm(p, 6.0, 270.0, 1.8, Some(CellKind::Shower)), 12000.0),
+            ("thunder", C172, 2500.0, |wx, p| wx.place_storm(p, 6.0, 270.0, 5.0, Some(CellKind::Thunder)), 20000.0),
+            ("thunder low", C172, 300.0, |wx, p| wx.place_storm(p, 6.0, 270.0, 5.0, Some(CellKind::Thunder)), 20000.0),
+            ("severe", C172, 2500.0, |wx, p| wx.place_storm(p, 8.0, 270.0, 6.0, None), 24000.0),
+            ("squall", C172, 2500.0, |wx, p| wx.place_squall(p, 6.0, 270.0, 100.0), 24000.0),
+            ("squall low", C172, 400.0, |wx, p| wx.place_squall(p, 6.0, 270.0, 100.0), 24000.0),
+            ("supercell 2.5", C172, 2500.0, |wx, p| wx.place_storm(p, 12.0, 270.0, crate::weather::SUPER_R, Some(CellKind::Supercell)), 30000.0),
+            ("supercell", C172, 4000.0, |wx, p| wx.place_storm(p, 12.0, 270.0, crate::weather::SUPER_R, Some(CellKind::Supercell)), 30000.0),
+            ("thunder 747", B747, 2500.0, |wx, p| wx.place_storm(p, 6.0, 270.0, 5.0, Some(CellKind::Thunder)), 20000.0),
+            ("supercell 747", B747, 4000.0, |wx, p| wx.place_storm(p, 12.0, 270.0, crate::weather::SUPER_R, Some(CellKind::Supercell)), 30000.0),
+        ];
+        for (name, spec, alt, setup, dist) in cases {
+          for seed in [7u64, 99, 12345] {
+            let mut wx = Weather::new(0.3);
+            wx.storms = 0.0;
+            setup(&mut wx, p0);
+            wx.cells = wx.storm_cells(p0);
+            let speed = if spec.b > 30.0 { 130.0 } else { 55.0 };
+            let mut p = Plane::spawn(spec, lat, lon, alt, -std::f64::consts::FRAC_PI_2, speed);
+            p.rng = Rng(seed);
+            let theta = |p: &Plane| p.forward().dot(p.pos.normalize()).asin();
+            let th0 = theta(&p);
+            let dt = 1.0 / 120.0;
+            let (mut t, mut prev) = (0.0, th0);
+            let (mut sig, mut sw, mut up, mut dn, mut gmax, mut gmin, mut dh, mut bank, mut dv) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 1.0f64, 1.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let mut gust = 0.0f64;
+            let mut prof = String::new();
+            let mut broke = false;
+            let mut vmin = 999.0f64;
+            let mut gl: Vec<f64> = Vec::new();
+            let mut notes = Vec::new();
+            while (p.pos - geo::lla_to_pos(lat, lon, alt)).length() < dist && t < 900.0 {
+                let (_, _, h) = geo::pos_to_lla(p.pos);
+                let air = wx.air(p.pos, h, t, false);
+                let st = crate::storm::local(&wx, p.pos, h, t);
+                p.air = air;
+                p.wind = wx.at(p.pos, h, t) + p.pos.normalize() * air.draft + air.gust;
+                let th = theta(&p);
+                let q = (th - prev) / dt;
+                prev = th;
+                let roll_err = -p.right().dot(p.pos.normalize());
+                let c = Controls { pitch: ((th0 - th) * 4.0 - q * 1.0).clamp(-1.0, 1.0), roll: (-roll_err * 3.0 + p.omega.z * 0.5).clamp(-1.0, 1.0), ..Default::default() };
+                if p.step(dt, &c, &w).is_some() {
+                    broke = true;
+                    break;
+                }
+                t += dt;
+                if t > 2.0 {
+                    sig = sig.max(st.sigma);
+                    sw = sw.max(air.sigma_w);
+                    up = up.max(air.draft);
+                    dn = dn.min(air.draft);
+                    gust = gust.max(air.gust.length());
+                    gmax = gmax.max(p.g_load);
+                    gmin = gmin.min(p.g_load);
+                    dh = dh.max((h - alt).abs());
+                    bank = bank.max(roll_err.abs().min(1.0).asin().to_degrees());
+                    dv = dv.max((p.airspeed().length() - speed).abs());
+                    vmin = vmin.min(p.airspeed().length());
+                    gl.push(p.g_load);
+                    notes.extend(p.notes.drain(..));
+                }
+                if (t / dt) as usize % (10.0 / dt) as usize == 0 {
+                    let km = (p.pos - geo::lla_to_pos(lat, lon, alt)).length() / 1000.0;
+                    prof += &format!(" {km:.1}:{:.1}/{:+.0}", air.sigma_w, air.draft);
+                }
+            }
+            println!("{name:14} storm sigma {sig:4.1} sigma_w {sw:4.1}  draft {up:+5.1} {dn:+5.1}  gust {gust:4.1}  g {gmin:+5.2}..{gmax:+5.2}  dh {dh:5.0} m  bank {bank:4.0}  dv {dv:4.1} m/s vmin {vmin:4.1} grms {:.2} {notes:?}{}", gl.chunks((20.0 / dt) as usize).map(|c| { let n = c.len() as f64; let m = c.iter().sum::<f64>() / n; (c.iter().map(|g| (g - m) * (g - m)).sum::<f64>() / n).sqrt() }).fold(0.0, f64::max), if broke { "  CRASHED" } else { "" });
+            if seed == 7 { println!("    {prof}"); }
+          }
+        }
     }
 
     fn flat_world() -> World {
@@ -3825,7 +3942,7 @@ mod tests {
     #[test]
     fn a_rocket_lights_the_engines_it_is_told_to() {
         let w = flat_world();
-        let mut burn = |lit: usize| {
+        let burn = |lit: usize| {
             let mut p = on_the_pad();
             p.lit = lit;
             run(&mut p, &w, 4.0, Controls { throttle_set: Some(1.0), ..Default::default() });

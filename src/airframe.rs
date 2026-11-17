@@ -72,6 +72,7 @@ pub mod lamp {
     pub const GEAR_DOWN: f32 = 6.0;
     pub const GEAR_UP: f32 = 7.0;
     pub const ANNUNC: f32 = 8.0;
+    #[allow(dead_code)]
     pub const FORMATION: f32 = 9.0; // electroluminescent formation light strip (a fighter's)
 }
 
@@ -1020,6 +1021,10 @@ pub fn bake_ao(pieces: &mut [Piece], cfg: &AoBake) {
     let size = hi - lo + Vec3::splat(vox * 2.0);
     let dim = [(size.x / vox) as usize + 1, (size.y / vox) as usize + 1, (size.z / vox) as usize + 1];
     let mut grid = vec![0u64; (dim[0] * dim[1] * dim[2]) / 64 + 1];
+    // coarse occupancy, one flag per CB^3 block, so rays skip empty air in one step.
+    const CB: usize = 8;
+    let cdim = [dim[0].div_ceil(CB), dim[1].div_ceil(CB), dim[2].div_ceil(CB)];
+    let mut coarse = vec![false; cdim[0] * cdim[1] * cdim[2]];
     let cell = |p: Vec3| -> Option<usize> {
         let q = (p - lo) / vox;
         if q.min_element() < 0.0 {
@@ -1046,6 +1051,8 @@ pub fn bake_ao(pieces: &mut [Piece], cfg: &AoBake) {
                     }
                     if let Some(k) = cell(q) {
                         grid[k / 64] |= 1 << (k % 64);
+                        let (x, y, z) = (k % dim[0], (k / dim[0]) % dim[1], k / (dim[0] * dim[1]));
+                        coarse[((z / CB) * cdim[1] + y / CB) * cdim[0] + x / CB] = true;
                     }
                 }
             }
@@ -1065,10 +1072,27 @@ pub fn bake_ao(pieces: &mut [Piece], cfg: &AoBake) {
     let occluded = |o: Vec3, d: Vec3| -> bool {
         let mut t = vox * 1.2;
         while t < reach {
-            match cell(o + d * t) {
-                Some(k) if grid[k / 64] & (1 << (k % 64)) != 0 => return true,
-                None => return false,
-                _ => {}
+            let q = (o + d * t - lo) / vox;
+            if q.min_element() < 0.0 {
+                return false;
+            }
+            let (x, y, z) = (q.x as usize, q.y as usize, q.z as usize);
+            if x >= dim[0] || y >= dim[1] || z >= dim[2] {
+                return false;
+            }
+            let (bx, by, bz) = (x / CB, y / CB, z / CB);
+            if !coarse[(bz * cdim[1] + by) * cdim[0] + bx] {
+                // empty block, jump to where the ray leaves it.
+                let b0 = Vec3::new((bx * CB) as f32, (by * CB) as f32, (bz * CB) as f32);
+                let b1 = b0 + Vec3::splat(CB as f32);
+                let exit = |qa: f32, da: f32, lo: f32, hi: f32| if da > 1e-6 { (hi - qa) / da } else if da < -1e-6 { (lo - qa) / da } else { f32::MAX };
+                let e = exit(q.x, d.x, b0.x, b1.x).min(exit(q.y, d.y, b0.y, b1.y)).min(exit(q.z, d.z, b0.z, b1.z));
+                t += e.max(0.0) * vox + vox * 0.05;
+                continue;
+            }
+            let k = (z * dim[1] + y) * dim[0] + x;
+            if grid[k / 64] & (1 << (k % 64)) != 0 {
+                return true;
             }
             t += vox * 0.7 + t * 0.03;
         }
