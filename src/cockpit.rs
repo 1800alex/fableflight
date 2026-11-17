@@ -294,3 +294,32 @@ mod input_tests {
         assert!(triangle_depth(Vec3::ZERO,Vec3::Z,a,b,c).is_none());
     }
 }
+
+/// The cockpit controls that have no key of their own (not in
+/// `bind::ACTIONS`): the mouse works them directly (main.rs `cockpit_action`).
+/// (The tests check every hotspot stands for one of these or an action.)
+#[cfg(test)]
+pub const MOUSE_ACTIONS: &[&str] = &["prop_up", "prop_down", "cowl_open", "cowl_close", "brake_left", "brake_right", "nav_next", "nav_prev", "adf_next", "adf_prev", "landing_lights", "fuel_valve"];
+
+/// What a cockpit control does, for the label beside it: the action's own
+/// name when it has a key, else these.
+pub fn action_label(id: &str) -> &str {
+    if let Some(a) = crate::bind::ACTIONS.iter().find(|a| a.id == id) {
+        return a.label();
+    }
+    match id {
+        "prop_up" => crate::t!("Propeller RPM up", "Hélice : plus de tours"),
+        "prop_down" => crate::t!("Propeller RPM down", "Hélice : moins de tours"),
+        "cowl_open" => crate::t!("Open cowl flaps", "Ouvrir les volets de capot"),
+        "cowl_close" => crate::t!("Close cowl flaps", "Fermer les volets de capot"),
+        "brake_left" => crate::t!("Left toe brake", "Frein gauche"),
+        "brake_right" => crate::t!("Right toe brake", "Frein droit"),
+        "nav_next" => crate::t!("Tune next NAV station", "NAV : station suivante"),
+        "nav_prev" => crate::t!("Tune previous NAV station", "NAV : station précédente"),
+        "adf_next" => crate::t!("Tune next ADF station", "ADF : station suivante"),
+        "adf_prev" => crate::t!("Tune previous ADF station", "ADF : station précédente"),
+        "landing_lights" => crate::t!("Landing lights", "Phares d'atterrissage"),
+        "fuel_valve" => crate::t!("Fuel selector ON / OFF", "Robinet carburant ouvert / fermé"),
+        _ => id,
+    }
+}

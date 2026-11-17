@@ -878,6 +878,8 @@ struct Game {
     wheel_acc: cockpit::WheelSteps,
     hot_keys: HashSet<KeyCode>,
     pit_blocks: Vec<(usize, Vec3, Vec3)>,
+    /// FF_HOTSPOT_MAP: the hotspots' screen positions are logged (once)
+    hot_map_done: std::cell::Cell<bool>,
     cam_yaw: f64,
     cam_pitch: f64,
     cam_dist: f64,
@@ -1286,6 +1288,7 @@ impl Game {
             wheel_acc: cockpit::WheelSteps::default(),
             hot_keys: HashSet::new(),
             pit_blocks,
+            hot_map_done: std::cell::Cell::new(false),
             livewx: livewx::LiveWx::new(),
             gclouds: globeclouds::GlobeClouds::default(),
             menu_time_set: set_time,
@@ -1839,6 +1842,27 @@ impl Game {
         let depth = (Vec3::from(hs[i].at) - o).dot(d) - hs[i].r - 0.005;
         (!cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, d, depth)).then_some(i)
     }
+    /// FF_HOTSPOT_MAP set: logs, once, where each cockpit hotspot is on the
+    /// screen (for scripted clicks: --cursor, --click, --wheel).
+    fn log_hotspot_map(&self) {
+        if std::env::var_os("FF_HOTSPOT_MAP").is_none() || self.hot_map_done.get() || self.cam_mode != 1 || self.real < 6.0 {
+            return;
+        }
+        let Some((vp, cam)) = self.live_view else { return };
+        self.hot_map_done.set(true);
+        let s = self.window.inner_size();
+        let (w, h) = (s.width as f32, s.height as f32);
+        let pose = self.plane.pose(&self.model.pieces);
+        for (i, hs) in self.cockpit_hotspots(&pose).iter().enumerate() {
+            let p = self.plane.model_pos() + self.plane.rot * Vec3::from(hs.at).as_dvec3();
+            let c = vp * (p - cam).as_vec3().extend(1.0);
+            let (x, y) = ((c.x / c.w * 0.5 + 0.5) * w, (0.5 - c.y / c.w * 0.5) * h);
+            let id = hs.click.or(hs.wheel.map(|w| w.0)).or(hs.hold).unwrap_or("?");
+            let seen = self.hotspot_at(x as f64, y as f64) == Some(i);
+            log::info!("hotspot {i} {id}: {x:.0},{y:.0}{}", if seen { "" } else { "  (not reachable there)" });
+        }
+    }
+
     fn hotspot_under_mouse(&self) -> Option<usize> {
         if self.drag {
             return None;
@@ -1959,12 +1983,18 @@ impl Game {
             "nav_next" => self.radios.nav.as_ref().map(|s| format!("{} {}", s.freq_text(), s.label())).unwrap_or_else(|| "OFF".into()),
             "adf_next" => self.radios.adf.as_ref().map(|s| format!("{} {}", s.freq_text(), s.label())).unwrap_or_else(|| "OFF".into()),
             "baro_qnh" => format!("{:.0} hPa", self.radios.setting(self.wx.qnh)),
+            "speedbrake" => format!("{:.0} %", p.spoilers * 100.0),
+            "canopy" => if p.canopy_open { t!("open", "ouverte") } else { t!("shut", "fermée") }.into(),
+            "reversers" => format!("{:.0} %", p.reverser * 100.0),
+            "master_arm" => on_off(self.weapons.armed).into(),
+            "starter" => on_off(p.starter_on || p.cranking).into(),
             _ => return None,
         })
     }
     /// The cockpit control under the mouse: a ring round it, what it is, how
     /// it is set, and the pointing hand.
     fn hotspot_overlay(&self, ctx: &egui::Context) {
+        self.log_hotspot_map();
         use egui::{Align2, Color32, FontId};
         let Some(i) = self.hotspot_under_mouse() else { return };
         let Some((vp, cam)) = self.live_view else { return };
@@ -1981,7 +2011,7 @@ impl Game {
         let painter = ctx.layer_painter(egui::LayerId::background());
         let ring = Color32::from_rgba_unmultiplied(255, 210, 90, 200);
         painter.circle_stroke(c, (e - c).length().max(6.0), egui::Stroke::new(1.5, ring));
-        let label = |id: &'static str| bind::ACTIONS.iter().find(|a| a.id == id).map(|a| a.label()).unwrap_or_else(|| aircraft::c172::cabin::action_label(id));
+        let label = |id: &'static str| cockpit::action_label(id);
         let mut lines: Vec<String> = Vec::new();
         if let Some(id) = h.click {
             let hold = h.hold.map(|k| t!("  (hold: {})", "  (maintenir : {})", label(k))).unwrap_or_default();

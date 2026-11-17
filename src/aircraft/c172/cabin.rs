@@ -970,31 +970,6 @@ fn switches(b: &mut Builder) {
     b.add("parking brake", G_FUSE, p, Anim::slide(Drive::new(Input::ParkingBrake, 0.04), Vec3::Z), PARK_BRAKE, Vec3::Z, None);
 }
 
-pub const MOUSE_ACTIONS: &[&str] = &["prop_up", "prop_down", "cowl_open", "cowl_close", "brake_left", "brake_right", "nav_next", "nav_prev", "adf_next", "adf_prev", "landing_lights", "fuel_valve"];
-
-pub fn action_label(id: &str) -> &str {
-    match id {
-        "prop_up" => "Propeller RPM up", "prop_down" => "Propeller RPM down",
-        "cowl_open" => "Open cowl flaps", "cowl_close" => "Close cowl flaps",
-        "brake_left" => "Left toe brake", "brake_right" => "Right toe brake",
-        "nav_next" => "Tune next NAV station", "nav_prev" => "Tune previous NAV station",
-        "adf_next" => "Tune next ADF station", "adf_prev" => "Tune previous ADF station",
-        "landing_lights" => "Landing lights", "fuel_valve" => "Fuel selector BOTH / OFF", _ => id,
-    }
-}
-
-pub fn moving_piece(h: &Hotspot) -> Option<&'static str> {
-    match h.click.or(h.wheel.map(|w| w.0)).or(h.hold)? {
-        "ignition" => Some("ignition key"), "master" => Some("master switch"),
-        "mixture_rich" => Some("mixture knob"), "throttle_up" => Some("throttle"),
-        "flaps_up" => Some("flap lever"), "gear" => Some("gear handle"),
-        "parking_brake" => Some("parking brake"), "landing_lights" => Some("landing light switch"),
-        "brake_left" | "brake_right" => Some("pedal"),
-        "fuel_valve" => Some("fuel selector"), "prop_up" => Some("prop control"),
-        "cowl_open" => Some("cowl flap lever"), "boost" => Some("yoke"), _ => None,
-    }
-}
-
 fn label(m: &mut Mesh, c: Vec3, hx: f32, hy: f32, text: &str) {
     use crate::aircraft::b747::deck;
     let mm = mt(mat::PLASTIC, 0.035, 0.036, 0.038).pat(pat::LEGEND).x((16 * deck::sid(text)) as f32);
@@ -1003,32 +978,32 @@ fn label(m: &mut Mesh, c: Vec3, hx: f32, hy: f32, text: &str) {
 
 /// What the mouse can work in the cockpit (see `aircraft::Hotspot`).
 pub static HOTSPOTS: &[Hotspot] = &[
-    Hotspot { at: [0.048, -0.195, PANEL_Z + 0.034], r: 0.018, click: None, hold: None, wheel: Some(("prop_up", "prop_down")) },
-    Hotspot { at: [0.0, -0.518, PANEL_Z + 0.055], r: 0.023, click: None, hold: None, wheel: Some(("cowl_open", "cowl_close")) },
-    Hotspot { at: [-0.355, -0.47, -1.135], r: 0.04, click: None, hold: Some("brake_left"), wheel: None },
-    Hotspot { at: [-0.185, -0.47, -1.135], r: 0.04, click: None, hold: Some("brake_right"), wheel: None },
+    Hotspot { at: [0.048, -0.195, PANEL_Z + 0.034], r: 0.018, click: None, hold: None, wheel: Some(("prop_up", "prop_down")), piece: Some("prop control") },
+    Hotspot { at: [0.0, -0.518, PANEL_Z + 0.055], r: 0.023, click: None, hold: None, wheel: Some(("cowl_open", "cowl_close")), piece: Some("cowl flap lever") },
+    Hotspot { at: [-0.355, -0.47, -1.135], r: 0.04, click: None, hold: Some("brake_left"), wheel: None, piece: Some("pedal") },
+    Hotspot { at: [-0.185, -0.47, -1.135], r: 0.04, click: None, hold: Some("brake_right"), wheel: None, piece: Some("pedal") },
     // Ignition: a click turns the magnetos on or off; hold it to crank.
-    Hotspot { at: [KEY.x, KEY.y, KEY.z + 0.02], r: 0.025, click: Some("ignition"), hold: Some("starter"), wheel: None },
-    Hotspot { at: [MASTER.x, MASTER.y, MASTER.z], r: 0.014, click: Some("master"), hold: None, wheel: None },
+    Hotspot { at: [KEY.x, KEY.y, KEY.z + 0.02], r: 0.025, click: Some("ignition"), hold: Some("starter"), wheel: None, piece: Some("ignition key") },
+    Hotspot { at: [MASTER.x, MASTER.y, MASTER.z], r: 0.014, click: Some("master"), hold: None, wheel: None, piece: Some("master switch") },
     // (The knob travels 5 cm: the hotspot covers it in and out.)
-    Hotspot { at: [MIXTURE.x, MIXTURE.y, MIXTURE.z + 0.034], r: 0.019, click: None, hold: None, wheel: Some(("mixture_rich", "mixture_lean")) },
-    Hotspot { at: [0.0, -0.195, PANEL_Z + 0.04], r: 0.022, click: None, hold: None, wheel: Some(("throttle_up", "throttle_down")) },
-    Hotspot { at: [0.15, -0.195, PANEL_Z + 0.035], r: 0.02, click: None, hold: None, wheel: Some(("flaps_up", "flaps_down")) },
-    Hotspot { at: [-0.09, -0.185, PANEL_Z + 0.05], r: 0.02, click: Some("gear"), hold: None, wheel: None },
-    Hotspot { at: [PARK_BRAKE.x, PARK_BRAKE.y, PARK_BRAKE.z + 0.026], r: 0.025, click: Some("parking_brake"), hold: None, wheel: None },
+    Hotspot { at: [MIXTURE.x, MIXTURE.y, MIXTURE.z + 0.034], r: 0.019, click: None, hold: None, wheel: Some(("mixture_rich", "mixture_lean")), piece: Some("mixture knob") },
+    Hotspot { at: [0.0, -0.195, PANEL_Z + 0.04], r: 0.022, click: None, hold: None, wheel: Some(("throttle_up", "throttle_down")), piece: Some("throttle") },
+    Hotspot { at: [0.15, -0.195, PANEL_Z + 0.035], r: 0.02, click: None, hold: None, wheel: Some(("flaps_up", "flaps_down")), piece: Some("flap lever") },
+    Hotspot { at: [-0.09, -0.185, PANEL_Z + 0.05], r: 0.02, click: Some("gear"), hold: None, wheel: None, piece: Some("gear handle") },
+    Hotspot { at: [PARK_BRAKE.x, PARK_BRAKE.y, PARK_BRAKE.z + 0.026], r: 0.025, click: Some("parking_brake"), hold: None, wheel: None, piece: Some("parking brake") },
     // The trim wheel: rolled forward, nose down.
-    Hotspot { at: [0.0, -0.40, PANEL_Z + 0.05], r: 0.03, click: None, hold: None, wheel: Some(("trim_down", "trim_up")) },
+    Hotspot { at: [0.0, -0.40, PANEL_Z + 0.05], r: 0.03, click: None, hold: None, wheel: Some(("trim_down", "trim_up")), piece: None },
     // The two course deviation indicators: the wheel turns the OBS.
-    Hotspot { at: [-0.075, 0.090, PANEL_Z], r: 0.042, click: None, hold: None, wheel: Some(("obs_right", "obs_left")) },
-    Hotspot { at: [-0.075, -0.005, PANEL_Z], r: 0.042, click: None, hold: None, wheel: Some(("adf_next", "adf_prev")) },
+    Hotspot { at: [-0.075, 0.090, PANEL_Z], r: 0.042, click: None, hold: None, wheel: Some(("obs_right", "obs_left")), piece: None },
+    Hotspot { at: [-0.075, -0.005, PANEL_Z], r: 0.042, click: None, hold: None, wheel: Some(("adf_next", "adf_prev")), piece: None },
     // Heading indicator: a click sets it to the compass; altimeter: to the QNH.
-    Hotspot { at: [-0.270, -0.005, PANEL_Z], r: 0.042, click: Some("heading_sync"), hold: None, wheel: None },
-    Hotspot { at: [-0.175, 0.090, PANEL_Z], r: 0.042, click: Some("baro_qnh"), hold: None, wheel: None },
+    Hotspot { at: [-0.270, -0.005, PANEL_Z], r: 0.042, click: Some("heading_sync"), hold: None, wheel: None, piece: None },
+    Hotspot { at: [-0.175, 0.090, PANEL_Z], r: 0.042, click: Some("baro_qnh"), hold: None, wheel: None, piece: None },
     // The radio stack shows or hides the navigation instruments.
-    Hotspot { at: [0.07, 0.01, PANEL_Z], r: 0.07, click: Some("nav_display"), hold: None, wheel: Some(("nav_next", "nav_prev")) },
-    Hotspot { at: [-0.405, -0.205, PANEL_Z + 0.0065], r: 0.014, click: Some("landing_lights"), hold: None, wheel: None },
-    Hotspot { at: [0.0, FLOOR_Y + 0.016, -0.98], r: 0.04, click: Some("fuel_valve"), hold: None, wheel: None },
-    Hotspot { at: [-0.40, 0.035, -1.048], r: 0.011, click: None, hold: Some("boost"), wheel: None },
+    Hotspot { at: [0.07, 0.01, PANEL_Z], r: 0.07, click: Some("nav_display"), hold: None, wheel: Some(("nav_next", "nav_prev")), piece: None },
+    Hotspot { at: [-0.405, -0.205, PANEL_Z + 0.0065], r: 0.014, click: Some("landing_lights"), hold: None, wheel: None, piece: Some("landing light switch") },
+    Hotspot { at: [0.0, FLOOR_Y + 0.016, -0.98], r: 0.04, click: Some("fuel_valve"), hold: None, wheel: None, piece: Some("fuel selector") },
+    Hotspot { at: [-0.40, 0.035, -1.048], r: 0.011, click: None, hold: Some("boost"), wheel: None, piece: Some("yoke") },
 ];
 
 // ---------------------------------------------------------------- glass

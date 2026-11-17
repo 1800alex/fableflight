@@ -34,6 +34,8 @@ pub struct Hotspot {
     /// held past a moment instead of clicked (the key turned on to START)
     pub hold: Option<&'static str>,
     pub wheel: Option<(&'static str, &'static str)>,
+    /// the cockpit piece it rides on (it moves with it), if any
+    pub piece: Option<&'static str>,
 }
 
 /// The hotspot a ray from `o` along `d` (body frame, `d` unit length) meets
@@ -57,7 +59,7 @@ pub fn pick(hs: &[Hotspot], o: Vec3, d: Vec3) -> Option<usize> {
 pub fn animated_hotspots(hs: &[Hotspot], pieces: &[crate::airframe::Piece], pose: &[glam::Mat4]) -> Vec<Hotspot> {
     hs.iter().map(|h| {
         let mut h = *h;
-        if let Some(name) = c172::cabin::moving_piece(&h) {
+        if let Some(name) = h.piece {
             if let Some(i) = pieces.iter().position(|p| p.name == name && match h.hold {
                 Some("brake_left") => p.pivot.x < -0.27,
                 Some("brake_right") => p.pivot.x > -0.27 && p.pivot.x < 0.0,
@@ -617,7 +619,7 @@ mod hotspot_tests {
 
     #[test]
     fn hotspots_stand_for_real_actions() {
-        let known = |id: &str| crate::bind::ACTIONS.iter().any(|a| a.id == id) || c172::cabin::MOUSE_ACTIONS.contains(&id);
+        let known = |id: &str| crate::bind::ACTIONS.iter().any(|a| a.id == id) || crate::cockpit::MOUSE_ACTIONS.contains(&id);
         for s in BUILTIN.iter() {
             for h in s.hotspots {
                 for id in h.click.iter().chain(h.hold.iter()).chain(h.wheel.iter().flat_map(|w| [&w.0, &w.1])) {

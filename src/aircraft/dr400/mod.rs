@@ -97,7 +97,7 @@ pub static SPEC: Spec = Spec {
         stab_tip: DVec3::new(1.60, 0.06, 3.95 + DZ64),
     },
     eye: Vec3::new(EYE.x, EYE.y, EYE.z + DZ),
-    hotspots: &[],
+    hotspots: cabin::HOTSPOTS,
     eye2: None,
     sees_inside: |eye, d| cabin::sees_inside(eye - Vec3::Z * DZ, d),
     // (Body frame: the design frame's z + 0.55.)
