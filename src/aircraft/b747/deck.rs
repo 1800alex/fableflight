@@ -14,6 +14,7 @@
 //! knobs a cream plastic, the lining an off-white. What is shown on the
 //! displays is drawn in the shader from the instrument readings.
 use super::*;
+use crate::aircraft::Hotspot;
 use glam::{Mat3, Quat, Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
@@ -1778,7 +1779,30 @@ fn levers(b: &mut Builder) {
     g.tube(&ALU, &[gp - f2.n() * 0.02, gp + f2.n() * 0.03], &|_| 0.005, 8, false);
     g.lathe(&mt(mat::PLASTIC, 0.08, 0.075, 0.07), gp + f2.n() * 0.03 - Vec3::X * 0.014, Vec3::X, &[[0.0, 0.0], [0.016, 0.0], [0.02, 0.004], [0.02, 0.024], [0.016, 0.028], [0.0, 0.028]], 20, false);
     b.add("gear lever", G_ENGINE, g, Anim::slide(Drive::new(Input::GearHandle, -0.055), f2.ay), gp, Vec3::X, None);
+
+    // The parking brake: a red T-handle on the pedestal, behind the
+    // speedbrake lever at the quadrant's aft corner, pulled up to set.
+    let pb = Vec3::new(-0.15, ytq, zm + 0.005);
+    let mut p = Mesh::default();
+    p.tube(&CHROME, &[pb - Vec3::Y * 0.02, pb + Vec3::Y * 0.05], &|_| 0.0035, 8, false);
+    p.rbox(&mt(mat::PLASTIC, 0.55, 0.06, 0.04), pb + Vec3::Y * 0.055, Vec3::new(0.022, 0.006, 0.007), 0.004, Quat::IDENTITY);
+    b.add("parking brake", G_ENGINE, p, Anim::slide(Drive::new(Input::ParkingBrake, 0.025), Vec3::Y), pb, Vec3::Y, None);
 }
+
+/// What the mouse can work on the flight deck (see `aircraft::Hotspot`).
+pub static HOTSPOTS: &[Hotspot] = &[
+    // The four thrust levers: the wheel sets the thrust; held, the reverse levers come up.
+    Hotspot { at: [0.0, 2.792, -26.469], r: 0.03, click: None, hold: Some("reversers"), wheel: Some(("throttle_up", "throttle_down")), piece: Some("thrust lever") },
+    Hotspot { at: [-0.125, 2.775, -26.463], r: 0.022, click: Some("speedbrake"), hold: None, wheel: None, piece: Some("speedbrake lever") },
+    Hotspot { at: [0.125, 2.762, -26.459], r: 0.022, click: None, hold: None, wheel: Some(("flaps_up", "flaps_down")), piece: Some("flap lever") },
+    Hotspot { at: [0.15, 2.940, -26.711], r: 0.025, click: Some("gear"), hold: None, wheel: None, piece: Some("gear lever") },
+    Hotspot { at: [-0.15, 2.655, -26.275], r: 0.022, click: Some("parking_brake"), hold: None, wheel: None, piece: Some("parking brake") },
+    // The fuel control switches, RUN or CUTOFF, behind the quadrant; the stabiliser trim's alternate switches.
+    Hotspot { at: [-0.035, 2.621, -26.201], r: 0.055, click: Some("ignition"), hold: None, wheel: None, piece: None },
+    Hotspot { at: [0.105, 2.601, -26.20], r: 0.028, click: None, hold: None, wheel: Some(("trim_down", "trim_up")), piece: None },
+    // The engine start switches on the overhead panel: held, the starters turn.
+    Hotspot { at: [0.0, 3.935, -25.881], r: 0.06, click: None, hold: Some("starter"), wheel: None, piece: None },
+];
 
 fn columns(b: &mut Builder) {
     for sx in [-1.0f32, 1.0] {

@@ -223,9 +223,13 @@ impl WheelSteps {
 }
 
 /// Coarse local bounds avoid testing triangles in pieces the pointer cannot meet.
+/// The cockpit pieces that can hide a control from the pilot's eye: a light
+/// aircraft's cabin, an airliner's flight deck panels and furnishings.
+const PANELS: &[&str] = &["cabin", "flight deck panels", "flight deck lining", "flight deck furnishings", "overhead panel"];
+
 pub fn blockers(pieces: &[crate::airframe::Piece]) -> Vec<(usize, Vec3, Vec3)> {
     pieces.iter().enumerate().filter(|(_, p)| !p.glass &&
-        (p.name == "cabin" || p.name == "yoke" || p.name == "pedal" ||
+        (PANELS.contains(&p.name) || p.name == "yoke" || p.name == "pedal" ||
          p.anim != crate::airframe::Anim::Fixed && p.group == crate::airframe::G_FUSE))
         .filter_map(|(i, p)| {
             if p.mesh.v.is_empty() { return None; }
