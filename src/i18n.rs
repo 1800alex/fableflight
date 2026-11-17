@@ -135,6 +135,7 @@ fn fr(en: &str) -> Option<&'static str> {
         "Controls" => "Commandes",
         "Bindings" => "Assignations",
         "Radio" => "Radios",
+        "Autopilot" => "Pilote automatique",
         "Failures" => "Pannes",
         "battery master switch" => "batterie (interrupteur général)",
         "Ins" => "Inser",
@@ -231,6 +232,8 @@ fn fr(en: &str) -> Option<&'static str> {
         "start at the crosshair" => "partir depuis le viseur",
         "take off" => "décoller",
         "settings and this controls list" => "réglages et cette liste des commandes",
+        "back to the main menu" => "retour au menu principal",
+        "aircraft" => "avion",
         "parking brake" => "frein de parc",
         // gamepad prompts
         "move" => "naviguer",
