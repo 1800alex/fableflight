@@ -235,7 +235,7 @@ impl Game {
     pub(crate) fn systems_card(&self, ctx: &egui::Context, vs: f64, base_up: f64) -> Option<Rect> {
         let p = &self.plane;
         let rocket = p.engines().is_some();
-        if !rocket && !self.weapons.has_weapons() {
+        if !rocket && !self.missiles_ok() {
             return None;
         }
         let amber = Color32::from_rgb(255, 196, 80);
@@ -263,7 +263,7 @@ impl Game {
                         row(ui, t!("Mass, load", "Masse, facteur"), format!("{:.0} t  ·  {:.1} g", p.mass() / 1000.0, p.g_load), TEXT);
                     });
                 }
-                if self.weapons.has_weapons() {
+                if self.missiles_ok() {
                     let armed = self.weapons.armed;
                     let power = p.sys.powered();
                     ui.label(menu::section_text(t!("Weapons", "Armement")).color(DIM));
