@@ -3,18 +3,23 @@
 use crate::buildings::{self, Footprint, Parked, TreeChunk};
 use crate::cars::{self, Car};
 use crate::geo::{self, TileId};
-use crate::render::{BuildGpu, DetailDraw, Inst, NearDraw, Renderer, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
+use crate::render::{BuildGpu, DetailDraw, Inst, NearDraw, Renderer, TessCells, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
 use crate::roads::RoadNet;
 use crate::trees::{lod_span, tree_jit, NearCell, TreeDim, Under, CARDS, CARD_RANGE, IMP_DIST, LODS, LOD_DIST, LOD_JITTER, TREE_SPECIES, VARIANTS};
 use crate::weapons::{Target, TargetKey};
 use crate::sources::{Job, JobResult, Loader, DATA_ZOOM, GRID, GV};
 use glam::{DMat4, DVec3, DVec4, Vec3};
-use std::collections::{HashMap, VecDeque};
+// Fx hashing: these maps are hit many times a frame with small, locally made keys (no untrusted input).
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::VecDeque;
 
 struct Tile {
     center: DVec3,
     radius: f64,
     gpu: TileGpu,
+    /// the grid vertices' positions as uploaded, to pick the patch each
+    /// tessellated cell is drawn with (`tess_cells`)
+    grid: Vec<[f32; 3]>,
     heights: Vec<f32>,
     water: Vec<bool>,
     /// how much of the ocean's long waves the water shows (sources.rs TileData::sea)
@@ -141,7 +146,6 @@ pub struct Wreck {
 /// at least once (terrain.wgsl: closer than cell / (2 TESS_K)), plus a margin.
 /// Empty when the camera is too high or too far away.
 fn tess_block(id: TileId, lat: f64, lon: f64, agl: f64, cell: f64) -> [f32; 4] {
-    const TESS_K: f64 = 0.03;
     let r = cell / (2.0 * TESS_K) + 1.5 * cell;
     if agl >= r || agl.is_nan() {
         return [0.0; 4];
@@ -155,6 +159,51 @@ fn tess_block(id: TileId, lat: f64, lon: f64, agl: f64, cell: f64) -> [f32; 4] {
         return [0.0; 4];
     }
     [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32]
+}
+
+/// terrain.wgsl TESS_K and TN: triangles are kept to about TESS_K of their
+/// distance across; a tessellated cell splits into at most TN x TN.
+const TESS_K: f64 = 0.03;
+const TESS_N: u32 = 16;
+
+/// Sorts the cells of a tile's tessellated block (`b`, from `tess_block`) by
+/// the patch each is drawn with: `out[k]` gets `cell | k << 16` for an
+/// n = 2^k patch (terrain.wgsl `vs_tess`). The shader picks a level for each
+/// edge and for the inside of a cell from their midpoints' distance. An
+/// n x n patch whose vertices stand for every (TN / n)-th of the full
+/// TN x TN patch's makes exactly the same triangles, stitching included, when
+/// all five levels are n, or when n is at least twice the highest of them
+/// (fewer, and the stitching or the corners come out differently). The levels
+/// are worked out here as the shader does, with a margin for rounding: where
+/// any is in doubt the larger patch is taken, which costs time but changes
+/// nothing on screen. `p`: the grid vertices, `o`: the tile's offset from the
+/// camera and `cell` its grid spacing, as in the tile's uniform.
+fn tess_cells(p: &[[f32; 3]], o: Vec3, cell: f32, b: [f32; 4], out: &mut [Vec<u32>; 5]) {
+    let w = cell as f64;
+    // terrain.wgsl `tess_level` at distance d.
+    let level = |d: f64| {
+        let sp = (d * TESS_K).max(w / TESS_N as f64);
+        ((w / sp).max(1.0).log2().floor().exp2() as u32).clamp(1, TESS_N)
+    };
+    let at = |i: usize| Vec3::from(p[i]) + o;
+    let (x0, y0) = (b[0] as usize, b[1] as usize);
+    for cj in y0..(y0 + b[3] as usize).min(GRID) {
+        for ci in x0..(x0 + b[2] as usize).min(GRID) {
+            let i00 = cj * GV + ci;
+            let (c00, c10, c01, c11) = (at(i00), at(i00 + 1), at(i00 + GV), at(i00 + GV + 1));
+            // The edges' midpoints, then the inside's (the shader's order of operations).
+            let mids = [(c00 + c10) * 0.5, (c01 + c11) * 0.5, (c00 + c01) * 0.5, (c10 + c11) * 0.5, (c00 + c11) * 0.5];
+            let (mut lo, mut hi) = (TESS_N, 1);
+            for m in mids {
+                let d = m.as_dvec3().length();
+                lo = lo.min(level(d * 1.001));
+                hi = hi.max(level(d * 0.999));
+            }
+            let n = if lo == hi { hi } else { (2 * hi).min(TESS_N) };
+            let k = n.trailing_zeros();
+            out[k as usize].push((cj * GRID + ci) as u32 | k << 16);
+        }
+    }
 }
 
 pub fn crater_profile(d: f64) -> f64 {
@@ -235,7 +284,7 @@ impl Frustum {
 impl World {
     pub fn new(loader: Loader, max_zoom: u8) -> Self {
         let photo = Some(Box::new(crate::tiles3d::Photo::new(loader.src.google.clone(), Some(loader.src.clone()))));
-        Self { photo, flat: None, loader, tiles: HashMap::new(), builds: HashMap::new(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, reach_k: 1.0, city_k: 1.0, tree_far: 3200.0, tree_imp_k: 1.0, cars: (1.0, 2200.0, 1100.0), buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::new(), ocean: crate::ocean::Ocean::new() }
+        Self { photo, flat: None, loader, tiles: HashMap::default(), builds: HashMap::default(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, reach_k: 1.0, city_k: 1.0, tree_far: 3200.0, tree_imp_k: 1.0, cars: (1.0, 2200.0, 1100.0), buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::default(), ocean: crate::ocean::Ocean::new() }
     }
 
     /// Tiles wanted but not yet asked for (at most 28 are on their way at once).
@@ -857,7 +906,7 @@ impl World {
                     let slot = match res {
                         Ok(td) => {
                             bytes += crate::render::tile_bytes(&td);
-                            Slot::Ready(Box::new(Tile { center: td.center, radius: td.radius, gpu: r.upload_tile(&td), heights: td.heights, wet: td.water.iter().any(|w| *w), water: td.water, sea: td.sea, last_used: self.frame, generation: td.imagery_gen, refreshing: false }))
+                            Slot::Ready(Box::new(Tile { center: td.center, radius: td.radius, gpu: r.upload_tile(&td), grid: td.verts[..GV * GV].iter().map(|v| v.pos).collect(), heights: td.heights, wet: td.water.iter().any(|w| *w), water: td.water, sea: td.sea, last_used: self.frame, generation: td.imagery_gen, refreshing: false }))
                         }
                         Err(e) => {
                             log::debug!("tile {id:?} failed: {e}");
@@ -1361,8 +1410,10 @@ impl World {
 
     /// Terrain tiles and detail tiles to draw. `focus` and `casc` (radius of
     /// each shadow cascade) decide what has to be rendered into the shadow maps.
-    pub fn draw_lists(&self, cam: DVec3, focus: DVec3, casc: [f32; 3]) -> (Vec<(&TileGpu, [f32; 12])>, Vec<DetailDraw<'_>>, Vec<TreeInst>) {
-        let mut tiles = Vec::with_capacity(self.draw.len());
+    /// Also the tessellated cells of the terrain tiles, by the patch they are
+    /// drawn with (`tess_cells`).
+    pub fn draw_lists(&self, cam: DVec3, focus: DVec3, casc: [f32; 3]) -> (Vec<(&TileGpu, [f32; 12])>, TessCells, Vec<DetailDraw<'_>>, Vec<TreeInst>) {
+        let mut drawn = Vec::with_capacity(self.draw.len());
         let (clat, clon, calt) = geo::pos_to_lla(cam);
         let agl = calt - self.ground(clat, clon).map(|g| g.h).unwrap_or(0.0);
         let base = Self::cover_base(cam);
@@ -1372,9 +1423,26 @@ impl World {
                 let cell = id.width_m() / GRID as f64;
                 let tess = tess_block(*id, clat, clon, agl, cell);
                 let cv = Self::cover_info(*id, base);
-                tiles.push((&t.gpu, [o.x, o.y, o.z, cell as f32, id.z as f32, cv[0], cv[1], cv[2], tess[0], tess[1], tess[2], tess[3]]));
+                drawn.push((&**t, [o.x, o.y, o.z, cell as f32, id.z as f32, cv[0], cv[1], cv[2], tess[0], tess[1], tess[2], tess[3]]));
             }
         }
+        // near to far, so nearer geometry hides what is behind it before it is shaded.
+        drawn.sort_by(|a, b| Vec3::new(a.1[0], a.1[1], a.1[2]).length_squared().total_cmp(&Vec3::new(b.1[0], b.1[1], b.1[2]).length_squared()));
+        let mut tess = TessCells::default();
+        let mut by_n: [Vec<u32>; 5] = Default::default();
+        for (i, (t, u)) in drawn.iter().enumerate() {
+            // (render.rs draws a block tessellated only if it has cells both ways)
+            if u[10] >= 1.0 && u[11] >= 1.0 {
+                tess_cells(&t.grid, Vec3::new(u[0], u[1], u[2]), u[3], [u[8], u[9], u[10], u[11]], &mut by_n);
+                for (k, cells) in by_n.iter_mut().enumerate() {
+                    if !cells.is_empty() {
+                        tess.groups.push((i as u32, k as u32, tess.cells.len() as u32, cells.len() as u32));
+                        tess.cells.append(cells);
+                    }
+                }
+            }
+        }
+        let tiles: Vec<_> = drawn.into_iter().map(|(t, u)| (&t.gpu, u)).collect();
         let mut details = Vec::with_capacity(self.draw_b.len());
         let mut near_inst: Vec<TreeInst> = Vec::new();
         let mut tb = TreeBatcher::new();
@@ -1519,11 +1587,9 @@ impl World {
                 close: near,
             });
         }
-        // near to far, so nearer geometry hides what is behind it before it is shaded.
-        tiles.sort_by(|a, b| Vec3::new(a.1[0], a.1[1], a.1[2]).length_squared().total_cmp(&Vec3::new(b.1[0], b.1[1], b.1[2]).length_squared()));
         let key = |d: &DetailDraw| Vec3::new(d.u[0], d.u[1], d.u[2]).length() - d.radius;
         details.sort_by(|a, b| key(a).total_cmp(&key(b)));
-        (tiles, details, near_inst)
+        (tiles, tess, details, near_inst)
     }
 }
 
