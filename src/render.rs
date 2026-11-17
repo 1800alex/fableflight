@@ -676,10 +676,15 @@ fn split_instruments(verts: &[PartVertex], idx: &[u32]) -> (Vec<u32>, u32) {
     (main, n)
 }
 
-/// the g-buffer pipeline for aircraft parts with fixed constants, mode 0 or 5 of `geom`.
-fn obj_pipeline(d: &wgpu::Device, layout: &wgpu::PipelineLayout, m: &wgpu::ShaderModule, cut: bool, constants: &[(&str, f64)]) -> wgpu::RenderPipeline {
+/// the aircraft shader source with its kind fixed and the instrument faces left out.
+pub fn specialise(src: &str, kind: u32) -> String {
+    src.replacen("const KIND: u32 = 99u;", &format!("const KIND: u32 = {kind}u;"), 1).replacen("const INSTR: u32 = 1u;", "const INSTR: u32 = 0u;", 1)
+}
+
+/// the g-buffer pipeline for aircraft parts, mode 0 or 5 of `geom`.
+fn obj_pipeline(d: &wgpu::Device, layout: &wgpu::PipelineLayout, m: &wgpu::ShaderModule, cut: bool) -> wgpu::RenderPipeline {
     const A_PART: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x4];
-    let opts = wgpu::PipelineCompilationOptions { constants, ..Default::default() };
+    let opts = wgpu::PipelineCompilationOptions::default();
     let targets = [
         Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL }),
         Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL }),
@@ -918,8 +923,8 @@ pub struct Renderer {
     obj_ub: wgpu::Buffer,
     bg_obj: wgpu::BindGroup,
     l_obj: wgpu::BindGroupLayout,
-    /// the aircraft shader and its layout, kept to specialise it per kind off the main thread
-    m_obj: wgpu::ShaderModule,
+    /// the aircraft shader source and its layout, kept to specialise it per kind off the main thread
+    obj_src: std::sync::Arc<String>,
     pl_obj: wgpu::PipelineLayout,
     obj_fast: Option<ObjFast>,
     obj_fast_rx: Option<(u32, crossbeam_channel::Receiver<ObjFast>)>,
@@ -1475,7 +1480,9 @@ impl Renderer {
         let m_photo = module("photo", include_str!("shaders/photo.wgsl"));
         let facade = include_str!("shaders/facade.wgsl");
         let m_build = module("buildings", &format!("{facade}\n{}", include_str!("shaders/buildings.wgsl")));
-        let m_obj = module("plane", &format!("{}\n{}\n{}\n{}", include_str!("shaders/plane.wgsl"), crate::aircraft::b747::deck::strings_wgsl(), include_str!("shaders/deck747.wgsl"), include_str!("shaders/pit18.wgsl")));
+        let obj_src = format!("{}\n{}\n{}\n{}", include_str!("shaders/plane.wgsl"), crate::aircraft::b747::deck::strings_wgsl(), include_str!("shaders/deck747.wgsl"), include_str!("shaders/pit18.wgsl"));
+        let m_obj = module("plane", &obj_src);
+        let obj_src = std::sync::Arc::new(format!("{common}\n{obj_src}"));
         let sky = include_str!("shaders/sky.wgsl");
         let m_comp = module("composite", &format!("{sky}\n{}", include_str!("shaders/composite.wgsl")));
         let m_cloud = module("clouds", &format!("{sky}\n{}", include_str!("shaders/clouds.wgsl")));
@@ -2169,7 +2176,7 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, m_obj: m_obj.clone(), pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
@@ -2459,11 +2466,11 @@ impl Renderer {
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let (d, m, pl) = (self.device.clone(), self.m_obj.clone(), self.pl_obj.clone());
+        let (d, src, pl) = (self.device.clone(), self.obj_src.clone(), self.pl_obj.clone());
         let spawned = std::thread::Builder::new().name("obj shader".into()).spawn(move || {
             let t = std::time::Instant::now();
-            let c = [("KIND", kind as f64), ("INSTR", 0.0)];
-            let f = ObjFast { kind, cut: obj_pipeline(&d, &pl, &m, true, &c), solid: obj_pipeline(&d, &pl, &m, false, &c) };
+            let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("plane fast"), source: wgpu::ShaderSource::Wgsl(specialise(&src, kind).into()) });
+            let f = ObjFast { kind, cut: obj_pipeline(&d, &pl, &m, true), solid: obj_pipeline(&d, &pl, &m, false) };
             log::info!("aircraft shader for kind {kind} ready in {:.1} s", t.elapsed().as_secs_f64());
             let _ = tx.send(f);
         });

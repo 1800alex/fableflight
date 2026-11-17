@@ -52,10 +52,10 @@ struct Paint { box: vec4f, view: vec4f };
 // light single, 1 the 747, 2 the Hornet, 3 the Phantom, 4 the Raptor, 5 the Starship rocket. Its windows, wells,
 // paint and panel lines differ. tint.y and tint.z carry the engines: how far the afterburners
 // are lit, and how hard they are running dry (0 idle .. 1).
-// pipeline constants, render.rs obj_fast. a kind under 99 is fixed at compile time.
-override KIND: u32 = 99u;
+// specialisation, render.rs `specialise` rewrites these two lines. a kind under 99 is fixed.
+const KIND: u32 = 99u;
 // instrument faces and displays, 0 left out (drawn by their own pipeline), 1 drawn.
-override INSTR: u32 = 1u;
+const INSTR: u32 = 1u;
 fn kind() -> u32 { if (KIND < 99u) { return KIND; } return u32(O.glow.y + 0.5); }
 // The fighters: modelled in Blender, their paint a picture, one blown canopy over a tub.
 fn fighter() -> bool { return (kind() >= 2u && kind() <= 4u) || kind() == 7u; }
