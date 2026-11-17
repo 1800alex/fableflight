@@ -733,6 +733,7 @@ pub struct TerrainVertex {
 }
 
 pub struct TileData {
+    #[allow(dead_code)]
     pub id: TileId,
     pub center: DVec3,
     pub radius: f64,
