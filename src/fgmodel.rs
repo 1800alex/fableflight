@@ -198,6 +198,9 @@ fn parse_ac(text: &str) -> Result<Ac, String> {
 
 // ------------------------------------------------------------------ textures
 
+/// The largest SGI image we decode (8192 x 8192): past any aircraft texture.
+const SGI_MAX_PIXELS: usize = 8192 * 8192;
+
 /// An SGI image (.rgb, .rgba, .sgi, .bw), as FlightGear's older models use.
 fn read_sgi(d: &[u8]) -> Option<image::RgbaImage> {
     if d.len() < 512 || u16::from_be_bytes([d[0], d[1]]) != 474 {
@@ -208,6 +211,10 @@ fn read_sgi(d: &[u8]) -> Option<image::RgbaImage> {
         return None; // only 8 bits a channel
     }
     let (w, h, zs) = (u16::from_be_bytes([d[6], d[7]]) as usize, u16::from_be_bytes([d[8], d[9]]) as usize, u16::from_be_bytes([d[10], d[11]]).max(1) as usize);
+    // (the header's own word for its size: up to 65535 x 65535 x 65535 bytes to allocate)
+    if w == 0 || h == 0 || zs > 4 || w * h > SGI_MAX_PIXELS {
+        return None;
+    }
     let mut ch = vec![vec![0u8; w * h]; zs];
     if rle {
         let tab = |i: usize| -> usize { let o = 512 + i * 4; u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize };
@@ -934,6 +941,15 @@ fn to_anim(d: &AnimDef, origin: Vec3) -> (Anim, Vec3, Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sgi_header_cannot_ask_for_gigabytes() {
+        // 65535 x 65535, 65535 channels, 8 bits: a 512-byte file asking for terabytes.
+        let mut d = vec![0u8; 512];
+        d[..4].copy_from_slice(&[0x01, 0xda, 0, 1]);
+        d[6..12].copy_from_slice(&[0xff; 6]);
+        assert!(read_sgi(&d).is_none());
+    }
 
     #[test]
     fn ac_hierarchy_and_frames() {
