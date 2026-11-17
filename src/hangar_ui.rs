@@ -66,8 +66,8 @@ impl crate::Game {
                     }
                     let name_w = ui.available_width() - 34.0 - ui.spacing().item_spacing.x;
                     ui.allocate_ui_with_layout(egui::vec2(name_w, 34.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(t!("AIRCRAFT  {} / {}", "AVION  {} / {}", k + 1, n)).size(10.5).strong().color(DIM).extra_letter_spacing(1.5));
-                        ui.label(RichText::new(spec.name).size(17.0).strong().color(Color32::WHITE));
+                        ui.label(menu::section_text(&t!("Aircraft  {} / {}", "Avion  {} / {}", k + 1, n)).color(DIM));
+                        ui.label(RichText::new(spec.name).font(menu::item_title()).color(Color32::WHITE));
                     });
                     if arrow(ui, 0.0).on_hover_text(t!("Next aircraft", "Avion suivant")).clicked() {
                         choose = Some((k + 1) % n);
@@ -75,10 +75,13 @@ impl crate::Game {
                 });
             });
             // The picture: click it for the aircraft screen.
-            let ph = w * 392.0 / 680.0;
+            // a little shorter than the picture, which keeps its shape (its edges are empty)
+            let ph = w * 0.46;
             let (pic, resp) = ui.allocate_exact_size(egui::vec2(w, ph), egui::Sense::click());
             ui.painter().rect_filled(pic, 0.0, menu::PANEL);
-            egui::Image::new(&tex).paint_at(ui, pic);
+            let iw = (ph * 680.0 / 392.0 * 1.08).min(w);
+            let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().with_clip_rect(pic).image(tex.id(), egui::Rect::from_center_size(pic.center(), egui::vec2(iw, iw * 392.0 / 680.0)), full, Color32::WHITE);
             if spec.origin.is_some() {
                 badge(ui.painter(), pic.left_top() + egui::vec2(12.0, 6.0), if spec.ext.is_some() { "FlightGear" } else { "JSBSim" });
             }
@@ -153,47 +156,48 @@ impl crate::Game {
         egui::Area::new(egui::Id::unique("aircraft_screen")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
             ui.interact(screen, ui.scope_id().with("backdrop"), Sense::click());
             let p = ui.painter().clone();
-            p.rect_filled(screen, 0.0, Color32::from_rgb(8, 11, 15));
+            p.rect_filled(screen, 0.0, menu::BG);
             let side_w = if screen.width() < 1100.0 { 280.0 } else { 330.0 };
             let side = Rect::from_min_size(screen.min, vec2(side_w, screen.height()));
-            p.rect_filled(side, 0.0, Color32::from_black_alpha(90));
-            p.vline(side.right(), side.y_range(), Stroke::new(1.0, Color32::from_white_alpha(16)));
+            p.rect_filled(side, 0.0, Color32::from_black_alpha(110));
+            p.vline(side.right(), side.y_range(), Stroke::new(1.0, menu::LINE_HI));
 
             // The sidebar: title, every aircraft, more to download, Back.
             let foot_h = if crate::padui::active() { 96.0 } else { 74.0 };
             let list_r = Rect::from_min_max(side.min + vec2(16.0, 28.0), pos2(side.right() - 16.0, side.bottom() - foot_h - 12.0));
             let mut s = ui.new_child(egui::UiBuilder::new().max_rect(list_r).layout(Layout::top_down(egui::Align::Min)));
-            s.add_space(4.0);
-            s.label(RichText::new("FABLE FLIGHT").size(11.5).strong().color(ACCENT).extra_letter_spacing(1.5));
-            s.label(RichText::new(t!("Aircraft", "Avions")).size(30.0).strong().color(Color32::WHITE));
-            s.add_space(16.0);
+            s.add_space(10.0);
+            menu::screen_heading(&mut s, t!("Aircraft", "Avions"));
+            s.add_space(20.0);
             egui::ScrollArea::vertical().id_salt("aircraft_list").auto_shrink([false, false]).max_height(s.available_height()).show(&mut s, |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for (k, spec) in list.iter().enumerate() {
                     let on = tab == Tab::Mine && k == self.menu.air_view;
-                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
                     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, spec.name));
                     if on {
                         self.pad_home_focus(&resp);
                     }
-                    let lit = resp.hovered() || resp.has_focus();
+                    let lit = menu::ease(ui.ctx(), resp.id, (resp.hovered() || resp.has_focus()) && !on);
+                    let pick = ui.ctx().animate_bool_with_time(resp.id.with("on"), on, 0.18);
                     let p = ui.painter();
-                    if on || lit {
-                        p.rect_filled(rect, menu::R_WIDGET, Color32::from_white_alpha(if on { 16 } else { 8 }));
+                    let a = (7.0 * lit + 14.0 * pick).min(16.0);
+                    if a > 0.0 {
+                        p.rect_filled(rect, menu::R_WIDGET, Color32::from_white_alpha(a as u8));
                     }
-                    if on {
-                        p.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 0.0, ACCENT);
+                    if pick > 0.0 {
+                        p.rect_filled(Rect::from_center_size(pos2(rect.left() + 1.5, rect.center().y), vec2(3.0, rect.height() * 0.5 * pick)), 1.0, ACCENT);
                     }
-                    let pic = Rect::from_min_size(pos2(rect.left() + 10.0, rect.center().y - 23.0), vec2(80.0, 46.0));
+                    let pic = Rect::from_min_size(pos2(rect.left() + 12.0 + 3.0 * lit, rect.center().y - 23.0), vec2(80.0, 46.0));
                     egui::Image::new(&texs[k]).paint_at(ui, pic);
-                    let x = pic.right() + 10.0;
+                    let x = rect.left() + 104.0;
                     let chosen = k == self.menu.aircraft;
-                    let name_col = if on { Color32::WHITE } else if lit { TEXT } else { Color32::from_rgb(198, 204, 214) };
+                    let name_col = menu::mix(menu::mix(Color32::from_rgb(200, 207, 218), TEXT, lit), Color32::WHITE, pick);
                     let room = rect.right() - x - 16.0;
-                    let g = one_line(p, spec.name, 15.0, name_col, room);
+                    let g = one_line_font(p, spec.name, menu::label(), name_col, room);
                     let name_w = g.size().x;
-                    p.galley(pos2(x, rect.center().y - 17.0), g, name_col);
-                    p.galley(pos2(x, rect.center().y + 2.0), one_line(p, &kind_line(spec), 11.5, DIM, room + 10.0), DIM);
+                    p.galley(pos2(x, rect.center().y - 18.0), g, name_col);
+                    p.galley(pos2(x, rect.center().y + 2.0), one_line(p, &kind_line(spec), 13.0, DIM, room + 10.0), DIM);
                     if chosen {
                         // the one flown: a small accent dot after its name
                         p.circle_filled(pos2((x + name_w + 9.0).min(rect.right() - 6.0), rect.center().y - 8.0), 3.5, ACCENT);
@@ -214,20 +218,20 @@ impl crate::Game {
                 if on {
                     self.pad_home_focus(&resp);
                 }
-                let lit = resp.hovered() || resp.has_focus();
+                let lit = menu::ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
                 let p = ui.painter();
-                p.rect_filled(rect, menu::R_WIDGET, Color32::from_white_alpha(if on { 16 } else if lit { 10 } else { 4 }));
+                p.rect_filled(rect, menu::R_WIDGET, Color32::from_white_alpha(if on { 16 } else { (4.0 + 6.0 * lit) as u8 }));
                 if on {
-                    p.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 0.0, ACCENT);
+                    p.rect_filled(Rect::from_center_size(pos2(rect.left() + 1.5, rect.center().y), vec2(3.0, rect.height() * 0.5)), 1.0, ACCENT);
                 } else {
-                    p.rect_stroke(rect, menu::R_WIDGET, Stroke::new(1.0, Color32::from_white_alpha(if lit { 50 } else { 24 })), egui::StrokeKind::Inside);
+                    p.rect_stroke(rect, menu::R_WIDGET, Stroke::new(1.0, menu::mix(menu::LINE_HI, Color32::from_white_alpha(60), lit)), egui::StrokeKind::Inside);
                 }
-                let c = pos2(rect.left() + 50.0, rect.center().y);
-                let col = if on || lit { ACCENT } else { DIM };
-                p.line_segment([c - vec2(9.0, 0.0), c + vec2(9.0, 0.0)], Stroke::new(2.2, col));
-                p.line_segment([c - vec2(0.0, 9.0), c + vec2(0.0, 9.0)], Stroke::new(2.2, col));
-                p.text(pos2(rect.left() + 100.0, rect.center().y - 8.0), Align2::LEFT_CENTER, t!("Download more", "En télécharger"), egui::FontId::proportional(15.0), if on || lit { Color32::WHITE } else { TEXT });
-                p.text(pos2(rect.left() + 100.0, rect.center().y + 10.0), Align2::LEFT_CENTER, t!("FlightGear's collection", "Collection de FlightGear"), egui::FontId::proportional(11.5), DIM);
+                let c = pos2(rect.left() + 52.0, rect.center().y);
+                let col = if on { ACCENT } else { menu::mix(DIM, ACCENT, lit) };
+                p.line_segment([c - vec2(9.0, 0.0), c + vec2(9.0, 0.0)], Stroke::new(2.0, col));
+                p.line_segment([c - vec2(0.0, 9.0), c + vec2(0.0, 9.0)], Stroke::new(2.0, col));
+                p.text(pos2(rect.left() + 104.0, rect.center().y - 9.0), Align2::LEFT_CENTER, t!("Download more", "En télécharger"), menu::label(), if on { Color32::WHITE } else { menu::mix(TEXT, Color32::WHITE, lit) });
+                p.text(pos2(rect.left() + 104.0, rect.center().y + 10.0), Align2::LEFT_CENTER, t!("FlightGear's collection", "Collection de FlightGear"), menu::caption(), DIM);
                 if resp.clicked() && tab != Tab::Download {
                     tab = Tab::Download;
                     hangar::open();
@@ -261,7 +265,7 @@ impl crate::Game {
                     }
                 }
                 Tab::Download => {
-                    c.label(RichText::new(t!("Download more aircraft", "Télécharger d'autres avions")).size(26.0).strong().color(Color32::WHITE));
+                    c.label(RichText::new(t!("Download more aircraft", "Télécharger d'autres avions")).font(menu::page_title()).color(Color32::WHITE));
                     c.add_space(6.0);
                     if let Some(k) = self.downloads(&mut c) {
                         select = Some(k);
@@ -295,7 +299,7 @@ impl crate::Game {
         {
             let p = ui.painter();
             let mut mesh = egui::Mesh::default();
-            let (top, bot) = (Color32::from_rgb(30, 37, 48), Color32::from_rgb(12, 15, 20));
+            let (top, bot) = (Color32::from_rgb(28, 35, 47), Color32::from_rgb(10, 13, 18));
             mesh.colored_vertex(stage.left_top(), top);
             mesh.colored_vertex(stage.right_top(), top);
             mesh.colored_vertex(stage.right_bottom(), bot);
@@ -304,8 +308,12 @@ impl crate::Game {
             mesh.add_triangle(0, 2, 3);
             p.add(mesh);
             // a faint floor line under it
-            p.hline(stage.x_range().shrink(stage.width() * 0.12), stage.bottom() - ph * 0.12, Stroke::new(1.0, Color32::from_white_alpha(14)));
-            p.rect_stroke(stage, menu::R_PANEL, Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+            // a pool of light where it stands, and a faint floor line under it
+            let floor = stage.bottom() - ph * 0.12;
+            let sp = p.with_clip_rect(stage);
+            menu::glow(&sp, egui::pos2(stage.center().x, floor), egui::vec2(stage.width() * 0.42, ph * 0.2), Color32::from_white_alpha(22));
+            p.hline(stage.x_range().shrink(stage.width() * 0.12), floor, Stroke::new(1.0, Color32::from_white_alpha(16)));
+            p.rect_stroke(stage, menu::R_PANEL, Stroke::new(1.0, menu::LINE), egui::StrokeKind::Inside);
         }
         let iw = (ph * 680.0 / 392.0).min(w);
         let img = egui::Rect::from_center_size(stage.center(), egui::vec2(iw, iw * 392.0 / 680.0));
@@ -314,15 +322,20 @@ impl crate::Game {
             badge(ui.painter(), stage.left_top() + egui::vec2(14.0, 12.0), if spec.ext.is_some() { "FlightGear" } else { "JSBSim" });
         }
         if chosen {
-            ui.painter().text(stage.right_top() + egui::vec2(-16.0, 20.0), Align2::RIGHT_CENTER, t!("SELECTED", "CHOISI"), egui::FontId::proportional(11.5), ACCENT);
+            // the one you will fly: a mark in the stage's corner
+            let g = ui.painter().layout_no_wrap(t!("IN USE", "UTILISÉ").to_string(), menu::bold(13.0), ACCENT);
+            let r = egui::Rect::from_min_size(stage.right_top() + egui::vec2(-16.0 - g.size().x - 22.0, 14.0), g.size() + egui::vec2(22.0, 6.0));
+            ui.painter().rect_stroke(r, menu::R_WIDGET, Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+            ui.painter().circle_filled(egui::pos2(r.left() + 8.0, r.center().y), 3.0, ACCENT);
+            ui.painter().galley(egui::pos2(r.left() + 15.0, r.top() + 3.0), g, ACCENT);
         }
         ui.add_space(18.0);
         let mut go = None;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.set_width((w - 260.0).max(200.0));
-                ui.label(RichText::new(spec.name).size(30.0).strong().color(Color32::WHITE));
-                ui.label(RichText::new(origin_line(spec)).size(12.5).color(DIM));
+                ui.label(RichText::new(spec.name).font(menu::page_title()).color(Color32::WHITE));
+                ui.label(RichText::new(origin_line(spec)).font(menu::body()).color(DIM));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.set_width(240.0);
@@ -333,8 +346,8 @@ impl crate::Game {
             });
         });
         ui.add_space(8.0);
-        ui.add(egui::Label::new(RichText::new(tr(spec.blurb)).size(14.5).color(TEXT)).wrap());
-        ui.add_space(14.0);
+        ui.add(egui::Label::new(RichText::new(tr(spec.blurb)).size(16.0).color(TEXT)).wrap());
+        ui.add_space(18.0);
         // The numbers, in a row of tiles.
         let cells = numbers(spec);
         let cols = if w > 760.0 { 3 } else { 2 };
@@ -344,11 +357,12 @@ impl crate::Game {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for (k, v) in row {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(cw, 58.0), egui::Sense::hover());
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(cw, 64.0), egui::Sense::hover());
                     let p = ui.painter();
-                    p.rect_filled(r, menu::R_PANEL, Color32::from_white_alpha(7));
-                    p.text(r.left_top() + egui::vec2(14.0, 17.0), Align2::LEFT_CENTER, k.to_uppercase(), egui::FontId::proportional(10.5), DIM);
-                    p.text(r.left_top() + egui::vec2(14.0, 39.0), Align2::LEFT_CENTER, v, egui::FontId::proportional(17.0), Color32::WHITE);
+                    p.rect_filled(r, menu::R_PANEL, menu::SURFACE);
+                    p.rect_stroke(r, menu::R_PANEL, Stroke::new(1.0, menu::LINE), egui::StrokeKind::Inside);
+                    p.text(r.left_top() + egui::vec2(16.0, 19.0), Align2::LEFT_CENTER, *k, menu::caption(), DIM);
+                    p.text(r.left_top() + egui::vec2(16.0, 43.0), Align2::LEFT_CENTER, v, menu::item_title(), Color32::WHITE);
                 }
             });
             ui.add_space(gap - ui.spacing().item_spacing.y);
@@ -356,7 +370,7 @@ impl crate::Game {
         if let Some(o) = spec.origin {
             ui.add_space(6.0);
             let by = if o.author.is_empty() { String::new() } else { t!("  ·  by {}", "  ·  par {}", o.author) };
-            ui.label(RichText::new(t!("License: {}{}", "Licence : {}{}", o.license, by)).size(12.0).color(DIM));
+            ui.label(RichText::new(t!("License: {}{}", "Licence : {}{}", o.license, by)).font(menu::caption()).color(DIM));
         }
         go
     }
@@ -366,13 +380,13 @@ impl crate::Game {
     fn downloads(&mut self, ui: &mut egui::Ui) -> Option<usize> {
         let mut fly = None;
         let link = |ui: &mut egui::Ui, text: &str, url: &str| {
-            ui.hyperlink_to(RichText::new(text).size(12.0), url);
+            ui.hyperlink_to(RichText::new(text).font(menu::caption()), url);
         };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label(RichText::new(t!("Aircraft from", "Avions de")).size(12.0).color(DIM));
+            ui.label(RichText::new(t!("Aircraft from", "Avions de")).font(menu::caption()).color(DIM));
             link(ui, t!("FlightGear's collection (FGAddon)", "la collection de FlightGear (FGAddon)"), &hangar::repo_url());
-            ui.label(RichText::new(t!("— each with its own 3D model. Its flight model (JSBSim or YASim) is fitted to ours. Each keeps the license its files state. They are made by FlightGear's community: some are not of high quality, and some don't fly realistically here.", "— chacun avec son propre modèle 3D. Son modèle de vol (JSBSim ou YASim) est adapté au nôtre. Chacun garde la licence indiquée dans ses fichiers. Ils sont faits par la communauté de FlightGear : certains ne sont pas de grande qualité, et certains ne volent pas de façon réaliste ici.")).size(12.0).color(DIM));
+            ui.label(RichText::new(t!("— each with its own 3D model. Its flight model (JSBSim or YASim) is fitted to ours. Each keeps the license its files state. They are made by FlightGear's community: some are not of high quality, and some don't fly realistically here.", "— chacun avec son propre modèle 3D. Son modèle de vol (JSBSim ou YASim) est adapté au nôtre. Chacun garde la licence indiquée dans ses fichiers. Ils sont faits par la communauté de FlightGear : certains ne sont pas de grande qualité, et certains ne volent pas de façon réaliste ici.")).font(menu::caption()).color(DIM));
         });
         ui.add_space(8.0);
         let (status, entries) = {
@@ -418,10 +432,10 @@ impl crate::Game {
                 ui.set_width(left_w);
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.menu.hangar_find).hint_text(t!("Search", "Rechercher")).desired_width(left_w - 120.0).margin(egui::vec2(8.0, 5.0)));
-                    ui.checkbox(&mut self.menu.hangar_all, RichText::new(t!("Show all", "Tout voir")).size(12.0)).on_hover_text(t!("Also list the ones that can't be flown here (helicopters, rockets, gliders…)", "Lister aussi ceux qui ne peuvent pas voler ici (hélicoptères, fusées, planeurs…)"));
+                    menu::toggle(ui, &mut self.menu.hangar_all, t!("Show all", "Tout voir")).on_hover_text(t!("Also list the ones that can't be flown here (helicopters, rockets, gliders…)", "Lister aussi ceux qui ne peuvent pas voler ici (hélicoptères, fusées, planeurs…)"));
                 });
                 let line = t!("{} aircraft · pick one to see if it flies here", "{} avions · choisissez-en un pour voir s'il vole ici", entries.len());
-                ui.label(RichText::new(line).size(11.5).color(DIM));
+                ui.label(RichText::new(line).font(menu::caption()).color(DIM));
                 ui.add_space(4.0);
                 let find = self.menu.hangar_find.to_lowercase();
                 egui::ScrollArea::vertical().id_salt("hangar_list").auto_shrink([false, false]).max_height(ui.available_height()).show(ui, |ui| {
@@ -442,14 +456,15 @@ impl crate::Game {
                         }
                         let sel = self.menu.hangar_sel.as_deref() == Some(e.folder.as_str());
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
-                        let lit = resp.hovered() || resp.has_focus();
+                        let lit = menu::ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
                         let p = ui.painter();
-                        p.rect_filled(rect, menu::R_WIDGET, if sel { ACCENT.gamma_multiply(0.18) } else { Color32::from_white_alpha(if lit { 14 } else { 5 }) });
+                        // chosen: raised, with the accent mark at its left, as in the aircraft list
+                        p.rect_filled(rect, menu::R_WIDGET, Color32::from_white_alpha(if sel { 16 } else { (4.0 + 8.0 * lit) as u8 }));
                         if sel {
-                            p.rect_stroke(rect, menu::R_WIDGET, Stroke::new(1.0, ACCENT.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+                            p.rect_filled(egui::Rect::from_center_size(egui::pos2(rect.left() + 1.5, rect.center().y), egui::vec2(3.0, rect.height() * 0.5)), 1.0, ACCENT);
                         }
                         let name_col = if can || matches!(e.state, State::Pending) { Color32::WHITE } else { DIM };
-                        p.text(rect.left_center() + egui::vec2(10.0, -7.0), Align2::LEFT_CENTER, &name, egui::FontId::proportional(14.0), name_col);
+                        p.text(rect.left_center() + egui::vec2(10.0, -7.0), Align2::LEFT_CENTER, &name, menu::body(), name_col);
                         let sub = match &e.state {
                             State::Ready(i) => match &i.fit {
                                 Ok(s) => format!("{} · {}", s.kind, i.license),
@@ -463,7 +478,7 @@ impl crate::Game {
                             State::Failed(_) => t!("couldn't be read", "illisible").to_string(),
                         };
                         let sub: String = sub.chars().take(44).collect();
-                        p.text(rect.left_center() + egui::vec2(10.0, 9.0), Align2::LEFT_CENTER, sub, egui::FontId::proportional(11.0), DIM);
+                        p.text(rect.left_center() + egui::vec2(10.0, 9.0), Align2::LEFT_CENTER, sub, menu::caption(), DIM);
                         let (tag, col) = match &e.install {
                             Install::Installed => (t!("installed", "installé").to_string(), OK),
                             Install::Downloading(a, b) => (format!("{:.0}%", *a as f64 * 100.0 / (*b).max(1) as f64), ACCENT),
@@ -471,7 +486,7 @@ impl crate::Game {
                             Install::Failed(_) => ("!".to_string(), BAD),
                             Install::No => (String::new(), DIM),
                         };
-                        p.text(rect.right_top() + egui::vec2(-10.0, 13.0), Align2::RIGHT_CENTER, tag, egui::FontId::proportional(11.0), col);
+                        p.text(rect.right_top() + egui::vec2(-10.0, 13.0), Align2::RIGHT_CENTER, tag, menu::caption(), col);
                         if resp.clicked() {
                             self.menu.hangar_sel = Some(e.folder.clone());
                         }
@@ -510,65 +525,65 @@ impl crate::Game {
                 None
             }
             State::Failed(err) => {
-                ui.label(RichText::new(&e.folder).size(22.0).strong().color(Color32::WHITE));
+                ui.label(RichText::new(&e.folder).font(menu::page_title()).color(Color32::WHITE));
                 ui.label(RichText::new(t!("Couldn't read it: {}", "Lecture impossible : {}", err)).color(BAD));
                 None
             }
         };
         let Some(i) = info else { return None };
-        ui.label(RichText::new(&i.name).size(24.0).strong().color(Color32::WHITE));
+        ui.label(RichText::new(&i.name).font(menu::page_title()).color(Color32::WHITE));
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(RichText::new(format!("{}  ·  {}", e.folder, crate::bytes(e.bytes()))).size(12.0).color(DIM));
-            ui.hyperlink_to(RichText::new(t!("view its files", "voir ses fichiers")).size(12.0), hangar::folder_url(&e.folder));
+            ui.label(RichText::new(format!("{}  ·  {}", e.folder, crate::bytes(e.bytes()))).font(menu::caption()).color(DIM));
+            ui.hyperlink_to(RichText::new(t!("view its files", "voir ses fichiers")).font(menu::caption()), hangar::folder_url(&e.folder));
         });
         if !i.author.is_empty() {
-            ui.label(RichText::new(t!("By {}", "Par {}", i.author)).size(13.0).color(TEXT));
+            ui.label(RichText::new(t!("By {}", "Par {}", i.author)).font(menu::body()).color(TEXT));
         }
         if !i.description.is_empty() {
-            ui.label(RichText::new(&i.description).size(13.0).color(TEXT));
+            ui.label(RichText::new(&i.description).font(menu::body()).color(TEXT));
         }
         ui.add_space(10.0);
 
         // The license.
-        menu::heading(ui, t!("LICENSE", "LICENCE"));
-        egui::Frame::new().fill(Color32::from_white_alpha(7)).corner_radius(menu::R_PANEL).inner_margin(12.0).show(ui, |ui| {
+        menu::heading(ui, t!("License", "Licence"));
+        egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 4, bottom: 8 }).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if i.license_url.is_empty() {
-                ui.label(RichText::new(&i.license).size(15.0).strong().color(Color32::WHITE));
+                ui.label(RichText::new(&i.license).font(menu::label()).color(Color32::WHITE));
             } else {
-                ui.hyperlink_to(RichText::new(&i.license).size(15.0).strong(), &i.license_url);
+                ui.hyperlink_to(RichText::new(&i.license).font(menu::label()), &i.license_url);
             }
             let from = match i.license_from {
                 LicenseFrom::Header => t!("as stated in the aircraft file's header", "indiquée dans l'en-tête du fichier de l'avion").to_string(),
                 LicenseFrom::Comment => t!("as stated in the aircraft file's comments", "indiquée dans les commentaires du fichier de l'avion").to_string(),
                 LicenseFrom::Repository => t!("the file states no license of its own: it is covered by the license of FlightGear's collection", "le fichier n'indique pas de licence propre : la licence de la collection de FlightGear s'applique").to_string(),
             };
-            ui.label(RichText::new(from).size(12.0).color(DIM));
+            ui.label(RichText::new(from).font(menu::caption()).color(DIM));
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(RichText::new(t!("FlightGear's collection:", "Collection de FlightGear :")).size(12.0).color(DIM));
-                ui.hyperlink_to(RichText::new(hangar::REPO_LICENSE).size(12.0), hangar::REPO_LICENSE_URL);
+                ui.label(RichText::new(t!("FlightGear's collection:", "Collection de FlightGear :")).font(menu::caption()).color(DIM));
+                ui.hyperlink_to(RichText::new(hangar::REPO_LICENSE).font(menu::caption()), hangar::REPO_LICENSE_URL);
             });
             if !i.notes.is_empty() {
                 ui.add_space(4.0);
-                ui.label(RichText::new(t!("Notes from its authors", "Notes de ses auteurs")).size(11.5).strong().color(DIM));
+                ui.label(menu::section_text(t!("Notes from its authors", "Notes de ses auteurs")).color(DIM));
                 let notes: String = i.notes.chars().take(900).collect();
-                ui.label(RichText::new(notes).size(11.5).color(DIM));
+                ui.label(RichText::new(notes).font(menu::caption()).color(DIM));
             }
         });
         ui.add_space(10.0);
 
         // What it becomes here.
-        menu::heading(ui, t!("IN FABLE FLIGHT", "DANS FABLE FLIGHT"));
-        egui::Frame::new().fill(Color32::from_white_alpha(7)).corner_radius(menu::R_PANEL).inner_margin(12.0).show(ui, |ui| {
+        menu::heading(ui, t!("In Fable Flight", "Dans Fable Flight"));
+        egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 4, bottom: 8 }).show(ui, |ui| {
             ui.set_width(ui.available_width());
             match &i.fit {
                 Ok(s) => {
                     egui::Grid::new("fit").num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
                         let cell = |ui: &mut egui::Ui, k: &str, v: String| {
-                            ui.label(RichText::new(k).size(12.0).color(DIM));
-                            ui.label(RichText::new(v).size(13.0).color(Color32::WHITE));
+                            ui.label(RichText::new(k).font(menu::caption()).color(DIM));
+                            ui.label(RichText::new(v).font(menu::caption()).color(Color32::WHITE));
                         };
                         cell(ui, t!("Type", "Type"), s.kind.clone());
                         cell(ui, t!("Engines", "Moteurs"), s.power.clone());
@@ -586,11 +601,11 @@ impl crate::Game {
                     } else {
                         t!("Flies with our flight model, fitted to its {1} lift, drag, mass and engines. Drawn as the {0} (body, cockpit, gear and paint).", "Vole avec notre modèle de vol, ajusté à sa portance, sa traînée, sa masse et ses moteurs {1}. Dessiné comme le {0} (fuselage, cockpit, train et peinture).", s.body, s.fdm)
                     };
-                    ui.label(RichText::new(how).size(12.0).color(DIM));
+                    ui.label(RichText::new(how).font(menu::caption()).color(DIM));
                 }
                 Err(why) => {
-                    ui.label(RichText::new(t!("Can't be flown here yet", "Ne peut pas encore voler ici")).size(14.0).strong().color(BAD));
-                    ui.label(RichText::new(why).size(12.0).color(DIM));
+                    ui.label(RichText::new(t!("Can't be flown here yet", "Ne peut pas encore voler ici")).font(menu::label()).color(BAD));
+                    ui.label(RichText::new(why).font(menu::caption()).color(DIM));
                 }
             }
         });
@@ -602,13 +617,13 @@ impl crate::Game {
         match &e.install {
             Install::No | Install::Failed(_) => {
                 if let Install::Failed(err) = &e.install {
-                    ui.label(RichText::new(t!("Download failed: {}", "Échec du téléchargement : {}", err)).size(12.0).color(BAD));
+                    ui.label(RichText::new(t!("Download failed: {}", "Échec du téléchargement : {}", err)).font(menu::caption()).color(BAD));
                 }
                 let label = t!("Download  ·  {}", "Télécharger  ·  {}", crate::bytes(e.bytes()));
                 if menu::wide_button(ui, &label, crate::padui::Hint::None, true, can).clicked() {
                     hangar::install(&e.folder);
                 }
-                ui.label(RichText::new(t!("Its package comes straight from a FlightGear mirror to {} under {}.", "Son paquet vient directement d'un miroir FlightGear dans {} sous {}.", hangar::install_dir().join(&e.folder).display(), i.license)).size(11.0).color(DIM));
+                ui.label(RichText::new(t!("Downloaded straight from a FlightGear mirror, under {}.", "Téléchargé directement depuis un miroir FlightGear, sous {}.", i.license)).font(menu::caption()).color(DIM));
             }
             Install::Downloading(a, b) => {
                 ui.add(egui::ProgressBar::new(*a as f32 / (*b).max(1) as f32).text(t!("Downloading… {} / {}", "Téléchargement… {} / {}", crate::bytes(*a), crate::bytes(*b))).desired_height(30.0));
@@ -628,14 +643,14 @@ impl crate::Game {
                         }
                     }
                     None => {
-                        ui.label(RichText::new(t!("Downloaded, but it doesn't load here.", "Téléchargé, mais ne se charge pas ici.")).size(12.0).color(BAD));
+                        ui.label(RichText::new(t!("Downloaded, but it doesn't load here.", "Téléchargé, mais ne se charge pas ici.")).font(menu::caption()).color(BAD));
                     }
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(t!("Downloaded", "Téléchargé")).size(12.5).color(OK));
+                    ui.label(RichText::new(t!("Downloaded", "Téléchargé")).font(menu::caption()).color(OK));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(RichText::new(t!("Remove", "Supprimer")).size(12.5)).clicked() {
+                        if ui.button(RichText::new(t!("Remove", "Supprimer")).font(menu::caption())).clicked() {
                             let chosen = aircraft::nth(self.menu.aircraft).keys.first().copied();
                             if let Err(err) = hangar::remove(&e.folder) {
                                 log::warn!("removing {}: {err}", e.folder);
@@ -709,15 +724,21 @@ fn thousands(v: f64) -> String {
 
 /// One line of text cut to a width, with an ellipsis where it is cut.
 fn one_line(p: &egui::Painter, text: &str, size: f32, col: Color32, w: f32) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(egui::FontId::proportional(size), col));
+    one_line_font(p, text, egui::FontId::proportional(size), col, w)
+}
+
+/// `one_line` in a given font.
+fn one_line_font(p: &egui::Painter, text: &str, font: egui::FontId, col: Color32, w: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(font, col));
     job.wrap = egui::text::TextWrapping { max_width: w.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
     p.layout_job(job)
 }
 
 /// A small label on a picture.
 fn badge(p: &egui::Painter, at: egui::Pos2, text: &str) {
-    let g = p.layout_no_wrap(text.to_string(), egui::FontId::proportional(10.5), menu::ON_ACCENT);
-    let r = egui::Rect::from_min_size(at, g.size() + egui::vec2(12.0, 4.0));
-    p.rect_filled(r, menu::R_WIDGET, ACCENT);
-    p.galley(r.min + egui::vec2(6.0, 2.0), g, menu::ON_ACCENT);
+    let g = p.layout_no_wrap(text.to_uppercase(), menu::bold(12.5), TEXT);
+    let r = egui::Rect::from_min_size(at, g.size() + egui::vec2(14.0, 4.0));
+    p.rect_filled(r, menu::R_WIDGET, Color32::from_rgba_premultiplied(0, 0, 0, 150));
+    p.rect_stroke(r, menu::R_WIDGET, Stroke::new(1.0, menu::LINE_HI), egui::StrokeKind::Inside);
+    p.galley(r.min + egui::vec2(7.0, 2.0), g, TEXT);
 }

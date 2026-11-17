@@ -290,15 +290,11 @@ pub enum Hint<'a> {
 }
 
 impl<'a> Hint<'a> {
-    /// The key when typing, the pad's buttons while a pad is plugged in
-    /// (either may be empty for no hint).
-    pub fn of(key: &'a str, pad: &'a str) -> Self {
-        let s = if active() { pad } else { key };
-        match (s.is_empty(), active()) {
-            (true, _) => Hint::None,
-            (false, true) => Hint::Pad(s),
-            (false, false) => Hint::Text(s),
-        }
+    /// The pad's buttons while a pad is plugged in, else nothing. (The key
+    /// is named for the reader of the code only: key names on buttons read as
+    /// clutter, and the keys work all the same.)
+    pub fn of(_key: &'a str, pad: &'a str) -> Self {
+        if active() && !pad.is_empty() { Hint::Pad(pad) } else { Hint::None }
     }
 }
 

@@ -462,19 +462,23 @@ impl Minimap {
                 let hot = resize.hovered() || resize.dragged();
                 painter.circle_filled(knob, 7.0, Color32::from_black_alpha(220));
                 painter.circle_stroke(knob, 7.0, Stroke::new(1.5, if hot { crate::menu::ACCENT } else { Color32::WHITE }));
-                // Controls sit under the disc.
-                egui::Frame::new().fill(Color32::from_black_alpha(210)).corner_radius(crate::menu::R_PANEL).inner_margin(3.0).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 3.0;
-                    ui.spacing_mut().button_padding = Vec2::new(5.0, 4.0);
-                    ui.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
+                // Controls sit under the disc, on one glass strip: the two views as
+                // segmented choices, then zoom and hide.
+                egui::Frame::new().fill(crate::menu::GLASS).stroke(Stroke::new(1.0, crate::menu::LINE)).corner_radius(crate::menu::R_PANEL).inner_margin(4.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     ui.horizontal(|ui| {
-                        let button = egui::Button::selectable(self.heading_up, if self.heading_up { crate::t!("Heading", "Cap") } else { crate::t!("North", "Nord") });
-                        if ui.add_sized([48.0, 24.0], button).on_hover_text(crate::t!("Toggle north up / heading up", "Basculer nord en haut / cap en haut")).clicked() { self.heading_up = !self.heading_up; }
-                        let button = egui::Button::selectable(self.plan, if self.plan { crate::t!("Map", "Plan") } else { "Satellite" });
-                        if ui.add_sized([62.0, 24.0], button).on_hover_text(crate::t!("Toggle satellite / map", "Basculer satellite / plan")).clicked() { self.plan = !self.plan; }
-                        if ui.add_enabled(self.zoom > 3, egui::Button::new("-").min_size(Vec2::splat(24.0))).on_hover_text(crate::t!("Zoom out", "D\u{00e9}zoomer")).clicked() { self.zoom -= 1; }
-                        if ui.add_enabled(self.zoom < 17, egui::Button::new("+").min_size(Vec2::splat(24.0))).on_hover_text(crate::t!("Zoom in", "Zoomer")).clicked() { self.zoom += 1; }
-                        if ui.add_sized([24.0, 24.0], egui::Button::new("x")).on_hover_text(crate::t!("Hide map (`)", "Masquer la carte (`)")).clicked() { self.visible = false; }
+                        crate::menu::segments(ui, |ui| {
+                            crate::menu::seg(ui, &mut self.heading_up, false, crate::t!("North", "Nord"));
+                            crate::menu::seg(ui, &mut self.heading_up, true, crate::t!("Heading", "Cap"));
+                        });
+                        crate::menu::segments(ui, |ui| {
+                            crate::menu::seg(ui, &mut self.plan, false, crate::t!("Photo", "Photo"));
+                            crate::menu::seg(ui, &mut self.plan, true, crate::t!("Map", "Plan"));
+                        });
+                        let b = |ui: &mut egui::Ui, on: bool, text: &str| ui.add_enabled(on, egui::Button::new(egui::RichText::new(text).font(crate::menu::data())).min_size(Vec2::new(30.0, 30.0)));
+                        if b(ui, self.zoom > 3, "−").on_hover_text(crate::t!("Zoom out", "D\u{00e9}zoomer")).clicked() { self.zoom -= 1; }
+                        if b(ui, self.zoom < 17, "+").on_hover_text(crate::t!("Zoom in", "Zoomer")).clicked() { self.zoom += 1; }
+                        if b(ui, true, "×").on_hover_text(crate::t!("Hide map (`)", "Masquer la carte (`)")).clicked() { self.visible = false; }
                     });
                 });
             });

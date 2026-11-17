@@ -3,7 +3,7 @@
 //! side: Aircraft, FLY (the largest, the globe behind it) and Settings.
 //! Quit sits small in the bottom left corner. Behind it the renderer draws
 //! space alone (the menu camera looks away from the planet, see `frame`).
-use crate::menu::{self, Screen, ACCENT, DIM, TEXT};
+use crate::menu::{self, Screen, ACCENT, DIM, FAINT, TEXT};
 use crate::padui::{self, Hint};
 use crate::{aircraft, hangar_ui, t, tr, Game};
 use egui::{pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke};
@@ -24,6 +24,8 @@ enum Tile {
     Aircraft,
     Fly,
     Settings,
+    /// straight back into the air where the last flight started
+    Again,
 }
 
 impl Game {
@@ -32,8 +34,11 @@ impl Game {
         let screen = ctx.content_rect();
         let globe = self.picture(ctx, GLOBE_PICTURE);
         let spec = aircraft::nth(self.menu.aircraft);
+        let still = self.still(ctx, spec);
         let mut press: Option<Tile> = None;
         let mut quit = false;
+        let again = self.last_start_label();
+        let rise = entrance(ctx);
         egui::Area::new(egui::Id::unique("main_menu")).order(egui::Order::Background).fixed_pos(screen.min).show(ctx, |ui| {
             let p = ui.painter().clone();
             // Darken space towards the foot of the screen, for depth.
@@ -48,57 +53,83 @@ impl Game {
             let (fw, fh, sw, sh, gap) = (fw * k, fh * k, sw * k, sh * k, gap * k);
             let cy = top + (screen.height() - top - 60.0) * 0.5;
             let x0 = screen.center().x - (fw + 2.0 * sw + 2.0 * gap) * 0.5;
-            let air = Rect::from_min_size(pos2(x0, cy - sh * 0.5), vec2(sw, sh));
-            let fly = Rect::from_min_size(pos2(air.right() + gap, cy - fh * 0.5), vec2(fw, fh));
-            let set = Rect::from_min_size(pos2(fly.right() + gap, cy - sh * 0.5), vec2(sw, sh));
+            // Each tile rises into place as the menu opens, FLY first, the sides just after.
+            let lift = |r: Rect, i: usize| r.translate(vec2(0.0, 26.0 * (1.0 - rise(i))));
+            let air = lift(Rect::from_min_size(pos2(x0, cy - sh * 0.5), vec2(sw, sh)), 1);
+            let fly = lift(Rect::from_min_size(pos2(x0 + sw + gap, cy - fh * 0.5), vec2(fw, fh)), 0);
+            let set = lift(Rect::from_min_size(pos2(x0 + sw + gap + fw + gap, cy - sh * 0.5), vec2(sw, sh)), 2);
 
             // Tab and the d-pad go left to right: Aircraft, FLY, Settings.
             let r = ui.interact(air, ui.scope_id().with("tile_air"), Sense::click());
             r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, t!("Aircraft", "Avions")));
-            side_tile(&p, air, &r, k, t!("Aircraft", "Avions"), spec.name, |p, c, s, col| plane_icon(p, c, s, col));
+            let mut pa = p.clone();
+            pa.set_opacity(rise(1));
+            aircraft_tile(&pa, air, &r, k, spec.name, &still);
             if r.clicked() {
                 press = Some(Tile::Aircraft);
             }
             let r = ui.interact(fly, ui.scope_id().with("tile_fly"), Sense::click());
             r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, t!("Fly", "Voler")));
             self.pad_home_focus(&r);
-            fly_tile(&p, fly, &r, k, &globe);
+            let mut pf = p.clone();
+            pf.set_opacity(rise(0));
+            fly_tile(&pf, fly, &r, k, &globe);
             if r.clicked() {
                 press = Some(Tile::Fly);
             }
             let r = ui.interact(set, ui.scope_id().with("tile_set"), Sense::click());
             r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, t!("Settings", "Réglages")));
-            side_tile(&p, set, &r, k, t!("Settings", "Réglages"), t!("Graphics · sound · controls", "Graphismes · son · commandes"), |p, c, s, col| gear_icon(p, c, s, col));
+            let mut ps = p.clone();
+            ps.set_opacity(rise(2));
+            settings_tile(&ps, set, &r, k);
             if r.clicked() {
                 press = Some(Tile::Settings);
             }
 
+            // Under FLY: the last flight's start, one press away.
+            if let Some((place, plane)) = &again {
+                let b = Rect::from_min_size(pos2(fly.left(), fly.bottom() + 14.0 * k), vec2(fly.width(), 46.0));
+                let r = ui.interact(b, ui.scope_id().with("again"), Sense::click());
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, t!("Fly again", "Revoler")));
+                let mut pg = p.clone();
+                pg.set_opacity(rise(3));
+                again_button(&pg, b, &r, place, plane);
+                if r.clicked() {
+                    press = Some(Tile::Again);
+                }
+            }
+
             // The foot: Quit at the left, the gamepad's buttons (or a word on the keys) in the middle.
             let foot_y = screen.bottom() - 34.0;
-            let q = Rect::from_min_size(pos2(screen.left() + 24.0, foot_y - 16.0), vec2(96.0, 32.0));
+            let q = Rect::from_min_size(pos2(screen.left() + 24.0, foot_y - 17.0), vec2(104.0, 34.0));
             let qr = ui.interact(q, ui.scope_id().with("quit"), Sense::click());
             qr.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, t!("Quit", "Quitter")));
-            let lit = qr.hovered() || qr.has_focus();
-            if lit {
-                p.rect_filled(q, menu::R_WIDGET, Color32::from_white_alpha(12));
+            let lit = menu::ease(ctx, qr.id, qr.hovered() || qr.has_focus());
+            if lit > 0.0 {
+                p.rect_filled(q, menu::R_WIDGET, Color32::from_white_alpha((14.0 * lit) as u8));
             }
-            power_icon(&p, pos2(q.left() + 18.0, q.center().y), 14.0, if lit { ACCENT } else { DIM });
-            p.text(pos2(q.left() + 34.0, q.center().y), Align2::LEFT_CENTER, t!("Quit", "Quitter"), FontId::proportional(14.5), if lit { Color32::WHITE } else { DIM });
+            let qc = menu::mix(DIM, Color32::WHITE, lit);
+            power_icon(&p, pos2(q.left() + 18.0, q.center().y), 14.0, qc);
+            p.text(pos2(q.left() + 34.0, q.center().y), Align2::LEFT_CENTER, t!("Quit", "Quitter"), menu::medium(15.0), qc);
             if qr.clicked() {
                 quit = true;
             }
             if padui::active() {
                 let mut f = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_center_size(pos2(screen.center().x, foot_y), vec2(360.0, 28.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
                 padui::prompts(&mut f, &[("Dpad", tr("move")), ("A", tr("press"))], 20.0, 12.5, DIM);
-            } else {
-                p.text(pos2(screen.center().x, foot_y), Align2::CENTER_CENTER, t!("Enter to fly", "Entrée pour voler"), FontId::proportional(12.5), DIM.gamma_multiply(0.8));
             }
-            p.text(pos2(screen.right() - 24.0, foot_y), Align2::RIGHT_CENTER, t!("Globe: Esri, Maxar, Earthstar Geographics · night lights NASA Black Marble · clouds Live Cloud Maps", "Globe : Esri, Maxar, Earthstar Geographics · lumières NASA Black Marble · nuages Live Cloud Maps"), FontId::proportional(11.0), DIM.gamma_multiply(0.7));
+            p.text(pos2(screen.right() - 24.0, foot_y), Align2::RIGHT_CENTER, t!("Globe: Esri, Maxar, Earthstar Geographics · night lights NASA Black Marble · clouds Live Cloud Maps", "Globe : Esri, Maxar, Earthstar Geographics · lumières NASA Black Marble · nuages Live Cloud Maps"), FontId::proportional(11.5), FAINT);
         });
         match press {
             Some(Tile::Fly) => self.menu.screen = Screen::Fly,
             Some(Tile::Aircraft) => self.open_aircraft(hangar_ui::Tab::Mine, Screen::Main),
             Some(Tile::Settings) => self.menu.screen = Screen::Settings,
+            Some(Tile::Again) => {
+                // (over the globe, whose take-off button shows it preparing)
+                self.restore_last_start();
+                self.menu.screen = Screen::Fly;
+                self.begin();
+            }
             None => {}
         }
         if press.is_some() {
@@ -110,38 +141,91 @@ impl Game {
     }
 }
 
-/// The frame every tile shares: a dark glass fill, a hairline border, and
-/// when hovered or picked out by the gamepad an accent border and a bar
-/// along its foot.
-fn tile_frame(p: &Painter, r: Rect, lit: bool, fill: bool) {
-    if fill {
-        p.rect_filled(r, menu::R_PANEL, if lit { Color32::from_rgba_premultiplied(24, 30, 39, 235) } else { Color32::from_rgba_premultiplied(12, 16, 22, 222) });
+/// How far each tile has risen into place (0..1, eased) since the menu
+/// was last opened: `rise(i)` for the i-th tile, each a beat after the one before.
+fn entrance(ctx: &egui::Context) -> impl Fn(usize) -> f32 {
+    let now = ctx.input(|i| i.time);
+    let id = egui::Id::unique("main_menu_entrance");
+    let (start, seen) = ctx.data(|d| d.get_temp::<(f64, f64)>(id)).unwrap_or((now, f64::NEG_INFINITY));
+    // Away for more than a moment: play it again.
+    let start = if now - seen > 0.3 { now } else { start };
+    ctx.data_mut(|d| d.insert_temp(id, (start, now)));
+    let t = (now - start) as f32;
+    if t < 1.0 {
+        ctx.request_repaint();
     }
-    if lit {
-        p.rect_stroke(r, menu::R_PANEL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
-        p.rect_filled(Rect::from_min_max(pos2(r.left(), r.bottom() - 4.0), r.max), 0.0, ACCENT);
-    } else {
-        p.rect_stroke(r, menu::R_PANEL, Stroke::new(1.0, Color32::from_white_alpha(26)), egui::StrokeKind::Inside);
+    move |i: usize| {
+        let x = ((t - 0.07 * i as f32) / 0.55).clamp(0.0, 1.0);
+        1.0 - (1.0 - x).powi(4)
     }
 }
 
-/// Aircraft and Settings: an icon, a title and a dim line under it.
-fn side_tile(p: &Painter, r: Rect, resp: &egui::Response, k: f32, title: &str, sub: &str, icon: impl Fn(&Painter, Pos2, f32, Color32)) {
-    let lit = resp.hovered() || resp.has_focus();
+/// "Fly again": a slim bar under FLY with the last start and aircraft.
+fn again_button(p: &Painter, r: Rect, resp: &egui::Response, place: &str, plane: &str) {
+    let lit = menu::ease(p.ctx(), resp.id, resp.hovered() || resp.has_focus());
+    p.rect_filled(r, menu::R_WIDGET, menu::mix(Color32::from_rgba_premultiplied(12, 16, 22, 226), Color32::from_rgba_premultiplied(26, 32, 42, 238), lit));
+    p.rect_stroke(r, menu::R_WIDGET, Stroke::new(1.0, menu::mix(Color32::from_white_alpha(26), ACCENT, lit)), egui::StrokeKind::Inside);
+    // a circular arrow: round again
+    let c = pos2(r.left() + 24.0, r.center().y);
+    let col = menu::mix(TEXT, ACCENT, lit);
+    let pts: Vec<Pos2> = (0..=18).map(|i| {
+        let a = -0.4 + i as f32 / 18.0 * 4.9;
+        c + vec2(a.cos(), a.sin()) * 7.0
+    }).collect();
+    let end = *pts.last().unwrap();
+    p.line(pts, Stroke::new(1.8, col));
+    p.add(egui::Shape::convex_polygon(vec![end + vec2(3.5, -3.5), end + vec2(4.0, 3.0), end + vec2(-2.5, 1.5)], col, Stroke::NONE));
+    p.text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, t!("Fly again", "Revoler"), menu::label(), menu::mix(TEXT, Color32::WHITE, lit));
+    let g = p.layout_no_wrap(format!("{place}  ·  {plane}"), menu::caption(), DIM);
+    p.galley(pos2(r.right() - 16.0 - g.size().x, r.center().y - g.size().y * 0.5), g, DIM);
+}
+
+/// The frame every tile shares: a dark fill, a hairline border, and when
+/// hovered or picked out by the gamepad an accent border easing in.
+fn tile_frame(p: &Painter, r: Rect, lit: f32, fill: bool) {
+    if fill {
+        p.rect_filled(r, menu::R_PANEL, menu::mix(Color32::from_rgba_premultiplied(12, 16, 22, 226), Color32::from_rgba_premultiplied(22, 28, 37, 236), lit));
+    }
+    p.rect_stroke(r, menu::R_PANEL, Stroke::new(1.0 + lit, menu::mix(Color32::from_white_alpha(26), ACCENT, lit)), egui::StrokeKind::Inside);
+}
+
+/// The caption of a side tile: its name in the display face, a dim line under it.
+fn caption(p: &Painter, r: Rect, k: f32, lit: f32, title: &str, sub: &str) {
+    let y = r.bottom() - 74.0 * k.max(0.7);
+    spaced(p, pos2(r.left() + 24.0 * k, y), Align2::LEFT_BOTTOM, &title.to_uppercase(), menu::bold(30.0 * k.max(0.7)), menu::mix(TEXT, Color32::WHITE, lit), 2.5 * k);
+    p.text(pos2(r.left() + 25.0 * k, y + 8.0), Align2::LEFT_TOP, sub, menu::label(), menu::mix(DIM, TEXT, lit));
+}
+
+/// Aircraft: the aircraft you will fly, large, easing forward when hovered.
+fn aircraft_tile(p: &Painter, r: Rect, resp: &egui::Response, k: f32, name: &str, still: &egui::TextureHandle) {
+    let lit = menu::ease(p.ctx(), resp.id, resp.hovered() || resp.has_focus());
     tile_frame(p, r, lit, true);
-    let c = pos2(r.center().x, r.top() + r.height() * 0.40);
-    // a soft disc behind the icon
-    p.circle_filled(c, 62.0 * k, Color32::from_white_alpha(if lit { 12 } else { 6 }));
-    icon(p, c, 84.0 * k, if lit { ACCENT } else { Color32::from_rgb(214, 219, 227) });
-    spaced(p, pos2(r.center().x, r.top() + r.height() * 0.70), Align2::CENTER_CENTER, &title.to_uppercase(), menu::bold(22.0 * k.max(0.7)), if lit { Color32::WHITE } else { TEXT }, 3.0 * k);
-    p.text(pos2(r.center().x, r.top() + r.height() * 0.70 + 30.0 * k.max(0.7)), Align2::CENTER_CENTER, sub, FontId::proportional(13.0), DIM);
+    // a pool of light under the aeroplane
+    let c = pos2(r.center().x, r.top() + r.height() * 0.38);
+    let clip = p.with_clip_rect(r.shrink(1.0));
+    menu::glow(&clip, c + vec2(0.0, 30.0 * k), vec2(r.width() * 0.62, r.width() * 0.36), Color32::from_white_alpha((14.0 + 8.0 * lit) as u8));
+    // The picture is 680 x 392 with the aeroplane in its middle, easing forward on hover.
+    let w = r.width() * 0.98;
+    let pic = Rect::from_center_size(c + vec2(5.0 * lit, -4.0 * lit) * k, vec2(w, w * 392.0 / 680.0));
+    clip.image(still.id(), pic, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    caption(p, r, k, lit, t!("Aircraft", "Avions"), name);
+}
+
+/// Settings: a cog that turns a little when hovered.
+fn settings_tile(p: &Painter, r: Rect, resp: &egui::Response, k: f32) {
+    let lit = menu::ease(p.ctx(), resp.id, resp.hovered() || resp.has_focus());
+    tile_frame(p, r, lit, true);
+    let c = pos2(r.center().x, r.top() + r.height() * 0.38);
+    p.circle_stroke(c, 72.0 * k, Stroke::new(1.0, Color32::from_white_alpha((14.0 + 16.0 * lit) as u8)));
+    gear_icon_turned(p, c, 92.0 * k, menu::mix(Color32::from_rgb(200, 207, 218), Color32::WHITE, lit), lit * std::f32::consts::TAU / 16.0);
+    caption(p, r, k, lit, t!("Settings", "Réglages"), t!("Graphics · sound · controls", "Graphismes · son · commandes"));
 }
 
 /// FLY: the globe picture filling it (easing in a little when hovered),
 /// shades along the foot and the left for the words, and the word.
 fn fly_tile(p: &Painter, r: Rect, resp: &egui::Response, k: f32, globe: &egui::TextureHandle) {
-    let lit = resp.hovered() || resp.has_focus();
-    let zoom = p.ctx().animate_bool_with_time(resp.id.with("zoom"), lit, 0.9);
+    let lit = menu::ease(p.ctx(), resp.id, resp.hovered() || resp.has_focus());
+    let zoom = p.ctx().animate_bool_with_time(resp.id.with("zoom"), lit > 0.5, 0.9);
     p.rect_filled(r, menu::R_PANEL, Color32::BLACK);
     // Fill the tile, cropping the picture to its aspect.
     let [iw, ih] = globe.size().map(|v| v as f32);
@@ -157,30 +241,30 @@ fn fly_tile(p: &Painter, r: Rect, resp: &egui::Response, k: f32, globe: &egui::T
     let z = 1.0 - 0.035 * (zoom * zoom * (3.0 - 2.0 * zoom));
     let at = uv.lerp_inside(vec2(0.72, 0.42));
     let uv = Rect::from_min_max(at + (uv.min - at) * z, at + (uv.max - at) * z);
-    let tint = if lit { Color32::WHITE } else { Color32::from_gray(226) };
-    p.image(globe.id(), r.shrink(1.0), uv, tint);
+    p.image(globe.id(), r.shrink(1.0), uv, menu::mix(Color32::from_gray(222), Color32::WHITE, lit));
     // Shades for the words: across from the left, and up from the foot.
     let inner = r.shrink(1.0);
-    hgradient(p, Rect::from_min_max(inner.min, pos2(inner.left() + inner.width() * 0.42, inner.bottom())), Color32::from_black_alpha(110), Color32::TRANSPARENT);
-    gradient(p, Rect::from_min_max(pos2(inner.left(), inner.top() + inner.height() * 0.58), inner.max), Color32::TRANSPARENT, Color32::from_black_alpha(165));
-    // and a hairline of light along the top, as on glass
-    gradient(p, Rect::from_min_max(inner.min, pos2(inner.right(), inner.top() + 36.0 * k)), Color32::from_white_alpha(10), Color32::TRANSPARENT);
+    hgradient(p, Rect::from_min_max(inner.min, pos2(inner.left() + inner.width() * 0.5, inner.bottom())), Color32::from_black_alpha(130), Color32::TRANSPARENT);
+    gradient(p, Rect::from_min_max(pos2(inner.left(), inner.top() + inner.height() * 0.5), inner.max), Color32::TRANSPARENT, Color32::from_black_alpha(180));
     tile_frame(p, r, lit, false);
-    let x = r.left() + 30.0 * k;
-    let base = r.bottom() - 34.0 * k;
-    spaced(p, pos2(x - 2.0, base - 26.0 * k), Align2::LEFT_BOTTOM, t!("FLY", "VOLER"), menu::bold(60.0 * k.max(0.6)), if lit { ACCENT } else { Color32::WHITE }, 8.0 * k);
-    p.text(pos2(x + 2.0, base - 6.0 * k), Align2::LEFT_CENTER, t!("Pick a place on the globe and take off", "Choisissez un lieu sur le globe et décollez"), FontId::proportional(15.0), Color32::from_rgb(214, 219, 227));
-    // its key or button, bottom right
-    let hint = Hint::of("Enter", "A");
-    let hc = Color32::from_white_alpha(170);
-    match hint {
+    let x = r.left() + 32.0 * k;
+    let base = r.bottom() - 36.0 * k;
+    spaced(p, pos2(x - 3.0, base - 30.0 * k), Align2::LEFT_BOTTOM, t!("FLY", "VOLER"), menu::bold(112.0 * k.max(0.6)), menu::mix(Color32::WHITE, ACCENT, lit), 5.0 * k);
+    p.text(pos2(x, base - 8.0 * k), Align2::LEFT_CENTER, t!("Pick a place on the globe and take off", "Choisissez un lieu sur le globe et décollez"), menu::medium(16.5), Color32::from_rgb(220, 226, 234));
+    // its key or button, bottom right, on a key cap
+    let hc = Color32::from_white_alpha(190);
+    match Hint::of("Enter", "A") {
         Hint::Text(h) => {
-            p.text(pos2(r.right() - 26.0 * k, base - 6.0 * k), Align2::RIGHT_CENTER, h, FontId::proportional(13.0), hc);
+            let g = p.layout_no_wrap(h.to_string(), FontId::monospace(11.5), hc);
+            let cap = Rect::from_min_size(pos2(r.right() - 28.0 * k - g.size().x - 14.0, base - 8.0 * k - 11.0), vec2(g.size().x + 14.0, 22.0));
+            p.rect_filled(cap, menu::R_WIDGET, Color32::from_white_alpha(18));
+            p.rect_stroke(cap, menu::R_WIDGET, Stroke::new(1.0, Color32::from_white_alpha(46)), egui::StrokeKind::Inside);
+            p.galley(cap.center() - g.size() * 0.5, g, hc);
         }
         Hint::Pad(spec) => {
             let h = 22.0;
             let w = padui::spec_width(p, spec, h);
-            padui::paint_spec(p, r.right() - 26.0 * k - w, base - 6.0 * k, spec, h, hc);
+            padui::paint_spec(p, r.right() - 26.0 * k - w, base - 8.0 * k, spec, h, hc);
         }
         Hint::None => {}
     }
@@ -221,41 +305,12 @@ fn gradient(p: &Painter, r: Rect, top: Color32, bottom: Color32) {
     p.add(mesh);
 }
 
-/// An airliner from above, nose up, `s` points across, in outline.
-pub fn plane_icon(p: &Painter, c: Pos2, s: f32, col: Color32) {
-    // Right half, nose to tail (x right, y down, in units of half the span).
-    let half = [
-        (0.0, -0.98),
-        (0.07, -0.88),
-        (0.09, -0.62),
-        (0.09, -0.24),
-        (0.98, 0.20),
-        (0.98, 0.31),
-        (0.09, 0.10),
-        (0.07, 0.62),
-        (0.40, 0.84),
-        (0.40, 0.93),
-        (0.03, 0.86),
-        (0.0, 0.96),
-    ];
-    let u = s * 0.5;
-    let mut pts: Vec<Pos2> = half.iter().map(|&(x, y)| c + vec2(x, y) * u).collect();
-    pts.extend(half.iter().rev().skip(1).take(half.len() - 2).map(|&(x, y)| c + vec2(-x, y) * u));
-    let st = Stroke::new((s * 0.03).clamp(1.6, 3.0), col);
-    p.add(egui::Shape::closed_line(pts, st));
-    // the two engines under the wings
-    for sx in [-1.0, 1.0] {
-        let e = c + vec2(sx * 0.42, 0.02) * u;
-        p.line_segment([e - vec2(0.0, 0.12 * u), e + vec2(0.0, 0.06 * u)], Stroke::new((s * 0.05).clamp(2.0, 5.0), col));
-    }
-}
-
-/// A cog: eight teeth round a ring, a hole in the middle.
-pub fn gear_icon(p: &Painter, c: Pos2, s: f32, col: Color32) {
+/// A cog, turned `turn` radians: eight teeth round a ring, a hole in the middle.
+fn gear_icon_turned(p: &Painter, c: Pos2, s: f32, col: Color32, turn: f32) {
     let (r_out, r_in, teeth) = (s * 0.46, s * 0.36, 8);
     let mut pts = Vec::new();
     for i in 0..teeth {
-        let a0 = i as f32 / teeth as f32 * std::f32::consts::TAU;
+        let a0 = turn + i as f32 / teeth as f32 * std::f32::consts::TAU;
         let step = std::f32::consts::TAU / teeth as f32;
         // root, rise, top across, fall
         for (f, r) in [(0.0, r_in), (0.18, r_in), (0.28, r_out), (0.62, r_out), (0.72, r_in)] {
