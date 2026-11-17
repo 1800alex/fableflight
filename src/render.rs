@@ -1491,6 +1491,7 @@ impl Renderer {
         config.format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
         config.present_mode = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
         surface.configure(&device, &config);
+        log::info!("surface {:?}, final passes {}", config.format, if direct_out(&config) { "straight to it" } else { "via a blit" });
 
         let d = &device;
         let common = include_str!("shaders/common.wgsl");
@@ -1845,10 +1846,10 @@ impl Renderer {
         let p_down = full("down", &pl(&l_post), &m_post, "fs_down", HDR, None);
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let p_up = full("up", &pl(&l_post), &m_post, "fs_up", HDR, Some(wgpu::BlendState { color: add, alpha: add }));
-        let p_final = full("final", &pl(&l_post), &m_post, "fs_final", wgpu::TextureFormat::Rgba8Unorm, None);
-        let p_final_taa = full("final taa", &pl(&l_post), &m_post, "fs_final_taa", wgpu::TextureFormat::Rgba8Unorm, None);
+        let p_final = full("final", &pl(&l_post), &m_post, "fs_final", out_format(&config), None);
+        let p_final_taa = full("final taa", &pl(&l_post), &m_post, "fs_final_taa", out_format(&config), None);
         let invert = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::OneMinusDst, dst_factor: wgpu::BlendFactor::OneMinusSrc, operation: wgpu::BlendOperation::Add };
-        let p_logo = full("logo", &pl(&l_post), &m_post, "fs_logo", wgpu::TextureFormat::Rgba8Unorm, Some(wgpu::BlendState { color: invert, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }));
+        let p_logo = full("logo", &pl(&l_post), &m_post, "fs_logo", out_format(&config), Some(wgpu::BlendState { color: invert, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }));
         let p_blit = full("blit", &pl(&l_post), &m_post, if config.format.is_srgb() { "fs_blit_srgb" } else { "fs_blit" }, config.format, None);
         let pm = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
         let p_particles = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2185,7 +2186,7 @@ impl Renderer {
         let bg_vol_b = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_vol_b, entries: &[buf_res(0, &psim_ub, 0), tex_res(6, &vol_dens), tex_res(7, &vol_light)] });
         let fluid = crate::fluid::FluidGpu::new(d, &l0, common, &vol_acc);
 
-        let egui = egui_wgpu::Renderer::new(d, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
+        let egui = egui_wgpu::Renderer::new(d, out_format(&config), egui_wgpu::RendererOptions::default());
         let targets = Self::make_targets(d, &config, (config.width, config.height), &l_dres, &l_ao, &l_composite, &l_cloud, &l_cloud_apply, &l_cloud_temporal, &l_post, &l_pdraw, &l_glass, &psim_ub, &pbuf, &black);
         let fluid_t = fluid.draw_targets(d, &targets.depth, config.width, config.height);
         // The transmittance and multi-scatter tables depend only on the planet
@@ -2237,7 +2238,7 @@ impl Renderer {
         let cloud_hist = [view(&make_tex(d, "cloud hist 0", cw, ch, 1, 1, HDR, rt)), view(&make_tex(d, "cloud hist 1", cw, ch, 1, 1, HDR, rt))];
         let bloom_tex = make_tex(d, "bloom", (w / 2).max(64), (h / 2).max(64), 1, BLOOM_MIPS, HDR, rt);
         let bloom: Vec<_> = (0..BLOOM_MIPS).map(|i| bloom_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
-        let ldr_tex = make_tex(d, "ldr", ow, oh, 1, 1, wgpu::TextureFormat::Rgba8Unorm, rt | wgpu::TextureUsages::COPY_SRC);
+        let ldr_tex = make_tex(d, "ldr", ow, oh, 1, 1, out_format(config), rt | wgpu::TextureUsages::COPY_SRC);
         let ldr = view(&ldr_tex);
         let logo_tex = make_tex(d, "logo", ow, oh, 1, 1, wgpu::TextureFormat::R8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let logo = view(&logo_tex);
@@ -3458,7 +3459,12 @@ impl Renderer {
         for i in (0..BLOOM_MIPS as usize - 1).rev() {
             full(&mut enc, &t.bloom[i], false, &self.p_up, &t.bg_up[i]);
         }
-        full(&mut enc, &t.ldr, true, if taa { &self.p_final_taa } else { &self.p_final }, &t.bg_final[src]);
+        // The tonemap, UI and title go straight into the window's frame when
+        // it takes them as they are; `ldr` and a copy to the window otherwise,
+        // and for screenshots, which read `ldr` back.
+        let direct = sview.as_ref().filter(|_| f.shot.is_none() && direct_out(&self.config));
+        let out = direct.unwrap_or(&t.ldr);
+        full(&mut enc, out, true, if taa { &self.p_final_taa } else { &self.p_final }, &t.bg_final[src]);
 
         let egui_jobs = f.egui.map(|(jobs, delta, ppp)| {
             let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point: ppp };
@@ -3466,7 +3472,7 @@ impl Renderer {
             (jobs, delta, sd)
         });
         if let Some((jobs, _, sd)) = &egui_jobs {
-            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.ldr, false))], None)).forget_lifetime();
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(out, false))], None)).forget_lifetime();
             self.egui.render(&mut rp, jobs, sd);
         }
         if let Some(scale) = f.logo {
@@ -3476,11 +3482,14 @@ impl Renderer {
                 self.queue.write_texture(t.logo_tex.as_image_copy(), &m, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: Some(h) }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
                 self.logo_key = Some((w, h, scale.to_bits()));
             }
-            full(&mut enc, &t.ldr, false, &self.p_logo, &t.bg_logo);
+            full(&mut enc, out, false, &self.p_logo, &t.bg_logo);
         }
-        if let Some(sview) = &sview {
+        mark(&mut enc, "post+ui");
+        if let Some(sview) = sview.as_ref().filter(|_| direct.is_none()) {
             full(&mut enc, sview, true, &self.p_blit, &t.bg_blit);
+            mark(&mut enc, "blit");
         }
+        let bgra = out_format(&self.config) == wgpu::TextureFormat::Bgra8Unorm;
         let shot = f.shot.map(|path| {
             let (w, h) = (self.config.width, self.config.height);
             let row = (w * 4).div_ceil(256) * 256;
@@ -3490,11 +3499,10 @@ impl Renderer {
                 wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
-            (path, buf, w, h, row)
+            (path, buf, w, h, row, bgra)
         });
         let t_sub = std::time::Instant::now();
         self.stats[2] += (t_sub - t_enc).as_secs_f64();
-        mark(&mut enc, "post+ui");
         if let Some(g) = gt.as_mut() {
             g.resolve(&mut enc);
         }
@@ -3517,7 +3525,7 @@ impl Renderer {
                 self.egui.free_texture(&id);
             }
         }
-        if let Some((path, buf, w, h, row)) = shot {
+        if let Some((path, buf, w, h, row, bgra)) = shot {
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
             let data = buf.slice(..).get_mapped_range().expect("mapped");
@@ -3525,12 +3533,31 @@ impl Renderer {
             for y in 0..h as usize {
                 img.as_flat_samples_mut().samples[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(&data[y * row as usize..y * row as usize + w as usize * 4]);
             }
+            if bgra {
+                for p in img.pixels_mut() {
+                    p.0.swap(0, 2);
+                }
+            }
             match image::DynamicImage::ImageRgba8(img).to_rgb8().save(&path) {
                 Ok(_) => log::info!("saved screenshot {}", path.display()),
                 Err(e) => log::error!("screenshot failed: {e}"),
             }
         }
     }
+}
+
+/// The format the tonemap, UI and title are drawn in: the window's own when it
+/// is plain 8-bit unorm (the same bytes either way, so they can be drawn
+/// straight into it), RGBA8 otherwise, which `fs_blit`/`fs_blit_srgb` convert.
+fn out_format(config: &wgpu::SurfaceConfiguration) -> wgpu::TextureFormat {
+    match config.format {
+        f @ (wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm) => f,
+        _ => wgpu::TextureFormat::Rgba8Unorm,
+    }
+}
+/// Whether the final passes can draw into the window's frame without the blit.
+fn direct_out(config: &wgpu::SurfaceConfiguration) -> bool {
+    out_format(config) == config.format && config.usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
 }
 
 fn color_att(view: &wgpu::TextureView, clear: bool) -> wgpu::RenderPassColorAttachment<'_> {
