@@ -92,7 +92,7 @@ use render::{DrawObj, Frame, Globals, PSim, Renderer};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -5801,9 +5801,14 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(g) = &self.game {
             g.window.request_redraw();
+            if g.gfx.fps_cap > 0 {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_secs_f64(1.0 / g.gfx.fps_cap as f64)));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
         }
     }
 }
