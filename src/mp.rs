@@ -218,7 +218,7 @@ fn run(server: &str, name: &str, sh: &Shared) -> Result<(), String> {
 /// relay's `/servers.json`, see relay/; any relay serves the whole network's).
 /// When none answers, the last list received (kept on disk) stands in, and
 /// its servers are asked directly.
-pub const DIRECTORY_URLS: &[&str] = &["https://fableflight.danux.be/servers.json"];
+pub const DIRECTORY_URLS: &[&str] = &["https://fableflight.danux.be/servers.json", "https://fableflight.rolandiscool.com/servers.json"];
 
 /// A server of the network, as the list gives it and as we hear it.
 #[derive(Clone, Debug, PartialEq)]
