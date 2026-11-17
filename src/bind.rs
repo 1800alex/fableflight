@@ -117,12 +117,15 @@ pub const ACTIONS: &[Action] = &[
     act("flaps_up", KeyCode::KeyV, "Flaps up a notch", "Volets : rentrer d'un cran"),
     act("gear", KeyCode::KeyL, "Landing gear", "Train d'atterrissage"),
     act("speedbrake", KeyCode::Slash, "Speedbrake", "Aérofreins"),
-    act("canopy", KeyCode::Digit3, "Canopy open / shut", "Verrière : ouvrir / fermer"),
+    act("canopy", KeyCode::Digit6, "Canopy open / shut", "Verrière : ouvrir / fermer"),
     act("reversers", KeyCode::KeyZ, "Thrust reversers (hold)", "Inverseurs de poussée (maintenir)"),
     act("boost", KeyCode::Space, "Boost / afterburner", "Boost / postcombustion"),
     act("engines", KeyCode::Digit1, "Rocket: which engines burn", "Fusée : choix des moteurs allumés"),
     act("stage", KeyCode::Backspace, "Rocket: drop the booster", "Fusée : larguer le booster"),
     act("autoland", KeyCode::Digit2, "Rocket: the ship lands itself", "Fusée : atterrissage automatique du vaisseau"),
+    act("master_arm", KeyCode::Digit3, "Master arm", "Armement maître"),
+    act("target_lock", KeyCode::Digit4, "Lock / cycle target", "Verrouiller / changer de cible"),
+    act("fire_missile", KeyCode::Digit5, "Fire missile", "Tirer un missile"),
     act("engine_auto", KeyCode::F4, "Start / stop the engine", "Démarrer / couper le moteur"),
     act("master", KeyCode::Insert, "Battery master switch", "Batterie (interrupteur général)"),
     act("ignition", KeyCode::KeyI, "Magnetos (jets: fuel controls)", "Magnétos (jets : robinets carburant)"),
@@ -610,6 +613,21 @@ pub fn key_name(k: KeyCode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canopy_and_master_arm_rebind_independently() {
+        let mut b = Bindings::default();
+        let canopy = action("canopy").unwrap();
+        let arm = action("master_arm").unwrap();
+        assert_ne!(b.key_of(canopy), b.key_of(arm));
+        b.set_key("canopy", KeyCode::Digit7);
+        assert_eq!(b.map_key(KeyCode::Digit7), Some(canopy.key));
+        assert_eq!(b.key_of(arm), Some(arm.key));
+        assert_eq!(b.map_key(arm.key), Some(arm.key));
+        b.set_key("master_arm", KeyCode::Digit8);
+        assert_eq!(b.map_key(KeyCode::Digit8), Some(arm.key));
+        assert_eq!(b.map_key(KeyCode::Digit7), Some(canopy.key));
+    }
 
     #[test]
     fn moving_keys() {
