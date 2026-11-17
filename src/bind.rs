@@ -136,6 +136,15 @@ pub const ACTIONS: &[Action] = &[
     act("obs_left", KeyCode::BracketLeft, "OBS course left", "OBS : course à gauche"),
     act("obs_right", KeyCode::BracketRight, "OBS course right", "OBS : course à droite"),
     act("baro_qnh", KeyCode::KeyX, "Altimeter to the QNH", "Caler l'altimètre au QNH"),
+    act("ap", KeyCode::F5, "Autopilot on / off", "Pilote automatique : engager / couper"),
+    act("ap_hdg", KeyCode::Digit7, "Autopilot: heading mode", "Pilote automatique : mode cap (HDG)"),
+    act("ap_nav", KeyCode::Digit8, "Autopilot: follow NAV 1", "Pilote automatique : suivre la NAV 1"),
+    act("ap_apr", KeyCode::Digit9, "Autopilot: ILS approach", "Pilote automatique : approche ILS"),
+    act("ap_alt", KeyCode::Digit0, "Autopilot: hold the altitude", "Pilote automatique : tenue d'altitude"),
+    act("ap_hdg_left", KeyCode::Minus, "Heading bug left", "Consigne de cap à gauche"),
+    act("ap_hdg_right", KeyCode::Equal, "Heading bug right", "Consigne de cap à droite"),
+    act("ap_alt_down", KeyCode::Semicolon, "Altitude preselect down", "Altitude présélectionnée : moins"),
+    act("ap_alt_up", KeyCode::Quote, "Altitude preselect up", "Altitude présélectionnée : plus"),
     act("heading_sync", KeyCode::KeyK, "Heading indicator to compass", "Recaler le conservateur de cap"),
     act("camera", KeyCode::KeyC, "Chase / cockpit camera", "Caméra extérieure / cockpit"),
     act("hud", KeyCode::KeyH, "Hide / show the HUD", "Masquer / afficher le HUD"),
@@ -637,15 +646,15 @@ mod tests {
         let pitch_down = action("pitch_down").unwrap();
         let pitch_up = action("pitch_up").unwrap();
         assert_eq!(b.map_key(KeyCode::KeyW), Some(KeyCode::KeyW));
-        // Pitch down onto 7: 7 now pitches down, W does nothing.
-        b.set_key("pitch_down", KeyCode::Digit7);
-        assert_eq!(b.map_key(KeyCode::Digit7), Some(KeyCode::KeyW));
+        // Pitch down onto F9: F9 now pitches down, W does nothing.
+        b.set_key("pitch_down", KeyCode::F9);
+        assert_eq!(b.map_key(KeyCode::F9), Some(KeyCode::KeyW));
         assert_eq!(b.map_key(KeyCode::KeyW), None);
         // Pitch down onto S takes it from pitch up, which is left without a key.
         b.set_key("pitch_down", KeyCode::KeyS);
         assert_eq!(b.map_key(KeyCode::KeyS), Some(KeyCode::KeyW));
         assert_eq!(b.key_of(pitch_up), None);
-        assert_eq!(b.map_key(KeyCode::Digit7), Some(KeyCode::Digit7));
+        assert_eq!(b.map_key(KeyCode::F9), Some(KeyCode::F9));
         // Back to the defaults.
         b.reset_key("pitch_down");
         b.reset_key("pitch_up");

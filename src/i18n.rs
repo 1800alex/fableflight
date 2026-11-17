@@ -135,6 +135,7 @@ fn fr(en: &str) -> Option<&'static str> {
         "Controls" => "Commandes",
         "Bindings" => "Assignations",
         "Radio" => "Radios",
+        "Autopilot" => "Pilote automatique",
         "Failures" => "Pannes",
         "battery master switch" => "batterie (interrupteur général)",
         "Ins" => "Inser",
