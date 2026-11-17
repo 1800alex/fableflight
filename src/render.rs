@@ -148,12 +148,27 @@ pub struct Globals {
     pub foam: [[f32; 4]; 16],
     /// the start screen: x = 1 while it shows (deep-space sky, no clouds)
     pub start: [f32; 4],
+    /// storms close up (storm.rs): bit mask of the cells near enough to darken
+    /// the ground, rain at the camera 0..1, lightning flashes lit, how deep the
+    /// camera is in a storm's shade 0..1
+    pub stormfx: [f32; 4],
+    /// lightning lighting the scene, two each: one end of the lit stretch
+    /// (camera-relative) + brightness; the other end + kind (1 = to the ground)
+    pub flash: [[f32; 4]; 2 * crate::storm::MAX_FLASHES],
+    /// the rain falling around the camera (precip.wgsl): how far it has moved
+    /// past the camera (east, north, up, m, wrapped) + intensity; its velocity
+    /// relative to the camera (planet frame, m/s) + nearest drop drawn (m)
+    pub rain: [[f32; 4]; 2],
     /// graphics settings (set by the renderer): cloud step length (1 = High),
     /// render resolution scale, 1 / window width and height (the tonemap's output)
     pub quality: [f32; 4],
     /// graphics settings (graphics.rs): building LOD distance factor, tree
     /// impostor distance factor, how far out trees are drawn (m); 0 = High
     pub detail: [f32; 4],
+    /// the rain deck (nimbostratus, weather.rs `deck_globals`): centre of its
+    /// area (cloud space, km) + amount (0 = none); axis + mean base (m); axis +
+    /// top (m); darkness under it, -, how far its scud hangs (m), area radius (km)
+    pub nimbo: [[f32; 4]; 4],
     /// city light in the air (skyglow.rs `SkyGlow::globals`): map centre
     /// relative to the camera + half side (0 = none); its east axis + ground
     /// height under the camera; its north axis + how far the lights are on
@@ -170,6 +185,9 @@ pub struct Globals {
     /// flags (1 alive, 2 TO, 4 FROM, 8 glide slope alive)
     pub nav: [f32; 4],
 }
+
+/// Raindrops drawn around the camera in rain (as many as the rain is heavy show).
+pub const RAIN_DROPS: u32 = 131072;
 
 /// The cloud shadow map: the sun's view of the cloud layer (common.wgsl
 /// `cloud_sun`). Each texel is a ray along the sun from a point on the cloud
@@ -695,6 +713,10 @@ pub struct Frame<'a> {
     pub shot: Option<std::path::PathBuf>,
     /// the start screen's title, drawn at this UI scale (None: not shown)
     pub logo: Option<f32>,
+    /// raindrops to draw around the camera (0: no rain)
+    pub rain_drops: u32,
+    /// lightning channel segments (storm.rs `Lightning::segments`)
+    pub bolts: Vec<[f32; 8]>,
     /// COVER_N x COVER_N, row by row: how far the building tile there has faded
     /// in (255 = fully drawn, 0 = none), from the corner tile in
     /// `World::cover_base`. The terrain's city glow gives way to it.
@@ -789,6 +811,11 @@ pub struct Renderer {
     p_field: wgpu::RenderPipeline,
     p_lights: wgpu::RenderPipeline,
     dyn_lights: wgpu::Buffer,
+    /// falling rain and lightning channels (precip.wgsl), over the clouds
+    p_rain: wgpu::RenderPipeline,
+    p_veil: wgpu::RenderPipeline,
+    p_bolt: wgpu::RenderPipeline,
+    bolt_buf: wgpu::Buffer,
     /// loose trees; `p_tree_near` draws the rest short of IMP_DIST (with the
     /// outlines of their crowns cut into clumps), `imp` the ones beyond
     p_tree: wgpu::RenderPipeline,
@@ -1401,6 +1428,7 @@ impl Renderer {
         let m_vol = module("vol", include_str!("shaders/vol.wgsl"));
         let m_ao = module("ao", include_str!("shaders/ao.wgsl"));
         let m_taa = module("taa", include_str!("shaders/taa.wgsl"));
+        let m_precip = module("precip", include_str!("shaders/precip.wgsl"));
         let m_dres = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("resolve"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/resolve.wgsl").into()) });
 
         // ---- shared resources
@@ -1958,6 +1986,40 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        // Rain and lightning: over the finished scene and clouds, behind the
+        // glass, tested against the resolved depth. Both write how much they
+        // cover into alpha (hdr alpha is otherwise 1) so the anti-aliasing takes
+        // them from this frame instead of smearing them into the history.
+        const A_BOLT: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+        let precip = |label: &str, vs: &str, fs: &str, color: wgpu::BlendComponent, alpha: wgpu::BlendComponent, buffers: &[Option<wgpu::VertexBufferLayout>]| {
+            d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl(&l_cloud_apply)),
+                vertex: wgpu::VertexState { module: &m_precip, entry_point: Some(vs), compilation_options: Default::default(), buffers },
+                primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Greater), stencil: Default::default(), bias: Default::default() }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &m_precip,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR,
+                        blend: Some(wgpu::BlendState { color, alpha }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        // (Alpha: the share of this frame the anti-aliasing must take.)
+        let cover = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+        let over = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+        let p_rain = precip("rain", "vs_rain", "fs_rain", over, cover, &[]);
+        let p_bolt = precip("lightning", "vs_bolt", "fs_bolt", wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, cover, &[vb(32, true, &A_BOLT)]);
+        // The veil of distant rain is smooth and steady: it leaves alpha alone.
+        let p_veil = precip("rain veil", "vs_veil", "fs_veil", over, wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, &[]);
         let p_tree = geom("tree", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 0);
         let imp = crate::impostor::Impostors::new(d, &l0, &l_tileu, &m_tree);
         let p_tree_near = geom("trees near", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 7);
@@ -1988,6 +2050,7 @@ impl Renderer {
         let (inst_buf, fall_buf) = (dynbuf("instances", MAX_INST as u64 * 80), dynbuf("loose trees", MAX_FALL as u64 * 36));
         let near_buf = dynbuf("near trees", MAX_NEAR as u64 * 36);
         let dyn_lights = dynbuf("aircraft lights", MAX_DYN_LIGHTS as u64 * 40);
+        let bolt_buf = dynbuf("lightning", crate::storm::MAX_SEGS as u64 * 32);
         // (No paint until the aircraft is known: `set_paint`.)
         let paint = paint_texture(d, &queue, None);
         let paint_ub = d.create_buffer(&wgpu::BufferDescriptor { label: Some("paint"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -2039,7 +2102,7 @@ impl Renderer {
         }
         Ok(Self {
             ground_mats,
-            casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
+            casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_rain, p_veil, p_bolt, bolt_buf, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
             p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
@@ -2469,6 +2532,10 @@ impl Renderer {
             blob[k..k + 12].copy_from_slice(bytemuck::cast_slice(o));
         }
         let field_slot = |i: usize| ((n_builds + 1 + i) * 256) as u32;
+        let n_bolt = f.bolts.len().min(crate::storm::MAX_SEGS);
+        if n_bolt > 0 {
+            q.write_buffer(&self.bolt_buf, 0, bytemuck::cast_slice(&f.bolts[..n_bolt]));
+        }
         let n_dyn = f.lights.len().min(MAX_DYN_LIGHTS);
         if n_dyn > 0 {
             q.write_buffer(&self.dyn_lights, 0, bytemuck::cast_slice(&f.lights[..n_dyn]));
@@ -3140,6 +3207,25 @@ impl Renderer {
             rp.set_pipeline(&self.fluid.p_up);
             rp.set_bind_group(1, &ft.bg_up, &[]);
             rp.draw(0..3, 0..1);
+        }
+        if f.rain_drops > 0 || n_bolt > 0 {
+            let ds = wgpu::RenderPassDepthStencilAttachment { view: &t.depth, depth_ops: None, stencil_ops: None };
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], Some(ds)));
+            rp.set_bind_group(0, &self.bg0, &[]);
+            rp.set_bind_group(1, &t.bg_cloud_apply[cf], &[]);
+            if f.rain_drops > 0 {
+                rp.set_pipeline(&self.p_veil);
+                rp.draw(0..3, 0..1);
+            }
+            if n_bolt > 0 {
+                rp.set_pipeline(&self.p_bolt);
+                rp.set_vertex_buffer(0, self.bolt_buf.slice(..));
+                rp.draw(0..6, 0..n_bolt as u32);
+            }
+            if f.rain_drops > 0 {
+                rp.set_pipeline(&self.p_rain);
+                rp.draw(0..6, 0..f.rain_drops);
+            }
         }
         if f.objs.iter().take(n_objs).any(|o| o.glass) {
             // The windows bend what is seen through them, so they read the

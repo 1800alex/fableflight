@@ -23,6 +23,7 @@ mod bind;
 mod i18n;
 mod jsbsim;
 mod live;
+mod radar;
 mod livewx;
 mod nav;
 mod settings;
@@ -40,6 +41,8 @@ mod padui;
 mod pave;
 mod photonight;
 mod relight;
+mod rain;
+mod storm;
 mod weather;
 mod weapons;
 mod mvt;
@@ -221,6 +224,12 @@ struct Args {
     clouds: f32,
     /// cumulonimbus storm cell amount 0..1
     storms: Option<f32>,
+    /// storm cells placed by hand: distance (km), compass bearing (deg), tower radius (km)
+    storm_at: Vec<(f64, f64, f64, Option<weather::CellKind>)>,
+    /// --squall-at: (km, bearing, length km) of squall lines
+    squall_at: Vec<(f64, f64, f64)>,
+    /// km,bearing: where the rain deck's area is centred, from the spawn
+    rain_at: Option<(f64, f64)>,
     time_rate: Option<f64>,
     alto: Option<f32>,
     /// wind in knots and the direction it blows from, haze, day of year; open the F3 panel
@@ -228,6 +237,10 @@ struct Args {
     haze: Option<f32>,
     day: Option<f64>,
     weather_panel: bool,
+    /// real weather on for this run (else the saved setting, off when the command line sets the weather)
+    live_weather: bool,
+    /// print where it is storming now (weather radar) and quit
+    find_storms: bool,
     vsync: bool,
     taa: bool,
     /// graphics preset and render resolution for this run (not saved; the
@@ -290,6 +303,15 @@ struct Args {
     aircraft: Option<String>,
     /// start with the HUD hidden (H), for screenshots
     no_hud: bool,
+    /// rain 0..1 (wets the windows), and how wet the glass starts (default: settled in that rain)
+    rain: Option<f32>,
+    wet: Option<f32>,
+    /// airborne start speed (kt) instead of the aircraft's cruise
+    speed: Option<f64>,
+    /// a weather preset by name (`--weather storm`: thunderstorms all round)
+    weather_preset: Option<String>,
+    /// lightning strikes forced at given times, for screenshots
+    strikes: Vec<storm::Forced>,
     /// fuel to start with (fraction of full tanks), and the engine off on the ground
     fuel: Option<f64>,
     cold: bool,
@@ -310,12 +332,17 @@ fn parse_args() -> Args {
         hour: 16.6,
         clouds: 0.5,
         storms: None,
+        storm_at: Vec::new(),
+        squall_at: Vec::new(),
+        rain_at: None,
         time_rate: None,
         alto: None,
         wind: None,
         haze: None,
         day: None,
         weather_panel: false,
+        live_weather: false,
+        find_storms: false,
         vsync: true,
         taa: true,
         graphics: None,
@@ -355,6 +382,11 @@ fn parse_args() -> Args {
         approach: false,
         aircraft: None,
         no_hud: false,
+        rain: None,
+        wet: None,
+        speed: None,
+        weather_preset: None,
+        strikes: Vec::new(),
         fuel: None,
         cold: false,
         mcp: true,
@@ -428,6 +460,36 @@ fn parse_args() -> Args {
             "--time" => a.hour = num(&v, i).unwrap_or(a.hour),
             "--clouds" => a.clouds = num(&v, i).unwrap_or(0.5) as f32,
             "--storms" => a.storms = num(&v, i).map(|x| x as f32),
+            "--storm-at" => {
+                // km,bearing[,radius km[,shower|thunder|severe|supercell]]: a convective cell that far
+                // from the spawn, a mature cumulonimbus unless a kind says otherwise (repeatable)
+                let f: Vec<&str> = v.get(i + 1).map(|s| s.split(',').collect()).unwrap_or_default();
+                let p: Vec<f64> = f.iter().take(3).map_while(|x| x.parse().ok()).collect();
+                let kind = f.iter().skip(p.len()).find_map(|x| weather::CellKind::parse(x));
+                if p.len() >= 2 {
+                    let r = p.get(2).copied().unwrap_or(match kind {
+                        Some(weather::CellKind::Shower) => 1.8,
+                        Some(weather::CellKind::Supercell) => weather::SUPER_R,
+                        _ => 6.0,
+                    });
+                    a.storm_at.push((p[0], p[1], r, kind));
+                }
+            }
+            "--squall-at" => {
+                // km,bearing[,length km]: a squall line that far from the spawn, lying
+                // across that bearing (the wind aloft blows from there unless --wind says)
+                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').map_while(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if p.len() >= 2 {
+                    a.squall_at.push((p[0], p[1], p.get(2).copied().unwrap_or(100.0)));
+                }
+            }
+            "--rain-at" => {
+                // km,bearing: centre the rain deck's area (--rain) that far from the spawn
+                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if p.len() >= 2 {
+                    a.rain_at = Some((p[0], p[1]));
+                }
+            }
             "--time-rate" => a.time_rate = num(&v, i),
             "--alto" => a.alto = num(&v, i).map(|x| x as f32),
             "--wind" => {
@@ -440,8 +502,24 @@ fn parse_args() -> Args {
             "--haze" => a.haze = num(&v, i).map(|h| h as f32),
             "--day" => a.day = num(&v, i),
             "--weather" => {
-                a.weather_panel = true;
-                used = 1;
+                // a preset name (clear, fair, hazy, overcast, windy, storm), or on its own: open the weather panel
+                match v.get(i + 1).filter(|s| !s.starts_with("--")) {
+                    Some(p) => a.weather_preset = Some(p.clone()),
+                    None => {
+                        a.weather_panel = true;
+                        used = 1;
+                    }
+                }
+            }
+            "--strike" => {
+                // cg|ic,km,bearing@seconds: a lightning strike that far from the aircraft at that game time
+                let f: Vec<&str> = v.get(i + 1).map(|s| s.split('@').collect()).unwrap_or_default();
+                let p: Vec<&str> = f.first().map(|s| s.split(',').collect()).unwrap_or_default();
+                let n = |k: usize| p.get(k).and_then(|x| x.parse::<f64>().ok());
+                if let (Some(kind), Some(km), Some(at)) = (p.first(), n(1), f.get(1).and_then(|t| t.parse::<f64>().ok())) {
+                    let kind = if kind.eq_ignore_ascii_case("ic") { storm::Kind::Cloud } else { storm::Kind::Ground };
+                    a.strikes.push(storm::Forced { at, kind, km, bearing: n(2).unwrap_or(0.0) });
+                }
             }
             "--imagery" => a.imagery = v.get(i + 1).cloned().unwrap_or(a.imagery.clone()),
             "--crash-at" => a.crash_at = num(&v, i),
@@ -501,10 +579,21 @@ fn parse_args() -> Args {
                 a.taa = false;
                 used = 1;
             }
+            "--rain" => a.rain = num(&v, i).map(|x| x as f32),
+            "--wet" => a.wet = num(&v, i).map(|x| x as f32),
+            "--speed" => a.speed = num(&v, i),
             "--graphics" => a.graphics = v.get(i + 1).and_then(|s| graphics::Level::parse(s)).filter(|l| *l != graphics::Level::Off),
             "--render-scale" => a.render_scale = num(&v, i).map(|s| (s as f32).clamp(graphics::SCALE_MIN, graphics::SCALE_MAX)),
             "--headless" => {
                 a.headless = true;
+                used = 1;
+            }
+            "--live-weather" => {
+                a.live_weather = true;
+                used = 1;
+            }
+            "--find-storms" => {
+                a.find_storms = true;
                 used = 1;
             }
             "--fps-log" => {
@@ -571,7 +660,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -782,6 +871,16 @@ struct Game {
     cockpit_fov: f32,
     /// the instruments' own state: lags, gyros, the compass card
     gauges: gauges::Gauges,
+    /// water on the windows (rain.rs)
+    glass: rain::Glass,
+    /// lightning, and the rain falling around the camera (storm.rs)
+    lightning: storm::Lightning,
+    rain_field: storm::RainField,
+    /// rain falling where the camera is, 0..1, and how much of it is hail
+    cam_rain: f32,
+    cam_hail: f32,
+    /// how far the eye has opened up to the gloom under a storm, 0..1
+    storm_adapt: f32,
     head_live: bool,
     /// the cockpit warnings sounding, and when each latched one last tripped
     /// (pull up, too low, sink rate, gear) so they do not flicker
@@ -907,7 +1006,7 @@ impl Game {
         }
         let alt = args.alt.unwrap_or_else(|| ground_elev(&src, lat, lon) + args.agl.unwrap_or(450.0));
         let spec = args.aircraft.as_deref().and_then(aircraft::by_key).unwrap_or(aircraft::BUILTIN[0]);
-        let mut plane = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt, args.heading.to_radians(), spec.cruise);
+        let mut plane = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt, args.heading.to_radians(), args.speed.map(|kt| kt / 1.94384).unwrap_or(spec.cruise));
         if args.ship {
             plane.rocket_return();
         }
@@ -945,25 +1044,56 @@ impl Game {
             }
         }
         let mut wx = weather::Weather::new(args.clouds);
+        match args.weather_preset.as_deref() {
+            Some(p) if p.eq_ignore_ascii_case("storm") || p.eq_ignore_ascii_case("storms") || p.eq_ignore_ascii_case("thunderstorm") => wx.storm_field(plane.pos, args.heading),
+            Some(p) => {
+                if !wx.preset(p) {
+                    eprintln!("unknown weather preset {p}");
+                }
+            }
+            None => {}
+        }
         if let Some(s) = args.storms {
             wx.storms = s.clamp(0.0, 1.0);
         }
         if let Some(s) = args.alto {
             wx.alto = s.clamp(0.0, 1.0);
         }
+        wx.rain = args.rain.unwrap_or(0.0).clamp(0.0, 1.0);
+        wx.rain_set = args.rain.map(|r| r.clamp(0.0, 1.0));
+        wx.deck_place = args.rain_at;
+        // The rain deck closes in from the start; the windows start as wet as
+        // the rain where the aircraft is (none above the deck).
+        wx.step_deck(0.0, plane.pos, None);
+        wx.rain = wx.deck_rain(plane.pos) as f32;
+        let mut lightning = storm::Lightning::new();
+        lightning.forced = args.strikes.clone();
+        let mut glass = rain::Glass::new(wx.rain);
+        if let Some(w) = args.wet {
+            glass.wet = w.clamp(0.0, 1.0);
+        }
+        for &(d, b, r, kind) in &args.storm_at {
+            wx.place_storm(plane.pos, d, b, r.clamp(1.0, 12.0), kind);
+        }
         if let Some(r) = args.time_rate {
             wx.time_rate = r.clamp(0.0, 3600.0);
         }
         if let Some((kt, from)) = args.wind {
             (wx.wind, wx.wind_from) = (kt / 1.94384, from);
+        } else if let Some(&(_, b, _)) = args.squall_at.first() {
+            // A squall line comes on broadside with the wind: from where it was put.
+            (wx.wind, wx.wind_from) = (wx.wind.max(8.0), b.rem_euclid(360.0));
+        }
+        for &(d, b, l) in &args.squall_at {
+            wx.place_squall(plane.pos, d, b, l.clamp(10.0, 400.0));
         }
         if let Some(h) = args.haze {
             wx.haze = h.clamp(0.2, 40.0);
         }
         wx.open = args.weather_panel;
         // Real weather, unless the command line sets the weather itself.
-        let scripted = std::env::args().any(|a| matches!(a.as_str(), "--clouds" | "--storms" | "--alto" | "--wind" | "--haze"));
-        wx.live = prefs.live_weather && !scripted;
+        let scripted = std::env::args().any(|a| matches!(a.as_str(), "--clouds" | "--rain" | "--storms" | "--alto" | "--wind" | "--haze" | "--squall-at"));
+        wx.live = (prefs.live_weather && !scripted) || args.live_weather;
         let set_time = std::env::args().any(|a| matches!(a.as_str(), "--time" | "--day" | "--time-rate"));
         wx.real_time = prefs.real_time && !set_time;
         // The spawn speed is through the air: start out moving with the wind,
@@ -994,7 +1124,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), weapon_flash: None, damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane, weapons,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -1274,6 +1404,8 @@ impl Game {
         self.parking_brake = false;
         self.mcp_throttle = None;
         self.plane = Plane::spawn(self.spec, lat, lon, alt, heading, speed);
+        // Rain set by hand comes along to a new place (its deck closes in there).
+        self.wx.deck_moved(self.plane.pos);
         self.plane.fuel = self.spec.fuel_kg * self.menu.fuel;
         self.plane.payload = self.start_payload();
         // The spawn speed is through the air, not over the ground.
@@ -3037,6 +3169,8 @@ impl Game {
             cabin: if self.cam_mode == 1 && !self.crashed && !in_menu { 1.0 } else { 0.0 },
             dist: (cam - p.pos).length() as f32,
             fire,
+            rain: if in_menu { 0.0 } else { self.cam_rain },
+            hail: if in_menu { 0.0 } else { self.cam_hail },
             warn: self.warn,
         };
         if let Some(a) = &self.audio {
@@ -3218,14 +3352,20 @@ impl Game {
             // The air the aircraft flies through, gusts and all.
             let (la, lo, h) = geo::pos_to_lla(self.plane.pos);
             let g = self.world.ground(la, lo);
-            let agl = h - g.as_ref().map(|g| g.h).unwrap_or(0.0);
+            let gh = g.as_ref().map(|g| g.h);
+            let agl = h - gh.unwrap_or(0.0);
             let water = g.map(|g| g.water).unwrap_or(false);
             self.wx.sun = self.sun_dir().dot(self.plane.pos.normalize());
             // Turbulence, thermals and storm drafts ride on top of the gusting wind.
             let air = self.wx.air(self.plane.pos, agl, self.time, water);
             self.plane.air = air;
-            self.plane.wind = self.wx.at(self.plane.pos, agl, self.time) + self.plane.pos.normalize() * air.draft;
+            self.plane.wind = self.wx.at(self.plane.pos, agl, self.time) + self.plane.pos.normalize() * air.draft + air.gust;
+            // The rain on the windows: only under (or in) a cloud that rains, the
+            // rain deck the slider sets or a storm cell.
+            self.wx.step_deck(dt, self.plane.pos, gh);
+            self.wx.rain = self.wx.rain_at(self.plane.pos, agl, self.time) as f32;
             self.wx.advance(dt, self.plane.pos);
+            self.glass.step(dt, self.wx.rain, self.plane.ias() * 1.94384);
         }
 
         // Physics at a fixed step.
@@ -3691,6 +3831,21 @@ impl Game {
         };
         let calt = geo::pos_to_lla(cam).2;
         let agl = calt - ground.unwrap_or(0.0);
+        // Storms around the camera: the rain falling there, the lightning.
+        if in_menu {
+            self.cam_rain = 0.0;
+            self.cam_hail = 0.0;
+        } else {
+            self.cam_rain = self.wx.rain_at(cam, agl, self.time) as f32;
+            self.cam_hail = if self.cam_rain > 0.0 { storm::local(&self.wx, cam, agl, self.time).hail as f32 } else { 0.0 };
+            let world = &self.world;
+            let gnd = |p: DVec3| {
+                let (la, lo, _) = geo::pos_to_lla(p);
+                world.ground(la, lo).map(|g| g.h).unwrap_or(0.0)
+            };
+            self.lightning.step(dt, self.time, &self.wx, self.plane.pos, cam, &gnd);
+            self.rain_field.step(dt, cam, self.wx.at(cam, agl, self.time));
+        }
         let scrape = if steps > 0 { (scrape_n as f32 / steps as f32 * 0.5).min(1.0) } else { 0.0 };
         self.update_audio(cam, fire, in_menu, &c, dt, scrape);
 
@@ -3759,10 +3914,19 @@ impl Game {
         // Exposure moves in stops through twilight (a straight blend opens up
         // far too early, washing the city out while the sky still glows).
         // Night stays a night photograph: dark walls, bright windows.
-        let exposure = (6.0f32.ln() + (0.5f32.ln() - 6.0f32.ln()) * day).exp() * if self.cam_mode == 1 && !self.crashed && !in_menu { 2f32.powf(self.head.adapt) } else { 1.0 };
+        // Under a storm (in daylight) the eye opens up a stop or so to the gloom.
+        let shade = if in_menu { 0.0 } else { storm::shade(&self.wx, cam).max(self.wx.deck_shade(cam)) as f32 };
+        self.storm_adapt += (shade * day - self.storm_adapt) * (dt_real as f32 * 0.4).min(1.0);
+        let exposure = (6.0f32.ln() + (0.5f32.ln() - 6.0f32.ln()) * day).exp() * if self.cam_mode == 1 && !self.crashed && !in_menu { 2f32.powf(self.head.adapt) } else { 1.0 } * 2f32.powf(1.3 * self.storm_adapt);
         let v4 = |v: DVec3, w: f64| [v.x as f32, v.y as f32, v.z as f32, w as f32];
         let cam_right = dir.cross(upv).normalize();
         let cam_up = cam_right.cross(dir);
+        // Thunder from the lightning just set off, panned to where it struck.
+        for th in self.lightning.thunder.drain(..) {
+            if let Some(a) = &self.audio {
+                a.event(audio::Event::Thunder { delay: th.delay as f32, near: th.near as f32, far: th.far as f32, power: th.power as f32, pan: th.from.dot(cam_right) as f32 });
+            }
+        }
         // Shadow cascades: three nested boxes around the aircraft, each snapped
         // to its own texel grid so shadows do not shimmer as it moves.
         let shadow_on = mu > 0.04 && !in_menu && self.gfx.shadows != graphics::Level::Off;
@@ -3802,7 +3966,7 @@ impl Game {
             up: v4(up, calt),
             screen: [rw, rh, 1.0 / rw, 1.0 / rh],
             time: [self.time as f32, dt as f32, exposure, self.frame as f32],
-            cloud: [if in_menu { 0.0 } else { self.wx.clouds }, self.wx.cloud_base, self.wx.cloud_depth, self.wx.cloud_ceiling()],
+            cloud: [if in_menu { 0.0 } else { self.wx.clouds }, self.wx.base(), self.wx.depth(), self.wx.cloud_ceiling()],
             light_pos: [0.0; 4],
             light_col: [0.0; 4],
             vol_o: [0.0; 4],
@@ -3834,14 +3998,19 @@ impl Game {
             cut: [[0.0; 4]; 3 * tiles3d::MAX_CUTS],
             cut_v: [[0.0; 4]; tiles3d::MAX_CUT_V / 2],
             cs: [[0.0; 4]; 2 * render::CS_MAP],
-            alto: [if in_menu { 0.0 } else { self.wx.alto }, 4800f32.max(self.wx.cloud_base + 0.4 * self.wx.cloud_depth + 800.0), 0.0, 0.0],
+            alto: [if in_menu { 0.0 } else { self.wx.alto }, 4800f32.max(self.wx.base() + 0.4 * self.wx.depth() + 800.0), 0.0, 0.0],
             ocean: self.world.ocean.globals(),
             shore_vp: [[0.0; 4]; 4],
             shore: [0.0; 4],
             foam: [[0.0; 4]; 16],
-            start: [if in_menu { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            // (yzw: the rain, how wet the windows are, and the airspeed over them in kt; plane.wgsl rain_water)
+            start: [if in_menu { 1.0 } else { 0.0 }, self.wx.rain, self.glass.wet, (self.plane.ias() * 1.94384) as f32],
+            stormfx: [0.0; 4],
+            flash: [[0.0; 4]; 2 * storm::MAX_FLASHES],
+            rain: [[0.0; 4]; 2],
             quality: [0.0; 4],
             detail: [self.gfx.city_k(), self.gfx.tree_imp_k(), self.gfx.tree_far(), 0.0],
+            nimbo: if in_menu { [[0.0; 4]; 4] } else { self.wx.deck_globals() },
             glow_c: glow[0],
             glow_e: glow[1],
             glow_n: glow[2],
@@ -3857,6 +4026,16 @@ impl Game {
             }
             // The flight model flies through the same cells.
             self.wx.cells = cells;
+            // The storms close to the camera (they darken the ground under them),
+            // the lightning lighting the scene, and the rain falling around the camera.
+            g.stormfx = [storm::near_mask(&self.wx, cam) as f32, self.cam_rain, self.lightning.globals(cam, dt, &mut g.flash) as f32, shade];
+            let o = self.rain_field.off;
+            let v = self.rain_field.rel;
+            // Drops closer than this are inside the cockpit (or the camera's lens).
+            let near_cut = if self.cam_mode == 1 && !self.crashed { 2.5 } else { 0.3 };
+            // (Hail rides along in the intensity's whole part, in sixteenths: precip.wgsl.)
+            let rain_w = self.cam_rain.min(0.999) + (self.cam_hail.clamp(0.0, 1.0) * 15.0).round();
+            g.rain = [[o.x as f32, o.y as f32, o.z as f32, rain_w], [v.x as f32, v.y as f32, v.z as f32, near_cut as f32]];
         }
         if !self.crashed && !in_menu {
             // The aircraft keeps pace with the camera, so its pixels are found
@@ -3931,6 +4110,7 @@ impl Game {
             let blur = ((self.plane.prop_rate - 30.0) / 25.0).clamp(0.0, 1.0) as f32;
             let dm = self.plane.dmg;
             let kind = self.spec.id as f32;
+            let rain_ph = self.glass.phases();
             // What the exhaust shows (plane.wgsl, the plume and the nozzles): how far the
             // afterburners are lit, and how hard the engines are running dry (0 idle .. 1).
             let (burner, dry, nozzle_z) = match &self.spec.engine {
@@ -3974,8 +4154,10 @@ impl Game {
                 objs.push(DrawObj {
                     mesh: self.piece_mesh[i],
                     model: base * pose[i],
-                    tint: [blur, burner, dry, thin],
-                    glow: [0.0, kind, heat, 0.0],
+                    // (Windows: the phases of the water on them, rain.rs Glass::phases; a
+                    // rocket's other parts: how thin the air is and how hot its tiles.)
+                    tint: [blur, burner, dry, if p.glass { rain_ph[2] } else { thin }],
+                    glow: if p.glass { [0.0, kind, rain_ph[0], rain_ph[1]] } else { [0.0, kind, heat, 0.0] },
                     params,
                     cast: 1 << render::PLANE_LAYER,
                     glass: p.glass,
@@ -4117,7 +4299,7 @@ impl Game {
         let mut shot = match self.shots.first() {
             Some((t, _, _)) if self.real >= *t => {
                 // Logged with each scripted shot, for comparing builds.
-                log::info!("fps {:.1}", self.fps);
+                log::info!("fps {:.1}  rain {:.2} (glass {:.2}, wet {:.2}, hail {:.2})  sigma {:.2} draft {:.1}", self.fps, self.cam_rain, self.wx.rain, self.glass.wet, self.cam_hail, self.plane.air.sigma_w, self.plane.air.draft);
                 Some(self.shots.remove(0).1)
             }
             _ => None,
@@ -4147,7 +4329,12 @@ impl Game {
         let had_shots = shot.is_some() && self.shots.is_empty();
         let (skin_slots, skins) = if in_menu { (Vec::new(), Vec::new()) } else { self.destr.skin_draws() };
         self.r.stats[0] += now.elapsed().as_secs_f64();
-        self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && self.menu.hangar.is_none()).then(|| self.window.scale_factor() as f32), cover, glow: glow_px });
+        let mut bolts = Vec::new();
+        if !in_menu {
+            self.lightning.segments(cam, dt, &mut bolts);
+        }
+        let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
+        self.r.render(Frame { rain_drops, bolts, g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && self.menu.hangar.is_none()).then(|| self.window.scale_factor() as f32), cover, glow: glow_px });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
@@ -4581,7 +4768,10 @@ impl Game {
         let g = &self.src.google;
         let p = self.world.photo();
         let photo = if p.zone_r > 0.0 && p.stats.0 > 0 { format!("3D: {}  ·  ", if p.credits.is_empty() { "Google" } else { &p.credits }) } else { String::new() };
-        let live = if self.live.enabled() && !self.live.planes.is_empty() { format!("  ·  {}", t!("Traffic: adsb.lol (ODbL)", "Trafic : adsb.lol (ODbL)")) } else { String::new() };
+        let mut live = if self.live.enabled() && !self.live.planes.is_empty() { format!("  ·  {}", t!("Traffic: adsb.lol (ODbL)", "Trafic : adsb.lol (ODbL)")) } else { String::new() };
+        if self.wx.live && (!self.wx.live_cells.is_empty() || self.wx.deck_goal.is_some()) {
+            live += t!("  ·  Weather radar: RainViewer", "  ·  Radar météo : RainViewer");
+        }
         photo + &if g.enabled() {
             let c = g.attribution.lock();
             let c = if c.is_empty() { t!("Imagery © Google", "Imagerie © Google").to_string() } else { c.clone() };
@@ -6304,6 +6494,20 @@ fn main() -> anyhow::Result<()> {
     // Downloaded JSBSim aircraft join the list before `--aircraft` is read.
     hangar::load_installed();
     let args = parse_args();
+    if args.find_storms {
+        let cache = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame");
+        match livewx::find_storms(&fetch::Fetcher::new(cache, false)) {
+            Ok(s) if s.is_empty() => println!("no strong storms on radar right now"),
+            Ok(s) => {
+                println!("strongest radar echoes now (fly there with --lat --lon --live-weather):");
+                for (lat, lon, z) in s {
+                    println!("  --lat {lat:.2} --lon {lon:.2}   {z:.0} dBZ");
+                }
+            }
+            Err(e) => println!("weather radar: {e}"),
+        }
+        return Ok(());
+    }
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
