@@ -952,7 +952,9 @@ pub fn place(cx: &Ctx, vt: &VecTile, hoods: &Hoods, built: &[u8], roads: &[u8]) 
                 LC_BARE | LC_ROCK => 0.0,
                 _ => tr * tr * 1.5,
             };
-            if hash(s, 3) >= density {
+            // Satellite estimates can mistake scattered garden trees for
+            // continuous cover, especially at suburban edges.
+            if hash(s, 3) >= density * 0.62 {
                 continue;
             }
             let ground = cx.ground(p);
@@ -995,7 +997,7 @@ pub fn place(cx: &Ctx, vt: &VecTile, hoods: &Hoods, built: &[u8], roads: &[u8]) 
         }
     }
     // Thin out evenly if a tile is wall-to-wall forest.
-    const MAX: usize = 46000;
+    const MAX: usize = 30000;
     if cand.len() > MAX {
         let keep = MAX as f32 / cand.len() as f32;
         let mut k = 0u32;
@@ -1062,7 +1064,8 @@ pub fn place(cx: &Ctx, vt: &VecTile, hoods: &Hoods, built: &[u8], roads: &[u8]) 
                 LC_BARE | LC_ROCK => 0.0,
                 _ => tr * 0.8,
             } * (0.35 + 1.3 * drift) * if arid { 0.45 } else { 1.0 };
-            if hash(s, 3) >= density {
+            // Keep undergrowth from filling every open patch around the flight path.
+            if hash(s, 3) >= density * 0.62 {
                 continue;
             }
             let ground = cx.ground(p);

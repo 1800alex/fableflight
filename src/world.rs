@@ -1367,6 +1367,9 @@ impl World {
         }
         let mut details = Vec::with_capacity(self.draw_b.len());
         let mut near_inst: Vec<TreeInst> = Vec::new();
+        // Reuse this scratch list for each tile instead of allocating and
+        // freeing a potentially large tree list every frame.
+        let mut found: Vec<(u16, TreeInst)> = Vec::with_capacity(MAX_NEAR);
         let mut tb = TreeBatcher::new();
         for (id, view) in self.draw_b.iter().zip(&self.in_view) {
             let Some(BSlot::Ready(b)) = self.builds.get(id) else { continue };
@@ -1438,7 +1441,8 @@ impl World {
                 let seen = |c: Vec3, r: f32| self.frustum.as_ref().map(|f| f.sphere(c.as_dvec3(), r as f64)).unwrap_or(true);
                 // Sorted into rings by distance so the nearest are drawn first and hide the rest.
                 let ring = |d2: f32| if d2 < 20.0 * 20.0 { 0u16 } else if d2 < 45.0 * 45.0 { 256 } else if d2 < 80.0 * 80.0 { 512 } else { 768 };
-                let mut found: Vec<(u16, TreeInst)> = Vec::new();
+                found.clear();
+                let found_cap = MAX_NEAR - near_inst.len();
                 for c in &b.cells {
                     let co = c.center - lp;
                     if co.length() - c.radius > CARD_RANGE || !seen(co, c.radius + 20.0) {
@@ -1449,7 +1453,9 @@ impl World {
                         let to = Vec3::new(t.a[0], t.a[1], t.a[2]) - lp;
                         // Past IMP_DIST the tree is an impostor and has no cards.
                         if t.a[3] > 0.0 && to.length() < imp_dist * 1.01 * tree_jit(t.a) && seen(to, 26.0 * t.a[3]) {
-                            found.push((ring(to.length_squared()) | b.tree_var[*i as usize] as u16, *t));
+                            if found.len() < found_cap {
+                                found.push((ring(to.length_squared()) | b.tree_var[*i as usize] as u16, *t));
+                            }
                         }
                     }
                     for u in &b.under[c.under.0 as usize..(c.under.0 + c.under.1) as usize] {
@@ -1461,10 +1467,11 @@ impl World {
                         if self.craters.iter().any(|(cp, r)| ((*cp - cam).as_vec3() - uo).length_squared() < r * r * 1.5) {
                             continue;
                         }
-                        found.push((ring(uo.length_squared()) | u.var as u16, u.inst(c.center)));
+                        if found.len() < found_cap {
+                            found.push((ring(uo.length_squared()) | u.var as u16, u.inst(c.center)));
+                        }
                     }
                 }
-                found.truncate(MAX_NEAR - near_inst.len());
                 found.sort_unstable_by_key(|f| f.0);
                 let mut i = 0;
                 while i < found.len() {
