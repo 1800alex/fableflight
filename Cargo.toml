@@ -32,5 +32,20 @@ winit = "0.30"
 roxmltree = "0.20"
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# opens Feral GameMode's client library at run time (gamemode.rs)
+libloading = "0.8"
+
 [dev-dependencies]
 naga = { version = "=30.0.1", features = ["wgsl-in"] }
+
+# Dependencies (wgpu, egui, image decoding, audio...) built optimised even in
+# debug builds: the game stays playable while our own code stays quick to
+# rebuild and easy to debug.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release: link-time optimisation across every crate, in one unit.
+[profile.release]
+lto = "fat"
+codegen-units = 1

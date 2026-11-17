@@ -30,6 +30,7 @@ mod nav;
 mod settings;
 mod settings_ui;
 mod systems;
+mod gamemode;
 mod gauges;
 mod gmaps;
 mod graphics;
@@ -6488,6 +6489,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
+    // Linux: the machine in GameMode's performance state while we fly (if installed).
+    let _gamemode = gamemode::GameMode::request();
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
     el.run_app(&mut App { args, game: None, frame_pacer: frame_pacer::FramePacer::default() })?;
