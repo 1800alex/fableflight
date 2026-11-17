@@ -175,6 +175,12 @@ fn cache_dir() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame").join("fgaddon")
 }
 
+/// Whether a name from the catalogue can be used as one folder name on disk:
+/// no path separators, no drive or stream colon, not hidden, not `.` or `..`.
+fn safe_name(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('.') && !s.chars().any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+}
+
 /// Where downloaded aircraft live, one folder each.
 pub fn install_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame").join("aircraft")
@@ -256,7 +262,11 @@ fn read_directory(agent: &ureq::Agent, url: &str, size: u64, folder: &str) -> Op
     let tail = range(agent, url, tail_start, size)?;
     let eocd = (0..tail.len().saturating_sub(21)).rev().find(|&i| u32_at(&tail, i) == 0x0605_4b50)?;
     let (cd_size, cd_off) = (u32_at(&tail, eocd + 12) as u64, u32_at(&tail, eocd + 16) as u64);
-    let cd = if cd_off >= tail_start { tail[(cd_off - tail_start) as usize..].to_vec() } else { range(agent, url, cd_off, cd_off + cd_size)? };
+    // (a directory the record puts past the end of the file is not one to read)
+    if cd_off.checked_add(cd_size)? > size {
+        return None;
+    }
+    let cd = if cd_off >= tail_start { tail.get((cd_off - tail_start) as usize..)?.to_vec() } else { range(agent, url, cd_off, cd_off + cd_size)? };
     let mut files = HashMap::new();
     let mut i = 0usize;
     while i + 46 <= cd.len() && u32_at(&cd, i) == 0x0201_4b50 {
@@ -416,6 +426,12 @@ fn list(agent: &ureq::Agent) -> Result<Vec<Entry>, String> {
         if id.is_empty() || folder.is_empty() || entries.iter().any(|e| e.folder == folder) {
             continue;
         }
+        // The folder and revision name folders on disk (the install, the file cache): one plain name each.
+        let revision = t(p, "revision");
+        if !safe_name(&folder) || !(revision.is_empty() || safe_name(&revision)) {
+            log::warn!("FlightGear catalogue: skipping {id}, its folder or revision is not a plain name");
+            continue;
+        }
         let mut urls: Vec<String> = p.children().filter(|c| c.has_tag_name("url")).filter_map(|c| c.text()).map(|s| s.trim().to_string()).collect();
         // ibiblio first (over https: it answers range requests and fast; some other mirrors fail their TLS handshake)
         for u in &mut urls {
@@ -424,7 +440,7 @@ fn list(agent: &ureq::Agent) -> Result<Vec<Entry>, String> {
             }
         }
         urls.sort_by_key(|u| (!u.contains("ibiblio.org"), !u.starts_with("https")));
-        entries.push(Entry { folder, name: t(p, "name"), author: t(p, "author"), size: t(p, "file-size-bytes").parse().unwrap_or(0), urls, revision: t(p, "revision"), id, state: State::Pending, install: Install::No });
+        entries.push(Entry { folder, name: t(p, "name"), author: t(p, "author"), size: t(p, "file-size-bytes").parse().unwrap_or(0), urls, revision, id, state: State::Pending, install: Install::No });
     }
     if entries.is_empty() {
         return Err("the catalogue lists no aircraft".into());
@@ -1474,6 +1490,16 @@ mod tests {
     fn thousands_groups() {
         assert_eq!(thousands(1234567.0), "1\u{202f}234\u{202f}567");
         assert_eq!(thousands(980.0), "980");
+    }
+
+    #[test]
+    fn catalogue_names_stay_inside_their_folder() {
+        for ok in ["c172p", "A-10", "Boeing-707", "737-200", "2020.3", "DR400 Regent"] {
+            assert!(safe_name(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", ".hidden", "../x", "a/b", "/etc", "a\\b", "C:", "C:\\Users", "a\nb"] {
+            assert!(!safe_name(bad), "{bad:?}");
+        }
     }
 
     #[test]
