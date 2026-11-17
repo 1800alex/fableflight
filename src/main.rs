@@ -16,6 +16,7 @@ mod fetch;
 mod frame_pacer;
 mod fgmodel;
 mod fluid;
+mod gputime;
 mod geo;
 mod globeclouds;
 mod hangar;
@@ -167,6 +168,7 @@ struct Loaded {
     piece_mesh: Vec<usize>,
     group_mesh: Vec<usize>,
     piece_cut: Vec<bool>,
+    piece_inner: Vec<bool>,
     group_pivots: Vec<(Vec3, f32)>,
     /// what the anti-aliasing takes to be flying along with the camera:
     /// everything within the aircraft's bounds, and a little around them for
@@ -199,6 +201,10 @@ impl Loaded {
     fn upload(spec: &'static aircraft::Spec, model: airframe::Model, r: &mut Renderer) -> Loaded {
         let piece_mesh: Vec<usize> = model.pieces.iter().map(|p| r.add_mesh(&p.mesh.v, &p.mesh.i)).collect();
         let piece_cut: Vec<bool> = model.pieces.iter().map(|p| p.mesh.v.iter().any(|v| airframe::cut_by(v.mat[1]))).collect();
+        // cabin and cockpit pieces, cabin materials only and no outer skin, culled from far outside.
+        let inner_pat = |m: f32| matches!(m as u32, 7..=12 | 14 | 15 | 18..=20);
+        let outer_pat = |m: f32| matches!(m as u32, 1..=6 | 13 | 16 | 17);
+        let piece_inner: Vec<bool> = model.pieces.iter().map(|p| !p.glass && p.mesh.v.iter().any(|v| inner_pat(v.mat[1])) && !p.mesh.v.iter().any(|v| outer_pat(v.mat[1]))).collect();
         let mut group_mesh: Vec<usize> = model.groups.iter().map(|m| r.add_mesh(&m.v, &m.i)).collect();
         // A downloaded aircraft's own textures, for its pieces and its wreckage.
         if let Some(t) = &model.tex {
@@ -222,7 +228,7 @@ impl Loaded {
         let (c, h) = model.bounds();
         let plane_box = [c.extend(0.0).to_array(), (h + Vec3::splat(0.25 * spec.span / 5.5)).extend(0.0).to_array()];
         let lamps = model.lamps();
-        Loaded { spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, plane_box, lamps }
+        Loaded { spec, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, plane_box, lamps }
     }
 }
 
@@ -799,6 +805,8 @@ struct Game {
     group_mesh: Vec<usize>,
     /// does the piece have openings cut in it
     piece_cut: Vec<bool>,
+    /// is the piece inside the cabin
+    piece_inner: Vec<bool>,
     /// each breakable group's centre and size, for the wreckage
     group_pivots: Vec<(Vec3, f32)>,
     /// the models of the other aircraft flown this session, already on the GPU
@@ -1040,7 +1048,7 @@ impl Game {
         }
         gfx.vsync &= args.vsync;
         gfx.taa &= args.taa && prefs.taa;
-        let r = pollster::block_on(Renderer::new(window.clone(), gfx.vsync))?;
+        let r = pollster::block_on(Renderer::new(window.clone(), gfx.vsync, std::env::var("FABLE_MSAA").ok().and_then(|v| v.parse().ok()).unwrap_or(gfx.samples())))?;
         if let Some(sc) = args.render_scale {
             gfx.scale = sc;
         } else if r.integrated && !graphics::Graphics::saved() {
@@ -1084,7 +1092,7 @@ impl Game {
         let mut world = world::World::new(sources::Loader::new(src.clone(), 14), args.max_zoom);
         let mut r = r;
         r.set_paint(spec.paint.as_ref());
-        let Loaded { spec: _, model, piece_mesh, group_mesh, piece_cut, group_pivots, plane_box, lamps } = Loaded::build(spec, &mut r);
+        let Loaded { spec: _, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, plane_box, lamps } = Loaded::build(spec, &mut r);
         let tm = trees::build_meshes();
         r.set_tree_meshes(&tm.meshes);
         world.tree_dims = tm.dims;
@@ -1201,7 +1209,7 @@ impl Game {
         // for the gear, flaps and control surfaces as they move.
         let (cy, cp, cd) = args.cam.unwrap_or((0.0, 0.2, spec.cam_dist));
         let mut g = Self {
-            gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: std::collections::HashMap::new(), window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
+            gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: std::collections::HashMap::new(), window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
             minimap: minimap::Minimap::new(&prefs),
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
@@ -1353,6 +1361,7 @@ impl Game {
             piece_mesh: std::mem::replace(&mut self.piece_mesh, next.piece_mesh),
             group_mesh: std::mem::replace(&mut self.group_mesh, next.group_mesh),
             piece_cut: std::mem::replace(&mut self.piece_cut, next.piece_cut),
+            piece_inner: std::mem::replace(&mut self.piece_inner, next.piece_inner),
             group_pivots: std::mem::replace(&mut self.group_pivots, next.group_pivots),
             plane_box: std::mem::replace(&mut self.plane_box, next.plane_box),
             lamps: std::mem::replace(&mut self.lamps, next.lamps),
@@ -4079,7 +4088,8 @@ impl Game {
             light_col: [0.0; 4],
             vol_o: [0.0; 4],
             vol_u: [0.0; 4],
-            misc: [near, self.city_glow, 1.0, 2.0 * (fov * 0.5).tan() / rh],
+            // screen space reflections on water and glass, off on low.
+            misc: [near, self.city_glow, if self.gfx.matches() == Some(graphics::Level::Low) { 0.0 } else { 1.0 }, 2.0 * (fov * 0.5).tan() / rh],
             csm: [CASC[0] * 2.0 / sres, CASC[1] * 2.0 / sres, CASC[2] * 2.0 / sres, if shadow_on { 1.0 } else { 0.0 }],
             scorch: [[0.0; 4]; 8],
             crater: [[0.0; 4]; 8],
@@ -4247,7 +4257,12 @@ impl Game {
                     self.weapon_flash = None;
                 }
             }
+            // from far outside the cabin interior cannot be seen, skip its vertices.
+            let far_out = self.cam_mode != 1 && (cam - self.plane.model_pos()).length() > 40.0;
             for (i, p) in self.model.pieces.iter().enumerate() {
+                if far_out && self.piece_inner[i] {
+                    continue;
+                }
                 let hide = match p.vis {
                     airframe::Vis::Always => false,
                     airframe::Vis::SlowProp => blur >= 1.0,
@@ -4445,7 +4460,7 @@ impl Game {
             self.lightning.segments(cam, dt, &mut bolts);
         }
         let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
-        self.r.render(Frame { rain_drops, bolts, g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px });
+        self.r.render(Frame { rain_drops, bolts, g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;

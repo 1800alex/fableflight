@@ -32,6 +32,10 @@ pub struct Weather {
     /// where to put the rain area's centre next time (`--rain-at KM,BEARING`)
     pub deck_place: Option<(f64, f64)>,
     deck_prev: Option<f32>,
+    /// how far the rain deck's area has grown in, 0..1: it shrinks away (the
+    /// sky clearing in from the horizon) when the rain is turned off, rather
+    /// than lingering as a full overcast while its rain dwindles
+    pub deck_fade: f32,
     /// wind 10 m above the ground, m/s, and the compass direction it blows from
     pub wind: f64,
     pub wind_from: f64,
@@ -210,6 +214,9 @@ pub const MAX_STORMS: usize = 16;
 /// way) and how soft its edge is (km). Must match common.wgsl `nimbo_area`.
 pub const DECK_R: f64 = 45.0;
 const DECK_EDGE: f64 = 10.0;
+/// How far inside its centre the rain deck's edge goes when it has shrunk
+/// away (km): past the wobble and the soft edge, so nothing is left.
+const DECK_GONE: f64 = 26.0;
 /// How far below its mean base the rain deck's ragged scud hangs, m.
 pub const DECK_RAG: f32 = 320.0;
 /// Spacing of candidate storm sites, km.
@@ -313,7 +320,7 @@ fn sites(q: DVec3, grid: f64, range: f64, mut f: impl FnMut(DVec3, f64, u32)) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false, showers_only: false, qnh: 1013.25 }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, deck_fade: 0.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false, showers_only: false, qnh: 1013.25 }
     }
 
     /// The rain deck's mean base and top, metres above sea level: the heavier
@@ -363,7 +370,14 @@ impl Weather {
         let (ax, ay) = Self::deck_axes(c);
         let (x, y) = (d.dot(ax), d.dot(ay));
         let wob = 9.0 * (0.083 * x + 1.7 * (0.051 * y).sin()).sin() + 6.0 * (0.13 * y + 0.9 + 0.8 * (0.07 * x).sin()).sin();
-        smoothstep(DECK_R, DECK_R - DECK_EDGE, x.hypot(y) + wob)
+        let r = self.deck_radius();
+        smoothstep(r, r - DECK_EDGE, x.hypot(y) + wob)
+    }
+
+    /// The rain deck's area radius now (km): full size once grown in,
+    /// shrinking to nothing as it fades out (`deck_fade`).
+    pub fn deck_radius(&self) -> f64 {
+        -DECK_GONE + (DECK_R + DECK_GONE) * self.deck_fade as f64
     }
 
     /// Rain from the deck at a point, 0..1: under it and in it (thinning out
@@ -402,6 +416,9 @@ impl Weather {
     /// aircraft, when known (the deck's base is set above it).
     pub fn step_deck(&mut self, dt: f64, pos: DVec3, ground: Option<f64>) {
         let mut target = self.rain_set.unwrap_or(0.0);
+        // The deck grows in and shrinks away over this long (s), linearly so
+        // it is surely gone in the end.
+        let fade_time = 2.5 * self.deck_tau;
         // Live weather puts the deck over the real rain: a small shift glides
         // it there, a big one fades it out and back in at the new place.
         if let (Some(g), Some(at)) = (self.deck_goal, self.deck_at) {
@@ -424,9 +441,10 @@ impl Weather {
                 self.deck_at = Some(g);
                 // (at once only on a fresh start; otherwise it closes in)
                 if self.deck <= 0.0 && dt <= 0.0 {
-                    self.deck = target;
+                    (self.deck, self.deck_fade) = (target, 1.0);
                 }
                 self.deck += (target - self.deck) * (dt / self.deck_tau).min(1.0) as f32;
+                self.deck_fade = (self.deck_fade + (dt / fade_time) as f32).min(1.0);
                 return;
             }
             let p = match self.deck_place.take() {
@@ -442,10 +460,25 @@ impl Weather {
             if self.deck <= 0.0 {
                 self.deck = target;
             }
+            // (all there at once on a fresh start; otherwise it closes in)
+            if dt <= 0.0 {
+                self.deck_fade = 1.0;
+            }
         }
-        self.deck += (target - self.deck) * (dt / self.deck_tau).min(1.0) as f32;
-        if target <= 0.0 && self.deck < 0.003 {
-            (self.deck, self.deck_at) = (0.0, None);
+        if self.deck_at.is_none() {
+            return;
+        }
+        if target > 0.0 {
+            // A heavier or lighter rain: the deck eases to it, growing in if new.
+            self.deck += (target - self.deck) * (dt / self.deck_tau).min(1.0) as f32;
+            self.deck_fade = (self.deck_fade + (dt / fade_time) as f32).min(1.0);
+        } else {
+            // Turned off: the deck keeps its look and shrinks away (the rain
+            // stops as its edge goes by), then it is gone.
+            self.deck_fade -= (dt / fade_time) as f32;
+            if self.deck_fade <= 0.0 {
+                (self.deck, self.deck_at, self.deck_fade) = (0.0, None, 0.0);
+            }
         }
     }
 
@@ -465,7 +498,7 @@ impl Weather {
         let (Some(c), Some((base, top))) = (self.deck_at, self.deck_layer()) else { return [[0.0; 4]; 4] };
         let (ax, ay) = Self::deck_axes(c);
         let v = |v: DVec3, w: f32| [v.x as f32, v.y as f32, v.z as f32, w];
-        [v(c, self.deck), v(ax, base), v(ay, top), [0.6 + 0.4 * self.deck, (self.cloud_base - self.base()).max(0.0), DECK_RAG, DECK_R as f32]]
+        [v(c, self.deck), v(ax, base), v(ay, top), [0.6 + 0.4 * self.deck, (self.cloud_base - self.base()).max(0.0), DECK_RAG, self.deck_radius() as f32]]
     }
 
     /// Top of the cloud layer including any storm towers, metres.
@@ -1193,6 +1226,42 @@ mod tests {
     }
 
     #[test]
+    fn rain_deck_clears_when_turned_off() {
+        let mut w = Weather::new(0.3);
+        let p = geo::lla_to_pos(0.72, -1.68, 800.0);
+        let step = |w: &mut Weather, secs: f64| {
+            for _ in 0..(secs * 60.0) as usize {
+                w.step_deck(1.0 / 60.0, p, Some(300.0));
+            }
+        };
+        // Turned on in flight, it closes in over a few seconds, then rains.
+        w.rain_set = Some(0.7);
+        step(&mut w, 1.0);
+        assert!(w.deck_at.is_some() && w.deck_rain(p) == 0.0);
+        step(&mut w, 20.0);
+        assert!((w.deck_rain(p) - 0.7).abs() < 0.05, "{}", w.deck_rain(p));
+        // Turned off, the rain stops and the deck is gone within the fade
+        // (it used to linger as a full overcast for half a minute and more).
+        w.rain_set = Some(0.0);
+        step(&mut w, 10.0);
+        assert_eq!(w.deck_rain(p), 0.0);
+        step(&mut w, 6.0);
+        assert!(w.deck_at.is_none() && w.deck_layer().is_none());
+        assert_eq!(w.deck_globals(), [[0.0; 4]; 4]);
+        assert_eq!(w.base(), w.cloud_base);
+        // Back on half way through a fade: it grows back where it was.
+        w.rain_set = Some(0.5);
+        step(&mut w, 20.0);
+        w.rain_set = Some(0.0);
+        step(&mut w, 5.0);
+        let at = w.deck_at;
+        w.rain_set = Some(0.5);
+        step(&mut w, 20.0);
+        assert!(w.deck_at.is_some() && w.deck_fade == 1.0 && w.deck_rain(p) > 0.4);
+        assert!(w.deck_at.unwrap().distance(at.unwrap()) < 1.0);
+    }
+
+    #[test]
     fn wind_blows_from_its_direction() {
         let mut w = Weather::new(0.5);
         w.gusts = 0.0;
@@ -1390,4 +1459,5 @@ mod tests {
         assert!(hi > 1.0 && lo < -0.2, "{lo} {hi}");
     }
 }
+
 

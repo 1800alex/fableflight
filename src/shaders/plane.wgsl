@@ -52,7 +52,11 @@ struct Paint { box: vec4f, view: vec4f };
 // light single, 1 the 747, 2 the Hornet, 3 the Phantom, 4 the Raptor, 5 the Starship rocket. Its windows, wells,
 // paint and panel lines differ. tint.y and tint.z carry the engines: how far the afterburners
 // are lit, and how hard they are running dry (0 idle .. 1).
-fn kind() -> u32 { return u32(O.glow.y + 0.5); }
+// specialisation, render.rs `specialise` rewrites these two lines. a kind under 99 is fixed.
+const KIND: u32 = 99u;
+// instrument faces and displays, 0 left out (drawn by their own pipeline), 1 drawn.
+const INSTR: u32 = 1u;
+fn kind() -> u32 { if (KIND < 99u) { return KIND; } return u32(O.glow.y + 0.5); }
 // The fighters: modelled in Blender, their paint a picture, one blown canopy over a tub.
 fn fighter() -> bool { return (kind() >= 2u && kind() <= 4u) || kind() == 7u; }
 // The engines, of the aircraft being flown only (wreckage and parts that have come off carry a glow.x).
@@ -814,6 +818,11 @@ fn relief_dr400(pt: u32, uv: vec2f, L: vec3f, px: f32) -> vec3f {
 }
 
 // Height (m), seam dirt, rivet coverage, for the surface pattern.
+// constant tables live in constant memory, not copied per pixel.
+const FUSE_STATIONS = array<f32, 8>(-1.98, 0.92, 1.52, 2.12, 2.72, 3.32, 3.92, 4.40);
+const WIN747_BAYS = array<vec4f, 2>(vec4f(5.30, 5.86, 0.30, 0.55), vec4f(5.98, 6.40, 0.36, 0.55));
+const LAPS747 = array<f32, 4>(1.7, 3.6, 5.6, 7.7);
+const CHORDS747 = array<f32, 5>(0.44, 1.36, 2.48, 4.94, 6.06);
 fn relief(pt: u32, uv: vec2f, L: vec3f, Nl: vec3f, px: f32) -> vec3f {
   if (kind() == 1u) { return relief747(pt, uv, L, Nl, px); }
   // The Robin is wood and fabric: no rivets, no laps (its cabin keeps its
@@ -830,9 +839,8 @@ fn relief(pt: u32, uv: vec2f, L: vec3f, Nl: vec3f, px: f32) -> vec3f {
     case 1u: { // fuselage
       let z = uv.x;
       let s = abs(uv.y);
-      var st = array<f32, 8>(-1.98, 0.92, 1.52, 2.12, 2.72, 3.32, 3.92, 4.40);
       for (var i = 0; i < 8; i++) {
-        let dz = z - st[i];
+        let dz = z - FUSE_STATIONS[i];
         if (abs(dz) < 0.04) {
           h -= ga * line(dz, gw);
           dirt += line(dz, gw * 2.5);
@@ -1743,7 +1751,9 @@ fn surface(in: VOut) -> Shaded {
   let duv = max(length(duvx), length(duvy));
   let dLx = dpdx(in.L);
   let dLy = dpdy(in.L);
-  var rel = relief(pt, in.uv, in.L, in.Nl, px);
+  // low preset skips panel lines and rivets, G.quality.x is 1.8 there.
+  var rel = vec3f(0.0);
+  if (G.quality.x <= 1.5) { rel = relief(pt, in.uv, in.L, in.Nl, px); }
   // The Hornet's paint; its panel lines and rivets, darker than the skin
   // round them, are taken to lie a little below it.
   var paint = vec4f(0.0);
@@ -1817,9 +1827,11 @@ fn surface(in: VOut) -> Shaded {
       // Each skin panel's paint aged a little differently.
       albedo *= 0.985 + 0.03 * fine.a * select(0.4, 1.0, id == 1u);
       if (id == 1u || pt == P_FUSE) {
-        let w = weather(L, in.Nl, albedo);
-        albedo = w.rgb;
-        rough += w.a;
+        if (G.quality.x <= 1.5) {
+          let w = weather(L, in.Nl, albedo);
+          albedo = w.rgb;
+          rough += w.a;
+        }
         // Chipped paint where things get knocked: leading edges, around fasteners.
         let chip = smoothstep(0.80, 0.83, nz(L * 7.0).b + in.wear * 0.07) * sat(in.wear * 1.5);
         albedo = mix(albedo, vec3f(0.55, 0.56, 0.58), chip);
@@ -2041,11 +2053,13 @@ fn surface(in: VOut) -> Shaded {
       ssr = 0.5;
     }
     case 9u: { // instrument face under glass
-      let g = gauge(u32(in.mat.w + 0.5), in.uv, max(duv * 1.2, 0.004));
-      albedo = g.rgb;
-      rough = 0.04;
-      spec_k = 0.5;
-      emit = g.rgb * g.a * G.sun_dir.w * 0.0035 * night;
+      if (INSTR != 0u) {
+        let g = gauge(u32(in.mat.w + 0.5), in.uv, max(duv * 1.2, 0.004));
+        albedo = g.rgb;
+        rough = 0.04;
+        spec_k = 0.5;
+        emit = g.rgb * g.a * G.sun_dir.w * 0.0035 * night;
+      }
     }
     case 10u: { // matte black: scuffed
       rough = 0.65 + 0.2 * fine.g;
@@ -2158,6 +2172,7 @@ fn surface(in: VOut) -> Shaded {
       metal = ero;
     }
     case 14u: { // backlit display under glass
+      if (INSTR == 0u) { break; }
       albedo = vec3f(0.01);
       rough = 0.05;
       let did = u32(in.mat.w + 0.5);
@@ -2619,7 +2634,9 @@ fn tex_glass(in: VOut) -> vec4f {
   var env = l.amb * 0.035;
   if (!from_inside) { env = env_reflect(in.P, R, l.upn, true); }
   // A sheet has two faces, and from inside both mirror the cabin.
-  if (in_cabin) {
+  // low preset skips the cabin reflection, rain spots and scratches.
+  let lowq = G.quality.x > 1.5;
+  if (in_cabin && !lowq) {
     env = select(cabin_mirror(in.L, ml * R, l, ml * Ls), deck_mirror(in.L, ml * R, l, ml * Ls), kind() == 1u) * 2.0 / (1.0 + F);
     if (fighter()) { env = pit_mirror(in.L, ml * R, l, ml * Ls) * 2.0 / (1.0 + F); }
   }
@@ -2636,7 +2653,7 @@ fn tex_glass(in: VOut) -> vec4f {
   // Dried rain: rings of grime left where drops evaporated, in clusters.
   var spots = 0.0;
   let spot_cs = 0.016;
-  let fine = 1.0 - smoothstep(spot_cs * 0.06, spot_cs * 0.25, px);
+  let fine = select(1.0 - smoothstep(spot_cs * 0.06, spot_cs * 0.25, px), 0.0, lowq);
   if (fine > 0.0) {
     let cl = smoothstep(0.5, 0.78, nz(L * 1.6 + vec3f(0.4, 0.0, 0.2)).g);
     if (cl > 0.0) {
@@ -2674,7 +2691,7 @@ fn tex_glass(in: VOut) -> vec4f {
   // scatters sunlight only when it lies across the line to the sun, so the
   // lit ones ring the sun and slide round as the head moves.
   let face = dot(V, Ls);
-  if (face > 0.2) {
+  if (face > 0.2 && !lowq) {
     let dv = V - Ls;
     let d2 = vec2f(dot(dv, normalize((O.model * vec4f(tb, 0.0)).xyz)), dot(dv, normalize((O.model * vec4f(bb, 0.0)).xyz)));
     let dn = d2 / max(length(d2), 1e-5);
@@ -2882,9 +2899,8 @@ fn window747(p: vec3f) -> f32 {
     best = max(sd_poly(vec2f(abs(p.x), p.y), ws, 5) - 0.06, d - 5.26);
   }
   let th = atan2(abs(p.x), p.y - 0.3);
-  var w = array<vec4f, 2>(vec4f(5.30, 5.86, 0.30, 0.55), vec4f(5.98, 6.40, 0.36, 0.55));
   for (var i = 0; i < 2; i++) {
-    let v = w[i];
+    let v = WIN747_BAYS[i];
     var q = vec2f(abs(d - (v.x + v.y) * 0.5) - (v.y - v.x) * 0.5, (abs(th - (v.z + v.w) * 0.5) - (v.w - v.z) * 0.5) * 3.4);
     q += vec2f(0.06);
     best = min(best, length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - 0.06);
@@ -3259,9 +3275,8 @@ fn relief747(pt: u32, uv: vec2f, L: vec3f, Nl: vec3f, px: f32) -> vec3f {
       let bj = (fract((d - 1.6) / 6.096 + 0.5) - 0.5) * 6.096;
       h -= ga * line(bj, gw);
       dirt += line(bj, gw * 2.5);
-      var laps = array<f32, 4>(1.7, 3.6, 5.6, 7.7);
       for (var i = 0; i < 4; i++) {
-        let ds = s - laps[i];
+        let ds = s - LAPS747[i];
         h -= ga * line(ds, gw);
         dirt += line(ds, gw * 2.0);
         rv = max(rv, rivets(d, abs(abs(ds) - 0.014), 0.035, rr) * rf);
@@ -3353,9 +3368,8 @@ fn relief747(pt: u32, uv: vec2f, L: vec3f, Nl: vec3f, px: f32) -> vec3f {
     }
     case 6u: {
       let ax = abs(L.x);
-      var cs = array<f32, 5>(0.44, 1.36, 2.48, 4.94, 6.06);
-      var c = cs[0];
-      for (var i = 1; i < 5; i++) { if (abs(ax - cs[i]) < abs(ax - c)) { c = cs[i]; } }
+      var c = CHORDS747[0];
+      for (var i = 1; i < 5; i++) { if (abs(ax - CHORDS747[i]) < abs(ax - c)) { c = CHORDS747[i]; } }
       if (abs(Nl.x) < 0.6) {
         let o = abs(ax - c);
         let gd = min(abs(o - 0.07), abs(o - 0.16));

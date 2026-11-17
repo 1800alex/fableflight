@@ -39,6 +39,7 @@ pub const COUNT: usize = 3 * N_TYPES + 14;
 /// What the traffic needs to know about each type of aircraft.
 #[derive(Copy, Clone)]
 pub struct Type {
+    #[allow(dead_code)]
     pub name: &'static str,
     pub len: f32,
     pub span: f32,
