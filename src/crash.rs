@@ -128,6 +128,8 @@ pub struct Crash {
     pub water: bool,
     pub time: f64,
     pub power: f32,
+    /// whether the fuel caught fire (never in the water)
+    pub ignited: bool,
     pub debris: Vec<Debris>,
     fires: Vec<Fire>,
     pending: Vec<Blast>,
@@ -417,8 +419,8 @@ impl Crash {
                 omega: rng.dir().as_dvec3() * rng.range(5.0, 25.0) as f64 / ss as f64,
                 scale: rng.range(0.5, 1.7) * ss,
                 radius: 0.25 * ss as f64,
-                burn: if water { 0.0 } else { rng.range(3.0, 14.0) },
-                char: if water { rng.range(0.0, 0.08) } else { rng.range(0.2, 0.8) },
+                burn: if ignited { rng.range(3.0, 14.0) } else { 0.0 },
+                char: if ignited { rng.range(0.2, 0.8) } else { rng.range(0.0, 0.08) },
                 resting: false,
                 sunk: false,
                 tear: [Tear::NONE; 2],
@@ -448,6 +450,7 @@ impl Crash {
             water: imp.water,
             time: 0.0,
             power,
+            ignited,
             debris,
             fires: Vec::new(),
             pending: Vec::new(),
@@ -1152,7 +1155,7 @@ impl Crash {
 
         // The main smoke column over the site.
         let col_life = 75.0;
-        if self.time < col_life && self.domain.is_none() && !self.water {
+        if self.time < col_life && self.domain.is_none() && self.ignited {
             let k = (1.0 - (self.time / col_life) as f32).powf(0.6);
             self.column_acc += 11.0 * k * dtf * self.power.sqrt();
             while self.column_acc >= 1.0 {
@@ -1378,12 +1381,11 @@ fn rigid_step(d: &mut Debris, dt: f64, world: &World, ignore: &[(geo::TileId, us
         }
         if touching {
             d.pos += upw * deepest.min(1.5) * 0.6;
-            // Soft-body plastic crumpling, deformation damping and ground gouging:
-            // absorbing spin and kinetic energy in inelastic sheet metal crushing
-            let deform_damp = (0.9 * h + 0.15 * deepest).min(0.65);
-            d.omega *= 1.0 - deform_damp;
-            d.vel *= 1.0 - (0.04 * deepest as f64).min(0.2);
-            d.char = (d.char + (0.02 * deepest as f32)).min(1.0);
+            // Crumpling and scraping soak up its spin, the more the deeper it
+            // digs in (a rate, so it is the same at any frame rate; the
+            // impulses above already take out its speed into the ground and
+            // along it).
+            d.omega *= (-(0.9 + 6.0 * deepest.min(0.5)) * h).exp();
         }
         if touching && d.vel.length() < 0.4 && d.omega.length() < 0.25 {
             d.still += h as f32;
