@@ -204,6 +204,15 @@ pub struct Globals {
     pub snow_c: [f32; 4],
     pub snow_e: [f32; 4],
     pub snow_n: [f32; 4],
+    /// snowflakes around the camera (precip.wgsl): how far they have moved
+    /// past the camera (east, north, up, m, wrapped) + how much of what falls
+    /// here is snow (0..1); their velocity relative to the camera (m/s) +
+    /// blowing snow (0..1)
+    pub flakes: [f32; 4],
+    pub flakes_v: [f32; 4],
+    /// fresh snow lying where it has snowed (snow.rs `Fresh`): its snow line
+    /// (m), how far it has settled (0..1)
+    pub fresh: [f32; 4],
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).
