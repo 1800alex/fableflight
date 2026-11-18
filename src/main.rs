@@ -44,6 +44,7 @@ mod flightui;
 mod mainmenu;
 mod menu;
 mod minimap;
+mod padmap;
 mod padui;
 mod pave;
 mod photonight;
@@ -981,6 +982,13 @@ struct Game {
     /// another button since: a Y chord arms or locks; Y alone fires.
     pad_y: bool,
     pad_y_combo: bool,
+    /// the pad's flying actions held now, and the key each holds
+    pad_held: Vec<(&'static str, Option<KeyCode>)>,
+    /// a word from binding the pad (what lost its binding), until when
+    pad_note: (String, f64),
+    /// the pad was used last, not the mouse: the middle of the cockpit view
+    /// picks out the controls (see `pad_aim_at`)
+    pad_aim: bool,
     /// the camera look the view starts out at (right stick click goes back to it)
     cam_home: (f64, f64),
     rng: crash::Rng,
@@ -1294,7 +1302,7 @@ impl Game {
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
-            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
+            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
@@ -1871,9 +1879,10 @@ impl Game {
     }
 
 
-    /// The cockpit control under the mouse at (x, y) window pixels (an index
-    /// into the loaded cockpit controls): in the cockpit view, flying, nothing open.
-    fn hotspot_at(&self, x: f64, y: f64) -> Option<usize> {
+    /// The cockpit view's ray through (x, y) window pixels, in the aircraft's
+    /// body frame (from the eye, unit length), with the pose and the hotspots
+    /// where they are now: in the cockpit view, flying, nothing open.
+    fn cockpit_ray(&self, x: f64, y: f64) -> Option<(Vec3, Vec3, Vec<Mat4>, Vec<aircraft::Hotspot>)> {
         if self.mode != Mode::Fly || self.cam_mode != 1 || self.pause_open || self.crashed || self.cockpit_controls.is_empty() {
             return None;
         }
@@ -1888,9 +1897,48 @@ impl Game {
         let d = (inv * d).as_vec3();
         let pose = self.plane.pose(&self.model.pieces);
         let hs = self.cockpit_hotspots(&pose);
+        Some((o, d, pose, hs))
+    }
+    /// The cockpit control under the mouse at (x, y) window pixels (an index
+    /// into the loaded cockpit controls): in the cockpit view, flying, nothing open.
+    fn hotspot_at(&self, x: f64, y: f64) -> Option<usize> {
+        let (o, d, pose, hs) = self.cockpit_ray(x, y)?;
         let i = aircraft::pick(&hs, o, d)?;
         let depth = (Vec3::from(hs[i].at) - o).dot(d) - hs[i].r - 0.005;
         (!cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, d, depth)).then_some(i)
+    }
+    /// Looking about the cockpit with the pad: the control the middle of the
+    /// view is on, if any, and how near the nearest one in sight is (1 on
+    /// it, falling to 0 at `AIM_NEAR` off it). None: not aiming with the pad.
+    fn pad_aim_at(&self) -> Option<(Option<usize>, f32)> {
+        /// how far off a control (radians, past its edge) the aim dot shows
+        const AIM_NEAR: f32 = 0.14;
+        if !self.pad_aim || self.info_open {
+            return None;
+        }
+        let s = self.window.inner_size();
+        let (o, d, pose, hs) = self.cockpit_ray(s.width as f64 * 0.5, s.height as f64 * 0.5)?;
+        let on = aircraft::pick(&hs, o, d).filter(|&i| {
+            let depth = (Vec3::from(hs[i].at) - o).dot(d) - hs[i].r - 0.005;
+            !cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, d, depth)
+        });
+        if on.is_some() {
+            return Some((on, 1.0));
+        }
+        // The angle from the middle of the view to each control's edge: the
+        // nearest few checked for being in sight (not behind the panel).
+        let mut near: Vec<(f32, usize)> = hs.iter().enumerate().filter_map(|(i, h)| {
+            let c = Vec3::from(h.at) - o;
+            let l = c.length();
+            (l > h.r && c.dot(d) > 0.0).then(|| (d.angle_between(c) - (h.r / l).asin(), i))
+        }).filter(|&(a, _)| a < AIM_NEAR).collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let seen = near.iter().take(4).find(|&&(_, i)| {
+            let c = Vec3::from(hs[i].at) - o;
+            let l = c.length();
+            !cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, c / l, l - hs[i].r - 0.005)
+        });
+        Some((None, seen.map_or(0.0, |&(a, _)| 1.0 - (a / AIM_NEAR).clamp(0.0, 1.0))))
     }
     fn hotspot_under_mouse(&self) -> Option<usize> {
         if self.drag || self.lean_drag.is_some() {
@@ -2025,13 +2073,35 @@ impl Game {
     }
     /// The cockpit control under the mouse: a ring round it, what it is, how
     /// it is set, and the pointing hand.
+    ///
+    /// Looking about with the pad it is the middle of the view that points:
+    /// a faint dot there once a control is near it, filling in on one, and
+    /// beside it the pad buttons that work the control.
     fn hotspot_overlay(&self, ctx: &egui::Context) {
         use egui::{Align2, Color32, FontId};
-        let Some(i) = self.hotspot_under_mouse() else { return };
-        let Some((vp, cam)) = self.live_view else { return };
-        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        let h = self.cockpit_hotspots(&self.plane.pose(&self.model.pieces))[i];
         let screen = ctx.content_rect();
+        let aim = self.pad_aim_at();
+        if let Some((on, near)) = aim {
+            if near > 0.0 {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let c = screen.center();
+                // (Faint at the edge of the range, firmer as it closes in.)
+                let a = 0.35 + 0.45 * near;
+                if on.is_some() {
+                    painter.circle_filled(c, 5.0, Color32::from_rgba_unmultiplied(255, 210, 90, 220));
+                    painter.circle_stroke(c, 5.0, egui::Stroke::new(1.0, Color32::from_black_alpha(140)));
+                } else {
+                    painter.circle_filled(c, 4.5, Color32::from_white_alpha((a * 255.0) as u8));
+                    painter.circle_stroke(c, 4.5, egui::Stroke::new(1.0, Color32::from_black_alpha((a * 160.0) as u8)));
+                }
+            }
+        }
+        let Some(i) = (match aim { Some((on, _)) => on, None => self.hotspot_under_mouse() }) else { return };
+        let Some((vp, cam)) = self.live_view else { return };
+        if aim.is_none() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let h = self.cockpit_hotspots(&self.plane.pose(&self.model.pieces))[i];
         let to_screen = |b: Vec3| -> Option<egui::Pos2> {
             let w = self.plane.model_pos() + self.plane.rot * b.as_dvec3();
             let c = vp * (w - cam).as_vec3().extend(1.0);
@@ -2048,6 +2118,32 @@ impl Game {
             "speedbrake" if self.spec.chute.is_some() => t!("Drag chute", "Parachute-frein"),
             _ => bind::ACTIONS.iter().find(|a| a.id == id).map(|a| a.label()).unwrap_or_else(|| aircraft::c172::cabin::action_label(id)),
         };
+        if aim.is_some() {
+            // The pad: each action with the buttons that do it (none: not on the pad).
+            let mut rows: Vec<(String, String)> = Vec::new();
+            let mut add = |id: &'static str, extra: &str| rows.push((padmap::spec_of(id), format!("{}{extra}", label(id))));
+            if let Some(id) = h.click { add(id, ""); }
+            if let Some(id) = h.hold { add(id, &if h.click.is_none() { format!(" ({})", t!("hold", "maintenir")) } else { String::new() }); }
+            if let Some((up, down)) = h.wheel { add(up, ""); add(down, ""); }
+            rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+            if let Some(st) = h.click.or(h.wheel.map(|w| w.0)).and_then(|id| self.hot_state(id)) {
+                rows.push((String::new(), st));
+            }
+            let p = ctx.layer_painter(egui::LayerId::background());
+            let x0 = screen.center().x + 18.0;
+            let y0 = screen.center().y + 16.0;
+            let gw = rows.iter().map(|r| if r.0.is_empty() { 0.0 } else { padui::spec_width(&p, &r.0, 18.0) + 6.0 }).fold(0.0, f32::max);
+            for (k, (spec, text)) in rows.iter().enumerate() {
+                let y = y0 + 22.0 * k as f32;
+                if !spec.is_empty() {
+                    padui::paint_spec(&p, x0, y, spec, 18.0, Color32::WHITE);
+                }
+                let pos = egui::pos2(x0 + gw, y);
+                p.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_CENTER, text, FontId::proportional(13.5), Color32::from_black_alpha(200));
+                p.text(pos, Align2::LEFT_CENTER, text, FontId::proportional(13.5), Color32::WHITE);
+            }
+            return;
+        }
         let mut lines: Vec<String> = Vec::new();
         if let Some(id) = h.click {
             let hold = h.hold.map(|k| t!("  (hold: {})", "  (maintenir : {})", label(k))).unwrap_or_default();
@@ -2127,8 +2223,9 @@ impl Game {
         c
     }
 
-    /// An Xbox-style gamepad, laid out as Microsoft Flight Simulator (2020)
-    /// sets one up by default:
+    /// An Xbox-style gamepad. Its flying layout can be moved about in
+    /// Settings › Controls › Gamepad (padmap.rs); it starts as Microsoft
+    /// Flight Simulator (2020) sets one up by default:
     ///
     /// | input | does |
     /// |---|---|
@@ -2145,27 +2242,55 @@ impl Game {
     /// | d-pad | quick views: ahead, panel, left, right |
     /// | View | cockpit / chase camera |
     /// | Menu | pause menu |
+    /// | Y + View | flight panel |
     ///
-    /// In the menus A starts the flight and B closes the pause menu; after a
-    /// crash A starts again.
+    /// Y with another button reaches what the layout above leaves out:
+    ///
+    /// | input | does |
+    /// |---|---|
+    /// | Y + A (hold) | afterburner / boost |
+    /// | Y + X (hold) | thrust reversers |
+    /// | Y + LB | speedbrake |
+    /// | Y + RB | autopilot on / off (a rocket: the ship lands itself) |
+    /// | Y + left stick click | start / stop the engine |
+    /// | Y + right stick click | hide / show the HUD |
+    /// | Y + Menu | canopy open / shut |
+    /// | Y + d-pad left / right | master arm, lock a target (a rocket: which engines burn, drop the booster) |
+    /// | Y alone, let go | fire at a locked target |
+    ///
+    /// Those are the defaults; the menu buttons below are fixed, and so is
+    /// Menu (pause) and A after a crash.
+    ///
+    /// In the menus the d-pad (and the left stick, off the globe) moves, A
+    /// presses, B steps back and the right stick scrolls; the flight panel
+    /// takes the d-pad, A, B, the bumpers and the right stick while it is
+    /// open. A skips the loading screen, and after a crash starts again.
     fn gamepad(&mut self, dt: f64, c: &mut Controls) {
         use gilrs::{Axis, Button, EventType};
+        padmap::publish(&self.binds.pad);
         let Some(g) = self.gilrs.as_mut() else { return };
         let (mut pressed, mut released, mut relayout) = (Vec::new(), Vec::new(), false);
+        // A joystick capture (Settings › Controls › Buttons, Axes) takes every device but the pads.
+        let stick_capture = self.binds.capture.as_ref().is_some_and(|c| !c.from_pad() && !matches!(c, bind::Capture::Key(_)));
         while let Some(ev) = g.next_event() {
             // Every device's axes and buttons go to the bindings (joysticks,
             // pedals, throttles); one with something bound is not the gamepad.
-            let (uuid, name) = {
+            // A pad gilrs knows the layout of is left out unless it has been
+            // bound already, so binding a joystick button cannot take it by mistake.
+            let (uuid, name, pad_like) = {
                 let p = g.gamepad(ev.id);
-                (p.uuid(), p.name().to_string())
+                (p.uuid(), p.name().to_string(), p.mapping_source() == gilrs::MappingSource::SdlMappings)
             };
-            match ev.event {
-                EventType::AxisChanged(_, v, code) => self.binds.axis_event(uuid, &name, code.into_u32(), v),
-                EventType::ButtonPressed(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), true),
-                EventType::ButtonReleased(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), false),
-                _ => {}
+            let bound = self.binds.uses(&uuid);
+            if bound || !pad_like {
+                match ev.event {
+                    EventType::AxisChanged(_, v, code) => self.binds.axis_event(uuid, &name, code.into_u32(), v),
+                    EventType::ButtonPressed(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), true),
+                    EventType::ButtonReleased(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), false),
+                    _ => {}
+                }
             }
-            if self.binds.uses(&uuid) || self.binds.capture.is_some() {
+            if bound || (stick_capture && !pad_like) {
                 continue;
             }
             match ev.event {
@@ -2206,11 +2331,69 @@ impl Game {
         let Some(pad) = id.and_then(|id| g.connected_gamepad(id)) else {
             self.pad = Controls::default();
             padui::set_active(false);
+            self.pad_aim = false;
             self.pad_rep = None;
             (self.pad_y, self.pad_y_combo) = (false, false);
+            self.pad_release_all();
+            if self.binds.capture.as_ref().is_some_and(|c| c.from_pad()) {
+                self.binds.capture = None;
+            }
             return;
         };
         padui::set_active(true);
+        // Binding from the pad (Settings › Controls › Gamepad): its buttons
+        // and sticks go to that alone.
+        if let Some(cap) = self.binds.capture.clone().filter(|c| c.from_pad()) {
+            use padmap::{Caught, PadBtn};
+            let trig = |b: Button, z: Axis| match (pad.button_data(b), pad.axis_data(z)) {
+                (Some(d), _) => d.value(),
+                (None, Some(a)) => ((a.value() + 1.0) * 0.5).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            let sticks = [pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY), pad.value(Axis::RightStickX), pad.value(Axis::RightStickY), trig(Button::RightTrigger2, Axis::RightZ) - trig(Button::LeftTrigger2, Axis::LeftZ)];
+            let y_held = pad.is_pressed(Button::North);
+            let now = self.real;
+            let c = &mut self.binds.pad_catch;
+            let mut got = Caught::Wait;
+            let evs = pressed.iter().map(|b| (*b, true)).chain(released.iter().map(|b| (*b, false)));
+            for (b, down) in evs {
+                if let Some(pb) = PadBtn::from_gilrs(b) {
+                    match c.button(pb, down, y_held || (down && pb == PadBtn::Y), now) {
+                        Caught::Wait => {}
+                        r => got = r,
+                    }
+                }
+            }
+            if got == Caught::Wait {
+                got = c.tick(now);
+            }
+            if let (Caught::Wait, bind::Capture::PadAxis(_)) = (&got, &cap) {
+                got = c.sticks(sticks);
+            }
+            let lost = match (got, cap) {
+                (Caught::Wait, _) => None,
+                (Caught::Cancel, _) => Some(Vec::new()),
+                (Caught::Refused(_), _) => {
+                    self.pad_note = (t!("Menu pauses: it cannot be given anything else.", "Menu met en pause : on ne peut rien lui donner d'autre.").into(), self.real + 6.0);
+                    None
+                }
+                (Caught::Button(ch), bind::Capture::Pad(id)) => Some(self.binds.pad.set(id, ch)),
+                (Caught::Axis(src), bind::Capture::PadAxis(a)) => Some(self.binds.pad.set_axis(a, Some(src))),
+                // (a stick moved while waiting for a button, or the other way round)
+                _ => None,
+            };
+            if let Some(lost) = lost {
+                self.binds.capture = None;
+                if !lost.is_empty() {
+                    self.pad_note = (t!("No longer bound: {}", "Plus assigné : {}", lost.join(", ")), self.real + 8.0);
+                }
+            }
+            self.pad = Controls::default();
+            self.pad_rep = None;
+            (self.pad_y, self.pad_y_combo) = (false, false);
+            padui::set_scroll(0.0);
+            return;
+        }
         // Where the pad's buttons go: the globe, the pause menu, the flight
         // panel (which then has the d-pad, A, B and the bumpers), or the aircraft.
         let nav = if self.mode == Mode::Menu {
@@ -2237,29 +2420,32 @@ impl Game {
         };
         let modifier = pad.is_pressed(Button::North);
         let flying = self.mode == Mode::Fly && !self.pause_open;
-        self.pad = Controls {
-            pitch: -dz(pad.value(Axis::LeftStickY)),
-            roll: dz(pad.value(Axis::LeftStickX)),
-            yaw: (trig(Button::RightTrigger2, Axis::RightZ) - trig(Button::LeftTrigger2, Axis::LeftZ)).clamp(-1.0, 1.0),
-            // A and B work the flight panel while it is open.
-            throttle: if nav == Nav::Panel { 0.0 } else { ax_pad(pad.is_pressed(Button::South), pad.is_pressed(Button::East) && !modifier) },
-            brake: pad.is_pressed(Button::West),
-            brake_left: 0.0,
-            brake_right: 0.0,
-            boost: false,
-            reverse: false,
-            throttle_set: None,
-            starter: false,
+        // The globe itself is only on the start screen's Fly page; the main
+        // menu, aircraft and settings pages cover it.
+        let globe = nav == Nav::Globe && self.menu.screen == menu::Screen::Fly;
+        // The flying axes, wherever Settings › Controls › Gamepad has put them.
+        let map = &self.binds.pad;
+        let stick = |s: padmap::Stick| match s {
+            padmap::Stick::LX => dz(pad.value(Axis::LeftStickX)),
+            padmap::Stick::LY => dz(pad.value(Axis::LeftStickY)),
+            padmap::Stick::RX => dz(pad.value(Axis::RightStickX)),
+            padmap::Stick::RY => dz(pad.value(Axis::RightStickY)),
+            padmap::Stick::Trig => (trig(Button::RightTrigger2, Axis::RightZ) - trig(Button::LeftTrigger2, Axis::LeftZ)).clamp(-1.0, 1.0),
         };
-        let (look_x, look_y) = (dz(pad.value(Axis::RightStickX)), dz(pad.value(Axis::RightStickY)));
-        let trim = if modifier && nav != Nav::Panel { ax_pad(pad.is_pressed(Button::DPadDown), pad.is_pressed(Button::DPadUp)) } else { 0.0 };
+        let axis = |a: padmap::PadAxis| map.axis(a).map(|s| stick(s.stick) * s.sign as f64).unwrap_or(0.0);
+        self.pad = Controls { pitch: axis(padmap::PadAxis::Pitch), roll: axis(padmap::PadAxis::Roll), yaw: axis(padmap::PadAxis::Rudder), throttle: axis(padmap::PadAxis::Throttle), ..Controls::default() };
+        let (look_x, look_y) = (axis(padmap::PadAxis::LookX), axis(padmap::PadAxis::LookY));
+        // The buttons held now, for the flying actions held with them.
+        let down: Vec<padmap::PadBtn> = padmap::PadBtn::ALL.into_iter().filter(|b| pad.is_pressed(b.gilrs())).collect();
+        let ry = dz(pad.value(Axis::RightStickY));
 
-        // Moving about the menus: the d-pad (and in the pause menu the left
-        // stick too), repeating while held.
+        // Moving about the menus: the d-pad (and the left stick too, except
+        // where it turns the globe or flies), repeating while held.
         let dirs = [(Button::DPadUp, egui::Key::ArrowUp), (Button::DPadDown, egui::Key::ArrowDown), (Button::DPadLeft, egui::Key::ArrowLeft), (Button::DPadRight, egui::Key::ArrowRight)];
         let mut held = dirs.iter().find(|(b, _)| pad.is_pressed(*b)).map(|d| d.1);
         let (lx, ly) = (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
-        if held.is_none() && nav == Nav::Pause && lx.abs().max(ly.abs()) > 0.6 {
+        let stick_nav = nav == Nav::Pause || (nav == Nav::Globe && !globe);
+        if held.is_none() && stick_nav && lx.abs().max(ly.abs()) > 0.6 {
             held = Some(if ly.abs() > lx.abs() { if ly > 0.0 { egui::Key::ArrowUp } else { egui::Key::ArrowDown } } else if lx > 0.0 { egui::Key::ArrowRight } else { egui::Key::ArrowLeft });
         }
         let tap = pressed.iter().find_map(|b| dirs.iter().find(|d| d.0 == *b).map(|d| d.1));
@@ -2288,7 +2474,10 @@ impl Game {
         for k in nav_keys {
             self.pad_key(k);
         }
-        if nav == Nav::Globe {
+        // The right stick scrolls the menus and the flight panel: squared,
+        // for slow reading near the centre, fast at full tilt.
+        padui::set_scroll(if nav == Nav::Off { 0.0 } else { (ry * ry.abs() * 1600.0 * dt) as f32 });
+        if globe {
             // Left stick turns the globe (squared, for a fine touch), the triggers zoom.
             let h = self.window.inner_size().height.max(1) as f64;
             let sq = |v: f64| v * v.abs();
@@ -2306,27 +2495,28 @@ impl Game {
         c.roll = (c.roll + self.pad.roll).clamp(-1.0, 1.0);
         c.yaw = (c.yaw + self.pad.yaw).clamp(-1.0, 1.0);
         c.throttle = (c.throttle + self.pad.throttle).clamp(-1.0, 1.0);
-        c.brake |= self.pad.brake;
 
-        if flying {
+        // (With the flight panel open the right stick scrolls it instead.)
+        if flying && nav != Nav::Panel {
             // Right stick: look around, as fast as a quick head turn at full deflection.
             // Pushed right the view swings right, in the cockpit and outside.
             let rate = 2.2 * self.look_sens * dt;
             let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
             self.cam_yaw += look_x * rate * side;
             self.cam_pitch = (self.cam_pitch - look_y * rate * 0.8).clamp(-1.2, 1.4);
-            if trim != 0.0 && !self.crashed {
-                // Winds the trim (the angle of attack the elevator holds) at about 2 degrees a second.
-                self.plane.trim = (self.plane.trim + trim * 0.035 * dt).clamp(-0.05, 0.24);
-            }
+        }
+        // Looking or flying with the pad: the middle of the view aims at the cockpit's controls.
+        if look_x != 0.0 || look_y != 0.0 || self.pad.pitch != 0.0 || self.pad.roll != 0.0 || !pressed.is_empty() {
+            self.pad_aim = true;
         }
 
+        // Y held before this frame, or pressed in it: what the buttons pressed now mean.
+        let y_now = self.pad_y || pressed.contains(&Button::North);
         for &b in &pressed {
             self.pad_button(nav, b, modifier);
         }
-        // Y is the weapon chord: Y + left/right arms or locks and uses the
-        // chord up, so releasing Y alone only fires when it was not used with
-        // another button. Y on its own fires at a locked target.
+        self.pad_fly_buttons(nav, &down, &pressed, y_now);
+        // Y on its own, let go without having been used with another button.
         if pressed.contains(&Button::North) {
             self.pad_y = true;
             self.pad_y_combo = false;
@@ -2335,11 +2525,120 @@ impl Game {
             self.pad_y_combo = true;
         }
         if released.contains(&Button::North) {
-            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && !self.crashed && self.mode == Mode::Fly && !self.pause_open && self.missiles_ok() && self.weapons.lock >= 1.0 {
-                self.weapons.request_fire();
+            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && self.mode == Mode::Fly && !self.pause_open {
+                if let Some(id) = self.binds.pad.action_at(padmap::Y_ALONE) {
+                    // A tap of Y fires only at a locked target: no complaint otherwise.
+                    let quiet = id == "fire_missile" && (self.crashed || !self.missiles_ok() || self.weapons.lock < 1.0);
+                    if !quiet {
+                        self.pad_do(id, false);
+                    }
+                }
             }
             self.pad_y = false;
             self.pad_y_combo = false;
+        }
+    }
+
+    /// The pad's flying buttons, as Settings › Controls › Gamepad has them:
+    /// each action pressed with its button and held while it is (its key
+    /// held for the controls that read keys, like the throttle and brakes).
+    /// `down`: the buttons held now; `pressed`: those pressed this frame
+    /// (a tap quicker than a frame still counts); `y`: Y held for them.
+    fn pad_fly_buttons(&mut self, nav: Nav, down: &[padmap::PadBtn], pressed: &[gilrs::Button], y: bool) {
+        use padmap::{Chord, PadBtn};
+        let mut now: Vec<&'static str> = Vec::new();
+        let mut taps: Vec<&'static str> = Vec::new();
+        if matches!(nav, Nav::Off | Nav::Panel) && self.mode == Mode::Fly && !self.pause_open {
+            let map = &self.binds.pad;
+            // The flight panel keeps A, B, the d-pad and the bumpers while it is open.
+            let panel = |c: Chord| nav == Nav::Panel && !c.y && matches!(c.btn, PadBtn::A | PadBtn::B | PadBtn::LB | PadBtn::RB | PadBtn::Up | PadBtn::Down | PadBtn::Left | PadBtn::Right);
+            // While Y is held a button with a Y binding does that, not its own.
+            let live = |c: Chord, held: bool| held && c != padmap::Y_ALONE && !panel(c) && if c.y { y } else { !(y && map.has_y(c.btn)) };
+            for (id, c) in map.bound() {
+                if live(c, down.contains(&c.btn)) {
+                    now.push(id);
+                } else if live(c, pressed.contains(&c.btn.gilrs())) {
+                    taps.push(id);
+                }
+            }
+            // A after a crash flies again (pad_button), and skips the loading screen.
+            let skip_a = self.crashed || self.loading.as_ref().is_some_and(|l| l.done.is_none());
+            if skip_a {
+                let a = map.action_at(padmap::Chord { btn: PadBtn::A, y: false });
+                now.retain(|id| Some(*id) != a);
+                taps.retain(|id| Some(*id) != a);
+            }
+        }
+        let gone: Vec<_> = self.pad_held.iter().filter(|(id, _)| !now.contains(id)).copied().collect();
+        for (_, k) in gone {
+            if let Some(k) = k {
+                self.keys.remove(&k);
+            }
+        }
+        self.pad_held.retain(|(id, _)| now.contains(id));
+        for id in now {
+            match self.pad_held.iter().find(|(h, _)| *h == id) {
+                // (put back if the window losing focus let go of the keys)
+                Some((_, Some(k))) => {
+                    self.keys.insert(*k);
+                }
+                Some(_) => {}
+                None => {
+                    let k = self.pad_do(id, true);
+                    self.pad_held.push((id, k));
+                }
+            }
+        }
+        for id in taps {
+            self.pad_do(id, false);
+        }
+    }
+
+    /// A pad action pressed: what its key does (returned, to be let go of
+    /// later when `held`), or one of the pad's views.
+    fn pad_do(&mut self, id: &'static str, held: bool) -> Option<KeyCode> {
+        use padmap::{Does, View};
+        match padmap::does(id, self.spec.rocket().is_some())? {
+            Does::View(v) => {
+                // Quick views. Outside, left and right look at that side of the aircraft.
+                let (home_y, home_p) = self.cam_home;
+                let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
+                (self.cam_yaw, self.cam_pitch) = match v {
+                    View::Ahead => (home_y, home_p),
+                    View::Down if self.cam_mode == 1 => (home_y, 0.55),
+                    View::Down => (home_y + std::f64::consts::PI, home_p),
+                    View::Left => (home_y - side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
+                    View::Right => (home_y + side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
+                    View::Reset => {
+                        self.head.zoom = 1.0;
+                        (home_y, home_p)
+                    }
+                };
+                None
+            }
+            Does::Key(KeyCode::Tab) => {
+                // The flight panel, with its first choice picked out for the pad.
+                self.info_open = !self.info_open;
+                self.pad_home = self.info_open;
+                None
+            }
+            Does::Key(k) => {
+                self.key(k);
+                if held {
+                    self.keys.insert(k);
+                    return Some(k);
+                }
+                None
+            }
+        }
+    }
+
+    /// Lets go of every key the pad's buttons were holding.
+    fn pad_release_all(&mut self) {
+        for (_, k) in std::mem::take(&mut self.pad_held) {
+            if let Some(k) = k {
+                self.keys.remove(&k);
+            }
         }
     }
 
@@ -3029,64 +3328,20 @@ impl Game {
                 self.pad_home = true;
             }
             (Nav::Pause, _) => {}
-            // The flight panel, open beside the flying: the same, and B (or Y + View) closes it.
-            (Nav::Panel, Button::South) => self.pad_key(egui::Key::Enter),
-            (Nav::Panel, Button::East) => self.info_open = false,
-            (Nav::Panel, Button::Select) if modifier => self.info_open = false,
-            (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) => {
+            // The flight panel, open beside the flying: the same, and B closes it.
+            // (Its other buttons, and Y with any, still fly: pad_fly_buttons.)
+            (Nav::Panel, Button::South) if !modifier => self.pad_key(egui::Key::Enter),
+            (Nav::Panel, Button::East) if !modifier => self.info_open = false,
+            (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) if !modifier => {
                 self.info_page = menu::Page::cycle(&menu::Page::INFO, self.info_page, b == Button::RightTrigger);
                 self.pad_home = true;
             }
-            (Nav::Panel, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) => {}
-            // Y and the d-pad: master arm and target lock.
-            (Nav::Off, Button::DPadLeft) if modifier => {
-                if !self.missiles_ok() {
-                    self.status = self.missiles_refusal().into();
-                } else {
-                    let on = self.weapons.toggle_arm();
-                    self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
-                }
-                self.status_until = self.real + 3.0;
-            }
-            (Nav::Off, Button::DPadRight) if modifier => {
-                if !self.missiles_ok() {
-                    self.status = self.missiles_refusal().into();
-                } else {
-                    self.weapons.request_cycle();
-                }
-                self.status_until = self.real + 3.0;
-            }
-            (_, Button::Start) => self.set_pause_menu(true),
+            // A skips the loading screen (the scenery goes on loading), as Enter does.
+            (_, Button::South) if self.loading.as_ref().is_some_and(|l| l.done.is_none()) => self.key(KeyCode::Enter),
             (_, Button::South) if self.crashed => self.respawn_here(),
-            (_, Button::Select) if modifier => {
-                self.info_open = true;
-                self.pad_home = true;
-            }
-            (_, Button::Select) => self.next_view(),
-            (_, Button::RightThumb) => {
-                (self.cam_yaw, self.cam_pitch) = self.cam_home;
-                self.head.zoom = 1.0;
-            }
-            (_, Button::East) if modifier => {
-                self.plane.parking_brake = !self.plane.parking_brake;
-                self.status = if self.plane.parking_brake { t!("Parking brake set", "Frein de parc serré") } else { t!("Parking brake released", "Frein de parc desserré") }.into();
-                self.status_until = self.real + 2.0;
-            }
-            (_, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) if !modifier => {
-                // Quick views. Outside, left and right look at that side of the aircraft.
-                let (home_y, home_p) = self.cam_home;
-                let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
-                (self.cam_yaw, self.cam_pitch) = match b {
-                    Button::DPadUp => (home_y, home_p),
-                    Button::DPadDown if self.cam_mode == 1 => (home_y, 0.55),
-                    Button::DPadDown => (home_y + std::f64::consts::PI, home_p),
-                    Button::DPadLeft => (home_y - side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
-                    _ => (home_y + side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
-                };
-            }
-            (_, Button::LeftTrigger) if !self.crashed => self.plane.set_flaps(-1),
-            (_, Button::RightTrigger) if !self.crashed => self.plane.set_flaps(1),
-            (_, Button::LeftThumb) if !self.crashed => self.plane.toggle_gear(),
+            // Menu pauses, unless Y + Menu is given something to do.
+            (_, Button::Start) if !(modifier && self.binds.pad.has_y(padmap::PadBtn::Menu)) => self.set_pause_menu(true),
+            // Everything else that flies is in Settings › Controls › Gamepad (pad_fly_buttons).
             _ => {}
         }
     }
@@ -3428,6 +3683,7 @@ impl Game {
     /// box would otherwise keep left and right from the slider. (A widget
     /// only shows as a text box the pass after it takes the focus.)
     fn pad_pass(&mut self, ctx: &egui::Context) {
+        padui::begin_pass();
         if let Some(d) = self.pad_move.take() {
             ctx.memory_mut(|m| m.move_focus(d));
         }
@@ -6713,7 +6969,10 @@ impl Game {
                             ui.label(RichText::new(t!("AIRCRAFT WRECKED", "AVION DÉTRUIT")).font(menu::bold(34.0)).color(Color32::from_rgb(255, 160, 80)).extra_letter_spacing(1.5));
                             ui.add_space(6.0);
                             if pad {
-                                padui::prompts(ui, &[("Y + View", tr("go somewhere else")), ("Menu", tr("menu: respawn, globe"))], 24.0, 16.0, white);
+                                let panel = padmap::spec_of("flight_panel");
+                                let mut items = vec![(panel.as_str(), tr("go somewhere else")), ("Menu", tr("menu: respawn, globe"))];
+                                items.retain(|i| !i.0.is_empty());
+                                padui::prompts(ui, &items, 24.0, 16.0, white);
                             } else {
                                 keys_line(ui, &[("R", t!("respawn", "réapparaître")), ("G", t!("go somewhere else", "aller ailleurs")), ("Esc", t!("menu", "menu"))]);
                             }
@@ -6725,7 +6984,10 @@ impl Game {
                 egui::Area::new(egui::Id::unique("crash")).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ctx, |ui| {
                     flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)).show(ui, |ui| {
                         if pad {
-                            padui::prompts(ui, &[("A", tr("respawn")), ("Y + View", tr("go somewhere else")), ("Menu", tr("menu"))], 24.0, 16.0, white);
+                            let panel = padmap::spec_of("flight_panel");
+                            let mut items = vec![("A", tr("respawn")), (panel.as_str(), tr("go somewhere else")), ("Menu", tr("menu"))];
+                            items.retain(|i| !i.0.is_empty());
+                            padui::prompts(ui, &items, 24.0, 16.0, white);
                         } else {
                             keys_line(ui, &[("R", t!("respawn", "réapparaître")), ("G", t!("go somewhere else", "aller ailleurs")), ("Esc", t!("menu", "menu"))]);
                         }
@@ -7019,6 +7281,10 @@ impl ApplicationHandler for App {
                         g.cam_yaw -= (position.x - x) * 0.005 * k;
                         g.cam_pitch = (g.cam_pitch + (position.y - y) * 0.004 * k).clamp(-1.2, 1.4);
                     }
+                }
+                // The mouse moved (not just a twitch): it points at the controls again, not the pad.
+                if g.cursor.is_none_or(|(x, y)| (position.x - x).abs() + (position.y - y).abs() > 3.0) {
+                    g.pad_aim = false;
                 }
                 g.last_cursor = Some((position.x, position.y));
                 // (--cursor pins it, for scripted screenshots.)
@@ -7354,11 +7620,6 @@ fn write_wav(path: &std::path::Path, x: &[[f32; 2]], rate: u32) {
 fn smoothstep(a: f64, b: f64, x: f64) -> f64 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
-}
-
-/// +1, -1 or 0 from a pair of buttons.
-fn ax_pad(pos: bool, neg: bool) -> f64 {
-    (pos as i32 - neg as i32) as f64
 }
 
 /// The xpad driver's Xbox layout, in SDL's game controller mapping format.

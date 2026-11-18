@@ -196,6 +196,16 @@ pub enum Capture {
     Axis(AxisAct),
     Button(&'static str),
     Key(&'static str),
+    /// the gamepad's flying layout (padmap.rs): a button or Y + a button
+    Pad(&'static str),
+    PadAxis(crate::padmap::PadAxis),
+}
+
+impl Capture {
+    /// Taken from the gamepad (as against a joystick or the keyboard).
+    pub fn from_pad(&self) -> bool {
+        matches!(self, Capture::Pad(_) | Capture::PadAxis(_))
+    }
 }
 
 #[derive(Default)]
@@ -217,6 +227,10 @@ pub struct Bindings {
     baseline: HashMap<(Uuid, u32), f32>,
     /// devices a preset has been offered to on its own (once each)
     auto_done: std::collections::HashSet<Uuid>,
+    /// the gamepad's flying layout
+    pub pad: crate::padmap::PadMap,
+    /// a capture from the gamepad, under way
+    pub pad_catch: crate::padmap::Catch,
 }
 
 impl Bindings {
@@ -307,6 +321,7 @@ impl Bindings {
 
     pub fn start_capture(&mut self, c: Capture) {
         self.baseline = self.axis_now.clone();
+        self.pad_catch = Default::default();
         self.capture = Some(c);
     }
 
@@ -375,6 +390,7 @@ impl Bindings {
                 self.buttons.insert(a.id, ButtonBind { dev, name, code });
             }
         }
+        self.pad.read(&j["gamepad"]);
         for v in j["presets_applied"].as_array().into_iter().flatten() {
             if let Some(u) = v.as_str().and_then(uuid_from_hex) {
                 self.auto_done.insert(u);
@@ -395,7 +411,7 @@ impl Bindings {
         buttons.sort_by_key(|v| v["action"].to_string());
         let mut done: Vec<String> = self.auto_done.iter().map(hex).collect();
         done.sort();
-        serde_json::json!({ "keys": keys, "axes": axes, "buttons": buttons, "presets_applied": done })
+        serde_json::json!({ "keys": keys, "axes": axes, "buttons": buttons, "presets_applied": done, "gamepad": self.pad.json() })
     }
 
     pub fn save(&self) {

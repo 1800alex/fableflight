@@ -491,6 +491,7 @@ impl crate::Game {
                             self.menu.hangar_sel = Some(e.folder.clone());
                         }
                     }
+                    crate::padui::follow_focus(ui);
                 });
             });
             // The details.
@@ -502,6 +503,7 @@ impl crate::Game {
                         egui::ScrollArea::vertical().id_salt("hangar_detail").auto_shrink([false, false]).show(ui, |ui| {
                             ui.set_width(right.width() - 36.0);
                             fly = self.detail(ui, e);
+                            crate::padui::follow_focus(ui);
                         });
                     });
                 });
