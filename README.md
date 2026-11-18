@@ -1,13 +1,13 @@
 
 <div align="center">
 
-# Fable Flight
+# FableFlight
 
 ### An Open-World Flight Simulator Built in Pure Rust
 
 Explore the skies with real-world weather, live air traffic, and an immersive open-world flying experience.
 
-*Created with Claude Fable 5.2 & Opus 5.5*
+*Created with Claude Fable 5.2, Opus 5.5 and other AI's*
 
 <br>
 
@@ -61,5 +61,5 @@ Read [docs/relay.md](docs/relay.md) for more info.
 
 ## Contributing
 
-Contributions are welcome, especially aircraft models, flight physics, graphics, performance, and UI. See [AGENTS.md](AGENTS.md) for guidance on coding agent standards.
+Contributions are welcome, see [AGENTS.md](AGENTS.md) for guidance on coding agent standards.
 
