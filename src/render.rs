@@ -38,7 +38,6 @@ const VOL_CELLS: u64 = (VOL_N[0] * VOL_N[1] * VOL_N[2]) as u64;
 const UB_ALIGN: u64 = 256;
 const MAX_TILES: u64 = 1024;
 const MAX_BUILDS: u64 = 512; // detail tiles; one extra slot is kept for loose trees
-const MAX_OBJS: u64 = 1024;
 /// Bytes between objects' uniforms: two dynamic-offset alignments, as `ObjU`
 /// outgrew one when the aircraft's dent and wing bending were added.
 const OBJ_STRIDE: u64 = 2 * UB_ALIGN;
