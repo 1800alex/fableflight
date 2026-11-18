@@ -1,7 +1,7 @@
 
 <div align="center">
 
-# FableFlight
+# Fable Flight
 
 ### An Open-World Flight Simulator Built in Pure Rust
 
@@ -23,156 +23,43 @@ Explore the skies with real-world weather, live air traffic, and an immersive op
   </video>
 </div>
 
-# Compiling
-* Install rust
-```
-cargo build --release
-```
+## Download
+Download the [latest release](https://github.com/Rolandjg/fableflight/releases/latest)
 
-running
-```
+## Compiling
+
+Install [Rust](https://www.rust-lang.org/tools/install), then run:
+
+```sh
 cargo run --release
 ```
 
-# Arcade mode
-FableFlight is a simulator first: by default, the aircraft fly as they really do. **Arcade mode** (Settings › General, or `--arcade` for one run) turns on the game's fun features:
-- the F/A-18's Sidewinders (master arm, lock and fire on keys 3, 4 and 5);
-- boost on aircraft that have none in reality: the piston singles and the 747. Real afterburners and reheat (F/A-18, F-4, F-22, SR-71, Concorde) work in both modes;
-- respawning in flight at any time with R. In simulation mode R only works after a crash;
-- the weather and time keys in flight: T/Y for the time, N/M for the clouds. The weather panel and Go to work in both modes.
+Or build with `cargo build --release`.
 
-# Language
-The interface is in English or French. It follows the system language, can be changed in Settings (start screen or pause menu), and is remembered. For one run: `cargo run --release -- --lang fr`.
+## Features
 
-# Joysticks, pedals and key bindings
-Any joystick, throttle, rudder pedals or wheel can be used: in Bindings (pause menu, or Settings on the start screen), bind each axis by moving it the way that means "more" (nose up, right roll, right rudder, full throttle, brake pressed) and each button to any action. Each axis has an Invert switch and a dead zone. Presets set a device up in one click; the Turtle Beach VelocityOne Flightstick and rudder pedals get theirs on their own the first time they are plugged in. Keyboard keys can be moved too. Everything is kept in `bindings.json` in the config folder.
+- **Aircraft:** Cessna 172RG, Robin DR400, Boeing 747, F/A-18, F-4, F-22, Concorde, SR-71, Starship, and downloadable [FlightGear aircraft](https://wiki.flightgear.org/FGAddon).
+- **Flight systems:** fuel, mass and balance, electrical failures, clickable cockpits, radio navigation, and autopilot.
+- **World:** real METAR weather, satellite/road minimap, live ADS-B traffic, and multiplayer.
+- **Controls:** remappable keyboard, joystick, throttle, and pedals. Configure them in **Settings → Bindings**.
+- **Arcade mode:** optional boosts, missiles, and in-flight respawns. Enable in **Settings → General** or pass `--arcade`.
+- **AI copilot:** optional MCP integration; see [docs/mcp.md](docs/mcp.md).
 
-# Aircraft
-The Cessna 172RG, the Robin DR 400/180 Régent, the 747, the F/A-18, the F-4, the F-22, Concorde, the SR-71 and Starship. The Robin is the French wooden four-seater and glider tug: bubble canopy, the cranked Jodel wing, an all-moving tailplane, fixed gear and 60° flaps (`--aircraft dr400`); 6 slides its canopy open and shut. Like the Cessna it is built in code (`src/aircraft/dr400`), in a made-up classic Robin livery.
+The UI supports English and French. Settings and key bindings are saved automatically.
 
-# Fuel and engine start
-The engines burn fuel as they work (the Cessna some 30 l/h at 75% power, the 747 about 10 t/h in the cruise) and the fuel weighs: full tanks fly heavier than empty ones. Choose how much to take on the start screen (Flight); the HUD, the flight panel (fuel, flow, endurance) and the cockpit gauges show what is left, with LOW FUEL / NO FUEL warnings, and a dry engine stops. Start on a runway with the engine off ("cold start", or `--cold`) and start it by hand (I magnetos, Page Up mixture, hold O for the starter; on the jets I is the fuel controls and O engages the starters) or with F4, which also shuts it down. A windmilling engine with fuel and ignition catches again in the air; shut down on the ground, compression stops it within seconds.
+## Multiplayer
 
-# Mass and balance
-The fuel and the payload (crew, passengers, baggage: set on the start screen) make the aircraft heavier or lighter and move its centre of gravity, shown against its limits in % of the mean aerodynamic chord (start screen, flight panel; CG LIMIT on the HUD). Loaded aft, the nose is lighter and quicker to answer and a gust takes longer to settle; forward, it is stable but nose-heavy and the elevator runs out sooner (a harder flare). A Cessna with four aboard and full baggage is out of its aft limit, as the real one is.
-
-# Electrics and failures
-A battery behind the master switch (Ins) and an alternator (the jets' generators) that charges it once the engine turns fast enough: the starter, the radios, the electric gauges and the lights need power, the engine itself runs on its magnetos. The pause menu's Failures page sets failures by hand or at random (about every N minutes): engine, alternator, flat battery, vacuum pump (the attitude and heading gyros run down), blocked pitot (the airspeed indicator turns into an altimeter) or static port (altimeter and VSI freeze), fuel leak. The flight panel shows the volts, battery and current, and the HUD warns LOW VOLTS and VACUUM.
-
-# Clickable cockpits
-
-In cockpit view, hover over a working control to see its action and setting. Click a switch, roll the mouse wheel over a lever, or hold a toe brake. Drag elsewhere to look around. Middle-drag to lean sideways or down around a yoke or panel, and middle-click to sit upright again. The target follows the visible part as it moves.
-
-| Aircraft | Controls available from the pilot seat |
-| --- | --- |
-| Cessna 172RG | Battery, magnetos and starter key, throttle, propeller RPM, mixture, cowl flaps, tank selector, landing lights, gear, flaps, parking brake, toe brakes, trim wheel and yoke trim, NAV and ADF tuning, OBS, heading sync and altimeter setting |
-| Robin DR400/180 Régent | Battery, magnetos, separate starter button, throttle, mixture, tank selector, landing light, parking brake, toe brakes, trim wheel, flap lever and sliding canopy handle |
-| Boeing 747-400 | Overhead battery pushbutton and engine start switches, four thrust levers and reverse levers, fuel control switches, landing gear, flaps, speedbrake, alternate stabiliser trim, parking brake and toe brakes |
-| Concorde | Four thrust levers, gear, toe brakes and the nose/visor selector with up, visor down, 5° and 12.5° positions |
-| F/A-18C | Twin throttles, landing gear, flap selector, canopy switch and toe brakes |
-| F-4E | Twin throttles, landing gear, slats/flaps selector and toe brakes |
-| F-22A | Twin throttles, landing gear, canopy switch and toe brakes |
-| SR-71A | Twin throttles, landing gear, drag chute handle and toe brakes |
-
-The multi-engine aircraft share a thrust setting across engines. The piston aircraft have four fuel selector positions and a shared fuel quantity. Selecting OFF cuts fuel to the engine. The navigator and systems-operator stations, many panel switches and avionics pages remain simplified. Starship is uncrewed. [Cockpit references and modeling notes](docs/cockpits.md)
-
-# In-flight map
-
-A round minimap in the lower-left corner, stacked above the info panel, follows the aircraft; ` (backquote, the tilde key) shows or hides it. Choose **Satellite** or **Map** (a light road map), and **North** to keep north at the top or **Heading** to keep the nose pointing up. The controls, hints and status messages follow the game language (English/French). Place names use the corresponding translation when supplied by the map data, falling back to the local name; changing language also updates already loaded labels. City, town and village names stay upright on both backgrounds, with smaller places appearing as you zoom in and overlapping labels hidden. Use **+ / -** or the mouse wheel over the map to zoom. The compact toolbar sits under the map: click the orientation/background buttons to toggle them, or **x** to collapse it to a **Map** button. Drag the knob on the upper-right of the rim to resize it (240-640 logical pixels across, shrunk to fit between the HUD panels); the size is remembered and can also be set in the pause menu Settings. The map follows HUD visibility and remains visible beside the flight panel and temporarily hides while the pause menu is open. Visibility, background, orientation and zoom are remembered.
-
-Runways are highlighted in cyan using the loaded 3D airfield geometry when available, falling back to database endpoint coordinates for distant airfields. Near a loaded airfield, the active runway gets orange arrival arrows and a corridor on the map. In flight on its arrival side, orange gates show a visual 3-degree descent path toward the runway aiming point. This optional visual aid uses the game traffic runway selection (or wind-based selection), not an ATC clearance or terrain-clearance calculation. Toggle it in pause Settings; the choice is remembered.
-
-The minimap shares the terrain imagery and OpenFreeMap vector data caches. It loads tiles in the background, with at most one imagery and one vector request in flight, 64 satellite textures and 32 road-map tiles in memory. The road map is rasterized once per tile on a worker, not every frame, and does not request satellite images. Neither mode renders the 3D world a second time. Lower-resolution satellite tiles stand in while detail loads. Offline it uses cached data; missing imagery is indicated, and place names require cached vector tiles. The map is unavailable beyond 85 degrees latitude. Map and label data: [OpenFreeMap](https://openfreemap.org/), [OpenMapTiles](https://openmaptiles.org/), [OpenStreetMap contributors](https://www.openstreetmap.org/copyright).
-
-# Radio navigation
-VORs and NDBs from [OurAirports](https://ourairports.com/data/) (public domain), and an ILS on every paved runway end of 1500 m or more at medium and large airports. Tune NAV 1 (VOR or ILS) and the ADF on the flight panel's Radio page (Tab); J shows the instruments: a course deviation indicator with TO/FROM, the glide slope on an ILS and DME, and an ADF needle. [ and ] turn the OBS. Starting on a final approach tunes the runway's ILS. The altimeter is set to the QNH (from the METAR when the weather is real) unless you set it yourself; X sets it back. Courses are true: the world has no magnetic variation. `assets/mknav.py` rebuilds `assets/navaids.tsv.gz` from OurAirports' `navaids.csv`.
-
-# Autopilot
-Every aircraft has one, on its page of the flight toolbar (the attitude-indicator icon) and on keys you can rebind:
-- **F5**: engage or disconnect it. It starts by holding the heading and altitude of the moment.
-- **7 HDG**: fly the heading bug, moved with **−** / **=**.
-- **8 NAV**: track NAV 1, a VOR radial or a localizer.
-- **9 APR**: fly an ILS, localizer then glide slope.
-- **0 ALT**: hold the altitude.
-- **; / '**: move the preselected altitude.
-- On the page: **VS** climbs or descends at a set rate and levels off at the preselected altitude; **AT**, the autothrottle, holds an airspeed.
-
-NAV and APR can be armed before the signal comes in: they fly the heading bug until they capture the course, and APR captures the glide slope from below or from above. The modes show on a strip above the instruments, green when flying them, grey when armed.
-
-It gives up the vertical speed rather than stall the aircraft (MIN SPD), and climbs rather than pass the never-exceed speed (MAX SPD). A firm push on the controls, the ground, a stall or an unusual attitude disconnects it, with a warning tone. The AI copilot (docs/mcp.md) can set it too, with `set_autopilot`.
-
-# More aircraft: FlightGear's collection
-Click the aircraft picture on the start screen (or **All aircraft**) to see every aircraft you can fly as a gallery; **Get more…** opens [FlightGear's aircraft collection](https://wiki.flightgear.org/FGAddon) (its 2020 catalogue, about 650 aircraft). Pick one to read its files from FGAddon: its flight model, author, the license its JSBSim file states (else FGAddon's GNU GPL v2 or later), and what it becomes here; the ones that can't be flown are hidden once read (tick **Show all**). **Download** takes its package from a FlightGear mirror and unpacks it, without sounds, scripts and splash screens, into `~/.local/share/fablegame/aircraft/<folder>/` (with a `source.json` recording the source, revision and license), and it joins the list. Nothing from FlightGear ships with the game.
-
-A downloaded aircraft is **drawn with its own 3D model** (src/fgmodel.rs): the AC3D meshes and textures (PNG, JPEG, SGI .rgb) its model file names, with sub-models placed by their offsets. Its animations become our moving parts where we drive the same thing: control surfaces, flaps, slats, spoilers, gear retraction, steering, oleo compression, wheels and propellers. Others are taken at rest, and select animations hide what is off at rest or swap propeller blades for their blur. It sits on its own landing gear (the JSBSim contact points), sees from its pilot's view, and gets its picture from its previews.
-
-It is not flown by JSBSim or YASim: its flight model is *fitted* to ours (src/hangar.rs). Its mass, inertia, wing, lift and drag curves, flaps, engines and fuel go into a `Spec` built on the closest of our types, which lends its instruments, sounds and damage rules: propeller aircraft the Cessna's, fighters and anything with afterburners the Hornet's, other jets of 25 t or more the 747's. A JSBSim aircraft's curves are read from its own aerodynamic tables. A YASim aircraft (most of the catalogue) has none: YASim builds it from its geometry and solves for the lift and drag that fly the approach and cruise its file gives, and src/yasim.rs does the same for a polar, with its mass spread over the airframe around its ballast, engines and fuel for the centre of gravity and inertia. Helicopters and autogyros, rockets, gliders, balloons and electric aircraft can't be flown yet.
-
-**A word of caution:** the collection's aircraft are made by FlightGear's community and vary a lot. Some are not of high quality (rough models, odd files), and since each is fitted to our flight model rather than flown by its own, some don't fly realistically here. From the command line: `--fg-install SR22T` downloads, `--aircraft fg:sr22t` flies it, `--fg-survey [TEXT]` reads catalogue entries (those named JSBSim, or matching TEXT) and prints which can be flown, `--jsbsim-fit FILE...` prints what JSBSim (or YASim) files become, and `--fly-check KEY` flies any aircraft in an empty world (take-off, top speed, stall).
-
-# Comparing with a JSBSim flight model
-`cargo run --release -- --jsbsim-compare path/to/c172p.xml [--aircraft 747]` reads a JSBSim aircraft file (the XML flight models JSBSim and FlightGear use; none ship with the game) and prints how its aerodynamics compare with one of ours: geometry, mass and inertia, the lift and drag curves clean and with flaps, stall, best glide, the roll rate at full aileron, and the `Spec` values that would match its curves, as a start for tuning by hand.
-
-# Multiplayer
-Multiplayer has its own section in the settings, reached from the main menu's Multiplayer bar (under Settings), from the pilot count at the top of the globe, or from Esc › Settings in flight. Press Connect, choose a name, and you see the other players nearby and they see you. While connected, the start screen's globe shows every player of the network as a pink arrow pointing the way they fly, with their name (hover for aircraft, altitude and speed), and the Multiplayer settings list who is flying where, with Show to turn the globe to them. The Server list fills itself from the main relay's `/servers.json`, showing each server of the network with its pilots and its ping. Automatic picks the fastest, and you can also type an address in. Each one carries a tag with their name, aircraft, altitude, speed and distance, and the flight panel (Tab) lists them. The game talks to a small relay server (`relay/`) over UDP port 7480. It sends your aircraft's state and the name you chose while you fly, and nothing at all while multiplayer is off. On the start screen it sends nothing of your aircraft: it asks for the world map instead (a `Watch` about once a second), and the relay answers once a second with every player of the network to about 600 m, without attitude (`World`). Relays before 0.5.0 ignore the request, so the globe stays empty there, and you still see the others once in the air.
-
-To host a relay, run the Docker image (under 1 MB, a static binary in an empty image):
-```
-cd relay && docker compose up -d      # or: docker run -d -p 7480:7480/udp ghcr.io/danux-be/fableflight-relay
-```
-Open 7480/udp in the firewall. The relay keeps nothing on disk and checks every packet. Nothing is sent to an address until it has proved it can receive at that address, so the relay cannot be used to amplify an attack. A status page on port 7481 (`/`, and `/status.json`) shows who is flying, without positions, and how many are watching from the start screen (`watching`). Serve it through a reverse proxy for HTTPS. Settings are made through the environment: `FFMP_PORT`, `FFMP_HTTP_PORT` (0 turns the page off), `FFMP_MAX_PLAYERS`, `FFMP_RANGE_KM`. `FFMP_NAME` names the relay, and `FFMP_PUBLIC` (`host[:port]`) gives the address players use, as `/servers.json` lists it.
-
-Relays can form one network, so that players see each other whichever relay they use. Give every relay the same `FFMP_PEER_SECRET` (16 characters at least). The network has several main relays for redundancy (`fableflight.danux.be` and `fableflight.rolandiscool.com`, built in): a new relay makes itself known to every one of them, they list it to all the others every ten seconds, and the relays reach each other directly, so the network holds while any main relay is up. A main relay skips itself in the list (by `FFMP_PUBLIC` or `FFMP_NAME`, or when its own datagrams come back) and links with the other main relays. `FFMP_HUB` (`host[:port]`, comma-separated) replaces the built-in main relays, and `none` leaves them out, for a private network. The game reads its server list from each main relay in turn, until one answers. A relay that stays quiet for a minute drops out of the list. `FFMP_PEERS` (`host[:port]`, comma-separated) adds relays to reach directly as well. Each relay then passes its own players to the others ten times a second. Every datagram between relays is signed with the secret, dated and numbered, and must come from a listed relay. A relay never passes on another relay's players, and never answers a relay. The status page lists the network's relays, up or not, with the pilots on each. Within 4 km the other players are drawn with their aircraft's own model, with control surfaces, flaps, gear and propeller moving as they fly them. Farther off, and for Starship, the traffic model of their size stands in. For testing: `--mp host[,name]`, and `--mp-mirror`, which draws a copy of your own aircraft 25 m off the left wing the way another player is drawn.
-
-To add a main relay:
-1. Run a relay as above, on a host with a stable name (say `fableflight.example.com`), with UDP 7480 open and the status page behind HTTPS at `https://<host>/` (the game reads `https://<host>/servers.json`).
-2. Give it the network's `FFMP_PEER_SECRET`, `FFMP_PUBLIC=<host>` (so it knows itself in the list) and an `FFMP_NAME`. Leave `FFMP_HUB` empty: it links with the existing main relays and is listed to every relay at once.
-3. Add the host to `MAIN_RELAYS` in `src/mp_proto.rs`, and `https://<host>/servers.json` to `DIRECTORY_URLS` in `src/mp.rs` (a test checks the two agree). Relays and games built after that reach it by themselves; older ones still find it through the other main relays.
-
-# Live air traffic
-Real aircraft around you, as reported by ADS-B receivers (data from [adsb.lol](https://adsb.lol), ODbL), fly in the sky with tags (callsign, type, altitude, speed, distance); the flight panel (Tab) lists the nearest. It can be switched off in the pause menu's Settings.
-
-# Missiles
-The F/A-18C carries its two wingtip Sidewinders. Press **3** to set Master Arm, **4** to find and lock a target (press it again to step to the next one), and **5** to fire. On a gamepad, hold **Y** and press **left** on the d-pad to arm, **Y** + **right** to lock or cycle, and release **Y** on its own at a locked target to fire. The seeker looks about 45° either side of the nose for airborne aircraft — the real ADS-B traffic and airport departures and arrivals — and needs a few seconds to build a lock; the HUD shows `TRACK` until it is solid, then `LOCK`. Armed with no lock, firing says `NO LOCK`; with Master Arm off it says `MASTER ARM OFF`. The missile leaves the rail, boosts, follows the target's heat and detonates on a proximity fuse. The rail stays, the empty wingtip is visible, and the second missile is still there. The keys can be moved on the Bindings page.
-
-# Real weather
-The weather follows the real conditions where you fly: the nearest METAR within 60 km ([aviationweather.gov](https://aviationweather.gov)) sets the wind, gusts, visibility, cloud layers and thunderstorms; with no airport near, [Open-Meteo](https://open-meteo.com)'s model stands in. It is looked up again every 10 minutes or 30 km, and the sky eases into each report. Switch it off in the weather settings (start screen, flight panel or F3) to set the weather by hand.
-
-The clock can follow real time too ("Real time" above the day sliders): the sun and the date are those where you fly, now (solar time, so the local hour can differ from the legal one by up to an hour or so). Pressing T / Y to set the time by hand leaves real time.
-
-Settings (language, sound, camera, HUD, anti-aliasing) are kept in `settings.json` in the config folder (`~/.config/fablegame` on Linux).
-
-# AI copilot (MCP)
-The simulator can host an AI copilot through the [Model Context Protocol](https://modelcontextprotocol.io). Build the game and the small stdio bridge, run the game normally, and point your AI client at `target/release/fableflight-mcp`:
+Connect from the **Multiplayer** settings. To host a relay:
 
 ```sh
-cargo build --release
-./target/release/fablegame
+cd relay
+docker compose up -d
 ```
+Allow UDP port `7480` through your firewall.
 
-For OpenCode, add a local server to `opencode.json` (or use `opencode mcp add fableflight -- /absolute/path/to/fableflight-mcp`):
+Read [docs/relay.md](docs/relay.md) for more info.
 
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "servers": {
-      "fableflight": {
-        "type": "local",
-        "command": ["/absolute/path/to/fableflight-mcp"]
-      }
-    }
-  }
-}
-```
+## Contributing
 
-For Claude Code: `claude mcp add fableflight /absolute/path/to/fableflight-mcp`. Claude Desktop uses the same command in its `mcpServers` configuration. The bridge attaches to the running game over `127.0.0.1:42761`; start a flight, then ask the AI to read the aircraft state, tune radios, set flaps or weather, or take a screenshot. `--mcp-port PORT` changes the game's port and `FABLEFLIGHT_MCP_PORT` tells the bridge where to look. `--no-mcp` disables the service.
+Contributions are welcome, especially aircraft models, flight physics, graphics, performance, and UI. See [AGENTS.md](AGENTS.md) for guidance on coding agent standards.
 
-The copilot can read the aircraft, navigation, weather, traffic and airports, and can set the throttle, flaps, gear, speedbrake, parking brake, mixture, trim, engine state, radios, weather, time and the aircraft's position. It cannot move the stick: attitude stays with the human pilot. See [docs/mcp.md](docs/mcp.md) for the full tool list, units and examples.
-
-# Contributions
-Please contribute anything if you want to! Improvements to flight sim realism, graphics, optimization, UI, and especially plane models are needed! (((=
-
-For substantial AI-assisted contributions, use Claude Opus 5.5, GPT-6 Astra, Claude Fable, or a model with equivalent or greater capability. Sonnet, GPT-6.1 Sol, and less capable models should only handle simple fixes or very small features; switch to a stronger model for larger tasks, including aircraft creation and flight-model tuning. See [AGENTS.md](AGENTS.md) for the full guidance.
-
-I personally recommend using Opus 5.5 high for most tasks. If you don't have a routine for conserving tokens a general rule of thumb is to give models specific tasks (e.g. decompose the cockpit and plane body into different prompts) and keep conversations to one prompt, starting a new chat if refinement is needed.
