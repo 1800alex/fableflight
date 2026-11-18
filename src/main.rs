@@ -84,7 +84,7 @@ enum Nav {
 /// The height of the instruments drawn over the flying (`flight_hud`), bottom centre.
 /// The fewest points of height the interface is laid out for (see `egui_input`).
 pub const UI_MIN_H: f32 = 860.0;
-pub const HUD_H: f32 = 164.0;
+pub const HUD_H: f32 = 226.0;
 /// and its width
 pub const HUD_W: f32 = 410.0;
 
@@ -5904,8 +5904,6 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
     /// on the right, a heading ribbon over it, with the throttle and the
     /// vertical speed in bars at either side. `ias` is in m/s, `alt` and `agl`
     /// in metres, `vs` in m/s.
-    /// The compact flight display: attitude, heading, speed and height remain
-    /// visible while the larger flight panel carries the secondary systems.
     fn flight_hud(&self, ctx: &egui::Context, hdg: f64, ias: f64, alt: f64, vs: f64, agl: f64) {
         use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Shape, Stroke, StrokeKind};
         let p = &self.plane;
@@ -5919,98 +5917,233 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         let agl_ft = (agl.max(0.0) * 3.28084) as f32;
         let vs_fpm = (vs * 196.85) as f32;
         let hdg = hdg as f32;
-        let white = Color32::from_rgba_unmultiplied(255, 255, 255, 235);
+        let thr = (p.throttle as f32).clamp(0.0, 1.0);
+
+        let white = Color32::from_rgba_unmultiplied(255, 255, 255, 240);
         let dim = Color32::from_rgba_unmultiplied(255, 255, 255, 150);
-        let faint = Color32::from_rgba_unmultiplied(255, 255, 255, 65);
+        let faint = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
+        let green = Color32::from_rgb(110, 235, 140);
         let amber = Color32::from_rgb(255, 190, 60);
         let red = Color32::from_rgb(255, 90, 60);
+        let accent = Color32::from_rgb(228, 230, 232);
+        let glass = menu::GLASS;
+        let box_fill = Color32::from_rgba_premultiplied(8, 10, 14, 236);
+        // Keep the traditional blue-over-earth attitude colors distinct from
+        // the neutral liquid-glass chrome around the rest of the interface.
         let sky = Color32::from_rgb(55, 130, 190);
         let ground = Color32::from_rgb(150, 91, 58);
         let mono = |s: f32| FontId::monospace(s);
+
         const W: f32 = HUD_W;
         const H: f32 = HUD_H;
-        egui::Area::new(egui::Id::unique("flight_hud")).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).interactable(false).show(ctx, |ui| {
+        egui::Area::new(egui::Id::unique("flight_hud")).anchor(Align2::CENTER_BOTTOM, [0.0, -14.0]).interactable(false).show(ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(W, H), egui::Sense::hover());
             let painter = ui.painter().clone();
-            let c = pos2(rect.center().x, rect.top() + 77.0);
-            let ar = Rect::from_center_size(c, vec2(142.0, 90.0));
-            let glass = menu::GLASS;
+            let c = pos2(rect.center().x, rect.top() + 34.0 + 74.0);
+            let ar = Rect::from_center_size(c, vec2(196.0, 148.0));
+            let sr = Rect::from_min_size(pos2(ar.left() - 8.0 - 66.0, ar.top()), vec2(66.0, 148.0));
+            let tr = Rect::from_min_size(pos2(ar.right() + 8.0, ar.top()), vec2(66.0, 148.0));
+            let tb = Rect::from_min_size(pos2(sr.left() - 4.0 - 22.0, ar.top() + 14.0), vec2(22.0, 120.0));
+            let vr = Rect::from_min_size(pos2(tr.right() + 4.0, ar.top() + 14.0), vec2(22.0, 120.0));
+            let hr = Rect::from_min_size(pos2(ar.left(), rect.top()), vec2(196.0, 24.0));
 
-            // Small attitude window with a restrained pitch ladder and bank cue.
+            // ---- the horizon
             {
                 let ap = painter.with_clip_rect(ar);
-                ap.rect_filled(ar, 8.0, sky);
+                ap.rect_filled(ar, 0.0, sky);
                 let (sn, cs) = (-bank).sin_cos();
                 let rot = |x: f32, y: f32| pos2(c.x + x * cs - y * sn, c.y + x * sn + y * cs);
-                const K: f32 = 2.6;
-                const L: f32 = 260.0;
+                const K: f32 = 3.6;
+                const L: f32 = 400.0;
                 let hy = pitch * K;
                 ap.add(Shape::convex_polygon(vec![rot(-L, hy), rot(L, hy), rot(L, hy + L), rot(-L, hy + L)], ground, Stroke::NONE));
-                ap.line_segment([rot(-L, hy), rot(L, hy)], Stroke::new(1.6, white));
-                for a in (-20i32..=20).step_by(10) {
-                    if a == 0 { continue; }
+                ap.line_segment([rot(-L, hy), rot(L, hy)], Stroke::new(2.0, white));
+                for a in (-30i32..=30).step_by(5) {
+                    if a == 0 {
+                        continue;
+                    }
                     let y = (pitch - a as f32) * K;
-                    if y.abs() > 42.0 { continue; }
-                    let half = if a % 20 == 0 { 19.0 } else { 11.0 };
-                    ap.line_segment([rot(-half, y), rot(half, y)], Stroke::new(1.0, white));
+                    if y.abs() > 130.0 {
+                        continue;
+                    }
+                    let half = if a % 10 == 0 { 28.0 } else { 14.0 };
+                    ap.line_segment([rot(-half, y), rot(half, y)], Stroke::new(1.5, white));
+                    if a % 10 == 0 {
+                        for sgn in [-1.0f32, 1.0] {
+                            ap.text(rot(sgn * (half + 12.0), y), Align2::CENTER_CENTER, format!("{}", a.abs()), mono(11.0), white);
+                        }
+                    }
                 }
-                const R: f32 = 39.0;
-                for a in [-30.0f32, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0] {
-                    let (s, k) = a.to_radians().sin_cos();
-                    let len = if a % 20.0 == 0.0 { 7.0 } else { 4.0 };
-                    ap.line_segment([pos2(c.x + R * s, c.y - R * k), pos2(c.x + (R-len) * s, c.y - (R-len) * k)], Stroke::new(1.1, white));
+                // the bank scale, fixed, and the pointer that rides the horizon
+                const RR: f32 = 70.0;
+                for ang in [-45.0f32, -30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0, 45.0] {
+                    let (s, k) = ang.to_radians().sin_cos();
+                    let len = if ang % 30.0 == 0.0 { 9.0 } else { 5.0 };
+                    ap.line_segment([pos2(c.x + RR * s, c.y - RR * k), pos2(c.x + (RR - len) * s, c.y - (RR - len) * k)], Stroke::new(1.5, white));
                 }
-                let wing = Stroke::new(2.8, amber);
-                ap.line_segment([pos2(c.x - 38.0, c.y), pos2(c.x - 12.0, c.y)], wing);
-                ap.line_segment([pos2(c.x - 12.0, c.y), pos2(c.x - 12.0, c.y + 5.0)], wing);
-                ap.line_segment([pos2(c.x + 12.0, c.y), pos2(c.x + 38.0, c.y)], wing);
-                ap.line_segment([pos2(c.x + 12.0, c.y), pos2(c.x + 12.0, c.y + 5.0)], wing);
-                ap.circle_filled(c, 2.5, amber);
+                ap.add(Shape::convex_polygon(vec![rot(0.0, -RR + 1.0), rot(-5.0, -RR + 11.0), rot(5.0, -RR + 11.0)], accent, Stroke::NONE));
+                // the aircraft
+                let wing = Stroke::new(3.5, amber);
+                ap.line_segment([pos2(c.x - 54.0, c.y), pos2(c.x - 16.0, c.y)], wing);
+                ap.line_segment([pos2(c.x - 16.0, c.y), pos2(c.x - 16.0, c.y + 7.0)], wing);
+                ap.line_segment([pos2(c.x + 16.0, c.y), pos2(c.x + 54.0, c.y)], wing);
+                ap.line_segment([pos2(c.x + 16.0, c.y), pos2(c.x + 16.0, c.y + 7.0)], wing);
+                ap.circle_filled(c, 3.0, amber);
             }
-            painter.rect_stroke(ar, 8.0, Stroke::new(1.0, faint), StrokeKind::Outside);
+            painter.rect_stroke(ar, 0.0, Stroke::new(1.5, faint), StrokeKind::Outside);
 
-            // Four primary values sit outside the attitude window without tape frames.
-            let value_y = c.y - 8.0;
-            let left = c.x - 136.0;
-            let right = c.x + 136.0;
-            let spd_col = if p.stalled { red } else if p.overspeed() > 0.0 || (p.flaps > 0.25 && p.ias() > p.vfe()) { amber } else { white };
-            painter.text(pos2(left, value_y - 3.0), Align2::CENTER_CENTER, format!("{ias_kt:.0}"), mono(24.0), spd_col);
-            painter.text(pos2(left, value_y + 19.0), Align2::CENTER_CENTER, format!("IAS KT  ·  GS {gs_kt:.0}"), mono(10.0), dim);
-            painter.text(pos2(right, value_y - 3.0), Align2::CENTER_CENTER, format!("{:.0}", (alt_ft / 10.0).round() * 10.0), mono(24.0), white);
-            let agl_col = if agl_ft < 300.0 && !p.on_ground { amber } else { dim };
-            painter.text(pos2(right, value_y + 19.0), Align2::CENTER_CENTER, format!("ALT FT  ·  AGL {agl_ft:.0}"), mono(10.0), agl_col);
-
-            let heading = Rect::from_center_size(pos2(c.x, rect.top() + 15.0), vec2(84.0, 24.0));
-            painter.rect_filled(heading, 5.0, glass);
-            painter.text(heading.center(), Align2::CENTER_CENTER, format!("{:03.0}°", hdg.rem_euclid(360.0).round() % 360.0), mono(15.0), white);
-            let vs_col = if vs_fpm < -1500.0 && agl_ft < 2500.0 { red } else { dim };
-            painter.text(pos2(c.x, ar.bottom() + 13.0), Align2::CENTER_CENTER, format!("VS {:+.0} FPM", (vs_fpm / 10.0).round() * 10.0), mono(10.0), vs_col);
-
-            // Configuration appears only as a compact status row.
-            let mut chips: Vec<(String, Color32)> = Vec::new();
-            if p.spec.rocket().is_none() {
-                let flaps = match &p.spec.lever { Some(l) => l.notches.get(p.flap_set as usize).map_or("", |n| n[0]).to_string(), None => t!("Flaps {:.0}°", "Volets {:.0}°", p.flap_notch_deg()) };
-                chips.push((flaps, if p.flaps > 0.25 && p.ias() > p.vfe() { amber } else { dim }));
-                if !p.spec.fixed_gear() {
-                    let (g, col) = if p.gear >= 1.0 { (t!("GEAR DOWN", "TRAIN SORTI"), Color32::from_rgb(110, 235, 140)) } else if p.gear <= 0.0 { (t!("GEAR UP", "TRAIN RENTRÉ"), dim) } else { (t!("GEAR MOVING", "TRAIN EN TRANSIT"), amber) };
-                    chips.push((g.to_string(), col));
+            // ---- speed
+            {
+                painter.rect_filled(sr, menu::R_WIDGET, glass);
+                let tp = painter.with_clip_rect(sr);
+                const PPK: f32 = 3.0;
+                let lo = ((ias_kt - 26.0) / 10.0).floor() as i32 * 10;
+                for v in (lo..=lo + 60).step_by(10) {
+                    if v < 0 {
+                        continue;
+                    }
+                    let y = c.y - (v as f32 - ias_kt) * PPK;
+                    let long = v % 20 == 0;
+                    tp.line_segment([pos2(sr.right(), y), pos2(sr.right() - if long { 12.0 } else { 6.0 }, y)], Stroke::new(1.3, white));
+                    if long {
+                        tp.text(pos2(sr.right() - 16.0, y), Align2::RIGHT_CENTER, format!("{v}"), mono(12.0), dim);
+                    }
                 }
+                let col = if p.stalled { red } else if p.overspeed() > 0.0 || (p.flaps > 0.25 && p.ias() > p.vfe()) { amber } else { white };
+                let b = Rect::from_min_max(pos2(sr.left() + 2.0, c.y - 13.0), pos2(sr.right() + 6.0, c.y + 13.0));
+                painter.rect_filled(b, menu::R_WIDGET, box_fill);
+                painter.rect_stroke(b, menu::R_WIDGET, Stroke::new(1.2, col.gamma_multiply(0.7)), StrokeKind::Inside);
+                painter.text(pos2(b.center().x - 3.0, c.y), Align2::CENTER_CENTER, format!("{:.0}", ias_kt), mono(19.0), col);
+                painter.text(pos2(sr.center().x, sr.top() - 8.0), Align2::CENTER_CENTER, "IAS KT", mono(11.0), dim);
+                painter.text(pos2(sr.center().x, sr.bottom() + 9.0), Align2::CENTER_CENTER, format!("GS {:.0}", gs_kt), mono(11.0), dim);
             }
-            if p.spoilers > 0.05 { chips.push(((if p.spec.chute.is_some() { t!("CHUTE", "PARACHUTE") } else { t!("SPEEDBRAKE", "AÉROFREINS") }).to_string(), amber)); }
-            if !p.running { chips.push((t!("ENGINE OFF", "MOTEUR ARRÊTÉ").to_string(), red)); }
-            let font = menu::caption();
-            let gal: Vec<_> = chips.into_iter().map(|(s, col)| (painter.layout_no_wrap(s, font.clone(), col), col)).collect();
-            let total: f32 = gal.iter().map(|(g, _)| g.size().x + 14.0).sum::<f32>() + 5.0 * gal.len().saturating_sub(1) as f32;
-            let mut x = rect.center().x - total * 0.5;
-            let y = rect.bottom() - 9.0;
-            for (g, col) in gal {
-                let r = Rect::from_min_size(pos2(x, y - 9.0), vec2(g.size().x + 14.0, 18.0));
-                painter.rect_filled(r, 5.0, glass);
-                painter.galley(pos2(r.left() + 7.0, y - g.size().y * 0.5), g, col);
-                x = r.right() + 5.0;
+
+            // ---- altitude
+            {
+                painter.rect_filled(tr, menu::R_WIDGET, glass);
+                let tp = painter.with_clip_rect(tr);
+                const PPF: f32 = 0.30;
+                let lo = ((alt_ft - 260.0) / 100.0).floor() as i32 * 100;
+                for v in (lo..=lo + 600).step_by(100) {
+                    let y = c.y - (v as f32 - alt_ft) * PPF;
+                    let long = v % 200 == 0;
+                    tp.line_segment([pos2(tr.left(), y), pos2(tr.left() + if long { 12.0 } else { 6.0 }, y)], Stroke::new(1.3, white));
+                    if long {
+                        tp.text(pos2(tr.left() + 16.0, y), Align2::LEFT_CENTER, format!("{v}"), mono(12.0), dim);
+                    }
+                }
+                let b = Rect::from_min_max(pos2(tr.left() - 6.0, c.y - 13.0), pos2(tr.right() - 2.0, c.y + 13.0));
+                painter.rect_filled(b, menu::R_WIDGET, box_fill);
+                painter.rect_stroke(b, menu::R_WIDGET, Stroke::new(1.2, white.gamma_multiply(0.5)), StrokeKind::Inside);
+                painter.text(pos2(b.center().x + 3.0, c.y), Align2::CENTER_CENTER, format!("{:.0}", (alt_ft / 10.0).round() * 10.0), mono(19.0), white);
+                painter.text(pos2(tr.center().x, tr.top() - 8.0), Align2::CENTER_CENTER, "ALT FT", mono(11.0), dim);
+                let col = if agl_ft < 300.0 && !p.on_ground { amber } else { dim };
+                painter.text(pos2(tr.center().x, tr.bottom() + 9.0), Align2::CENTER_CENTER, format!("AGL {:.0}", agl_ft), mono(11.0), col);
+            }
+
+            // ---- vertical speed
+            {
+                painter.rect_filled(vr, menu::R_WIDGET, glass);
+                let y0 = vr.center().y;
+                let span = vr.height() * 0.5 - 8.0;
+                for k in [-2.0f32, -1.0, 0.0, 1.0, 2.0] {
+                    let y = y0 - k * span * 0.5;
+                    painter.line_segment([pos2(vr.left() + 2.0, y), pos2(vr.left() + if k == 0.0 { 12.0 } else { 7.0 }, y)], Stroke::new(1.2, dim));
+                    if k != 0.0 {
+                        painter.text(pos2(vr.right() - 5.0, y), Align2::CENTER_CENTER, format!("{}", k.abs() as i32), mono(11.0), dim);
+                    }
+                }
+                let y = y0 - (vs_fpm / 2000.0).clamp(-1.0, 1.0) * span;
+                let col = if vs_fpm < -1500.0 && agl_ft < 2500.0 { red } else if vs_fpm.abs() < 100.0 { white } else { green };
+                painter.line_segment([pos2(vr.left() + 2.0, y0), pos2(vr.left() + 2.0, y)], Stroke::new(2.0, col.gamma_multiply(0.45)));
+                painter.rect_filled(Rect::from_min_max(pos2(vr.left() + 2.0, y - 2.5), pos2(vr.right() - 2.0, y + 2.5)), 1.0, col);
+                painter.text(pos2(vr.center().x, vr.top() - 8.0), Align2::CENTER_CENTER, "VS", mono(11.0), dim);
+                painter.text(pos2(vr.center().x, vr.bottom() + 9.0), Align2::CENTER_CENTER, format!("{:+.0}", (vs_fpm / 10.0).round() * 10.0), mono(11.0), col);
+            }
+
+            // ---- throttle
+            {
+                painter.rect_filled(tb, menu::R_WIDGET, glass);
+                let inner = tb.shrink2(vec2(6.0, 5.0));
+                let h = inner.height() * thr;
+                let col = if p.running { accent } else { red };
+                painter.rect_filled(Rect::from_min_max(pos2(inner.left(), inner.bottom() - h), inner.right_bottom()), 1.0, col.gamma_multiply(0.85));
+                painter.rect_stroke(inner, 1.0, Stroke::new(1.0, faint), StrokeKind::Inside);
+                painter.text(pos2(tb.center().x, tb.top() - 8.0), Align2::CENTER_CENTER, "THR", mono(11.0), dim);
+                painter.text(pos2(tb.center().x, tb.bottom() + 9.0), Align2::CENTER_CENTER, format!("{:.0}%", thr * 100.0), mono(11.0), dim);
+            }
+
+            // ---- heading ribbon
+            {
+                painter.rect_filled(hr, menu::R_WIDGET, glass);
+                let hp = painter.with_clip_rect(hr);
+                const PPD: f32 = 3.0;
+                let h0 = ((hdg - 34.0) / 5.0).floor() as i32 * 5;
+                for d in (h0..=h0 + 75).step_by(5) {
+                    let x = hr.center().x + (d as f32 - hdg) * PPD;
+                    let dd = d.rem_euclid(360);
+                    let long = dd % 10 == 0;
+                    hp.line_segment([pos2(x, hr.bottom()), pos2(x, hr.bottom() - if long { 8.0 } else { 4.0 })], Stroke::new(1.2, white));
+                    if long {
+                        let label = match dd {
+                            0 => "N".to_string(),
+                            90 => "E".to_string(),
+                            180 => "S".to_string(),
+                            270 => "W".to_string(),
+                            _ => format!("{:02}", dd / 10),
+                        };
+                        hp.text(pos2(x, hr.top() + 8.0), Align2::CENTER_CENTER, label, mono(11.0), if dd % 90 == 0 { accent } else { dim });
+                    }
+                }
+                let b = Rect::from_center_size(pos2(hr.center().x, hr.center().y), vec2(46.0, 22.0));
+                painter.rect_filled(b, menu::R_WIDGET, box_fill);
+                painter.rect_stroke(b, menu::R_WIDGET, Stroke::new(1.2, white.gamma_multiply(0.5)), StrokeKind::Inside);
+                painter.text(b.center(), Align2::CENTER_CENTER, format!("{:03.0}°", hdg.rem_euclid(360.0).round() % 360.0), mono(14.0), white);
+                // Fixed center index makes the direction of travel immediately
+                // readable while the compass tape slides beneath it.
+                painter.add(Shape::convex_polygon(
+                    vec![pos2(hr.center().x, hr.bottom() + 1.0), pos2(hr.center().x - 5.0, hr.bottom() - 4.0), pos2(hr.center().x + 5.0, hr.bottom() - 4.0)],
+                    amber,
+                    Stroke::NONE,
+                ));
+            }
+
+            // ---- the aircraft's state, in a row of small plates under the instruments
+            {
+                let mut chips: Vec<(String, Color32)> = Vec::new();
+                if p.spec.rocket().is_none() {
+                    let flaps = match &p.spec.lever { Some(l) => l.notches.get(p.flap_set as usize).map_or("", |n| n[0]).to_string(), None => t!("Flaps {:.0}°", "Volets {:.0}°", p.flap_notch_deg()) };
+                    chips.push((flaps, if p.flaps > 0.25 && p.ias() > p.vfe() { amber } else { dim }));
+                    if !p.spec.fixed_gear() {
+                        let (g, col) = if p.gear >= 1.0 { (t!("Gear down", "Train sorti"), green) } else if p.gear <= 0.0 { (t!("Gear up", "Train rentré"), dim) } else { (t!("Gear moving", "Train en transit"), amber) };
+                        chips.push((g.to_string(), col));
+                    }
+                }
+                if p.spoilers > 0.05 {
+                    chips.push(((if p.spec.chute.is_some() { t!("Chute", "Parachute") } else { t!("Speedbrake", "Aérofreins") }).to_string(), amber));
+                }
+                if self.parking_brake {
+                    chips.push((t!("Parking brake", "Frein de parc").to_string(), amber));
+                }
+                if !p.running {
+                    chips.push((t!("Engine off", "Moteur arrêté").to_string(), red));
+                }
+                let font = menu::caption();
+                let gal: Vec<_> = chips.into_iter().map(|(t, col)| (painter.layout_no_wrap(t, font.clone(), col), col)).collect();
+                let total: f32 = gal.iter().map(|(g, _)| g.size().x + 16.0).sum::<f32>() + 6.0 * gal.len().saturating_sub(1) as f32;
+                let mut x = rect.center().x - total * 0.5;
+                let y = rect.bottom() - 11.0;
+                for (g, col) in gal {
+                    let r = Rect::from_min_size(pos2(x, y - 10.0), vec2(g.size().x + 16.0, 20.0));
+                    painter.rect_filled(r, menu::R_WIDGET, glass);
+                    painter.rect_stroke(r, menu::R_WIDGET, Stroke::new(1.0, col.gamma_multiply(0.45)), StrokeKind::Inside);
+                    painter.galley(pos2(r.left() + 8.0, y - g.size().y * 0.5), g, col);
+                    x = r.right() + 6.0;
+                }
             }
         });
     }
+
     fn ui(&mut self, agl: f64) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32) {
         let raw = self.egui_input();
         let (lat, lon, alt) = geo::pos_to_lla(self.plane.pos);
