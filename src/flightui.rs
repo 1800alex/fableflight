@@ -5,7 +5,7 @@
 //! and a systems card at the top left for the aircraft that have something
 //! to show there: a rocket's flight figures, a fighter's weapons.
 use crate::menu::{self, Icon, Page, DIM, TEXT};
-use crate::{padui, t, tr, Game};
+use crate::{padui, t, Game};
 use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke};
 
 // ---- the flight panel's pieces (its pages are in main.rs, radio_page and weather.rs)
@@ -204,12 +204,43 @@ impl Game {
         }
     }
 
+    /// the autopilot's modes as an annunciator row: green what it flies, grey what is armed.
+    /// "ap off" flashes amber for a few seconds after it lets go.
+    fn ap_strip(&self, ui: &mut egui::Ui) {
+        let off_for = self.real - self.ap_off_t;
+        let flash = !self.ap.on && off_for < 4.0;
+        if !self.ap.on && !flash {
+            return;
+        }
+        frosted(ui, glass().inner_margin(egui::Margin::symmetric(16, 8)), |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let green = Color32::from_rgb(64, 200, 96);
+                if self.ap.on {
+                    let (on, armed) = self.ap.annunciation();
+                    ui.label(RichText::new("AP").font(menu::semibold(14.0)).color(green));
+                    for m in on {
+                        ui.label(RichText::new(m).font(num_s()).color(green));
+                    }
+                    for m in armed {
+                        ui.label(RichText::new(m).font(num_s()).color(SOFT));
+                    }
+                } else if (off_for * 2.5).fract() < 0.6 {
+                    ui.label(RichText::new("AP OFF").font(menu::semibold(14.0)).color(AMBER));
+                } else {
+                    ui.label(RichText::new("AP OFF").font(menu::semibold(14.0)).color(Color32::TRANSPARENT));
+                }
+            });
+        });
+    }
+
     /// The systems card at the top left: a rocket's flight figures, or a
     /// fighter's weapons. Nothing (None) for every other aircraft.
     pub(crate) fn systems_card(&self, ctx: &egui::Context, vs: f64, base_up: f64) -> Option<Rect> {
         let p = &self.plane;
         let rocket = p.engines().is_some();
-        if !rocket && !self.weapons.has_weapons() {
+        if !rocket && !self.missiles_ok() {
             return None;
         }
         let amber = Color32::from_rgb(255, 196, 80);
@@ -237,7 +268,7 @@ impl Game {
                         row(ui, t!("Mass, load", "Masse, facteur"), format!("{:.0} t  ·  {:.1} g", p.mass() / 1000.0, p.g_load), TEXT);
                     });
                 }
-                if self.weapons.has_weapons() {
+                if self.missiles_ok() {
                     let armed = self.weapons.armed;
                     let power = p.sys.powered();
                     ui.label(tag_text(t!("Weapons", "Armement")));
@@ -675,8 +706,15 @@ impl Game {
             // the head: how to open the menu
             let hy = r.top() + 19.0;
             glyph(p, Glyph::Menu, pos2(r.left() + 22.0, hy), 14.0, white(0.75));
-            let hint = if padui::active() { tr("Y + View: flight panel") } else { t!("Tab: flight panel", "Tab : panneau de vol") };
-            paint_tag(p, pos2(r.left() + 38.0, hy), Align2::LEFT_CENTER, hint);
+            let hint = if padui::active() {
+                match crate::padmap::spec_of("flight_panel") {
+                    k if k.is_empty() => t!("Menu: pause", "Menu : pause").to_string(),
+                    k => t!("{}: flight panel", "{} : panneau de vol", k),
+                }
+            } else {
+                t!("Tab: flight panel", "Tab : panneau de vol").to_string()
+            };
+            paint_tag(p, pos2(r.left() + 38.0, hy), Align2::LEFT_CENTER, &hint);
             p.hline(r.x_range(), r.top() + 38.0, Stroke::new(1.0, white(0.16)));
             // the body: the sky, the time of day, the temperature
             let by = r.top() + 70.0;
@@ -845,18 +883,21 @@ impl Game {
             let rr = drum(&pt, pos2(tape.right() - 18.0, c.y), Align2::RIGHT_CENTER, alt, 3, 20, Color32::WHITE);
             pt.add(egui::Shape::convex_polygon(vec![pos2(tape.right() - 10.0, c.y), pos2(rr.right() - 0.5, c.y - 7.0), pos2(rr.right() - 0.5, c.y + 7.0)], BOX, Stroke::NONE));
             // The buttons: the flight panel's pages, the map, the camera, the pause menu.
-            let items: [(Icon, &str, &str, Bar, bool); 6] = [
+            let items: [(Icon, &str, &str, Bar, bool); 7] = [
                 (Icon::Flight, t!("Flight", "Vol"), t!("Flight", "Vol"), Bar::Page(Page::Flight), self.info_open && self.info_page == Page::Flight),
                 (Icon::GoTo, t!("Go to", "Aller"), t!("Go to", "Aller à"), Bar::Page(Page::Places), self.info_open && self.info_page == Page::Places),
                 (Icon::Radio, t!("Radio", "Radio"), t!("Radio", "Radio"), Bar::Page(Page::Radio), self.info_open && self.info_page == Page::Radio),
+                (Icon::Autopilot, t!("Autopilot", "Auto"), t!("Autopilot", "Pilote auto"), Bar::Page(Page::Autopilot), self.info_open && self.info_page == Page::Autopilot),
                 (Icon::Weather, t!("Weather", "Météo"), t!("Weather", "Météo"), Bar::Page(Page::Weather), self.info_open && self.info_page == Page::Weather),
                 (Icon::Map, t!("Map", "Carte"), t!("Map", "Carte"), Bar::Map, self.minimap.visible),
                 (Icon::Camera, t!("Camera", "Caméra"), t!("Camera (C)", "Caméra (C)"), Bar::Camera, false),
             ];
-            let bs = BTN_W - 18.0;
-            let gap = (TAPE_H - 20.0 - bs * items.len() as f32) / (items.len() - 1) as f32;
+            // as big as fits with a 6 pt gap between them.
+            let n = items.len() as f32;
+            let bs = (BTN_W - 18.0).min((TAPE_H - 20.0 - 6.0 * (n - 1.0)) / n);
+            let gap = (TAPE_H - 20.0 - bs * n) / (n - 1.0);
             for (k, (ic, label, tip, act, on)) in items.into_iter().enumerate() {
-                let br = Rect::from_min_size(pos2(panel.left() + 9.0, panel.top() + 10.0 + k as f32 * (bs + gap)), vec2(bs, bs));
+                let br = Rect::from_min_size(pos2(panel.left() + (BTN_W - bs) * 0.5, panel.top() + 10.0 + k as f32 * (bs + gap)), vec2(bs, bs));
                 let resp = ui.interact(br, ui.scope_id().with(("hud_btn", k)), Sense::click()).on_hover_text(tip);
                 resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, tip));
                 let lit = menu::ease(ctx, resp.id, resp.hovered() || resp.has_focus());
@@ -906,7 +947,8 @@ impl Game {
     /// Bottom centre, stacked upwards: the approach line, the alerts, and what
     /// has broken. `lift`: room kept under it (the radio instruments).
     pub(crate) fn alerts(&self, ctx: &egui::Context, warn: &[(&str, Color32)], report: &[String], guidance: Option<&(String, u8)>, lift: f32) {
-        if warn.is_empty() && report.is_empty() && guidance.is_none() {
+        let ap = self.ap.on || self.real - self.ap_off_t < 4.0;
+        if warn.is_empty() && report.is_empty() && guidance.is_none() && !ap {
             return;
         }
         egui::Area::new(egui::Id::unique("hud_alerts")).anchor(Align2::CENTER_BOTTOM, [0.0, -16.0 - lift]).interactable(false).show(ctx, |ui| {
@@ -923,6 +965,7 @@ impl Game {
                         });
                     });
                 }
+                self.ap_strip(ui);
                 if !warn.is_empty() {
                     ui.horizontal(|ui| {
                         for (w, col) in warn {
@@ -937,8 +980,12 @@ impl Game {
                     frosted(ui, glass(), |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         ui.label(tag_text(t!("Damage", "Dégâts")).color(AMBER));
-                        for l in report {
+                        // at most six lines, then how many more.
+                        for l in report.iter().take(6) {
                             ui.label(RichText::new(l.as_str()).font(num_s()).color(Color32::WHITE));
+                        }
+                        if report.len() > 6 {
+                            ui.label(RichText::new(format!("+{}", report.len() - 6)).font(num_s()).color(SOFT));
                         }
                     });
                 }

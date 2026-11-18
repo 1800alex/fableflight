@@ -101,6 +101,7 @@ struct Globals {
   // (+ fly right), glide slope needle -1..1 (+ fly up), OBS (deg), flags (1
   // alive, 2 TO, 4 FROM, 8 glide slope alive).
   nav: vec4f,
+  cockpit: array<vec4f, 8>,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -1496,17 +1497,17 @@ fn road_surface(across: f32, along: f32, half: f32, kind: u32, endd: f32, app: f
     let sl = stripe(fract(along / 0.65) - 0.5, 0.36, fw / 0.65) * step(ax, 1.25);
     col = mix(col, vec3f(0.09, 0.075, 0.06), sl);
     col = mix(col, vec3f(0.42, 0.40, 0.38), stripe(ax - 0.72, 0.09, fw));
-    return vec4f(col, edge * 0.9);
+    return vec4f(col, edge);
   }
   if (rclass == 7u) {
     // Dirt track: two worn ruts, ragged edges.
     let rut = stripe(ax - 0.8, 0.5, fw);
     let col = mix(vec3f(0.20, 0.16, 0.11), vec3f(0.27, 0.22, 0.16), rut) * (0.75 + 0.5 * n2);
-    return vec4f(col, clamp((half - ax + (n2 - 0.5) * 0.9) / max(fw, 0.25), 0.0, 1.0) * 0.7);
+    return vec4f(col, clamp((half - ax + (n2 - 0.5) * 0.9) / max(fw, 0.25), 0.0, 1.0));
   }
   if (rclass == 8u) {
     let col = vec3f(0.30, 0.29, 0.27) * (0.8 + 0.4 * n2);
-    return vec4f(col, edge * 0.8);
+    return vec4f(col, edge);
   }
   // Asphalt, newer and darker on the big roads.
   var tone = 0.050;
@@ -1599,7 +1600,9 @@ fn road_surface(across: f32, along: f32, half: f32, kind: u32, endd: f32, app: f
     mk *= 0.55 + 0.45 * smoothstep(0.3, 0.6, n2);
     col = mix(col, mcol, mk);
   }
-  return vec4f(col, edge * 0.9);
+  // Asphalt and markings are solid; only the feathered outer edge blends
+  // against terrain. A constant 0.9 made the ground show through every road.
+  return vec4f(col, edge);
 }
 
 // Street lights: must match `lamp_spec` in roads.rs. Returns the light landing

@@ -7,7 +7,7 @@
 use super::tools;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -16,6 +16,9 @@ pub const DEFAULT_PORT: u16 = 42761;
 
 /// How long a tool may take before the bridge gives up.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The longest request line we read (the bridge's are a few hundred bytes).
+const MAX_LINE: u64 = 1 << 20;
 
 /// One tool call for the game thread.
 pub struct Call {
@@ -58,14 +61,24 @@ fn handle(stream: TcpStream, tx: Sender<Call>) {
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        match (&mut reader).take(MAX_LINE).read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
             Err(_) => break,
         }
+        // (a line that long is not one of the bridge's)
+        if line.len() as u64 >= MAX_LINE && !line.ends_with('\n') {
+            break;
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        // The bridge only ever sends JSON objects. Anything else is another
+        // program on this port (a web page's HTTP request, say): hang up
+        // before reading whatever it sends next.
+        if !line.starts_with('{') {
+            break;
         }
         let Some(response) = response(line, &tx) else { continue };
         let mut text = match serde_json::to_string(&response) {
@@ -155,5 +168,23 @@ mod tests {
         assert_eq!(answer["result"]["isError"], false);
         assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("\"ok\""));
         game.join().unwrap();
+    }
+
+    /// A web page can make a browser send an HTTP request here whose body is
+    /// a tool call. The request line is not JSON: the connection closes and
+    /// the body is never read.
+    #[test]
+    fn http_request_is_hung_up_on() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let calls = serve_listener(listener).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = stream.write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/plain\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"set_gear\",\"arguments\":{}}}\n");
+        let _ = stream.flush();
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        assert!(answer.is_empty(), "answered an HTTP request: {}", String::from_utf8_lossy(&answer));
+        assert!(calls.recv_timeout(Duration::from_millis(300)).is_err(), "the tool call in the HTTP body reached the game");
     }
 }

@@ -112,6 +112,7 @@ Units are feet, knots, ft/min, degrees true, hPa and kg.
 | `set_aircraft_config` | Throttle/power lever, flap notch or one-notch move, gear, speedbrake/braking parachute, parking brake, mixture (pistons) and pitch trim. |
 | `set_engine` | Normal start/stop, ignition or fuel control, and the jet starters. |
 | `set_radios` | NAV1 by ident or VOR frequency, ADF by ident or kHz, OBS, and the altimeter setting (a value, or `"qnh"`). |
+| `set_autopilot` | Engage or disconnect the autopilot; lateral mode (`hdg`, `nav`, `apr`, `roll`), vertical mode (`alt`, `vs`, `pitch`), heading bug, preselected altitude, vertical speed, autothrottle and its speed. `get_aircraft_state` reports it under `autopilot`. |
 | `set_environment` | Clouds, cloud base/depth, storms, mid-level cloud, visibility, wind and gusts, time of day, day of year, clock rate, live weather and real time. Setting weather turns live weather off; setting the clock turns real time off unless asked otherwise. |
 | `place_aircraft` | An airport code with an optional runway or final approach, or an airborne latitude/longitude/altitude/heading/speed. Airport placement loads the layout in the background. |
 
@@ -130,6 +131,9 @@ FableFlight config folder's `screenshots` directory.
 - The stick is deliberately not writable: the human pilot keeps positive
   control of attitude.  The copilot can set the throttle; the pilot's own
   throttle input from the keys, gamepad or a bound lever takes it back.
+- The copilot can engage the autopilot (`set_autopilot`), which then flies
+  the attitude; a firm input on the controls disconnects it at once, as in
+  the aircraft, and the pilot's small inputs still add to it.
 - A tool call is processed on the game thread at the start of the next frame,
   so reads are live rather than cached.  When the game is paused or in the
   menu, read tools still work; `place_aircraft` can start or move a flight.

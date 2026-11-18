@@ -40,7 +40,11 @@ const VOL_CELLS: u64 = (VOL_N[0] * VOL_N[1] * VOL_N[2]) as u64;
 const UB_ALIGN: u64 = 256;
 const MAX_TILES: u64 = 1024;
 const MAX_BUILDS: u64 = 512; // detail tiles; one extra slot is kept for loose trees
-const MAX_OBJS: u64 = 256;
+/// Bytes between objects' uniforms: two dynamic-offset alignments, as `ObjU`
+/// outgrew one when the aircraft's dent and wing bending were added.
+const OBJ_STRIDE: u64 = 2 * UB_ALIGN;
+/// pieces of aircraft (ours, wreckage, the other players') drawn in a frame
+pub const MAX_OBJS: u64 = 1024;
 /// airfields drawn at once, and lights on moving things (aircraft)
 pub const MAX_FIELDS: usize = 8;
 pub const MAX_DYN_LIGHTS: usize = 8192;
@@ -190,6 +194,8 @@ pub struct Globals {
     /// (+ fly right), glide slope needle -1..1 (+ fly up), OBS (degrees),
     /// flags (1 alive, 2 TO, 4 FROM, 8 glide slope alive)
     pub nav: [f32; 4],
+    /// Cessna instruments, radio receivers and heading-up navigation plot.
+    pub cockpit: [[f32; 4]; 8],
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).
@@ -522,7 +528,12 @@ struct ObjU {
     tear: [[f32; 4]; 2],
     dmg: [f32; 4],
     dmg2: [f32; 4],
+    crumple: [f32; 4],
+    crumple_dir: [f32; 4],
+    pose: [[f32; 4]; 3],
+    flex: [f32; 4],
 }
+const _: () = assert!(std::mem::size_of::<ObjU>() <= OBJ_STRIDE as usize);
 
 /// An airfield's pavement and lights on the GPU.
 pub struct FieldGpu {
@@ -535,6 +546,14 @@ pub struct FieldGpu {
 pub struct TileGpu {
     vbuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
+}
+/// The cells of the terrain tiles' tessellated blocks (world.rs `tess_cells`),
+/// each `cell | k << 16` for a 2^k x 2^k patch (terrain.wgsl `vs_tess`), in
+/// groups of (tile index in `Frame::tiles`, k, first, count).
+#[derive(Default)]
+pub struct TessCells {
+    pub cells: Vec<u32>,
+    pub groups: Vec<(u32, u32, u32, u32)>,
 }
 /// A photorealistic 3D tile (tiles3d.rs) on the GPU.
 pub struct PhotoGpu {
@@ -723,16 +742,28 @@ pub struct DrawObj {
     pub dmg: [f32; 4],
     /// oil film on the windshield, crack centre z and y, crack size
     pub dmg2: [f32; 4],
+    /// a lasting dent (damage.rs `crumple`): its centre (body frame) and radius (m)
+    pub crumple: [f32; 4],
+    /// the dent's push direction into the airframe (body frame) and depth (m)
+    pub crumple_dir: [f32; 4],
+    /// the top three rows of the piece's pose (mesh frame to body frame), so
+    /// the dent and the wing bending can be worked out in the body frame
+    pub pose: [[f32; 4]; 3],
+    /// wing bending: tip deflection over the half-span squared (1/m), 0 for
+    /// anything that is not part of a wing
+    pub flex: f32,
 }
 
 impl DrawObj {
-    pub const DEFAULT: DrawObj = DrawObj { mesh: 0, model: Mat4::IDENTITY, tint: [0.0; 4], glow: [0.0; 4], params: [[0.0; 4]; 6], cast: 0, glass: false, cut: false, tear: [[0.0; 4]; 2], dmg: [0.0; 4], dmg2: [0.0; 4] };
+    pub const DEFAULT: DrawObj = DrawObj { mesh: 0, model: Mat4::IDENTITY, tint: [0.0; 4], glow: [0.0; 4], params: [[0.0; 4]; 6], cast: 0, glass: false, cut: false, tear: [[0.0; 4]; 2], dmg: [0.0; 4], dmg2: [0.0; 4], crumple: [0.0; 4], crumple_dir: [0.0; 4], pose: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], flex: 0.0 };
 }
 
 pub struct Frame<'a> {
     pub g: Globals,
     /// terrain tile and its uniform: offset, info, tessellated cell block (see terrain.wgsl)
     pub tiles: Vec<(&'a TileGpu, [f32; 12])>,
+    /// the cells of those blocks, by the patch they are drawn with
+    pub tess: TessCells,
     pub details: Vec<DetailDraw<'a>>,
     /// photorealistic 3D tiles: offset from the camera and geometric error,
     /// then their level-of-detail crossfade (photo.wgsl `PhotoTile`)
@@ -945,9 +976,13 @@ pub struct Renderer {
     p_terrain: wgpu::RenderPipeline,
     p_terrain_tess: wgpu::RenderPipeline,
     p_terrain_cells: wgpu::RenderPipeline,
-    /// index buffers of a tessellated cell patch and of a single cell quad
+    /// index buffers of the tessellated cell patches (1, 2, 4 .. TESS_N sub-cells
+    /// across, where each starts and ends), and of a single cell quad
     tess_ibuf: wgpu::Buffer,
-    tess_nidx: u32,
+    tess_idx: [std::ops::Range<u32>; 5],
+    /// per tessellated cell: which, and its patch (`TessCells`), and room for so many
+    tess_buf: wgpu::Buffer,
+    tess_cap: usize,
     cell_ibuf: wgpu::Buffer,
     p_build: wgpu::RenderPipeline,
     /// the same without any discard in the fragment shader (`fs_whole`)
@@ -959,6 +994,8 @@ pub struct Renderer {
     p_obj_shadow_solid: wgpu::RenderPipeline,
     p_glass: wgpu::RenderPipeline,
     p_composite: wgpu::RenderPipeline,
+    /// the composite again, sample by sample, where water shares a pixel
+    p_composite_edge: wgpu::RenderPipeline,
     p_cloud: wgpu::RenderPipeline,
     p_cloud_apply: wgpu::RenderPipeline,
     p_cloud_temporal: wgpu::RenderPipeline,
@@ -1494,6 +1531,7 @@ impl Renderer {
         config.format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
         config.present_mode = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
         surface.configure(&device, &config);
+        log::info!("surface {:?}, final passes {}", config.format, if direct_out(&config) { "straight to it" } else { "via a blit" });
 
         let d = &device;
         let common = include_str!("shaders/common.wgsl");
@@ -1827,6 +1865,7 @@ impl Renderer {
             mix: ([0; 8], 1.0),
         };
         let p_composite = full("composite", &pl(&l_composite), &m_comp, "fs", HDR, None);
+        let p_composite_edge = full("composite edge", &pl(&l_composite), &m_comp, "fs_edge", HDR, None);
         let p_gtao = full("gtao", &pl(&l_ao), &m_ao, "fs_gtao", AMB, None);
         let p_ao_blur = full("ao blur", &pl(&l_ao), &m_ao, "fs_blur", AMB, None);
         let p_cloud = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1854,10 +1893,10 @@ impl Renderer {
         let p_frost_out = full("frost out", &pl(&l_post), &m_post, "fs_up", HDR, None);
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let p_up = full("up", &pl(&l_post), &m_post, "fs_up", HDR, Some(wgpu::BlendState { color: add, alpha: add }));
-        let p_final = full("final", &pl(&l_post), &m_post, "fs_final", wgpu::TextureFormat::Rgba8Unorm, None);
-        let p_final_taa = full("final taa", &pl(&l_post), &m_post, "fs_final_taa", wgpu::TextureFormat::Rgba8Unorm, None);
+        let p_final = full("final", &pl(&l_post), &m_post, "fs_final", out_format(&config), None);
+        let p_final_taa = full("final taa", &pl(&l_post), &m_post, "fs_final_taa", out_format(&config), None);
         let invert = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::OneMinusDst, dst_factor: wgpu::BlendFactor::OneMinusSrc, operation: wgpu::BlendOperation::Add };
-        let p_logo = full("logo", &pl(&l_post), &m_post, "fs_logo", wgpu::TextureFormat::Rgba8Unorm, Some(wgpu::BlendState { color: invert, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }));
+        let p_logo = full("logo", &pl(&l_post), &m_post, "fs_logo", out_format(&config), Some(wgpu::BlendState { color: invert, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }));
         let p_blit = full("blit", &pl(&l_post), &m_post, if config.format.is_srgb() { "fs_blit_srgb" } else { "fs_blit" }, config.format, None);
         let pm = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
         let p_particles = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1956,7 +1995,8 @@ impl Renderer {
         const A_INST: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
         let p_terrain = geom("terrain", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 0);
         // Mode 8: cells near the camera as tessellated patches; 9: the rest of such a tile.
-        let p_terrain_tess = geom("terrain tess", Some(&l_tile), &m_terrain, &[], 8);
+        let tess_layout = wgpu::VertexBufferLayout { array_stride: 4, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Uint32] };
+        let p_terrain_tess = geom("terrain tess", Some(&l_tile), &m_terrain, &[Some(tess_layout)], 8);
         let p_terrain_cells = geom("terrain cells", Some(&l_tile), &m_terrain, &[], 9);
         let p_build = geom("build", Some(&l_build), &m_build, &[vb(40, false, &A_BUILD)], 0);
         let p_build_whole = geom("build whole", Some(&l_build), &m_build, &[vb(40, false, &A_BUILD)], 14);
@@ -2142,7 +2182,7 @@ impl Renderer {
 
         // ---- per-draw uniform pools
         let pool = |label: &str, n: u64| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: n * UB_ALIGN, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let (tile_ub, build_ub, obj_ub, casc_ub) = (pool("tiles", MAX_TILES), pool("builds", MAX_BUILDS + 1 + MAX_FIELDS as u64), pool("objs", MAX_OBJS), pool("cascades", CASCADES as u64 + 4));
+        let (tile_ub, build_ub, obj_ub, casc_ub) = (pool("tiles", MAX_TILES), pool("builds", MAX_BUILDS + 1 + MAX_FIELDS as u64), pool("objs", MAX_OBJS * OBJ_STRIDE / UB_ALIGN), pool("cascades", CASCADES as u64 + 4));
         let photo_ub = pool("photo tiles", MAX_PHOTO);
         let bg_tileu = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_tileu, entries: &[buf_res(0, &build_ub, 48)] });
         let bg_casc = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_casc, entries: &[buf_res(0, &casc_ub, 64)] });
@@ -2167,7 +2207,15 @@ impl Renderer {
             }
             v
         };
-        let (tix, cix) = (patch(TESS_N), patch(1));
+        let (mut tix, mut tess_idx) = (Vec::new(), std::array::from_fn(|_| 0..0));
+        for (k, r) in tess_idx.iter_mut().enumerate() {
+            let p = patch(1 << k);
+            *r = tix.len() as u32..(tix.len() + p.len()) as u32;
+            tix.extend(p);
+        }
+        debug_assert_eq!(1 << (tess_idx.len() - 1), TESS_N);
+        let cix = patch(1);
+        let (tess_cap, tess_buf) = (4096, dynbuf("tess cells", 4096 * 4));
         let tess_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("tess idx"), contents: bytemuck::cast_slice(&tix), usage: wgpu::BufferUsages::INDEX });
         let cell_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cell idx"), contents: bytemuck::cast_slice(&cix), usage: wgpu::BufferUsages::INDEX });
 
@@ -2185,7 +2233,7 @@ impl Renderer {
         let bg_vol_b = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_vol_b, entries: &[buf_res(0, &psim_ub, 0), tex_res(6, &vol_dens), tex_res(7, &vol_light)] });
         let fluid = crate::fluid::FluidGpu::new(d, &l0, common, &vol_acc);
 
-        let egui = egui_wgpu::Renderer::new(d, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
+        let egui = egui_wgpu::Renderer::new(d, out_format(&config), egui_wgpu::RendererOptions::default());
         let targets = Self::make_targets(d, &config, (config.width, config.height), &l_dres, &l_ao, &l_composite, &l_cloud, &l_cloud_apply, &l_cloud_temporal, &l_post, &l_pdraw, &l_glass, &psim_ub, &pbuf, &black);
         let fluid_t = fluid.draw_targets(d, &targets.depth, config.width, config.height);
         // The transmittance and multi-scatter tables depend only on the planet
@@ -2207,7 +2255,7 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, gclouds_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_composite_edge, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
@@ -2238,7 +2286,7 @@ impl Renderer {
         let cloud_hist = [view(&make_tex(d, "cloud hist 0", cw, ch, 1, 1, HDR, rt)), view(&make_tex(d, "cloud hist 1", cw, ch, 1, 1, HDR, rt))];
         let bloom_tex = make_tex(d, "bloom", (w / 2).max(64), (h / 2).max(64), 1, BLOOM_MIPS, HDR, rt);
         let bloom: Vec<_> = (0..BLOOM_MIPS).map(|i| bloom_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
-        let ldr_tex = make_tex(d, "ldr", ow, oh, 1, 1, wgpu::TextureFormat::Rgba8Unorm, rt | wgpu::TextureUsages::COPY_SRC);
+        let ldr_tex = make_tex(d, "ldr", ow, oh, 1, 1, out_format(config), rt | wgpu::TextureUsages::COPY_SRC);
         let ldr = view(&ldr_tex);
         let frost_tex = make_tex(d, "frost", (ow / 2).max(16), (oh / 2).max(16), 1, FROST_MIPS, HDR, rt);
         let frost: Vec<_> = (0..FROST_MIPS).map(|i| frost_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
@@ -2660,6 +2708,13 @@ impl Renderer {
             blob[i * 256..i * 256 + 48].copy_from_slice(bytemuck::bytes_of(u));
         }
         q.write_buffer(&self.tile_ub, 0, &blob);
+        if f.tess.cells.len() > self.tess_cap {
+            self.tess_cap = f.tess.cells.len().next_power_of_two();
+            self.tess_buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tess cells"), size: self.tess_cap as u64 * 4, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        }
+        if !f.tess.cells.is_empty() {
+            q.write_buffer(&self.tess_buf, 0, bytemuck::cast_slice(&f.tess.cells));
+        }
         if let Some(px) = &f.glow {
             let n = crate::skyglow::N as u32;
             q.write_texture(
@@ -2759,10 +2814,11 @@ impl Renderer {
         let n_near = f.near.len().min(MAX_NEAR);
         q.write_buffer(&self.near_buf, 0, bytemuck::cast_slice(&f.near[..n_near]));
         let loose_slot = n_builds as u32 * 256;
-        let mut blob = vec![0u8; n_objs * UB_ALIGN as usize];
+        let stride = OBJ_STRIDE as usize;
+        let mut blob = vec![0u8; n_objs * stride];
         for (i, o) in f.objs.iter().take(n_objs).enumerate() {
-            let u = ObjU { model: o.model.to_cols_array_2d(), tint: o.tint, glow: o.glow, params: o.params, tear: o.tear, dmg: o.dmg, dmg2: o.dmg2 };
-            blob[i * 256..i * 256 + std::mem::size_of::<ObjU>()].copy_from_slice(bytemuck::bytes_of(&u));
+            let u = ObjU { model: o.model.to_cols_array_2d(), tint: o.tint, glow: o.glow, params: o.params, tear: o.tear, dmg: o.dmg, dmg2: o.dmg2, crumple: o.crumple, crumple_dir: o.crumple_dir, pose: o.pose, flex: [o.flex, 0.0, 0.0, 0.0] };
+            blob[i * stride..i * stride + std::mem::size_of::<ObjU>()].copy_from_slice(bytemuck::bytes_of(&u));
         }
         q.write_buffer(&self.obj_ub, 0, &blob);
 
@@ -3081,7 +3137,7 @@ impl Renderer {
                 if m.n_idx == 0 {
                     continue;
                 }
-                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[i as u32 * 256]);
+                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[(i as u64 * OBJ_STRIDE) as u32]);
                 rp.set_vertex_buffer(0, m.vbuf.slice(..));
                 rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 // the lean shader for the kind flown, the full one for the instruments.
@@ -3246,7 +3302,7 @@ impl Renderer {
                     if m.n_idx == 0 {
                     continue;
                 }
-                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[i as u32 * 256]);
+                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[(i as u64 * OBJ_STRIDE) as u32]);
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
                     rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     rp.draw_indexed(0..m.n_idx, 0, 0..1);
@@ -3296,6 +3352,7 @@ impl Renderer {
                 let first = if tess(u) { (crate::sources::GRID * crate::sources::GRID * 6) as u32 } else { 0 };
                 rp.draw_indexed(first..self.tile_nidx, 0, 0..1);
             }
+            let mut groups = f.tess.groups.iter().peekable();
             for (i, (tile, u)) in f.tiles.iter().take(n_tiles).enumerate() {
                 if !tess(u) {
                     continue;
@@ -3304,9 +3361,14 @@ impl Renderer {
                 rp.set_pipeline(&self.p_terrain_cells);
                 rp.set_index_buffer(self.cell_ibuf.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..6, 0, 0..(crate::sources::GRID * crate::sources::GRID) as u32);
+                // Each cell of the block as the smallest patch that makes the same triangles.
                 rp.set_pipeline(&self.p_terrain_tess);
                 rp.set_index_buffer(self.tess_ibuf.slice(..), wgpu::IndexFormat::Uint16);
-                rp.draw_indexed(0..self.tess_nidx, 0, 0..(u[10] * u[11]) as u32);
+                while groups.next_if(|g| (g.0 as usize) < i).is_some() {}
+                while let Some(&(_, k, first, n)) = groups.next_if(|g| g.0 as usize == i) {
+                    rp.set_vertex_buffer(0, self.tess_buf.slice(first as u64 * 4..(first + n) as u64 * 4));
+                    rp.draw_indexed(self.tess_idx[k as usize].clone(), 0, 0..n);
+                }
             }
             // Airfield pavement, then roads, straight onto the terrain.
             rp.set_pipeline(&self.p_field);
@@ -3352,6 +3414,7 @@ impl Renderer {
         }
         mark(&mut enc, "resolve+ao");
         full(&mut enc, &t.hdr, true, &self.p_composite, &t.bg_composite);
+        full(&mut enc, &t.hdr, false, &self.p_composite_edge, &t.bg_composite);
         mark(&mut enc, "composite");
         // Lights over the lit scene, under the clouds.
         if n_fields > 0 || n_dyn > 0 {
@@ -3455,7 +3518,7 @@ impl Renderer {
                 if m.n_idx == 0 {
                     continue;
                 }
-                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[i as u32 * 256]);
+                rp.set_bind_group(1, m.bind.as_deref().unwrap_or(&self.bg_obj), &[(i as u64 * OBJ_STRIDE) as u32]);
                 rp.set_vertex_buffer(0, m.vbuf.slice(..));
                 rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..m.n_idx, 0, 0..1);
@@ -3475,7 +3538,12 @@ impl Renderer {
         for i in (0..BLOOM_MIPS as usize - 1).rev() {
             full(&mut enc, &t.bloom[i], false, &self.p_up, &t.bg_up[i]);
         }
-        full(&mut enc, &t.ldr, true, if taa { &self.p_final_taa } else { &self.p_final }, &t.bg_final[src]);
+        // The tonemap, UI and title go straight into the window's frame when
+        // it takes them as they are; `ldr` and a copy to the window otherwise,
+        // and for screenshots, which read `ldr` back.
+        let direct = sview.as_ref().filter(|_| f.shot.is_none() && direct_out(&self.config));
+        let out = direct.unwrap_or(&t.ldr);
+        full(&mut enc, out, true, if taa { &self.p_final_taa } else { &self.p_final }, &t.bg_final[src]);
 
         // The frosted glass: the finished frame shrunk and blurred, for the HUD
         // to draw behind its panels (egui then draws over the frame itself).
@@ -3492,7 +3560,7 @@ impl Renderer {
             (jobs, delta, sd)
         });
         if let Some((jobs, _, sd)) = &egui_jobs {
-            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.ldr, false))], None)).forget_lifetime();
+            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(out, false))], None)).forget_lifetime();
             self.egui.render(&mut rp, jobs, sd);
         }
         if let Some(scale) = f.logo {
@@ -3502,11 +3570,14 @@ impl Renderer {
                 self.queue.write_texture(t.logo_tex.as_image_copy(), &m, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: Some(h) }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
                 self.logo_key = Some((w, h, scale.to_bits()));
             }
-            full(&mut enc, &t.ldr, false, &self.p_logo, &t.bg_logo);
+            full(&mut enc, out, false, &self.p_logo, &t.bg_logo);
         }
-        if let Some(sview) = &sview {
+        mark(&mut enc, "post+ui");
+        if let Some(sview) = sview.as_ref().filter(|_| direct.is_none()) {
             full(&mut enc, sview, true, &self.p_blit, &t.bg_blit);
+            mark(&mut enc, "blit");
         }
+        let bgra = out_format(&self.config) == wgpu::TextureFormat::Bgra8Unorm;
         let shot = f.shot.map(|path| {
             let (w, h) = (self.config.width, self.config.height);
             let row = (w * 4).div_ceil(256) * 256;
@@ -3516,11 +3587,10 @@ impl Renderer {
                 wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
-            (path, buf, w, h, row)
+            (path, buf, w, h, row, bgra)
         });
         let t_sub = std::time::Instant::now();
         self.stats[2] += (t_sub - t_enc).as_secs_f64();
-        mark(&mut enc, "post+ui");
         if let Some(g) = gt.as_mut() {
             g.resolve(&mut enc);
         }
@@ -3543,7 +3613,7 @@ impl Renderer {
                 self.egui.free_texture(&id);
             }
         }
-        if let Some((path, buf, w, h, row)) = shot {
+        if let Some((path, buf, w, h, row, bgra)) = shot {
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
             let data = buf.slice(..).get_mapped_range().expect("mapped");
@@ -3551,12 +3621,31 @@ impl Renderer {
             for y in 0..h as usize {
                 img.as_flat_samples_mut().samples[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(&data[y * row as usize..y * row as usize + w as usize * 4]);
             }
+            if bgra {
+                for p in img.pixels_mut() {
+                    p.0.swap(0, 2);
+                }
+            }
             match image::DynamicImage::ImageRgba8(img).to_rgb8().save(&path) {
                 Ok(_) => log::info!("saved screenshot {}", path.display()),
                 Err(e) => log::error!("screenshot failed: {e}"),
             }
         }
     }
+}
+
+/// The format the tonemap, UI and title are drawn in: the window's own when it
+/// is plain 8-bit unorm (the same bytes either way, so they can be drawn
+/// straight into it), RGBA8 otherwise, which `fs_blit`/`fs_blit_srgb` convert.
+fn out_format(config: &wgpu::SurfaceConfiguration) -> wgpu::TextureFormat {
+    match config.format {
+        f @ (wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm) => f,
+        _ => wgpu::TextureFormat::Rgba8Unorm,
+    }
+}
+/// Whether the final passes can draw into the window's frame without the blit.
+fn direct_out(config: &wgpu::SurfaceConfiguration) -> bool {
+    out_format(config) == config.format && config.usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
 }
 
 fn color_att(view: &wgpu::TextureView, clear: bool) -> wgpu::RenderPassColorAttachment<'_> {

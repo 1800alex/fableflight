@@ -29,6 +29,9 @@ pub struct Controls {
     pub yaw: f64,   // +1 = nose right
     pub throttle: f64,
     pub brake: bool,
+    /// Independent toe-brake pressure, 0..1.
+    pub brake_left: f64,
+    pub brake_right: f64,
     pub boost: bool,
     /// thrust reversers (on the ground, jets)
     pub reverse: bool,
@@ -46,6 +49,28 @@ pub struct Impact {
     pub ground_h: f64,
     /// the building that was hit, if any (tile, footprint index)
     pub building: Option<(geo::TileId, usize)>,
+}
+
+/// Positions around the piston aircraft's selector. The centre feed is BOTH
+/// on the 172RG and the main fuselage tank on the Régent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FuelSelector {
+    Center,
+    Right,
+    Off,
+    Left,
+}
+
+impl FuelSelector {
+    pub fn turn(self, clockwise: bool) -> Self {
+        use FuelSelector::*;
+        match (self, clockwise) {
+            (Center, true) | (Off, false) => Right,
+            (Right, true) | (Left, false) => Off,
+            (Off, true) | (Center, false) => Left,
+            (Left, true) | (Right, false) => Center,
+        }
+    }
 }
 
 pub struct Plane {
@@ -91,6 +116,17 @@ pub struct Plane {
     /// a jet's starter engaged (it stays in until the engine is up to idle),
     /// and an automatic start under way (seconds it still has)
     pub starter_on: bool,
+    /// the starter is turning the engine over this instant (the key at START)
+    pub cranking: bool,
+    /// the parking brake is set (it holds the wheel brakes on)
+    pub parking_brake: bool,
+    pub toe_brake: [f64; 2],
+    pub landing_lights: bool,
+    pub fuel_selector: FuelSelector,
+    pub engine_hours: f64,
+    pub propeller: f64,
+    prop_coarse: f64,
+    pub cowl_flaps: f64,
     auto_start: f64,
     /// the electrical system and the failures (systems.rs)
     pub sys: crate::systems::Systems,
@@ -179,6 +215,11 @@ pub struct Plane {
     fold_tq: [f64; 2],
     /// how far a ditched aircraft has settled into the water
     sink: f64,
+    /// wing tip deflection from the modelled (1 g) shape (m), left then right;
+    /// drawn only (see `flex_wings`)
+    pub wing_flex: [f64; 2],
+    /// wing flex rate of change (m/s)
+    wing_flex_v: [f64; 2],
     /// what made it go up in flames, once it has
     pub cause: &'static str,
     /// a rocket (plane/rocket.rs): the stage it is flying on (0 the whole
@@ -243,6 +284,15 @@ impl Plane {
             mixture: 1.0,
             running: true,
             starter_on: false,
+            cranking: false,
+            parking_brake: false,
+            toe_brake: [0.0; 2],
+            landing_lights: true,
+            fuel_selector: FuelSelector::Center,
+            engine_hours: 1834.6,
+            propeller: 1.0,
+            prop_coarse: 0.0,
+            cowl_flaps: 1.0,
             auto_start: 0.0,
             sys: Default::default(),
             payload: spec.payload[0],
@@ -295,6 +345,8 @@ impl Plane {
             cool: [0.0; 4],
             fold_tq: [0.0; 2],
             sink: 0.0,
+            wing_flex: [0.0; 2],
+            wing_flex_v: [0.0; 2],
             cause: "",
             stage: 0,
             lit: 0,
@@ -461,6 +513,10 @@ impl Plane {
     pub fn flap_notch_deg(&self) -> f64 {
         self.spec.flaps.get(self.flap_set as usize).copied().unwrap_or(0.0)
     }
+    fn brake_pressure(&self, c: &Controls, side: f64) -> f64 {
+        if c.brake || self.parking_brake { 1.0 } else if side < 0.0 { c.brake_left.clamp(0.0, 1.0) } else { c.brake_right.clamp(0.0, 1.0) }
+    }
+
     pub fn toggle_gear(&mut self) {
         // The squat switch blocks retraction on the ground. (A rocket has none to raise.)
         if !(self.gear_down && self.on_ground) && self.spec.rocket().is_none() && !self.spec.fixed_gear() {
@@ -569,6 +625,15 @@ impl Plane {
             Input::Prop => (self.prop % std::f64::consts::TAU) as f32,
             Input::Throttle => self.throttle as f32,
             Input::Trim => self.trim as f32,
+            Input::Master => self.sys.elec.master as u8 as f32,
+            Input::Ignition => if self.starter_on || self.cranking { 1.5 } else if self.ignition { 1.0 } else { 0.0 },
+            Input::Mixture => self.mixture as f32,
+            Input::ParkingBrake => self.parking_brake as u8 as f32,
+            Input::Brake(side) => self.toe_brake[if side < 0.0 { 0 } else { 1 }] as f32,
+            Input::LandingLights => self.landing_lights as u8 as f32,
+            Input::FuelValve => self.fuel_selector as u8 as f32,
+            Input::PropControl => self.propeller as f32,
+            Input::CowlFlaps => self.cowl_flaps as f32,
             Input::Reverser => self.reverser as f32,
             Input::Mach => self.mach() as f32,
             Input::Canopy => self.canopy as f32,
@@ -784,6 +849,111 @@ impl Plane {
         self.cause = cause;
         self.release_folds();
         Some(imp)
+    }
+    /// A hard hit at body point `r` (contact velocity `pv`, ground normal
+    /// `upw`, closing at `closing` m/s) leaves a lasting dent there.
+    ///
+    /// Sizes follow the square-cube law: geometrically similar airframes crush
+    /// at a force that grows with area (L²) while their mass grows with L³, so
+    /// the deceleration the structure can hold falls as 1/L and the crush depth
+    /// for a given closing speed grows with L: depth = v² L/L₀ / (2 a₀), with
+    /// a₀ = 30 g for a light aircraft (L₀ = an 11 m span). That gives about
+    /// 8 cm at 7 m/s and 25 cm at 12 m/s on a Cessna 172; a 747 about 0.4 m at
+    /// 6 m/s. The bowl spans a fuselage-sized patch, 0.4 to 0.9 of a light
+    /// aircraft's width scaled the same way, and is never deeper than a
+    /// quarter of its radius. (Estimates for the look: no crash test data.)
+    /// It is pushed in along the contact force, the ground's normal leaning
+    /// back against the slide as friction does.
+    fn dent(&mut self, r: DVec3, pv: DVec3, upw: DVec3, closing: f64) {
+        let ls = (self.scale() as f64).max(0.3);
+        let depth = closing * closing * ls / (2.0 * 30.0 * 9.81);
+        let radius = ((0.35 + 0.04 * closing) * ls).min(0.9 * ls);
+        let slide = pv - upw * pv.dot(upw);
+        let force = upw - slide.normalize_or_zero() * 0.4;
+        self.record_crumple(r, self.rot.inverse() * force, radius as f32, depth.min(radius * 0.25) as f32);
+    }
+    /// Add plastic damage to the strongest current dent. Repeated hits near
+    /// it deepen the same crush zone; a separate weak tap cannot erase it.
+    fn record_crumple(&mut self, center: DVec3, direction: DVec3, radius: f32, depth: f32) {
+        let old_radius = self.dmg.crumple[3];
+        let old_depth = self.dmg.crumple_dir[3];
+        let old_center = DVec3::new(self.dmg.crumple[0] as f64, self.dmg.crumple[1] as f64, self.dmg.crumple[2] as f64);
+        let dir = direction.normalize_or_zero();
+        if old_radius > 0.0 && (center - old_center).length() < (old_radius + radius) as f64 * 0.5 {
+            let combined = (old_depth + depth).min(radius.max(old_radius) * 0.25);
+            let center = (old_center * old_depth.max(0.01) as f64 + center * depth as f64) / (old_depth.max(0.01) + depth) as f64;
+            let old_dir = DVec3::new(self.dmg.crumple_dir[0] as f64, self.dmg.crumple_dir[1] as f64, self.dmg.crumple_dir[2] as f64);
+            let dir = (old_dir * old_depth as f64 + dir * depth as f64).normalize_or_zero();
+            self.dmg.crumple = [center.x as f32, center.y as f32, center.z as f32, old_radius.max(radius)];
+            self.dmg.crumple_dir = [dir.x as f32, dir.y as f32, dir.z as f32, combined];
+        } else if depth >= old_depth {
+            self.dmg.crumple = [center.x as f32, center.y as f32, center.z as f32, radius];
+            self.dmg.crumple_dir = [dir.x as f32, dir.y as f32, dir.z as f32, depth.min(radius * 0.25)];
+        }
+    }
+    /// Displace a collision point with the same permanent dent shown on the
+    /// model. This lets a crushed panel recede instead of colliding as intact.
+    fn crumple_offset(&self, point: DVec3) -> DVec3 {
+        let [x, y, z, radius] = self.dmg.crumple;
+        let depth = self.dmg.crumple_dir[3];
+        if radius <= 0.001 || depth <= 0.001 { return DVec3::ZERO; }
+        let delta = point - DVec3::new(x as f64, y as f64, z as f64);
+        let t = (1.0 - delta.length() / radius as f64).clamp(0.0, 1.0);
+        let falloff = t * t * (3.0 - 2.0 * t);
+        DVec3::new(self.dmg.crumple_dir[0] as f64, self.dmg.crumple_dir[1] as f64, self.dmg.crumple_dir[2] as f64) * (depth as f64 * falloff)
+    }
+    /// Wing bending, for the look only (the flight model's wing stays rigid):
+    /// how far each tip deflects from the modelled shape, which is taken as
+    /// the wing at 1 g. In the air the tips follow the load factor, a mass on
+    /// a spring at the wing's first bending frequency.
+    ///
+    /// Deflection per g is estimated from the half-span s as 6e-5 s³ m: about
+    /// 2 m per g for the 747-400 (s = 32 m; Boeing's 777 test wing rose some
+    /// 7.4 m at 1.5x its 2.5 g limit, about 2 m per g, and the 747's is
+    /// similar), a centimetre for the strut-braced 172, 1.4 cm for the stiff
+    /// Hornet (9 cm at 7.5 g), half that for the DR400. The bending frequency
+    /// goes as 1/s: about 1 Hz for the 747, 6 Hz for the 172. A rolling
+    /// wing is loaded unevenly: the rising tip meets the air p s / V lower in
+    /// incidence and the falling one higher, adding a lift curve slope of
+    /// about 4.5 per radian times q over the wing loading, in g, at the tip
+    /// (half of that, for the bending, from its linear spread along the span).
+    /// On the ground, skidding or past a wing's loss the tips settle back to
+    /// the modelled shape; the deflection never exceeds a fifth of the
+    /// half-span (beyond ultimate load, where the wing has broken anyway).
+    /// The wing bending for drawing, left then right: tip deflection over the
+    /// half-span squared, so a point x out along the span rises by bend x²
+    /// (plane.wgsl `deform`, main.rs `own_lights`).
+    pub fn wing_bend(&self) -> [f32; 2] {
+        // (`Spec::span` is the tip's station: the half-span)
+        let s = (self.spec.span as f64).max(0.5);
+        self.wing_flex.map(|f| (f / (s * s)) as f32)
+    }
+    fn flex_wings(&mut self, dt: f64, skidding: bool) {
+        let s = (self.spec.span as f64).max(0.5);
+        let per_g = 6e-5 * s * s * s;
+        let w = std::f64::consts::TAU * (32.0 / s).clamp(0.8, 8.0);
+        let zeta = 0.25;
+        let flying = !self.on_ground && !skidding;
+        let n = if flying { self.g_load.clamp(-6.0, 12.0) } else { 1.0 };
+        // Rolling about +Z (aft) lifts the right wing (+X): the right tip's
+        // incidence drops by p s / V, the left one's rises.
+        let (_, _, h) = geo::pos_to_lla(self.pos);
+        let v = self.airspeed().length().max(20.0);
+        let q = 0.5 * density(h) * v * v;
+        let loading = self.mass() * 9.81 / self.spec.wing_area.max(1.0);
+        let tip_alpha = (self.omega.z * s / v).clamp(-0.2, 0.2);
+        let roll_n = (0.5 * 4.5 * tip_alpha * q / loading).clamp(-3.0, 3.0);
+        let cap = 0.2 * s;
+        for side in 0..2 {
+            let broken = (self.dmg.wing[side] as f64) < self.spec.span as f64 - 0.01;
+            let sign = if side == 0 { 1.0 } else { -1.0 };
+            let target = if broken || !flying { 0.0 } else { ((n - 1.0 + sign * roll_n) * per_g).clamp(-cap, cap) };
+            // implicit (backward Euler) spring-damper: stable at any step
+            let x = self.wing_flex[side];
+            let vel = (self.wing_flex_v[side] + dt * w * w * (target - x)) / (1.0 + 2.0 * zeta * w * dt + w * w * dt * dt);
+            self.wing_flex_v[side] = vel;
+            self.wing_flex[side] = (x + vel * dt).clamp(-cap, cap);
+        }
     }
     fn lose_aileron(&mut self, side: usize, hanging: bool, why: &str) {
         if self.dmg.aileron[side] <= 0.0 || (hanging && self.dmg.aileron[side] < 1.0) {
@@ -1253,8 +1423,13 @@ impl Plane {
         self.stick += (target - self.stick) * (dt * 7.0).min(1.0);
         // Flaps run on an electric motor (or hydraulics), the gear on a pump;
         // the squat switch keeps the gear down while there is weight on the wheels.
+        let actuator_power = spec.id != 0 || self.sys.powered();
         let flap_target = spec.flap_frac(self.flap_set);
-        self.flaps += (flap_target - self.flaps).clamp(-spec.flap_rate * dt, spec.flap_rate * dt);
+        if actuator_power {
+            self.flaps += (flap_target - self.flaps).clamp(-spec.flap_rate * dt, spec.flap_rate * dt);
+        }
+        self.toe_brake = [self.brake_pressure(c, -1.0), self.brake_pressure(c, 1.0)];
+        if self.running { self.engine_hours += dt / 3600.0; }
         let slat_target = if spec.slats_at > 0 && self.flap_set >= spec.slats_at { 1.0 } else { 0.0 };
         self.slats += (slat_target - self.slats).clamp(-dt * 0.12, dt * 0.12);
         if !self.gear_down && self.on_ground {
@@ -1264,7 +1439,9 @@ impl Plane {
             // fixed gear (a downloaded aircraft's): always down
             (self.gear, self.gear_down) = (1.0, true);
         }
-        self.gear = (self.gear + if self.gear_down { spec.gear_rate * dt } else { -spec.gear_rate * dt }).clamp(0.0, 1.0);
+        if actuator_power {
+            self.gear = (self.gear + if self.gear_down { spec.gear_rate * dt } else { -spec.gear_rate * dt }).clamp(0.0, 1.0);
+        }
         // A canopy slides open or shut in about two seconds.
         self.canopy = (self.canopy + if self.canopy_open { 0.5 * dt } else { -0.5 * dt }).clamp(0.0, 1.0);
 
@@ -1453,13 +1630,24 @@ impl Plane {
                 // only slowing nearly to the stall stops it.
                 let w = self.prop_rate.max(0.0);
                 let v_ax = (-vb.z).max(0.0);
-                let (mut thrust, q_prop) = Self::prop_load(pe, w, v_ax, rho, prop_k);
+                let mut prop = pe.clone();
+                if spec.id == 0 && self.running && self.propeller < 0.999 {
+                    // Coarsening the blades increases their load, governing the selected RPM.
+                    let target = (1800.0 + 900.0 * self.propeller) * std::f64::consts::TAU / 60.0;
+                    self.prop_coarse = (self.prop_coarse + (w - target) * dt * 0.08).clamp(0.0, 2.0);
+                } else { self.prop_coarse = (self.prop_coarse - dt * 2.0).max(0.0); }
+                prop.cp0 *= 1.0 + self.prop_coarse;
+                prop.ct0 *= 1.0 + 0.3 * self.prop_coarse;
+                prop.j_t *= 1.0 + 0.2 * self.prop_coarse;
+                prop.j_p *= 1.0 + 0.2 * self.prop_coarse;
+                let (mut thrust, q_prop) = Self::prop_load(&prop, w, v_ax, rho, prop_k);
                 // It fires with the magnetos on, fuel, a mixture that will burn and the
                 // crankshaft turning (by the starter, or windmilling in the air); the
                 // starter motor's torque falls away as it spins up (it cranks at ~200 rpm).
                 // (The starter needs power from the bus; the magnetos do not.)
                 let cranking = (c.starter || self.auto_start > 0.0) && self.sys.powered();
-                self.running = self.ignition && self.fuel > 0.0 && self.mixture > 0.08 && w > 8.0 && eng > 0.0 && !self.sys.fail.engine;
+                self.cranking = cranking;
+                self.running = self.ignition && self.fuel_selector != FuelSelector::Off && self.fuel > 0.0 && self.mixture > 0.08 && w > 8.0 && eng > 0.0 && !self.sys.fail.engine;
                 let mix = smooth(0.08, 0.45, self.mixture);
                 let q_eng = if self.running { Self::engine_torque(pe, self.charge, rho, c.boost, eng) * mix } else { 0.0 } + if cranking { 120.0 * (1.0 - w / 25.0).max(0.0) } else { 0.0 };
                 if self.auto_start > 0.0 {
@@ -1495,6 +1683,19 @@ impl Plane {
                     let tk = thrust.max(0.0) / pe.static_thrust;
                     wdot.y += tk * slow * (0.22 + 0.25 * self.alpha.max(0.0));
                     wdot.z += tk * slow * 0.12 * if self.on_ground { 0.3 } else { 1.0 };
+                    // Taxiing slowly, the propwash over the fin and rudder adds to their
+                    // authority. Momentum theory: the slipstream's dynamic pressure is
+                    // the free stream's plus T/A (A the disc area); only that excess is
+                    // added here, the free stream's part already being in the rudder
+                    // term above. A share of it reaches the rudder (the rest passes
+                    // below and beside it), and it fades out by 30 m/s, where the
+                    // airflow itself does the work.
+                    let disc = std::f64::consts::FRAC_PI_4 * pe.prop_d * pe.prop_d;
+                    if self.on_ground && disc > 0.01 {
+                        let q_wash = thrust.max(0.0) / disc;
+                        let fade = 1.0 - smooth(10.0, 30.0, v);
+                        wdot.y += fade * (0.45 * q_wash / hd.q_ref).min(1.0) * (-hd.yaw_ctl * self.stick.y * rud);
+                    }
                 }
                 if dm.prop > 0.25 && dm.prop < 0.75 {
                     let spin = (self.prop_rate / 250.0) as f32;
@@ -1617,7 +1818,8 @@ impl Plane {
             pts.clear();
             self.contacts(&mut pts);
             let mut walled = false;
-            for &(r, part) in &pts {
+            for &(r0, part) in &pts {
+                let r = if matches!(part, Part::Nose | Part::Belly | Part::Side | Part::Roof) { r0 + self.crumple_offset(r0) } else { r0 };
                 let p = self.pos + self.rot * r;
                 let Some((mut pen, water, building)) = hit(p, world) else { continue };
                 if water {
@@ -1704,6 +1906,7 @@ impl Plane {
                             self.engine_hit(0.15 + (closing as f32 - 6.0) * 0.05, "NOSE IMPACT");
                             self.crack_windshield("NOSE IMPACT");
                             self.dmg.hull = (self.dmg.hull + (closing as f32 - 6.0) * 0.04).min(1.0);
+                            self.dent(r, pv, upw, closing);
                             if closing > 8.5 {
                                 self.lose_gear(0, "NOSE IMPACT");
                             }
@@ -1728,6 +1931,7 @@ impl Plane {
                         if closing > 4.5 && self.cool[3] <= 0.0 {
                             self.cool[3] = 0.3;
                             self.dmg.hull = (self.dmg.hull + (closing as f32 - 4.5) * 0.05).min(1.0);
+                            self.dent(r, pv, upw, closing);
                             self.dmg.vibe += 3.0;
                             if closing > 6.5 || part != Part::Belly {
                                 self.crack_windshield(if part == Part::Roof { "ROLLED OVER" } else { "HARD IMPACT" });
@@ -1869,9 +2073,10 @@ impl Plane {
                     let side = fwd.cross(upw);
                     let (vl, vs) = (pv.dot(fwd), pv.dot(side));
                     let f_side = (-vs * leg.side_k).clamp(-leg.side_mu * nf, leg.side_mu * nf);
-                    let braking = c.brake && leg.brakes;
-                    let mu = if braking { leg.brake_mu } else { leg.roll_mu };
-                    let f_long = (-vl * if braking { leg.brake_k } else { leg.roll_k }).clamp(-mu * nf, mu * nf);
+                    let brake = if leg.brakes { self.brake_pressure(c, leg.at.x) } else { 0.0 };
+                    let mu = leg.roll_mu + (leg.brake_mu - leg.roll_mu) * brake;
+                    let drag = leg.roll_k + (leg.brake_k - leg.roll_k) * brake;
+                    let f_long = (-vl * drag).clamp(-mu * nf, mu * nf);
                     let f = upw * nf + side * f_side + fwd * f_long;
                     force_w += f;
                     torque_b += r.cross(self.rot.inverse() * f);
@@ -1892,7 +2097,7 @@ impl Plane {
         // Wheels spin down in the air; brakes stop the mains at once.
         for (gi, leg) in spec.gear.iter().enumerate() {
             if !self.on_ground {
-                self.wheel_spin[gi] *= (1.0 - dt * if c.brake && leg.brakes && leg.steer == 0.0 { 8.0 } else { 0.25 }).max(0.0);
+                self.wheel_spin[gi] *= (1.0 - dt * if leg.brakes && leg.steer == 0.0 { 0.25 + 7.75 * self.brake_pressure(c, leg.at.x) } else { 0.25 }).max(0.0);
             }
             self.wheel_rot[gi] = (self.wheel_rot[gi] + self.wheel_spin[gi] * dt) % std::f64::consts::TAU;
         }
@@ -1922,6 +2127,8 @@ impl Plane {
         self.omega = self.omega.clamp_length_max(6.0);
         self.pos += self.vel * dt;
         self.rot = (self.rot * DQuat::from_scaled_axis(self.omega * dt)).normalize();
+
+        self.flex_wings(dt, skidding);
 
         // Airframe limits: pull too hard and a wing goes; too fast and the
         // control surfaces flutter themselves off; flaps out too fast tear away.
@@ -2201,25 +2408,77 @@ impl Plane {
     }
 }
 
-/// Air density (kg/m³) at height `h` (m) in the standard atmosphere: the
-/// troposphere's lapse rate up to 11 km, isothermal above.
+/// US Standard Atmosphere 1976, with layer bases in geopotential metres,
+/// base temperature in kelvin, and lapse rate in K/m. Base pressures are
+/// integrated from sea level so pressure, density and temperature stay
+/// thermodynamically consistent at every layer boundary.
+const ISA_LAYERS: [(f64, f64); 7] = [
+    (11_000.0, -0.0065),
+    (20_000.0, 0.0),
+    (32_000.0, 0.0010),
+    (47_000.0, 0.0028),
+    (51_000.0, 0.0),
+    (71_000.0, -0.0028),
+    (84_852.0, -0.0020),
+];
+
+/// Temperature (K) and pressure (Pa) at geometric altitude `h` (m), using
+/// the USSA 1976 geopotential layers. Above 84.852 km, continue isothermally
+/// from the last tabulated layer; aircraft performance checks stay well below
+/// this extension, while it avoids freezing density for high rocket flights.
+fn atmosphere(h: f64) -> (f64, f64) {
+    const G0: f64 = 9.80665;
+    const R_AIR: f64 = 287.05287;
+    const EARTH_RADIUS: f64 = 6_356_766.0;
+    const P0: f64 = 101_325.0;
+    const T0: f64 = 288.15;
+
+    // The standard tables use geopotential altitude; convert the simulator's
+    // geometric altitude before selecting a layer.
+    let h = h.max(-500.0);
+    let z = EARTH_RADIUS * h / (EARTH_RADIUS + h);
+    let mut base_z = 0.0;
+    let mut base_t = T0;
+    let mut base_p = P0;
+
+    for &(top_z, lapse) in &ISA_LAYERS {
+        let layer_z = z.min(top_z);
+        let dz = layer_z - base_z;
+        let t = base_t + lapse * dz;
+        let p = if lapse.abs() < 1e-12 {
+            base_p * (-G0 * dz / (R_AIR * base_t)).exp()
+        } else {
+            base_p * (t / base_t).powf(-G0 / (R_AIR * lapse))
+        };
+        if z <= top_z {
+            return (t, p);
+        }
+        let full_dz = top_z - base_z;
+        base_t += lapse * full_dz;
+        base_p = p;
+        base_z = top_z;
+    }
+
+    let dz = z - base_z;
+    let p = base_p * (-G0 * dz / (R_AIR * base_t)).exp();
+    (base_t, p)
+}
+
+/// Air density (kg/m³) at geometric altitude `h` (m) in the USSA 1976.
 pub fn density(h: f64) -> f64 {
-    let h = h.max(-500.0);
-    let t = 1.0 - 2.25577e-5 * h.min(11_000.0);
-    RHO0 * t.powf(4.2559) * (-(h - 11_000.0).max(0.0) / 6341.6).exp()
+    let (t, p) = atmosphere(h);
+    p / (287.05287 * t)
 }
 
-/// Static pressure as a fraction of sea level's, in the standard atmosphere.
+/// Static pressure as a fraction of sea level's, in the USSA 1976.
 pub fn pressure_ratio(h: f64) -> f64 {
-    let h = h.max(-500.0);
-    let t = 1.0 - 2.25577e-5 * h.min(11_000.0);
-    t.powf(5.2559) * (-(h - 11_000.0).max(0.0) / 6341.6).exp()
+    atmosphere(h).1 / 101_325.0
 }
 
-/// Speed of sound (m/s) at height `h` in the standard atmosphere.
+/// Speed of sound (m/s) at geometric altitude `h` in the USSA 1976.
 pub fn sound_speed(h: f64) -> f64 {
-    let t = 288.15 - 0.0065 * h.clamp(-500.0, 11_000.0);
-    (1.4 * 287.05 * t).sqrt()
+    let (t, _) = atmosphere(h);
+    (1.4 * 287.05287 * t).sqrt()
 }
 
 /// The intact airframe's lift and drag coefficients (wave drag and the
@@ -2265,6 +2524,83 @@ mod tests {
     const C172: &Spec = &c172::SPEC;
     const B747: &Spec = &b747::SPEC;
     const DR400: &Spec = &crate::aircraft::dr400::SPEC;
+
+    #[test]
+    fn wing_bending_is_sized_to_the_airframe_and_bounded() {
+        for (spec, per_g) in [(C172, 0.010), (B747, 2.0)] {
+            let s = spec.span as f64;
+            let mut p = Plane::spawn(spec, 0.6, -2.1, 3000.0, 0.0, 120.0);
+            p.on_ground = false;
+            // Steady 2 g: the tips settle about one g's deflection above the 1 g shape.
+            p.g_load = 2.0;
+            for _ in 0..2400 {
+                p.flex_wings(1.0 / 120.0, false);
+            }
+            let f = p.wing_flex[0];
+            assert!((f / per_g - 1.0).abs() < 0.25, "{}: {f} m at 2 g, want about {per_g}", spec.id);
+            assert!((p.wing_flex[1] - f).abs() < 1e-9);
+            // A crash's load spikes and a long frame never bend it past a fifth of the half-span.
+            for g in [80.0, -60.0, 1e6, f64::MAX] {
+                p.g_load = g;
+                for _ in 0..30 {
+                    p.flex_wings(0.25, false);
+                    assert!(p.wing_flex.iter().all(|x| x.is_finite() && x.abs() <= 0.2 * s + 1e-9), "{}: {:?}", spec.id, p.wing_flex);
+                    assert!(p.wing_bend().iter().all(|b| (*b as f64 * s * s).abs() <= 0.2 * s + 1e-6));
+                }
+            }
+            // On the ground it goes back to the modelled shape.
+            p.on_ground = true;
+            for _ in 0..2400 {
+                p.flex_wings(1.0 / 120.0, false);
+            }
+            assert!(p.wing_flex.iter().all(|x| x.abs() < 1e-3));
+        }
+    }
+
+    #[test]
+    fn dents_scale_with_the_airframe() {
+        let up = DVec3::Y;
+        let depth = |spec: &'static Spec, closing: f64| {
+            let mut p = Plane::spawn(spec, 0.6, -2.1, 3000.0, 0.0, 60.0);
+            p.rot = DQuat::IDENTITY;
+            p.dent(DVec3::new(0.0, -1.0, -2.0), DVec3::new(0.0, -closing, -20.0), up, closing);
+            (p.dmg.crumple_dir, p.dmg.crumple[3])
+        };
+        let (d7, r7) = depth(C172, 7.0);
+        assert!((0.05..0.12).contains(&d7[3]), "172 at 7 m/s: {} m", d7[3]);
+        assert!((0.3..1.0).contains(&r7), "172 dent radius {r7} m");
+        // Pushed in mostly up (into the belly), leaning back against the slide.
+        assert!(d7[1] > 0.8 && d7[2] > 0.0, "{d7:?}");
+        let (d12, _) = depth(C172, 12.0);
+        assert!(d12[3] > d7[3] && d12[3] < 0.3);
+        let (b6, rb) = depth(B747, 6.0);
+        assert!((0.25..0.6).contains(&b6[3]), "747 at 6 m/s: {} m", b6[3]);
+        assert!(b6[3] <= 0.25 * rb + 1e-6);
+    }
+
+    #[test]
+    fn atmosphere_matches_ussa_1976_layer_bases() {
+        // USSA 1976 layer base pressures (NASA/TM—2005-213659, Appendix A,
+        // https://ntrs.nasa.gov/api/citations/20050207438/downloads/20050207438.pdf).
+        // The table uses geopotential altitude; convert each to geometric
+        // altitude because that's the coordinate used by the flight model.
+        const EARTH_RADIUS: f64 = 6_356_766.0;
+        let bases: [(f64, f64, f64); 7] = [
+            (0.0, 101_325.0, 288.15),
+            (11_000.0, 22_632.06, 216.65),
+            (20_000.0, 5_474.89, 216.65),
+            (32_000.0, 868.02, 228.65),
+            (47_000.0, 110.91, 270.65),
+            (51_000.0, 66.94, 270.65),
+            (71_000.0, 3.96, 214.65),
+        ];
+        for (z, p, t) in bases {
+            let h = EARTH_RADIUS * z / (EARTH_RADIUS - z);
+            assert!((pressure_ratio(h) * 101_325.0 / p - 1.0).abs() < 0.002, "pressure at {z} m geopotential");
+            assert!((sound_speed(h) / (1.4 * 287.05287 * t).sqrt() - 1.0).abs() < 0.0001, "temperature at {z} m geopotential");
+            assert!(density(h).is_finite() && density(h) > 0.0);
+        }
+    }
 
     fn empty_world() -> World {
         let dir = std::env::temp_dir().join("fablegame-test-cache");
@@ -3360,6 +3696,64 @@ mod tests {
         assert!(dist > 120.0 && dist < 300.0 && vlo * KT < 62.0, "{dist} {}", vlo * KT);
         assert!(h > 150.0, "{h}");
         assert!(p.notes.is_empty() && p.dmg.gear.iter().all(|g| *g), "{:?}", p.notes);
+    }
+
+    #[test]
+    fn piston_fuel_selectors_cut_and_restore_flow() {
+        use FuelSelector::*;
+        let world = flat_world();
+        for spec in [C172, DR400] {
+            let mut plane = Plane::spawn(spec, 0.6, -2.1, 1000.0, 0.0, 55.0);
+            for expected in [Right, Off, Left, Center] {
+                let previous = plane.fuel_selector;
+                plane.fuel_selector = previous.turn(true);
+                assert_eq!(plane.fuel_selector, expected);
+                assert_eq!(expected.turn(false), previous);
+                plane.step(1.0 / 180.0, &Controls::default(), &world);
+                assert_eq!(plane.running, expected != Off);
+            }
+        }
+    }
+
+    #[test]
+    fn cessna_actuators_wait_for_electrical_power() {
+        let world = flat_world();
+        let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
+        p.gear_down = true;
+        p.flap_set = 2;
+        p.sys.elec.master = false;
+        for _ in 0..180 { p.step(1.0/180.0, &Controls::default(), &world); }
+        assert_eq!(p.gear, 0.0);
+        assert_eq!(p.flaps, 0.0);
+        p.sys.elec.master = true;
+        for _ in 0..180 { p.step(1.0/180.0, &Controls::default(), &world); }
+        assert!(p.gear > 0.1 && p.flaps > 0.1);
+    }
+
+    #[test]
+    fn toe_brakes_are_independent_and_parking_brake_overrides_both() {
+        let world = flat_world();
+        let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
+        p.step(1.0/180.0, &Controls { brake_left: 0.7, ..Default::default() }, &world);
+        assert!((p.input(Input::Brake(-1.0))-0.7).abs()<1e-5);
+        assert_eq!(p.input(Input::Brake(1.0)),0.0);
+        p.parking_brake = true;
+        p.step(1.0/180.0, &Controls::default(), &world);
+        assert_eq!(p.toe_brake,[1.0,1.0]);
+        assert!(!C172.gear[0].brakes);
+    }
+
+    #[test]
+    fn prop_control_reduces_rpm_without_cutting_ignition() {
+        let world = flat_world();
+        let mut p = Plane::spawn(C172, 0.6, -2.1, 1000.0, 0.0, 55.0);
+        let mut fast = p.prop_rate;
+        p.propeller = 0.2;
+        for _ in 0..900 {
+            p.step(1.0/180.0, &Controls { throttle_set: Some(0.75), ..Default::default() }, &world);
+            fast = fast.max(p.prop_rate);
+        }
+        assert!(p.running && p.prop_rate < fast * 0.9, "{} / {}",p.prop_rate,fast);
     }
 
     #[test]
