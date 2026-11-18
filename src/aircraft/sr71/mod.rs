@@ -325,6 +325,7 @@ pub static SPEC: Spec = Spec {
     // (the reconnaissance systems officer's, 1.35 m behind)
     eye2: Some(Vec3::new(0.0, 0.95, st(9.65) as f32)),
     sees_inside: pit::sees_inside,
+    hotspots: &[],
     contacts: &[
         ([0.0, -0.10, st(16.7)], Part::Nose),
         ([0.0, -0.38, st(15.0)], Part::Nose),

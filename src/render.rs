@@ -188,6 +188,8 @@ pub struct Globals {
     /// (+ fly right), glide slope needle -1..1 (+ fly up), OBS (degrees),
     /// flags (1 alive, 2 TO, 4 FROM, 8 glide slope alive)
     pub nav: [f32; 4],
+    /// Cessna instruments, radio receivers and heading-up navigation plot.
+    pub cockpit: [[f32; 4]; 8],
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).

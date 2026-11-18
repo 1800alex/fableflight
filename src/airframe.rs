@@ -601,6 +601,18 @@ pub enum Input {
     Throttle,
     /// the angle of attack the trim holds (rad)
     Trim,
+    /// cockpit switches: the battery master (0 off, 1 on), the magnetos
+    /// (0 off, 1 both, 1.5 starting), the mixture (0 cut-off .. 1 rich),
+    /// the parking brake (0 off, 1 set)
+    Master,
+    Ignition,
+    Mixture,
+    ParkingBrake,
+    Brake(f32),
+    LandingLights,
+    FuelValve,
+    PropControl,
+    CowlFlaps,
     /// thrust reversers, 0 stowed .. 1 deployed
     Reverser,
     /// the Mach number (inlet spikes follow it)
@@ -743,6 +755,8 @@ pub enum Vis {
 }
 
 pub struct Piece {
+    /// Mouse control, with its centre relative to this piece’s pivot.
+    pub hotspot: Option<crate::aircraft::Hotspot>,
     pub name: &'static str,
     pub mesh: Mesh,
     /// which breakable group it belongs to (see `Spec::groups`)
@@ -777,7 +791,7 @@ pub struct Builder {
 }
 impl Builder {
     pub fn add(&mut self, name: &'static str, group: usize, mesh: Mesh, anim: Anim, pivot: Vec3, axis: Vec3, parent: Option<usize>) -> usize {
-        self.pieces.push(Piece { name, mesh, group, parent, pivot, axis: axis.normalize_or_zero(), anim, role: Role::Other, vis: Vis::Always, glass: false, occluder: true });
+        self.pieces.push(Piece { hotspot: None, name, mesh, group, parent, pivot, axis: axis.normalize_or_zero(), anim, role: Role::Other, vis: Vis::Always, glass: false, occluder: true });
         self.pieces.len() - 1
     }
     pub fn fixed(&mut self, name: &'static str, group: usize, mesh: Mesh) -> usize {
@@ -892,7 +906,7 @@ pub fn split_cut(pieces: &mut Vec<Piece>) {
         let [cut, solid] = parts;
         let (name, group, occluder, role) = (p.name, p.group, p.occluder, p.role);
         p.mesh = cut;
-        pieces.push(Piece { name, mesh: solid, group, parent: None, pivot: Vec3::ZERO, axis: Vec3::X, anim: Anim::Fixed, role, vis: Vis::Always, glass: false, occluder });
+        pieces.push(Piece { hotspot: None, name, mesh: solid, group, parent: None, pivot: Vec3::ZERO, axis: Vec3::X, anim: Anim::Fixed, role, vis: Vis::Always, glass: false, occluder });
     }
 }
 

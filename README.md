@@ -59,6 +59,23 @@ The fuel and the payload (crew, passengers, baggage: set on the start screen) ma
 # Electrics and failures
 A battery behind the master switch (Ins) and an alternator (the jets' generators) that charges it once the engine turns fast enough: the starter, the radios, the electric gauges and the lights need power, the engine itself runs on its magnetos. The pause menu's Failures page sets failures by hand or at random (about every N minutes): engine, alternator, flat battery, vacuum pump (the attitude and heading gyros run down), blocked pitot (the airspeed indicator turns into an altimeter) or static port (altimeter and VSI freeze), fuel leak. The flight panel shows the volts, battery and current, and the HUD warns LOW VOLTS and VACUUM.
 
+# Clickable cockpits
+
+In cockpit view, hover over a working control to see its action and setting. Click a switch, roll the mouse wheel over a lever, or hold a toe brake. Drag elsewhere to look around. Middle-drag to lean sideways or down around a yoke or panel, and middle-click to sit upright again. The target follows the visible part as it moves.
+
+| Aircraft | Controls available from the pilot seat |
+| --- | --- |
+| Cessna 172RG | Battery, magnetos and starter key, throttle, propeller RPM, mixture, cowl flaps, tank selector, landing lights, gear, flaps, parking brake, toe brakes, trim wheel and yoke trim, NAV and ADF tuning, OBS, heading sync and altimeter setting |
+| Robin DR400/180 Régent | Battery, magnetos, separate starter button, throttle, mixture, tank selector, landing light, parking brake, toe brakes, trim wheel, flap lever and sliding canopy handle |
+| Boeing 747-400 | Overhead battery pushbutton and engine start switches, four thrust levers and reverse levers, fuel control switches, landing gear, flaps, speedbrake, alternate stabiliser trim, parking brake and toe brakes |
+| Concorde | Four thrust levers, gear, toe brakes and the nose/visor selector with up, visor down, 5° and 12.5° positions |
+| F/A-18C | Twin throttles, landing gear, flap selector, canopy switch and toe brakes |
+| F-4E | Twin throttles, landing gear, slats/flaps selector and toe brakes |
+| F-22A | Twin throttles, landing gear, canopy switch and toe brakes |
+| SR-71A | Twin throttles, landing gear, drag chute handle and toe brakes |
+
+The multi-engine aircraft share a thrust setting across engines. The piston aircraft have four fuel selector positions and a shared fuel quantity. Selecting OFF cuts fuel to the engine. The navigator and systems-operator stations, many panel switches and avionics pages remain simplified. Starship is uncrewed. [Cockpit references and modeling notes](docs/cockpits.md)
+
 # In-flight map
 
 A round minimap in the lower-left corner, stacked above the info panel, follows the aircraft; ` (backquote, the tilde key) shows or hides it. Choose **Satellite** or **Map** (a light road map), and **North** to keep north at the top or **Heading** to keep the nose pointing up. The controls, hints and status messages follow the game language (English/French). Place names use the corresponding translation when supplied by the map data, falling back to the local name; changing language also updates already loaded labels. City, town and village names stay upright on both backgrounds, with smaller places appearing as you zoom in and overlapping labels hidden. Use **+ / -** or the mouse wheel over the map to zoom. The compact toolbar sits under the map: click the orientation/background buttons to toggle them, or **x** to collapse it to a **Map** button. Drag the knob on the upper-right of the rim to resize it (240-640 logical pixels across, shrunk to fit between the HUD panels); the size is remembered and can also be set in the pause menu Settings. The map follows HUD visibility and remains visible beside the flight panel and temporarily hides while the pause menu is open. Visibility, background, orientation and zoom are remembered.

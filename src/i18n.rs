@@ -160,6 +160,7 @@ fn fr(en: &str) -> Option<&'static str> {
         // keys
         "Space" => "Espace",
         "Mouse drag" => "Glisser souris",
+        "Click / wheel" => "Clic / molette",
         "Mouse wheel" => "Molette",
         "Left stick" => "Stick gauche",
         "Right stick" => "Stick droit",
@@ -192,6 +193,7 @@ fn fr(en: &str) -> Option<&'static str> {
         "The weather and the traffic are real: METAR at the airports, live aircraft around you." => "La météo et le trafic sont réels : METAR des aéroports, avions en vol autour de vous.",
         "F1 lists every key; joysticks and pedals are set up in Settings, Bindings." => "F1 liste toutes les touches ; joysticks et palonniers se règlent dans Réglages, Assignations.",
         "look around" => "regarder autour",
+        "cockpit: work a switch, turn a knob (Cessna)" => "cockpit : actionner un interrupteur, tourner un bouton (Cessna)",
         "camera distance / cockpit zoom" => "distance caméra / zoom cockpit",
         "hide / show the HUD" => "masquer / afficher le HUD",
         "hide / show the minimap" => "masquer / afficher la mini-carte",
