@@ -41,7 +41,6 @@ mod graphics;
 mod tiles3d;
 mod impostor;
 mod materials;
-mod logo;
 mod flightui;
 mod mainmenu;
 mod menu;
@@ -347,6 +346,8 @@ struct Args {
     /// open the in-flight menu on this page after this many seconds, for scripted screenshots
     /// (page, settings section when the page is Settings, seconds)
     pause_menu: Option<(menu::Page, Option<settings_ui::Section>, f64)>,
+    /// open the flight menu after this many seconds, for scripted screenshots.
+    flight_menu: Option<f64>,
     /// `--settings SECTION`: the start screen opens with the settings screen on that section (scripted screenshots)
     settings: Option<settings_ui::Section>,
     /// `--hangar mine|download[:FOLDER]`: the start screen opens with the hangar on that page (scripted screenshots)
@@ -444,6 +445,7 @@ fn parse_args() -> Args {
         menu_go: None,
         damage: None,
         pause_menu: None,
+        flight_menu: None,
         settings: None,
         hangar: None,
         menu_screen: None,
@@ -620,6 +622,7 @@ fn parse_args() -> Args {
             }
             "--hold" => a.hold = num(&v, i).unwrap_or(0.0),
             "--damage" => a.damage = v.get(i + 1).cloned(),
+            "--flight-menu" => a.flight_menu = Some(num(&v, i).unwrap_or(3.0)),
             "--pause-menu" => {
                 // page[@seconds]: open the flight panel (Tab) or the pause menu (Esc) on that page, for scripted screenshots.
                 // `settings:SECTION` (or a section's name alone, e.g. `graphics`) opens the settings screen there.
@@ -801,7 +804,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -1031,11 +1034,15 @@ struct Game {
     volume: f32,
     /// the flight panel (Tab), beside the running game, and the page it shows
     info_open: bool,
+    /// the flight menu, a ring of icons on tab.
+    radial: flightui::Radial,
     info_page: menu::Page,
     /// the pause menu (Esc): open, the page it shows, and a scripted opening
     pause_open: bool,
     pause_page: menu::Page,
     pause_at: Option<(menu::Page, Option<settings_ui::Section>, f64)>,
+    /// when to open the flight menu, for scripted screenshots.
+    radial_at: Option<f64>,
     /// the section the settings screen shows (settings_ui.rs)
     settings_sec: settings_ui::Section,
     /// mouse-look speed (1 = default)
@@ -1353,7 +1360,7 @@ impl Game {
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
-            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
+            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, radial: Default::default(), info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, radial_at: args.flight_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
@@ -2680,7 +2687,7 @@ impl Game {
             Nav::Globe
         } else if self.pause_open {
             Nav::Pause
-        } else if self.info_open {
+        } else if self.info_open || self.radial.open {
             Nav::Panel
         } else {
             Nav::Off
@@ -2897,9 +2904,7 @@ impl Game {
                 None
             }
             Does::Key(KeyCode::Tab) => {
-                // The flight panel, with its first choice picked out for the pad.
-                self.info_open = !self.info_open;
-                self.pad_home = self.info_open;
+                self.flight_menu_key();
                 None
             }
             Does::Key(k) => {
@@ -3620,6 +3625,7 @@ impl Game {
             // The flight panel, open beside the flying: the same, and B closes it.
             // (Its other buttons, and Y with any, still fly: pad_fly_buttons.)
             (Nav::Panel, Button::South) if !modifier => self.pad_key(egui::Key::Enter),
+            (Nav::Panel, Button::East) if !modifier && self.radial.open => self.radial.open = false,
             (Nav::Panel, Button::East) if !modifier => self.info_open = false,
             (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) if !modifier => {
                 self.info_page = menu::Page::cycle(&menu::Page::INFO, self.info_page, b == Button::RightTrigger);
@@ -3717,7 +3723,8 @@ impl Game {
             return;
         }
         match code {
-            KeyCode::Tab => self.info_open = !self.info_open,
+            KeyCode::Tab => self.flight_menu_key(),
+            KeyCode::Escape if self.radial.open => self.radial.open = false,
             // Esc closes a pop-up window first; otherwise it pauses.
             KeyCode::Escape if self.show_help => self.show_help = false,
             KeyCode::Escape if self.wx.open => self.wx.open = false,
@@ -3892,6 +3899,7 @@ impl Game {
         }
         self.cancel_cockpit_input();
         self.pause_open = open;
+        self.radial.open = false;
         self.pause_page = menu::Page::Game;
         self.pad_home = open;
         self.drag = false;
@@ -4740,6 +4748,10 @@ impl Game {
         }
         let in_menu = self.mode == Mode::Menu;
 
+        if self.radial_at.is_some_and(|t| self.real >= t && self.mode == Mode::Fly) {
+            self.flight_menu_key();
+            self.radial_at = None;
+        }
         if let Some((page, sec, t)) = self.pause_at {
             if self.real >= t && self.mode == Mode::Fly {
                 if page.is_info() {
@@ -5815,7 +5827,7 @@ impl Game {
             self.lightning.segments(cam, dt, &mut bolts);
         }
         let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
-        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px });
+        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
@@ -6495,7 +6507,7 @@ impl Game {
             if pad {
                 padui::prompts(ui, &[("Dpad", tr("move")), ("A", tr("press")), ("B", tr("back"))], 20.0, 12.0, DIM);
             } else {
-                let t = t!("While you fly, move the pointer to the top of the screen (or press Tab) for the toolbar: places, airports, radio and weather.", "En vol, amenez le pointeur en haut de l'écran (ou appuyez sur Tab) pour la barre d'outils : lieux, aéroports, radio et météo.");
+                let t = t!("While you fly, Tab opens the flight menu: places, radio, autopilot, weather, the map and the camera.", "En vol, Tab ouvre le menu de vol : lieux, radio, pilote auto, météo, carte et caméra.");
                 ui.add(egui::Label::new(RichText::new(t).font(menu::caption()).color(DIM)).wrap());
             }
         });
@@ -6548,35 +6560,32 @@ impl Game {
         if !self.info_page.is_info() {
             self.info_page = Page::Flight;
         }
-        // under the heading strip when the hud shows.
-        let max_h = ctx.content_rect().height() - if self.hud_on() { flightui::HEADING_H + 34.0 + 40.0 } else { 120.0 };
         let warn = Color32::from_rgb(255, 196, 80);
         let bad = menu::BAD;
-        // left of the altitude tape.
+        // left of the altitude tape, under the heading strip.
         let (x, y) = if self.hud_on() { (-flightui::RIGHT_EDGE - 10.0, flightui::HEADING_H + 34.0) } else { (-14.0, 12.0) };
-        menu::set_switch_tint(ctx, Some(flightui::SKY));
+        // what is left below it, less the header, the margins and a gap.
+        let max_h = (ctx.content_rect().height() - y - 16.0 - 32.0 - 48.0).max(120.0);
         egui::Area::new(egui::Id::unique("info_panel")).anchor(Align2::RIGHT_TOP, [x, y]).show(ctx, |ui| {
             flightui::frosted(ui, flightui::glass().inner_margin(16.0), |ui| {
                 ui.set_width(flightui::PANEL_W);
-                // the pages as tabs and a close button.
+                // the page's icon and name, picked from the flight menu, and a close button.
                 ui.horizontal(|ui| {
-                    let mut page = self.info_page;
-                    let chosen = menu::segments(ui, |ui| {
-                        let mut chosen = None;
-                        for p in Page::INFO {
-                            let b = menu::seg(ui, &mut page, p, p.label());
-                            if p == self.info_page {
-                                chosen = Some(b);
-                            }
-                        }
-                        chosen
-                    });
-                    if let Some(b) = chosen {
-                        self.pad_home_focus(&b);
-                    }
-                    self.info_page = page;
+                    let ic = match self.info_page {
+                        Page::Places => menu::Icon::GoTo,
+                        Page::Radio => menu::Icon::Radio,
+                        Page::Autopilot => menu::Icon::Autopilot,
+                        Page::Weather => menu::Icon::Weather,
+                        _ => menu::Icon::Flight,
+                    };
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                    menu::icon(ui.painter(), ic, r.center(), 22.0, Color32::WHITE);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(self.info_page.label()).font(menu::page_title()).color(Color32::WHITE));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if chip(ui, "×", true, false).on_hover_text(t!("Close (Tab)", "Fermer (Tab)")).clicked() {
+                        let x = chip(ui, "×", true, false).on_hover_text(t!("Close (Tab)", "Fermer (Tab)"));
+                        self.pad_home_focus(&x);
+                        if x.clicked() {
                             self.info_open = false;
                         }
                     });
@@ -6812,7 +6821,6 @@ impl Game {
                 });
             });
         });
-        menu::set_switch_tint(ctx, None);
     }
 
     /// What the airport panel says: the airfield, the runway in use and the
@@ -6932,10 +6940,14 @@ impl Game {
             if self.info_open {
                 self.info_panel(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local, speed, alt, agl, hdg);
             }
+            // the flight menu, over everything but the pause menu.
+            if self.mode == Mode::Fly {
+                self.radial_menu(ctx, &mut bar);
+            }
             // the hud.
             let mut nav_lift = 0.0;
             if self.hud_on() {
-                self.hud(ctx, &flightui::HudIn { hdg, ias: speed, alt, agl, vs, local }, &mut bar);
+                self.hud(ctx, &flightui::HudIn { hdg, ias: speed, alt, agl, vs, local });
                 // rocket figures or weapons, for the aircraft that have them.
                 self.systems_card(ctx, vs, base_up);
                 self.notices(ctx, airport_hud.as_deref());
@@ -6972,7 +6984,7 @@ impl Game {
                 for (d, at, p) in seen {
                     // fainter with distance.
                     let a = (1.0 - d / 40_000.0).clamp(0.45, 1.0) as f32;
-                    painter.circle_stroke(at, 5.0, egui::Stroke::new(1.5, flightui::SKY.gamma_multiply(a)));
+                    painter.circle_stroke(at, 5.0, egui::Stroke::new(1.5, flightui::LIT.gamma_multiply(a)));
                     let line2 = format!("{}  ·  {:.0} ft  ·  {:.1} km", if p.ty.is_empty() { "?" } else { p.ty.as_str() }, p.alt_ft, d / 1000.0);
                     let g1 = painter.layout_no_wrap(p.call.clone(), menu::semibold(13.0), Color32::WHITE.gamma_multiply(a));
                     let g2 = painter.layout_no_wrap(line2, menu::medium(11.5), flightui::SOFT.gamma_multiply(a));
@@ -7389,6 +7401,12 @@ impl ApplicationHandler for App {
                         }
                     } else {
                         g.keys.remove(&code);
+                        // tab held, pointed and let go picks from the flight menu.
+                        if code == KeyCode::Tab {
+                            if let Some(b) = g.flight_menu_release() {
+                                g.toolbar_act(b);
+                            }
+                        }
                     }
                     }
                 }

@@ -1,6 +1,4 @@
-//! The main menu the game boots into: the "FABLE FLIGHT" title (logo.rs,
-//! drawn by the renderer over this screen only) and three tiles side by
-//! side: Aircraft, FLY (the largest, the globe behind it) and Settings.
+//! the main menu: the wordmark over the aircraft, fly and settings tiles.
 //! Quit sits small in the bottom left corner. Behind it the renderer draws
 //! space alone (the menu camera looks away from the planet, see `frame`).
 use crate::menu::{self, Screen, ACCENT, DIM, FAINT, TEXT};
@@ -63,6 +61,9 @@ impl Game {
             let bar_h = 46.0;
             let set = lift(Rect::from_min_size(pos2(x0 + sw + gap + fw + gap, cy - sh * 0.5), vec2(sw, sh - bar_h - gap)), 2);
             let mpb = lift(Rect::from_min_size(pos2(set.left(), set.bottom() + gap), vec2(sw, bar_h)), 3);
+            let mut pw = p.clone();
+            pw.set_opacity(rise(0));
+            wordmark(&pw, pos2(x0, fly.top() - 26.0 * k.max(0.7)), x0 + fw + 2.0 * sw + 2.0 * gap, k);
 
             // Tab and the d-pad go left to right: Aircraft, FLY, Settings.
             let r = ui.interact(air, ui.scope_id().with("tile_air"), Sense::click());
@@ -213,6 +214,25 @@ fn mp_bar(p: &Painter, r: Rect, resp: &egui::Response, status: &str, col: Color3
     let clip = p.with_clip_rect(Rect::from_min_max(pos2(x, r.top()), pos2(r.right() - 14.0, r.bottom())));
     clip.galley(pos2(x, r.center().y - g.size().y * 0.5), g, DIM);
     p.circle_filled(pos2(x - 10.0, r.center().y), 3.5, col);
+}
+
+/// the wordmark at `at`, a hairline running on to `right`.
+fn wordmark(p: &Painter, at: Pos2, right: f32, k: f32) {
+    let size = 60.0 * k.max(0.7);
+    let mut job = egui::text::LayoutJob::default();
+    let fmt = |col| egui::TextFormat { font_id: menu::bold(size), color: col, extra_letter_spacing: 3.0 * k, ..Default::default() };
+    job.append("FABLE ", 0.0, fmt(Color32::WHITE));
+    job.append("FLIGHT", 0.0, fmt(ACCENT));
+    let g = p.layout_job(job);
+    let r = Align2::LEFT_BOTTOM.anchor_size(at, g.size());
+    let w = g.size().x;
+    p.galley(r.min, g, Color32::WHITE);
+    // a short accent bar over the f, and a hairline from the end of the word to the row's edge.
+    p.rect_filled(Rect::from_min_size(pos2(r.left() + 2.0, r.top() - 6.0), vec2(34.0 * k.max(0.7), 3.0)), 1, ACCENT);
+    let y = r.center().y + 2.0;
+    if right - (r.left() + w + 24.0) > 40.0 {
+        p.hline(r.left() + w + 20.0..=right, y, Stroke::new(1.0, Color32::from_white_alpha(46)));
+    }
 }
 
 /// the frame every tile shares, its border lit on hover.

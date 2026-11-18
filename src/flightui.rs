@@ -52,7 +52,7 @@ pub fn tiles(ui: &mut egui::Ui, items: &[(&str, String, &str, Color32)]) {
     }
 }
 
-/// a small button, blue when chosen.
+/// a small button, yellow when chosen.
 pub fn chip(ui: &mut egui::Ui, text: &str, mono: bool, on: bool) -> egui::Response {
     let font = if mono { num_s() } else { menu::medium(13.5) };
     let g = ui.painter().layout_no_wrap(text.to_string(), font, TEXT);
@@ -61,12 +61,12 @@ pub fn chip(ui: &mut egui::Ui, text: &str, mono: bool, on: bool) -> egui::Respon
     let lit = menu::ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
     let p = ui.painter();
     if on {
-        p.rect_filled(r, R_IN, SKY);
+        p.rect_filled(r, R_IN, LIT);
     } else {
         p.rect_filled(r, R_IN, white(0.06 + 0.08 * lit));
         p.rect_stroke(r, R_IN, Stroke::new(1.0, white(0.22 + 0.2 * lit)), egui::StrokeKind::Inside);
     }
-    p.galley(r.center() - g.size() * 0.5, g, Color32::WHITE);
+    p.galley(r.center() - g.size() * 0.5, g, if on { menu::ON_ACCENT } else { Color32::WHITE });
     resp
 }
 
@@ -132,6 +132,7 @@ impl Game {
                 } else {
                     self.info_open = true;
                     self.info_page = p;
+                    self.pad_home = true;
                 }
             }
             Bar::Map => self.minimap.visible = !self.minimap.visible,
@@ -295,21 +296,20 @@ pub const HEADING_H: f32 = 46.0;
 /// the tapes' sizes.
 const TAPE_H: f32 = 352.0;
 const SPEED_W: f32 = 124.0;
-const ALT_W: f32 = 104.0;
-const BTN_W: f32 = 66.0;
+const ALT_W: f32 = 118.0;
 /// corner radii.
 pub(crate) const R_HUD: u8 = 14;
 pub(crate) const R_IN: u8 = 7;
 /// inset inside a panel.
 const PAD: f32 = 12.0;
 /// room the flight panel leaves for the altitude tape.
-pub const RIGHT_EDGE: f32 = ALT_W + BTN_W + 14.0;
+pub const RIGHT_EDGE: f32 = ALT_W + 14.0;
 /// the radio instruments' height.
 pub const NAV_H: f32 = 156.0;
 
 const AMBER: Color32 = Color32::from_rgb(255, 196, 80);
-/// the active light blue.
-pub const SKY: Color32 = Color32::from_rgb(56, 182, 240);
+/// the hud's accent: the game's yellow.
+pub const LIT: Color32 = menu::ACCENT;
 /// soft white for secondary text.
 pub const SOFT: Color32 = Color32::from_rgba_premultiplied(184, 184, 184, 184);
 /// the readouts' boxes.
@@ -572,7 +572,7 @@ fn glyph(p: &egui::Painter, g: Glyph, c: egui::Pos2, s: f32, col: Color32) {
 
 impl Game {
     /// the whole hud.
-    pub(crate) fn hud(&mut self, ctx: &egui::Context, h: &HudIn, bar: &mut Option<Bar>) {
+    pub(crate) fn hud(&mut self, ctx: &egui::Context, h: &HudIn) {
         let screen = ctx.content_rect();
         // the tapes' centre line, a little above the middle.
         let cy = screen.center().y - 36.0;
@@ -581,7 +581,7 @@ impl Game {
             self.conditions_card(ctx, h);
         }
         self.speed_tape(ctx, h, cy);
-        self.altitude_tape(ctx, h, cy, bar);
+        self.altitude_tape(ctx, h, cy);
         self.path_marker(ctx);
         self.minimap.top = cy + TAPE_H * 0.5 + 12.0;
         self.minimap.bottom = 14.0;
@@ -664,10 +664,10 @@ impl Game {
             let hint = if padui::active() {
                 match crate::padmap::spec_of("flight_panel") {
                     k if k.is_empty() => t!("Menu: pause", "Menu : pause").to_string(),
-                    k => t!("{}: flight panel", "{} : panneau de vol", k),
+                    k => t!("{}: flight menu", "{} : menu de vol", k),
                 }
             } else {
-                t!("Tab: flight panel", "Tab : panneau de vol").to_string()
+                t!("Tab: flight menu", "Tab : menu de vol").to_string()
             };
             paint_tag(p, pos2(r.left() + 38.0, hy), Align2::LEFT_CENTER, &hint);
             p.hline(r.x_range(), r.top() + 38.0, Stroke::new(1.0, white(0.16)));
@@ -780,20 +780,20 @@ impl Game {
             let track = Rect::from_min_max(pos2(col_r.center().x - 3.0, col_r.top() + 20.0), pos2(col_r.center().x + 3.0, col_r.bottom() - 26.0));
             pt.rect_filled(track, 3, white(0.14));
             let thr = (p.throttle as f32).clamp(0.0, 1.0);
-            pt.rect_filled(Rect::from_min_max(pos2(track.left(), track.bottom() - track.height() * thr), track.max), 3, if p.running { SKY } else { menu::BAD });
+            pt.rect_filled(Rect::from_min_max(pos2(track.left(), track.bottom() - track.height() * thr), track.max), 3, if p.running { LIT } else { menu::BAD });
             pt.text(pos2(col_r.center().x, col_r.bottom() - 8.0), Align2::CENTER_CENTER, format!("{:.0}%", thr * 100.0), num_s(), Color32::WHITE);
         });
     }
 
-    fn altitude_tape(&self, ctx: &egui::Context, h: &HudIn, cy: f32, bar: &mut Option<Bar>) {
+    fn altitude_tape(&self, ctx: &egui::Context, h: &HudIn, cy: f32) {
         let screen = ctx.content_rect();
         let ft = |m: f64| (m * 3.280_84) as f32;
         let alt = ft(h.alt);
         let vs_fpm = (h.vs * 196.85) as f32;
         let agl = ft(h.agl.max(0.0));
-        let w = ALT_W + BTN_W;
+        let w = ALT_W;
         let panel = Rect::from_min_size(pos2(screen.right() - w, cy - TAPE_H * 0.5), vec2(w, TAPE_H));
-        egui::Area::new(egui::Id::unique("hud_alt")).fixed_pos(panel.min - vec2(0.0, 24.0)).order(egui::Order::Background).show(ctx, |ui| {
+        egui::Area::new(egui::Id::unique("hud_alt")).fixed_pos(panel.min - vec2(0.0, 24.0)).interactable(false).order(egui::Order::Background).show(ctx, |ui| {
             ui.allocate_exact_size(vec2(w, TAPE_H + 48.0), Sense::hover());
             let pt = ui.painter().clone();
             // climb over it, height above the ground under it.
@@ -806,9 +806,7 @@ impl Game {
                 paint_tag_col(&pt, pos2(panel.right() - 14.0, panel.bottom() + 12.0), Align2::RIGHT_CENTER, &format!("{:.0} ft AGL", agl), col);
             }
             frost_rect(&pt, panel, egui::CornerRadius { nw: R_HUD, sw: R_HUD, ne: 0, se: 0 });
-            let col_x = panel.left() + BTN_W;
-            pt.vline(col_x, panel.top() + 12.0..=panel.bottom() - 12.0, Stroke::new(1.0, white(0.14)));
-            let tape = Rect::from_min_max(pos2(col_x + 1.0, panel.top() + 8.0), pos2(panel.right(), panel.bottom() - 8.0));
+            let tape = Rect::from_min_max(pos2(panel.left() + 30.0, panel.top() + 8.0), pos2(panel.right(), panel.bottom() - 8.0));
             let c = pos2(tape.center().x, cy);
             let clip = pt.with_clip_rect(tape);
             const PPF: f32 = 0.6;
@@ -835,40 +833,6 @@ impl Game {
             // the readout.
             let rr = drum(&pt, pos2(tape.right() - 18.0, c.y), Align2::RIGHT_CENTER, alt, 3, 20, Color32::WHITE);
             pt.add(egui::Shape::convex_polygon(vec![pos2(tape.right() - 10.0, c.y), pos2(rr.right() - 0.5, c.y - 7.0), pos2(rr.right() - 0.5, c.y + 7.0)], BOX, Stroke::NONE));
-            // the buttons.
-            let items: [(Icon, &str, &str, Bar, bool); 7] = [
-                (Icon::Flight, t!("Flight", "Vol"), t!("Flight", "Vol"), Bar::Page(Page::Flight), self.info_open && self.info_page == Page::Flight),
-                (Icon::GoTo, t!("Go to", "Aller"), t!("Go to", "Aller à"), Bar::Page(Page::Places), self.info_open && self.info_page == Page::Places),
-                (Icon::Radio, t!("Radio", "Radio"), t!("Radio", "Radio"), Bar::Page(Page::Radio), self.info_open && self.info_page == Page::Radio),
-                (Icon::Autopilot, t!("Autopilot", "Auto"), t!("Autopilot", "Pilote auto"), Bar::Page(Page::Autopilot), self.info_open && self.info_page == Page::Autopilot),
-                (Icon::Weather, t!("Weather", "Météo"), t!("Weather", "Météo"), Bar::Page(Page::Weather), self.info_open && self.info_page == Page::Weather),
-                (Icon::Map, t!("Map", "Carte"), t!("Map", "Carte"), Bar::Map, self.minimap.visible),
-                (Icon::Camera, t!("Camera", "Caméra"), t!("Camera (C)", "Caméra (C)"), Bar::Camera, false),
-            ];
-            // as big as fits with a 6 pt gap between them.
-            let n = items.len() as f32;
-            let bs = (BTN_W - 18.0).min((TAPE_H - 20.0 - 6.0 * (n - 1.0)) / n);
-            let gap = (TAPE_H - 20.0 - bs * n) / (n - 1.0);
-            for (k, (ic, label, tip, act, on)) in items.into_iter().enumerate() {
-                let br = Rect::from_min_size(pos2(panel.left() + (BTN_W - bs) * 0.5, panel.top() + 10.0 + k as f32 * (bs + gap)), vec2(bs, bs));
-                let resp = ui.interact(br, ui.scope_id().with(("hud_btn", k)), Sense::click()).on_hover_text(tip);
-                resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, tip));
-                let lit = menu::ease(ctx, resp.id, resp.hovered() || resp.has_focus());
-                if on {
-                    pt.rect_filled(br, R_IN, SKY);
-                } else {
-                    pt.rect_filled(br, R_IN, white(0.05 + 0.08 * lit));
-                    pt.rect_stroke(br, R_IN, Stroke::new(1.0, white(0.28 + 0.2 * lit)), egui::StrokeKind::Inside);
-                }
-                menu::icon(&pt, ic, pos2(br.center().x, br.top() + bs * 0.4), 17.0, Color32::WHITE);
-                let mut job = egui::text::LayoutJob::default();
-                job.append(&label.to_uppercase(), 0.0, egui::TextFormat { font_id: menu::medium(8.5), color: white(if on { 1.0 } else { 0.72 }), extra_letter_spacing: 0.6, ..Default::default() });
-                let g = pt.layout_job(job);
-                pt.galley(pos2(br.center().x - (g.size().x - 0.6) * 0.5, br.bottom() - 5.0 - g.size().y), g, Color32::WHITE);
-                if resp.clicked() {
-                    *bar = Some(act);
-                }
-            }
         });
     }
 
@@ -943,5 +907,192 @@ impl Game {
                 }
             });
         });
+    }
+}
+
+// the flight menu: a ring of icons around the middle of the view.
+
+/// the flight menu's state.
+#[derive(Default)]
+pub struct Radial {
+    pub open: bool,
+    /// when it opened (s), for its entrance and hold to pick.
+    pub since: f64,
+    /// the item under the pointer or the pad's focus.
+    pub hover: Option<usize>,
+}
+
+/// ring radii: the hub, the ring's inside and outside.
+const HUB_R: f32 = 58.0;
+const RING_IN: f32 = 70.0;
+const RING_OUT: f32 = 156.0;
+
+/// an annulus sector from `a0` to `a1` (radians) as a triangle strip.
+fn sector(c: egui::Pos2, r0: f32, r1: f32, a0: f32, a1: f32, col: Color32, tex: Option<(egui::TextureId, Rect)>) -> egui::Mesh {
+    let mut m = match tex {
+        Some((id, _)) => egui::Mesh::with_texture(id),
+        None => egui::Mesh::default(),
+    };
+    let n = 24;
+    let uv = |p: egui::Pos2| match tex {
+        Some((_, s)) => pos2((p.x - s.left()) / s.width(), (p.y - s.top()) / s.height()),
+        None => egui::epaint::WHITE_UV,
+    };
+    for i in 0..=n {
+        let a = a0 + (a1 - a0) * i as f32 / n as f32;
+        let d = vec2(a.cos(), a.sin());
+        for r in [r0, r1] {
+            let p = c + d * r;
+            m.vertices.push(egui::epaint::Vertex { pos: p, uv: uv(p), color: col });
+        }
+    }
+    for i in 0..n as u32 {
+        let k = i * 2;
+        m.add_triangle(k, k + 1, k + 3);
+        m.add_triangle(k, k + 3, k + 2);
+    }
+    m
+}
+
+/// the outline of a sector.
+fn sector_edge(c: egui::Pos2, r0: f32, r1: f32, a0: f32, a1: f32) -> Vec<egui::Pos2> {
+    let n = 24;
+    let mut v: Vec<egui::Pos2> = (0..=n).map(|i| { let a = a0 + (a1 - a0) * i as f32 / n as f32; c + vec2(a.cos(), a.sin()) * r1 }).collect();
+    v.extend((0..=n).rev().map(|i| { let a = a0 + (a1 - a0) * i as f32 / n as f32; c + vec2(a.cos(), a.sin()) * r0 }));
+    v
+}
+
+impl Game {
+    /// opens or closes the flight menu, for tab and the pad's flight menu binding.
+    pub(crate) fn flight_menu_key(&mut self) {
+        if self.radial.open {
+            self.radial.open = false;
+        } else if self.info_open {
+            self.info_open = false;
+        } else {
+            self.radial = Radial { open: true, since: self.real, hover: None };
+            self.pad_home = true;
+        }
+    }
+
+    /// tab let go: held long enough with an item pointed at, that item is picked.
+    pub(crate) fn flight_menu_release(&mut self) -> Option<Bar> {
+        if self.radial.open && self.real - self.radial.since > 0.3 {
+            if let Some(k) = self.radial.hover {
+                self.radial.open = false;
+                return Some(self.radial_items()[k].2);
+            }
+        }
+        None
+    }
+
+    fn radial_items(&self) -> [(Icon, &'static str, Bar, bool); 7] {
+        let page = |p: Page| self.info_open && self.info_page == p;
+        [
+            (Icon::Flight, t!("Flight", "Vol"), Bar::Page(Page::Flight), page(Page::Flight)),
+            (Icon::GoTo, t!("Go to", "Aller à"), Bar::Page(Page::Places), page(Page::Places)),
+            (Icon::Radio, t!("Radio", "Radio"), Bar::Page(Page::Radio), page(Page::Radio)),
+            (Icon::Autopilot, t!("Autopilot", "Pilote auto"), Bar::Page(Page::Autopilot), page(Page::Autopilot)),
+            (Icon::Weather, t!("Weather", "Météo"), Bar::Page(Page::Weather), page(Page::Weather)),
+            (Icon::Map, t!("Map", "Carte"), Bar::Map, self.minimap.visible),
+            (Icon::Camera, if self.cam_mode == 1 { t!("Cockpit", "Cockpit") } else { t!("Chase", "Extérieur") }, Bar::Camera, false),
+        ]
+    }
+
+    /// the flight menu, when open; a pick goes into `bar`.
+    pub(crate) fn radial_menu(&mut self, ctx: &egui::Context, bar: &mut Option<Bar>) {
+        if !self.radial.open {
+            return;
+        }
+        let items = self.radial_items();
+        let n = items.len();
+        let screen = ctx.content_rect();
+        let c = screen.center();
+        // a short entrance: it grows and fades in.
+        let t = ((self.real - self.radial.since) / 0.16).clamp(0.0, 1.0) as f32;
+        let k = 1.0 - (1.0 - t).powi(3);
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+        let scale = 0.86 + 0.14 * k;
+        let (hub, r0, r1) = (HUB_R * scale, RING_IN * scale, RING_OUT * scale);
+        let step = std::f32::consts::TAU / n as f32;
+        // item 0 sits at the top, the rest clockwise.
+        let mid = |i: usize| -std::f32::consts::FRAC_PI_2 + step * i as f32;
+        let gap = 0.035;
+        let frost = ctx.data(|d| d.get_temp::<Option<egui::TextureId>>(egui::Id::unique("flightui frost"))).flatten();
+        let mut pick: Option<usize> = None;
+        let mut close = false;
+        egui::Area::new(egui::Id::unique("flight_menu")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            ui.multiply_opacity(k);
+            // the backdrop takes every click; the world stays visible.
+            let back = ui.interact(screen, ui.scope_id().with("radial_back"), Sense::click());
+            let p = ui.painter().clone();
+            p.rect_filled(screen, 0.0, Color32::from_black_alpha(70));
+            // which item the pointer points at, from its angle round the hub.
+            let mut hover = None;
+            if let Some(pos) = ctx.pointer_latest_pos() {
+                let d = pos - c;
+                if d.length() > hub && d.length() < r1 + 90.0 {
+                    let a = (d.y.atan2(d.x) + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU);
+                    hover = Some(((a + step * 0.5) / step) as usize % n);
+                }
+            }
+            // the pad: one focusable spot per icon, the first picked out when it opens.
+            let mut focused = None;
+            for (i, (_, label, _, _)) in items.iter().enumerate() {
+                let at = c + vec2(mid(i).cos(), mid(i).sin()) * (r0 + r1) * 0.5;
+                let r = ui.interact(Rect::from_center_size(at, vec2(44.0, 44.0)), ui.scope_id().with(("radial", i)), Sense::click());
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, *label));
+                if i == 0 {
+                    self.pad_home_focus(&r);
+                }
+                if r.has_focus() {
+                    focused = Some(i);
+                }
+                if r.clicked() {
+                    pick = Some(i);
+                }
+            }
+            let hover = focused.or(hover);
+            self.radial.hover = hover;
+            if back.clicked() {
+                match hover {
+                    Some(i) => pick = Some(i),
+                    None => close = true,
+                }
+            }
+            // the ring: a frosted sector per item, the hovered one lit.
+            for (i, (ic, _, _, on)) in items.iter().enumerate() {
+                let (a0, a1) = (mid(i) - step * 0.5 + gap, mid(i) + step * 0.5 - gap);
+                let lit = menu::ease(ctx, ui.scope_id().with(("radial_lit", i)), hover == Some(i));
+                let grow = 6.0 * lit;
+                p.add(sector(c, r0, r1 + grow, a0, a1, Color32::WHITE, frost.map(|id| (id, screen))));
+                p.add(sector(c, r0, r1 + grow, a0, a1, menu::mix(Color32::from_rgba_premultiplied(10, 14, 22, 92), Color32::from_rgba_premultiplied(220, 177, 22, 225), lit), None));
+                p.add(egui::Shape::closed_line(sector_edge(c, r0, r1 + grow, a0, a1), Stroke::new(1.0, white(0.25 + 0.35 * lit))));
+                let at = c + vec2(mid(i).cos(), mid(i).sin()) * ((r0 + r1 + grow) * 0.5);
+                menu::icon(&p, *ic, at, 26.0 + 4.0 * lit, menu::mix(Color32::WHITE, menu::ON_ACCENT, lit));
+                // what is open or on: a small yellow dot by the outer edge.
+                if *on {
+                    p.circle_filled(c + vec2(mid(i).cos(), mid(i).sin()) * (r1 + grow - 11.0), 3.0, menu::mix(LIT, menu::ON_ACCENT, lit));
+                }
+            }
+            // the hub: the pointed item's name, else what this is.
+            for s in frost_shapes(ctx, Rect::from_center_size(c, vec2(hub * 2.0, hub * 2.0)), (hub as u8).into()) {
+                p.add(s);
+            }
+            match hover {
+                Some(i) => {
+                    p.text(c, Align2::CENTER_CENTER, items[i].1, menu::semibold(16.0), Color32::WHITE);
+                }
+                None => paint_tag(&p, c, Align2::CENTER_CENTER, t!("Flight", "Vol")),
+            }
+        });
+        if let Some(i) = pick {
+            *bar = Some(items[i].2);
+            self.radial.open = false;
+        } else if close {
+            self.radial.open = false;
+        }
     }
 }

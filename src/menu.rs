@@ -481,18 +481,6 @@ pub fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: &st
     resp
 }
 
-/// the colour switches use for on, none for the accent.
-pub fn set_switch_tint(ctx: &egui::Context, tint: Option<Color32>) {
-    ctx.data_mut(|d| match tint {
-        Some(c) => {
-            d.insert_temp(egui::Id::unique("menu switch tint"), c);
-        }
-        None => {
-            d.remove::<Color32>(egui::Id::unique("menu switch tint"));
-        }
-    });
-}
-
 /// an on or off switch.
 pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let t = if *on { crate::t!("On", "Activé") } else { crate::t!("Off", "Désactivé") };
@@ -517,15 +505,13 @@ pub fn toggle(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText
     let track = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.center().y - h * 0.5), egui::vec2(w, h));
     let p = ui.painter();
     let off_fill = mix(RAISED, RAISED_HI, lit);
-    // the hud's panels set their own on colour.
-    let tint = ui.ctx().data(|d| d.get_temp::<Color32>(egui::Id::unique("menu switch tint"))).unwrap_or(ACCENT);
-    let on_fill = if tint == ACCENT { if lit > 0.0 { mix(ACCENT, ACCENT_HI, lit) } else { ACCENT } } else { tint };
+    let on_fill = if lit > 0.0 { mix(ACCENT, ACCENT_HI, lit) } else { ACCENT };
     let fill = mix(off_fill, on_fill, t);
     p.rect_filled(track, h * 0.5, if en { fill } else { fill.gamma_multiply(0.45) });
     p.rect_stroke(track, h * 0.5, Stroke::new(1.0, mix(LINE_HI, Color32::TRANSPARENT, t)), egui::StrokeKind::Inside);
     let r = h * 0.5 - 3.0;
     let cx = egui::lerp((track.left() + 3.0 + r)..=(track.right() - 3.0 - r), t);
-    let knob = mix(Color32::from_rgb(196, 204, 216), if tint == ACCENT { ON_ACCENT } else { Color32::WHITE }, t);
+    let knob = mix(Color32::from_rgb(196, 204, 216), ON_ACCENT, t);
     p.circle_filled(egui::pos2(cx, track.center().y), r, if en { knob } else { knob.gamma_multiply(0.5) });
     if galley.size().x > 0.0 {
         let col = if en { mix(DIM.lerp_to_gamma(TEXT, 0.55), TEXT, lit.max(t * 0.6)) } else { FAINT };

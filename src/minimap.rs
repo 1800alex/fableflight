@@ -498,7 +498,7 @@ impl Minimap {
                 }
                 // the resize grip, lit under the pointer.
                 let hot = resize.hovered() || resize.dragged();
-                let col = if hot { crate::flightui::SKY } else { Color32::from_white_alpha(150) };
+                let col = if hot { crate::flightui::LIT } else { Color32::from_white_alpha(150) };
                 for k in [0.0, 4.5, 9.0] {
                     painter.line_segment([knob + Vec2::new(-6.0 + k, -6.0), knob + Vec2::new(6.0, 6.0 - k)], Stroke::new(1.4, col));
                 }
