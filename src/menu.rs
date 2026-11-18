@@ -983,43 +983,16 @@ pub fn key_row(ui: &mut egui::Ui, keys: &'static str, what: &'static str) {
 }
 
 /// One `buttons … action` row of the gamepad controls list.
-pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &'static str) {
+pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &str) {
     padui::glyphs(ui, spec, 20.0);
-    ui.add(egui::Label::new(RichText::new(tr(what)).font(caption()).color(TEXT)).truncate());
+    ui.add(egui::Label::new(RichText::new(what).font(caption()).color(TEXT)).truncate());
     ui.end_row();
 }
-
-/// The gamepad, flying: (buttons, what they do).
-pub const PAD_FLYING: &[(&str, &str)] = &[
-    ("LS", "pitch and roll"),
-    ("LT / RT", "rudder left / right"),
-    ("A / B", "throttle up / down (hold)"),
-    ("X", "wheel brakes (hold)"),
-    ("Y + B", "parking brake on / off"),
-    ("Y + Up / Down", "trim nose down / up"),
-    ("LB / RB", "flaps up / down a notch"),
-    ("L3", "landing gear"),
-    ("RS", "look around"),
-    ("R3", "reset the view"),
-    ("Dpad", "quick views"),
-    ("View", "chase / cockpit camera"),
-    ("Y + A", "afterburner / boost (hold)"),
-    ("Y + X", "thrust reversers (hold)"),
-    ("Y + LB", "speedbrake"),
-    ("Y + RB", "autopilot on / off"),
-    ("Y + L3", "start / stop the engine"),
-    ("Y + R3", "hide / show the HUD"),
-    ("Y + Menu", "canopy open / shut"),
-    ("Y + Left / Right", "master arm, lock a target"),
-    ("Y", "fire at a locked target (let go)"),
-    ("A", "fly again after a crash"),
-];
 
 /// The gamepad, in the menus and on the globe.
 pub const PAD_MENUS: &[(&str, &[(&str, &str)])] = &[
     ("GAMEPAD · MENUS", &[
         ("Menu", "pause menu"),
-        ("Y + View", "flight panel (beside the flying)"),
         ("Dpad", "move between choices"),
         ("RS", "scroll"),
         ("A", "press / choose"),
@@ -1043,15 +1016,16 @@ pub fn controls_list(ui: &mut egui::Ui) {
         ui.columns(2, |cols| {
             heading(&mut cols[0], tr("GAMEPAD · FLYING"));
             egui::Grid::new("pad_fly").num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[0], |ui| {
-                for (k, w) in PAD_FLYING {
-                    pad_row(ui, k, w);
+                // (as Settings › Controls › Gamepad has it)
+                for (k, w) in crate::padmap::flying_rows() {
+                    pad_row(ui, &k, &w);
                 }
             });
             for (title, rows) in PAD_MENUS {
                 heading(&mut cols[1], tr(title));
                 egui::Grid::new(("pad", *title)).num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[1], |ui| {
                     for (k, w) in rows.iter() {
-                        pad_row(ui, k, w);
+                        pad_row(ui, k, tr(w));
                     }
                 });
                 cols[1].add_space(4.0);
