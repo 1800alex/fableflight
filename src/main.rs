@@ -986,6 +986,9 @@ struct Game {
     pad_held: Vec<(&'static str, Option<KeyCode>)>,
     /// a word from binding the pad (what lost its binding), until when
     pad_note: (String, f64),
+    /// the pad was used last, not the mouse: the middle of the cockpit view
+    /// picks out the controls (see `pad_aim_at`)
+    pad_aim: bool,
     /// the camera look the view starts out at (right stick click goes back to it)
     cam_home: (f64, f64),
     rng: crash::Rng,
@@ -1299,7 +1302,7 @@ impl Game {
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
-            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
+            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
@@ -1876,9 +1879,10 @@ impl Game {
     }
 
 
-    /// The cockpit control under the mouse at (x, y) window pixels (an index
-    /// into the loaded cockpit controls): in the cockpit view, flying, nothing open.
-    fn hotspot_at(&self, x: f64, y: f64) -> Option<usize> {
+    /// The cockpit view's ray through (x, y) window pixels, in the aircraft's
+    /// body frame (from the eye, unit length), with the pose and the hotspots
+    /// where they are now: in the cockpit view, flying, nothing open.
+    fn cockpit_ray(&self, x: f64, y: f64) -> Option<(Vec3, Vec3, Vec<Mat4>, Vec<aircraft::Hotspot>)> {
         if self.mode != Mode::Fly || self.cam_mode != 1 || self.pause_open || self.crashed || self.cockpit_controls.is_empty() {
             return None;
         }
@@ -1893,9 +1897,48 @@ impl Game {
         let d = (inv * d).as_vec3();
         let pose = self.plane.pose(&self.model.pieces);
         let hs = self.cockpit_hotspots(&pose);
+        Some((o, d, pose, hs))
+    }
+    /// The cockpit control under the mouse at (x, y) window pixels (an index
+    /// into the loaded cockpit controls): in the cockpit view, flying, nothing open.
+    fn hotspot_at(&self, x: f64, y: f64) -> Option<usize> {
+        let (o, d, pose, hs) = self.cockpit_ray(x, y)?;
         let i = aircraft::pick(&hs, o, d)?;
         let depth = (Vec3::from(hs[i].at) - o).dot(d) - hs[i].r - 0.005;
         (!cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, d, depth)).then_some(i)
+    }
+    /// Looking about the cockpit with the pad: the control the middle of the
+    /// view is on, if any, and how near the nearest one in sight is (1 on
+    /// it, falling to 0 at `AIM_NEAR` off it). None: not aiming with the pad.
+    fn pad_aim_at(&self) -> Option<(Option<usize>, f32)> {
+        /// how far off a control (radians, past its edge) the aim dot shows
+        const AIM_NEAR: f32 = 0.14;
+        if !self.pad_aim || self.info_open {
+            return None;
+        }
+        let s = self.window.inner_size();
+        let (o, d, pose, hs) = self.cockpit_ray(s.width as f64 * 0.5, s.height as f64 * 0.5)?;
+        let on = aircraft::pick(&hs, o, d).filter(|&i| {
+            let depth = (Vec3::from(hs[i].at) - o).dot(d) - hs[i].r - 0.005;
+            !cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, d, depth)
+        });
+        if on.is_some() {
+            return Some((on, 1.0));
+        }
+        // The angle from the middle of the view to each control's edge: the
+        // nearest few checked for being in sight (not behind the panel).
+        let mut near: Vec<(f32, usize)> = hs.iter().enumerate().filter_map(|(i, h)| {
+            let c = Vec3::from(h.at) - o;
+            let l = c.length();
+            (l > h.r && c.dot(d) > 0.0).then(|| (d.angle_between(c) - (h.r / l).asin(), i))
+        }).filter(|&(a, _)| a < AIM_NEAR).collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let seen = near.iter().take(4).find(|&&(_, i)| {
+            let c = Vec3::from(hs[i].at) - o;
+            let l = c.length();
+            !cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, c / l, l - hs[i].r - 0.005)
+        });
+        Some((None, seen.map_or(0.0, |&(a, _)| 1.0 - (a / AIM_NEAR).clamp(0.0, 1.0))))
     }
     fn hotspot_under_mouse(&self) -> Option<usize> {
         if self.drag || self.lean_drag.is_some() {
@@ -2030,13 +2073,35 @@ impl Game {
     }
     /// The cockpit control under the mouse: a ring round it, what it is, how
     /// it is set, and the pointing hand.
+    ///
+    /// Looking about with the pad it is the middle of the view that points:
+    /// a faint dot there once a control is near it, filling in on one, and
+    /// beside it the pad buttons that work the control.
     fn hotspot_overlay(&self, ctx: &egui::Context) {
         use egui::{Align2, Color32, FontId};
-        let Some(i) = self.hotspot_under_mouse() else { return };
-        let Some((vp, cam)) = self.live_view else { return };
-        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        let h = self.cockpit_hotspots(&self.plane.pose(&self.model.pieces))[i];
         let screen = ctx.content_rect();
+        let aim = self.pad_aim_at();
+        if let Some((on, near)) = aim {
+            if near > 0.0 {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let c = screen.center();
+                // (Faint at the edge of the range, firmer as it closes in.)
+                let a = 0.35 + 0.45 * near;
+                if on.is_some() {
+                    painter.circle_filled(c, 5.0, Color32::from_rgba_unmultiplied(255, 210, 90, 220));
+                    painter.circle_stroke(c, 5.0, egui::Stroke::new(1.0, Color32::from_black_alpha(140)));
+                } else {
+                    painter.circle_filled(c, 4.5, Color32::from_white_alpha((a * 255.0) as u8));
+                    painter.circle_stroke(c, 4.5, egui::Stroke::new(1.0, Color32::from_black_alpha((a * 160.0) as u8)));
+                }
+            }
+        }
+        let Some(i) = (match aim { Some((on, _)) => on, None => self.hotspot_under_mouse() }) else { return };
+        let Some((vp, cam)) = self.live_view else { return };
+        if aim.is_none() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let h = self.cockpit_hotspots(&self.plane.pose(&self.model.pieces))[i];
         let to_screen = |b: Vec3| -> Option<egui::Pos2> {
             let w = self.plane.model_pos() + self.plane.rot * b.as_dvec3();
             let c = vp * (w - cam).as_vec3().extend(1.0);
@@ -2053,6 +2118,32 @@ impl Game {
             "speedbrake" if self.spec.chute.is_some() => t!("Drag chute", "Parachute-frein"),
             _ => bind::ACTIONS.iter().find(|a| a.id == id).map(|a| a.label()).unwrap_or_else(|| aircraft::c172::cabin::action_label(id)),
         };
+        if aim.is_some() {
+            // The pad: each action with the buttons that do it (none: not on the pad).
+            let mut rows: Vec<(String, String)> = Vec::new();
+            let mut add = |id: &'static str, extra: &str| rows.push((padmap::spec_of(id), format!("{}{extra}", label(id))));
+            if let Some(id) = h.click { add(id, ""); }
+            if let Some(id) = h.hold { add(id, &if h.click.is_none() { format!(" ({})", t!("hold", "maintenir")) } else { String::new() }); }
+            if let Some((up, down)) = h.wheel { add(up, ""); add(down, ""); }
+            rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+            if let Some(st) = h.click.or(h.wheel.map(|w| w.0)).and_then(|id| self.hot_state(id)) {
+                rows.push((String::new(), st));
+            }
+            let p = ctx.layer_painter(egui::LayerId::background());
+            let x0 = screen.center().x + 18.0;
+            let y0 = screen.center().y + 16.0;
+            let gw = rows.iter().map(|r| if r.0.is_empty() { 0.0 } else { padui::spec_width(&p, &r.0, 18.0) + 6.0 }).fold(0.0, f32::max);
+            for (k, (spec, text)) in rows.iter().enumerate() {
+                let y = y0 + 22.0 * k as f32;
+                if !spec.is_empty() {
+                    padui::paint_spec(&p, x0, y, spec, 18.0, Color32::WHITE);
+                }
+                let pos = egui::pos2(x0 + gw, y);
+                p.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_CENTER, text, FontId::proportional(13.5), Color32::from_black_alpha(200));
+                p.text(pos, Align2::LEFT_CENTER, text, FontId::proportional(13.5), Color32::WHITE);
+            }
+            return;
+        }
         let mut lines: Vec<String> = Vec::new();
         if let Some(id) = h.click {
             let hold = h.hold.map(|k| t!("  (hold: {})", "  (maintenir : {})", label(k))).unwrap_or_default();
@@ -2240,6 +2331,7 @@ impl Game {
         let Some(pad) = id.and_then(|id| g.connected_gamepad(id)) else {
             self.pad = Controls::default();
             padui::set_active(false);
+            self.pad_aim = false;
             self.pad_rep = None;
             (self.pad_y, self.pad_y_combo) = (false, false);
             self.pad_release_all();
@@ -2412,6 +2504,10 @@ impl Game {
             let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
             self.cam_yaw += look_x * rate * side;
             self.cam_pitch = (self.cam_pitch - look_y * rate * 0.8).clamp(-1.2, 1.4);
+        }
+        // Looking or flying with the pad: the middle of the view aims at the cockpit's controls.
+        if look_x != 0.0 || look_y != 0.0 || self.pad.pitch != 0.0 || self.pad.roll != 0.0 || !pressed.is_empty() {
+            self.pad_aim = true;
         }
 
         // Y held before this frame, or pressed in it: what the buttons pressed now mean.
@@ -7185,6 +7281,10 @@ impl ApplicationHandler for App {
                         g.cam_yaw -= (position.x - x) * 0.005 * k;
                         g.cam_pitch = (g.cam_pitch + (position.y - y) * 0.004 * k).clamp(-1.2, 1.4);
                     }
+                }
+                // The mouse moved (not just a twitch): it points at the controls again, not the pad.
+                if g.cursor.is_none_or(|(x, y)| (position.x - x).abs() + (position.y - y).abs() > 3.0) {
+                    g.pad_aim = false;
                 }
                 g.last_cursor = Some((position.x, position.y));
                 // (--cursor pins it, for scripted screenshots.)
