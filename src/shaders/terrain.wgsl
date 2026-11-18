@@ -771,6 +771,7 @@ fn city_glow(gq: vec2f, dens: f32, dcx: vec2f, dcy: vec2f, upn: vec3f) -> vec3f 
   var N = in.N;
   if (dot(N, N) < 1e-8) { N = normalize(in.P - G.planet.xyz); }
   N = normalize(N);
+  let Ngeo = N;
   let upn = normalize(in.P - G.planet.xyz);
   var wc = wc0;
   let fw = max(length(dx), length(dy));
@@ -847,6 +848,35 @@ fn city_glow(gq: vec2f, dens: f32, dcx: vec2f, dcy: vec2f, upn: vec3f) -> vec3f 
     c *= (0.55 + 0.45 * cav) / (0.55 + 0.45 * mix(cavm, 1.0, graze * graze * g.grassy));
     albedo = mix(img, c, fade);
     N = normalize(N + nd * fade);
+  }
+  // Snow lying on the ground (snow.rs): from the height above the snow line,
+  // the slope and the way the ground faces, broken by noise into tongues and
+  // bare patches near the line. Water returned above; roads and runways are
+  // drawn over it, cleared.
+  if (snow_on()) {
+    let s1 = snow_noise(wc0, 2300.0, fw);
+    let s2 = snow_noise(wc0 + 517.0, 610.0, fw);
+    let s3 = snow_noise(wc0 - 133.0, 47.0, fw);
+    // The slope through noise too, so the cut-off does not trace the mesh's triangles.
+    let Ns = normalize(Ngeo + upn * ((s2 - 0.5) * 0.35));
+    var ks = snow_at(in.P, Ns, upn, ((s1 - 0.5) * 0.6 + (s2 - 0.5) * 0.4) * SNOW_BAND * 1.2);
+    // Ragged edges where it thins out, solid where it is deep.
+    ks = clamp(ks + (s3 - 0.5) * 2.0 * min(ks, 1.0 - ks), 0.0, 1.0);
+    // The class from the nearest texel: filtered, the packed bits blend into
+    // other classes along every boundary.
+    let mdim = vec2f(textureDimensions(t_mask, 0));
+    let mt = textureLoad(t_mask, vec2i(clamp(floor(in.uv * mdim), vec2f(0.0), mdim - 1.0)), 0);
+    let cls = u32(round(mt.b * 255.0)) & 15u;
+    // Towns and roads in the photo are partly cleared; in woods the snow on
+    // the ground shows between dark trunks and crowns.
+    ks *= select(1.0, 0.85, cls == GC_PAVED);
+    // Bare rock in the photo is mostly steep or windswept: it keeps some showing.
+    ks *= select(1.0, 0.8, cls == GC_ROCK);
+    var sc = SNOW_ALBEDO * (0.93 + 0.14 * s3);
+    if (cls == GC_WOOD) { sc = mix(img, sc, 0.45); }
+    albedo = mix(albedo, sc, ks);
+    // It smooths over the ground's small relief.
+    N = normalize(mix(N, Ngeo, ks * 0.75));
   }
   for (var i = 0; i < 8; i++) {
     let s = G.scorch[i];

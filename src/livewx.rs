@@ -53,6 +53,9 @@ pub struct Target {
     pub gusts: f64,
     /// sea-level pressure, hPa (None: not reported)
     pub qnh: Option<f64>,
+    /// freezing level (m above sea level) from the surface temperature
+    /// (None: not reported)
+    pub freezing: Option<f64>,
     /// what it came from, for the weather panel: "EBBR" or "Open-Meteo",
     /// and the report itself (the raw METAR)
     pub station: String,
@@ -107,6 +110,7 @@ impl LiveWx {
             }
             // Hand-set weather: the standard atmosphere.
             wx.qnh = 1013.25;
+            wx.freezing = None;
             return;
         }
         let (got, radar) = {
@@ -177,6 +181,10 @@ impl LiveWx {
         if let Some(q) = t.qnh {
             wx.qnh += (q - wx.qnh) * k;
         }
+        wx.freezing = match (wx.freezing, t.freezing) {
+            (Some(a), Some(b)) => Some(a + (b - a) * k),
+            (_, b) => b,
+        };
         if let Some(from) = t.wind_from {
             let d = (from - wx.wind_from + 540.0).rem_euclid(360.0) - 180.0;
             wx.wind_from = (wx.wind_from + d * k).rem_euclid(360.0);
@@ -526,6 +534,7 @@ fn from_metar(m: &serde_json::Value) -> Option<Target> {
         wind_from,
         gusts: gust.map(|g| ((g - wind) / 8.0).clamp(0.0, 1.0)).unwrap_or(0.1),
         qnh: m["altim"].as_f64().filter(|q| (850.0..1100.0).contains(q)),
+        freezing: m["temp"].as_f64().filter(|t| (-80.0..60.0).contains(t)).map(|t| crate::snow::freezing_level(t, elev)),
         station,
         raw,
     })
@@ -670,6 +679,7 @@ fn from_open_meteo(j: &serde_json::Value) -> Option<Target> {
         wind_from: f("wind_direction_10m"),
         gusts: f("wind_gusts_10m").map(|g| ((g - wind) / 8.0).clamp(0.0, 1.0)).unwrap_or(0.1),
         qnh: f("pressure_msl").filter(|q| (850.0..1100.0).contains(q)),
+        freezing: f("temperature_2m").filter(|t| (-80.0..60.0).contains(t)).map(|t| crate::snow::freezing_level(t, elev)),
         station: "Open-Meteo".into(),
         raw: String::new(),
     })
@@ -681,9 +691,11 @@ mod tests {
 
     #[test]
     fn metar() {
-        let m = serde_json::json!({"icaoId":"EGLL","rawOb":"METAR EGLL 151720Z 24015G28KT 9999 -TSRA FEW012 BKN025CB OVC080 12/10 Q1002","altim":1002,"elev":25,"wdir":240,"wspd":15,"wgst":28,"visib":"6+","wxString":"-TSRA","clouds":[{"cover":"FEW","base":1200},{"cover":"BKN","base":2500},{"cover":"OVC","base":8000}]});
+        let m = serde_json::json!({"icaoId":"EGLL","rawOb":"METAR EGLL 151720Z 24015G28KT 9999 -TSRA FEW012 BKN025CB OVC080 12/10 Q1002","altim":1002,"elev":25,"temp":12,"wdir":240,"wspd":15,"wgst":28,"visib":"6+","wxString":"-TSRA","clouds":[{"cover":"FEW","base":1200},{"cover":"BKN","base":2500},{"cover":"OVC","base":8000}]});
         let t = from_metar(&m).unwrap();
         assert_eq!((t.station.as_str(), t.qnh), ("EGLL", Some(1002.0)));
+        // 12 °C at 25 m: the freezing level about 1850 m up (snow.rs).
+        assert!((t.freezing.unwrap() - (25.0 + 12.0 / 0.0065)).abs() < 1e-6);
         assert_eq!(t.wind_from, Some(240.0));
         assert!((t.wind - 15.0 / 1.94384).abs() < 1e-6);
         assert!(t.gusts > 0.8);
@@ -757,6 +769,8 @@ mod tests {
         assert_eq!(t.base_m, Some(300.0));
         assert_eq!(t.wind_from, Some(203.0));
         assert_eq!(t.station, "Open-Meteo");
+        // 10 °C at the grid cell's 37 m.
+        assert!((t.freezing.unwrap() - (37.0 + 10.0 / 0.0065)).abs() < 1e-6);
 
         let om = |code: u32, rain: f64, showers: f64| {
             let j = serde_json::json!({"elevation":0.0,"current":{"cloud_cover_low":30,"cloud_cover_mid":0,"wind_speed_10m":3.0,"weather_code":code,"rain":rain,"showers":showers}});

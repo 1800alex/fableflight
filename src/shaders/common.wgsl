@@ -102,6 +102,10 @@ struct Globals {
   // alive, 2 TO, 4 FROM, 8 glide slope alive).
   nav: vec4f,
   cockpit: array<vec4f, 8>,
+  // Snow lying on the ground (snow.rs `globals`): snow line under the camera
+  // (m), its change northwards (m per m), +1 / -1 for the north / south pole,
+  // 1 when there is any snow.
+  snow: vec4f,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -1919,6 +1923,63 @@ fn spot_light(P: vec3f, N: vec3f) -> vec3f {
   }
   return vec3f(1.0, 0.92, 0.80) * c;
 }
+// ------------------------------------------------------------- lying snow
+// Snow on the ground, trees and roofs (snow.rs; keep the constants and
+// `snow_cover` the same as there). G.snow: snow line under the camera (m),
+// its change northwards (m per m), +1 / -1 for the north / south pole, 1 when
+// there is any snow.
+const SNOW_BAND = 400.0;       // bare to fully white over this height (m)
+const SNOW_ASPECT = 500.0;     // the line drops this much on a slope facing the pole (per unit of its normal's poleward part)
+const SNOW_HOLD_COS = 0.866;   // holds fully up to 30 degrees
+const SNOW_SLIDE_COS = 0.5;    // none left from 60 degrees
+const SNOW_ALBEDO = vec3f(0.80, 0.82, 0.86);
+fn snow_on() -> bool { return G.snow.w > 0.0; }
+// An integer hash of a lattice point, 0..1 (sin-based hashes lose their
+// precision this far from the origin).
+fn snow_hash(i: vec2f) -> f32 {
+  let q = bitcast<vec2u>(vec2i(i));
+  var h = (q.x * 0x27d4eb2du) ^ ((q.y + 0x9e3779b9u) * 0x85ebca6bu);
+  h ^= h >> 15u;
+  h *= 0x2c1b3c6du;
+  h ^= h >> 12u;
+  return f32(h >> 8u) / 16777216.0;
+}
+// Smooth value noise 0..1 with no tiling (the snow's drifts and bare patches).
+fn snow_vnoise(p: vec2f) -> f32 {
+  let i = floor(p);
+  let f = p - i;
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = snow_hash(i);
+  let b = snow_hash(i + vec2f(1.0, 0.0));
+  let c = snow_hash(i + vec2f(0.0, 1.0));
+  let d = snow_hash(i + vec2f(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// The same, faded to its mean once a cell is under a few pixels.
+fn snow_noise(wc: vec2f, scale: f32, fw: f32) -> f32 {
+  return mix(snow_vnoise(wc / scale), 0.5, smoothstep(0.15, 0.5, fw / scale));
+}
+fn snow_cover(alt: f32, cos_slope: f32, poleward: f32, line: f32) -> f32 {
+  let z = alt - line + SNOW_ASPECT * poleward;
+  return smoothstep(-0.5 * SNOW_BAND, 0.5 * SNOW_BAND, z) * smoothstep(SNOW_SLIDE_COS, SNOW_HOLD_COS, cos_slope);
+}
+// How much snow lies at P (camera-relative) on ground whose normal is N;
+// `lift` (m) moves the point up or down through the band (noise).
+fn snow_at(P: vec3f, N: vec3f, upn: vec3f, lift: f32) -> f32 {
+  if (!snow_on()) { return 0.0; }
+  let alt = length(P - G.planet.xyz) - G.planet.w;
+  let line = G.snow.x + dot(P, G.north.xyz) * G.snow.y;
+  return snow_cover(alt + lift, dot(N, upn), dot(N, G.north.xyz) * G.snow.z, line);
+}
+// Snow resting on top of something above the ground (a crown, a roof): as
+// much as lies on flat ground there, where the surface faces up between
+// `lo` and `hi` (cosines with the vertical).
+fn snow_top(P: vec3f, N: vec3f, lo: f32, hi: f32) -> f32 {
+  if (!snow_on()) { return 0.0; }
+  let upn = normalize(P - G.planet.xyz);
+  return snow_at(P, upn, upn, 0.0) * smoothstep(lo, hi, dot(N, upn));
+}
+
 fn shade(P: vec3f, N: vec3f, albedo: vec3f) -> vec3f {
   let l = light_at(P);
   let ndl = max(dot(N, G.sun_dir.xyz), 0.0);

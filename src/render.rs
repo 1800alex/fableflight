@@ -194,6 +194,10 @@ pub struct Globals {
     pub nav: [f32; 4],
     /// Cessna instruments, radio receivers and heading-up navigation plot.
     pub cockpit: [[f32; 4]; 8],
+    /// snow lying on the ground (snow.rs `globals`): snow line under the
+    /// camera (m), its change northwards (m per m), +1 / -1 for the north /
+    /// south pole, 1 when there is any snow
+    pub snow: [f32; 4],
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).
