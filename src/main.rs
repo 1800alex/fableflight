@@ -67,6 +67,7 @@ mod ocean;
 mod shore;
 mod skyglow;
 mod snow;
+mod snowmap;
 mod world;
 mod yasim;
 
@@ -1119,6 +1120,8 @@ struct Game {
     /// how much city is around (0..1), for the orange skyglow at night
     city_glow: f32,
     skyglow: skyglow::SkyGlow,
+    /// today's real snow cover around the camera (snowmap.rs)
+    snowmap: snowmap::SnowMap,
     /// an airport start being prepared: (airport, the airfield if it could be put together, runway, on approach, keep the local time)
     airport_rx: Option<std::sync::mpsc::Receiver<(u32, Option<Arc<airports::Geo>>, Option<String>, bool, bool)>>,
     /// an airport start asked for on the command line
@@ -1370,7 +1373,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), toolbar_t: -100.0, weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -5362,6 +5365,9 @@ impl Game {
         self.city_glow += (city - self.city_glow) * (dt_real as f32 * 0.5).min(1.0);
         // City light in the air: the lights come on as the sun sets.
         let glow_px = if in_menu { None } else { self.skyglow.update(cam) };
+        // Today's real snow cover, when the snow follows the real world.
+        let snow_px = self.snowmap.update(&self.src, cam, !in_menu && self.snow == snow::Mode::Auto);
+        let snow_map = if in_menu || self.snow != snow::Mode::Auto { [[0.0; 4]; 3] } else { self.snowmap.globals(cam, self.doy) };
         let glow = {
             let (la, lo, _) = geo::pos_to_lla(cam);
             let gh = self.world.ground(la, lo).map(|g| g.h).unwrap_or(0.0);
@@ -5483,6 +5489,9 @@ impl Game {
             nav: self.nav_globals(),
             cockpit: self.cockpit_globals(),
             snow: if in_menu { [0.0; 4] } else { snow::globals(self.snow, clat.to_degrees(), self.doy, self.wx.freezing) },
+            snow_c: snow_map[0],
+            snow_e: snow_map[1],
+            snow_n: snow_map[2],
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -5827,7 +5836,7 @@ impl Game {
             self.lightning.segments(cam, dt, &mut bolts);
         }
         let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
-        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px });
+        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px, snow: snow_px });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
@@ -6361,6 +6370,9 @@ impl Game {
         let mut live = if self.live.enabled() && !self.live.planes.is_empty() { format!("  ·  {}", t!("Traffic: adsb.lol (ODbL)", "Trafic : adsb.lol (ODbL)")) } else { String::new() };
         if self.wx.live && (!self.wx.live_cells.is_empty() || self.wx.deck_goal.is_some()) {
             live += t!("  ·  Weather radar: RainViewer", "  ·  Radar météo : RainViewer");
+        }
+        if self.mode != Mode::Menu && self.snow == snow::Mode::Auto && self.snowmap.shown().is_some() {
+            live += t!("  ·  Snow cover: IMS, U.S. National Ice Center (NSIDC)", "  ·  Enneigement : IMS, U.S. National Ice Center (NSIDC)");
         }
         if self.mode == Mode::Menu && self.gclouds.shown {
             live += t!("  ·  Clouds: Live Cloud Maps (Matt Eason), contains modified EUMETSAT data", "  ·  Nuages : Live Cloud Maps (Matt Eason), contient des données EUMETSAT modifiées");

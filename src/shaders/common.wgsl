@@ -106,6 +106,12 @@ struct Globals {
   // (m), its change northwards (m per m), +1 / -1 for the north / south pole,
   // 1 when there is any snow.
   snow: vec4f,
+  // Today's real snow cover (snowmap.rs, t_snow): the map's centre relative to
+  // the camera + half its side; its east axis + how much it counts (0 = not
+  // at all); its north axis.
+  snow_c: vec4f,
+  snow_e: vec4f,
+  snow_n: vec4f,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -142,6 +148,10 @@ struct Globals {
 // The start screen globe's cloud map (globeclouds.rs): cloud cover from an
 // infrared composite, equirectangular, 180°W at u = 0, 90°N at v = 0.
 @group(0) @binding(20) var t_gclouds: texture_2d<f32>;
+// Today's real snow cover around the camera (snowmap.rs): R share of the
+// cell under snow, G how much of it the analysis knows (land, northern
+// hemisphere).
+@group(0) @binding(21) var t_snow: texture_2d<f32>;
 
 // GPU particles (explosions, smoke, dust, spray) and their simulation constants.
 struct Particle {
@@ -1968,8 +1978,29 @@ fn snow_cover(alt: f32, cos_slope: f32, poleward: f32, line: f32) -> f32 {
 fn snow_at(P: vec3f, N: vec3f, upn: vec3f, lift: f32) -> f32 {
   if (!snow_on()) { return 0.0; }
   let alt = length(P - G.planet.xyz) - G.planet.w;
+  return snow_cover(alt + lift, dot(N, upn), dot(N, G.north.xyz) * G.snow.z, snow_line_at(P));
+}
+// The snow line at P (camera-relative). Where today's analysis is known, it
+// decides at its 4 km scale: under snow the line comes down SNOW_DOWN below
+// the worked-out one (a cell is snowy when most of it is, so its lowest
+// ground may still be bare; the slope and the patches still shape it); where
+// there is none it rises SNOW_BARE above it, so only the peaks well above it
+// stay white. Its cells blend into each other, and into the worked-out line at the
+// map's edges and where it knows nothing (open water, the south).
+const SNOW_DOWN = 1500.0;
+const SNOW_BARE = 800.0;
+fn snow_line_at(P: vec3f) -> f32 {
   let line = G.snow.x + dot(P, G.north.xyz) * G.snow.y;
-  return snow_cover(alt + lift, dot(N, upn), dot(N, G.north.xyz) * G.snow.z, line);
+  if (G.snow_e.w <= 0.0 || G.snow_c.w <= 0.0) { return line; }
+  let q = P - G.snow_c.xyz;
+  let uv = vec2f(dot(q, G.snow_e.xyz), -dot(q, G.snow_n.xyz)) / (2.0 * G.snow_c.w) + 0.5;
+  let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  if (edge <= 0.0) { return line; }
+  let m = textureSampleLevel(t_snow, s_clamp, uv, 0.0);
+  // (R is the share of the known part: undo the blend with unknown texels.)
+  let share = m.r / max(m.g, 1e-3) * step(1e-3, m.g);
+  let w = G.snow_e.w * smoothstep(0.0, 1.0, m.g) * smoothstep(0.0, 0.05, edge);
+  return mix(line, mix(line + SNOW_BARE, line - SNOW_DOWN, clamp(share, 0.0, 1.0)), w);
 }
 // Snow resting on top of something above the ground (a crown, a roof): as
 // much as lies on flat ground there, where the surface faces up between
