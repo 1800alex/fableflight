@@ -411,8 +411,6 @@ pub const LINK: Color32 = Color32::from_rgb(132, 184, 255);
 pub const OK: Color32 = Color32::from_rgb(112, 214, 138);
 pub const BAD: Color32 = Color32::from_rgb(255, 122, 92);
 pub const PANEL: Color32 = Color32::from_rgba_premultiplied(9, 12, 17, 232);
-/// the see-through glass of the flight panel, over the running game
-pub const GLASS: Color32 = Color32::from_rgba_premultiplied(5, 8, 12, 150);
 
 /// Eases a hover (or any on/off state) in and out instead of snapping: 0..1.
 pub fn ease(ctx: &egui::Context, id: egui::Id, on: bool) -> f32 {
@@ -508,6 +506,18 @@ pub fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: &st
     resp
 }
 
+/// The colour switches show "on" in, until set back (None: the accent).
+pub fn set_switch_tint(ctx: &egui::Context, tint: Option<Color32>) {
+    ctx.data_mut(|d| match tint {
+        Some(c) => {
+            d.insert_temp(egui::Id::unique("menu switch tint"), c);
+        }
+        None => {
+            d.remove::<Color32>(egui::Id::unique("menu switch tint"));
+        }
+    });
+}
+
 /// An on/off switch reading only "On" or "Off": the row it sits in says what it is.
 pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let t = if *on { crate::t!("On", "Activé") } else { crate::t!("Off", "Désactivé") };
@@ -532,13 +542,15 @@ pub fn toggle(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText
     let track = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.center().y - h * 0.5), egui::vec2(w, h));
     let p = ui.painter();
     let off_fill = mix(RAISED, RAISED_HI, lit);
-    let on_fill = if lit > 0.0 { mix(ACCENT, ACCENT_HI, lit) } else { ACCENT };
+    // (the HUD's panels set their own colour for "on": see `set_switch_tint`)
+    let tint = ui.ctx().data(|d| d.get_temp::<Color32>(egui::Id::unique("menu switch tint"))).unwrap_or(ACCENT);
+    let on_fill = if tint == ACCENT { if lit > 0.0 { mix(ACCENT, ACCENT_HI, lit) } else { ACCENT } } else { tint };
     let fill = mix(off_fill, on_fill, t);
     p.rect_filled(track, h * 0.5, if en { fill } else { fill.gamma_multiply(0.45) });
     p.rect_stroke(track, h * 0.5, Stroke::new(1.0, mix(LINE_HI, Color32::TRANSPARENT, t)), egui::StrokeKind::Inside);
     let r = h * 0.5 - 3.0;
     let cx = egui::lerp((track.left() + 3.0 + r)..=(track.right() - 3.0 - r), t);
-    let knob = mix(Color32::from_rgb(196, 204, 216), ON_ACCENT, t);
+    let knob = mix(Color32::from_rgb(196, 204, 216), if tint == ACCENT { ON_ACCENT } else { Color32::WHITE }, t);
     p.circle_filled(egui::pos2(cx, track.center().y), r, if en { knob } else { knob.gamma_multiply(0.5) });
     if galley.size().x > 0.0 {
         let col = if en { mix(DIM.lerp_to_gamma(TEXT, 0.55), TEXT, lit.max(t * 0.6)) } else { FAINT };
@@ -805,7 +817,6 @@ pub enum Icon {
     Weather,
     Map,
     Camera,
-    Pause,
 }
 
 /// Draws an icon `s` points across, centred on `c`.
@@ -873,12 +884,6 @@ pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32)
             p.rect_stroke(r, 2.0, st, egui::StrokeKind::Middle);
             p.line_segment([pos2(c.x - u * 0.35, r.top() - u * 0.2), pos2(c.x + u * 0.35, r.top() - u * 0.2)], st);
             p.circle_stroke(r.center(), u * 0.36, st);
-        }
-        // two bars
-        Icon::Pause => {
-            for x in [-0.3, 0.3] {
-                p.rect_filled(egui::Rect::from_center_size(c + vec2(x * u, 0.0), vec2(u * 0.28, u * 1.5)), 1.0, col);
-            }
         }
     }
 }

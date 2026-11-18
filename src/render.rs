@@ -28,6 +28,8 @@ const MAX_FALL: usize = 4096;
 /// trees and undergrowth close enough to the camera for their leaf cards
 pub const MAX_NEAR: usize = 20000;
 const BLOOM_MIPS: u32 = 6;
+/// Halvings of the finished frame for the HUD's frosted glass (see `frost`).
+const FROST_MIPS: u32 = 4;
 pub const MAX_PARTICLES: u32 = 1 << 16;
 /// Smoke volume around the effects anchor: cells along east, north, up; cell
 /// size in metres; height of the bottom of the grid above the anchor.
@@ -822,6 +824,12 @@ struct Targets {
     bg_up: Vec<wgpu::BindGroup>,
     bg_final: [wgpu::BindGroup; 3],
     bg_blit: wgpu::BindGroup,
+    /// the frosted glass's halvings, its smoothed result, and their bind groups
+    frost: Vec<wgpu::TextureView>,
+    frost_out: wgpu::TextureView,
+    bg_frost_in: wgpu::BindGroup,
+    bg_frost_down: Vec<wgpu::BindGroup>,
+    bg_frost_out: wgpu::BindGroup,
 }
 
 pub struct Renderer {
@@ -972,6 +980,9 @@ pub struct Renderer {
     parts_until: f32,
     now: f32,
     p_down: wgpu::RenderPipeline,
+    /// the frosted glass: the frame shrunk (decoded to linear), and the last shrink smoothed back up a step
+    p_frost_in: wgpu::RenderPipeline,
+    p_frost_out: wgpu::RenderPipeline,
     p_up: wgpu::RenderPipeline,
     p_final: wgpu::RenderPipeline,
     p_final_taa: wgpu::RenderPipeline,
@@ -997,6 +1008,10 @@ pub struct Renderer {
     taa_hist_ok: bool,
     pub meshes: Vec<MeshGpu>,
     pub egui: egui_wgpu::Renderer,
+    /// The finished frame, blurred, as an egui texture: the HUD draws it
+    /// behind its panels for frosted glass. Re-registered when the targets change.
+    pub frost_id: Option<egui::TextureId>,
+    frost_dirty: bool,
     /// the font of the start screen's title, and the screen size and UI
     /// scale its mask was last drawn for
     pub logo_font: Option<Vec<u8>>,
@@ -1835,6 +1850,8 @@ impl Renderer {
         let p_cloud_apply = full("cloud apply", &pl(&l_cloud_apply), &m_cloud, "fs_apply", HDR, Some(wgpu::BlendState { color: over, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }));
         let p_taa = full("taa", &pl(&l_post), &m_taa, "fs_taa", HDR, None);
         let p_down = full("down", &pl(&l_post), &m_post, "fs_down", HDR, None);
+        let p_frost_in = full("frost in", &pl(&l_post), &m_post, "fs_frost_in", HDR, None);
+        let p_frost_out = full("frost out", &pl(&l_post), &m_post, "fs_up", HDR, None);
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let p_up = full("up", &pl(&l_post), &m_post, "fs_up", HDR, Some(wgpu::BlendState { color: add, alpha: add }));
         let p_final = full("final", &pl(&l_post), &m_post, "fs_final", wgpu::TextureFormat::Rgba8Unorm, None);
@@ -2184,6 +2201,7 @@ impl Renderer {
             queue.submit([enc.finish()]);
         }
         Ok(Self {
+            p_frost_in, p_frost_out, frost_id: None, frost_dirty: true,
             ground_mats,
             casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_rain, p_veil, p_bolt, bolt_buf, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
@@ -2222,6 +2240,9 @@ impl Renderer {
         let bloom: Vec<_> = (0..BLOOM_MIPS).map(|i| bloom_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
         let ldr_tex = make_tex(d, "ldr", ow, oh, 1, 1, wgpu::TextureFormat::Rgba8Unorm, rt | wgpu::TextureUsages::COPY_SRC);
         let ldr = view(&ldr_tex);
+        let frost_tex = make_tex(d, "frost", (ow / 2).max(16), (oh / 2).max(16), 1, FROST_MIPS, HDR, rt);
+        let frost: Vec<_> = (0..FROST_MIPS).map(|i| frost_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
+        let frost_out = view(&make_tex(d, "frost out", (ow / 8).max(4), (oh / 8).max(4), 1, 1, HDR, rt));
         let logo_tex = make_tex(d, "logo", ow, oh, 1, 1, wgpu::TextureFormat::R8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let logo = view(&logo_tex);
         let taa = [view(&make_tex(d, "taa 0", w, h, 1, 1, HDR, rt)), view(&make_tex(d, "taa 1", w, h, 1, 1, HDR, rt))];
@@ -2251,6 +2272,10 @@ impl Renderer {
             bg_final: [&hdr, &taa[0], &taa[1]].map(|src| post(src, &bloom[0])),
             taa,
             bg_blit: post(&ldr, black),
+            bg_frost_in: post(&ldr, black),
+            bg_frost_down: (1..FROST_MIPS as usize).map(|i| post(&frost[i - 1], black)).collect(),
+            bg_frost_out: post(&frost[FROST_MIPS as usize - 1], black),
+            frost, frost_out,
             bg_logo: post(&logo, black),
             logo_tex,
             color, aux, amb, depth, hdr, cloud, cloud_dist, cloud_hist, bloom, ldr_tex, ldr,
@@ -2288,6 +2313,7 @@ impl Renderer {
         let (w, h) = self.render_size();
         self.targets = Self::make_targets(&self.device, &self.config, (w, h), &self.l_dres, &self.l_ao, &self.l_composite, &self.l_cloud, &self.l_cloud_apply, &self.l_cloud_temporal, &self.l_post, &self.l_pdraw, &self.l_glass, &self.psim_ub, &self.pbuf, &self.black);
         self.fluid_t = self.fluid.draw_targets(&self.device, &self.targets.depth, w, h);
+        self.frost_dirty = true;
     }
 
     /// Render resolution as a share of the window's (graphics settings).
@@ -2742,6 +2768,14 @@ impl Renderer {
 
         let _ = self.device.poll(wgpu::PollType::Poll);
         self.fluid.poll();
+        // (the frosted glass's texture, handed to egui again when the targets were rebuilt)
+        if self.frost_dirty {
+            match self.frost_id {
+                Some(id) => self.egui.update_egui_texture_from_wgpu_texture(&self.device, &self.targets.frost_out, wgpu::FilterMode::Linear, id),
+                None => self.frost_id = Some(self.egui.register_native_texture(&self.device, &self.targets.frost_out, wgpu::FilterMode::Linear)),
+            }
+            self.frost_dirty = false;
+        }
         let t = &self.targets;
         let mut enc = self.device.create_command_encoder(&Default::default());
         let mut gt = self.gpu_timer.take();
@@ -3443,6 +3477,15 @@ impl Renderer {
         }
         full(&mut enc, &t.ldr, true, if taa { &self.p_final_taa } else { &self.p_final }, &t.bg_final[src]);
 
+        // The frosted glass: the finished frame shrunk and blurred, for the HUD
+        // to draw behind its panels (egui then draws over the frame itself).
+        if f.egui.is_some() {
+            full(&mut enc, &t.frost[0], true, &self.p_frost_in, &t.bg_frost_in);
+            for i in 1..FROST_MIPS as usize {
+                full(&mut enc, &t.frost[i], true, &self.p_down, &t.bg_frost_down[i - 1]);
+            }
+            full(&mut enc, &t.frost_out, true, &self.p_frost_out, &t.bg_frost_out);
+        }
         let egui_jobs = f.egui.map(|(jobs, delta, ppp)| {
             let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point: ppp };
             self.egui.update_buffers(&self.device, &self.queue, &mut enc, &jobs, &sd);
