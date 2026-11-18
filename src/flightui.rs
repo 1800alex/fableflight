@@ -10,7 +10,7 @@
 //! - a systems card at the top left, only for the aircraft that have
 //!   something to show there: a rocket's flight figures, a fighter's weapons.
 use crate::menu::{self, Icon, Page, ACCENT, DIM, TEXT};
-use crate::{padui, t, tr, Game};
+use crate::{padui, t, Game};
 use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke};
 
 /// What the toolbar asked for this frame.
@@ -51,10 +51,11 @@ impl Game {
         if want && show < 1.0 {
             ctx.request_repaint();
         }
-        let items: [(Icon, &str, Bar, bool); 7] = [
+        let items: [(Icon, &str, Bar, bool); 8] = [
             (Icon::Flight, t!("Flight", "Vol"), Bar::Page(Page::Flight), self.info_open && self.info_page == Page::Flight),
             (Icon::GoTo, t!("Go to", "Aller à"), Bar::Page(Page::Places), self.info_open && self.info_page == Page::Places),
             (Icon::Radio, t!("Radio", "Radio"), Bar::Page(Page::Radio), self.info_open && self.info_page == Page::Radio),
+            (Icon::Autopilot, t!("Autopilot", "Pilote auto"), Bar::Page(Page::Autopilot), self.info_open && self.info_page == Page::Autopilot),
             (Icon::Weather, t!("Weather", "Météo"), Bar::Page(Page::Weather), self.info_open && self.info_page == Page::Weather),
             (Icon::Map, t!("Map", "Carte"), Bar::Map, self.minimap.visible),
             (Icon::Camera, if self.cam_mode == 1 { t!("Cockpit", "Cockpit") } else { t!("Chase", "Extérieur") }, Bar::Camera, false),
@@ -96,7 +97,12 @@ impl Game {
                 });
             });
             // what opens it from the keyboard or the gamepad, under the bar
-            let hint = if padui::active() { tr("Y + View: flight panel   Menu: pause") } else { t!("Tab: flight panel   Esc: pause", "Tab : panneau de vol   Échap : pause") };
+            let hint = if padui::active() {
+                match crate::padmap::spec_of("flight_panel") {
+                    k if k.is_empty() => t!("Menu: pause", "Menu : pause").to_string(),
+                    k => t!("{}: flight panel   Menu: pause", "{} : panneau de vol   Menu : pause", k),
+                }
+            } else { t!("Tab: flight panel   Esc: pause", "Tab : panneau de vol   Échap : pause").to_string() };
             let r = ui.min_rect();
             ui.painter().text(pos2(r.center().x, r.bottom() + 12.0), Align2::CENTER_CENTER, hint, menu::caption(), Color32::from_white_alpha(170));
         });
@@ -171,6 +177,8 @@ impl Game {
             ctx.request_repaint();
         }
         // The live line: on a runway, at a holding point, or on an approach.
+        let guidance = airport.and_then(|l| l.get(2)).is_some();
+        self.ap_strip(ctx, guidance);
         if let Some((text, col)) = airport.and_then(|l| l.get(2)) {
             let col = match col {
                 1 => menu::OK,
@@ -191,12 +199,48 @@ impl Game {
         }
     }
 
+    /// The autopilot's modes over the instruments, as an annunciator strip:
+    /// green what it flies, grey what is armed; "AP OFF" flashing amber a
+    /// few seconds after it lets go. Above the guidance line when that shows.
+    fn ap_strip(&self, ctx: &egui::Context, guidance: bool) {
+        let off_for = self.real - self.ap_off_t;
+        let flash = !self.ap.on && off_for < 4.0;
+        if !self.ap.on && !flash {
+            return;
+        }
+        let lift = if guidance { 44.0 } else { 0.0 };
+        egui::Area::new(egui::Id::unique("ap_strip")).anchor(Align2::CENTER_BOTTOM, [0.0, -14.0 - crate::HUD_H - 10.0 - lift]).interactable(false).show(ctx, |ui| {
+            glass().inner_margin(egui::Margin::symmetric(14, 6)).show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.horizontal(|ui| {
+                    let mono = egui::FontId::monospace(14.0);
+                    if self.ap.on {
+                        let (on, armed) = self.ap.annunciation();
+                        ui.label(RichText::new("AP").font(mono.clone()).strong().color(menu::OK));
+                        for m in on {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(m).font(mono.clone()).color(menu::OK));
+                        }
+                        for m in armed {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(m).font(mono.clone()).color(DIM));
+                        }
+                    } else if (off_for * 2.5).fract() < 0.6 {
+                        ui.label(RichText::new("AP OFF").font(mono).strong().color(Color32::from_rgb(255, 196, 80)));
+                    } else {
+                        ui.label(RichText::new("      ").font(mono));
+                    }
+                });
+            });
+        });
+    }
+
     /// The systems card at the top left: a rocket's flight figures, or a
     /// fighter's weapons. Nothing (None) for every other aircraft.
     pub(crate) fn systems_card(&self, ctx: &egui::Context, vs: f64, base_up: f64) -> Option<Rect> {
         let p = &self.plane;
         let rocket = p.engines().is_some();
-        if !rocket && !self.weapons.has_weapons() {
+        if !rocket && !self.missiles_ok() {
             return None;
         }
         let amber = Color32::from_rgb(255, 196, 80);
@@ -224,7 +268,7 @@ impl Game {
                         row(ui, t!("Mass, load", "Masse, facteur"), format!("{:.0} t  ·  {:.1} g", p.mass() / 1000.0, p.g_load), TEXT);
                     });
                 }
-                if self.weapons.has_weapons() {
+                if self.missiles_ok() {
                     let armed = self.weapons.armed;
                     let power = p.sys.powered();
                     ui.label(menu::section_text(t!("Weapons", "Armement")).color(DIM));

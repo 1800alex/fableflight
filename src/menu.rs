@@ -556,6 +556,7 @@ pub enum Page {
     Flight,
     Places,
     Radio,
+    Autopilot,
     Weather,
     Game,
     /// the settings screen (settings_ui.rs), over the paused game
@@ -566,7 +567,7 @@ pub enum Page {
 }
 
 impl Page {
-    pub const INFO: [Page; 4] = [Page::Flight, Page::Places, Page::Radio, Page::Weather];
+    pub const INFO: [Page; 5] = [Page::Flight, Page::Places, Page::Radio, Page::Autopilot, Page::Weather];
     pub const PAUSE: [Page; 4] = [Page::Game, Page::Settings, Page::Controls, Page::Failures];
 
     pub fn name(self) -> &'static str {
@@ -574,6 +575,7 @@ impl Page {
             Page::Flight => "Flight",
             Page::Places => "Go to",
             Page::Radio => "Radio",
+            Page::Autopilot => "Autopilot",
             Page::Weather => "Weather",
             Page::Game => "Game",
             Page::Settings => "Settings",
@@ -639,6 +641,7 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
     ("VIEW", &[
         ("C", "chase / cockpit camera"),
         ("Mouse drag", "look around"),
+        ("Click / wheel", "cockpit: work a switch, turn a knob (Cessna)"),
         ("Mouse wheel", "camera distance / cockpit zoom"),
         ("H", "hide / show the HUD"),
         ("`", "hide / show the minimap"),
@@ -674,6 +677,15 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("View", "chase / cockpit camera"),
         ("Menu", "pause menu (B closes it)"),
         ("Y + View", "flight panel"),
+        ("Y + A", "afterburner / boost (hold)"),
+        ("Y + X", "thrust reversers (hold)"),
+        ("Y + LB", "speedbrake"),
+        ("Y + RB", "autopilot on / off"),
+        ("Y + Left stick click", "start / stop the engine"),
+        ("Y + Right stick click", "hide / show the HUD"),
+        ("Y + Menu", "canopy open / shut"),
+        ("Y + D-pad left / right", "master arm, lock a target"),
+        ("Y (let go)", "fire at a locked target"),
         ("A after a crash", "fly again"),
 ]),
 ];
@@ -804,6 +816,7 @@ pub enum Icon {
     Flight,
     GoTo,
     Radio,
+    Autopilot,
     Weather,
     Map,
     Camera,
@@ -842,6 +855,19 @@ pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32)
                 // to the right, and to the left
                 p.add(egui::Shape::line(arc(c - vec2(0.0, u * 0.15), u * r, -0.75, 0.75), st));
                 p.add(egui::Shape::line(arc(c - vec2(0.0, u * 0.15), u * r, pi - 0.75, pi + 0.75), st));
+            }
+        }
+        // an aeroplane seen from above between two pairs of arcs, like a signal
+        Icon::Autopilot => {
+            let k = 0.55;
+            let pts = [(0.0, -1.0), (0.14, -0.78), (0.14, -0.25), (0.85, 0.25), (0.85, 0.45), (0.14, 0.2), (0.12, 0.62), (0.38, 0.78), (0.38, 0.95), (0.0, 0.85)];
+            let mut v: Vec<egui::Pos2> = pts.iter().map(|&(x, y)| c + vec2(x, y) * u * k).collect();
+            v.extend(pts.iter().rev().skip(1).take(pts.len() - 2).map(|&(x, y)| c + vec2(-x, y) * u * k));
+            p.add(egui::Shape::closed_line(v, st));
+            let pi = std::f32::consts::PI;
+            for r in [0.72, 0.98] {
+                p.add(egui::Shape::line(arc(c, u * r, -0.65, 0.65), st));
+                p.add(egui::Shape::line(arc(c, u * r, pi - 0.65, pi + 0.65), st));
             }
         }
         // a cloud
@@ -959,35 +985,18 @@ pub fn key_row(ui: &mut egui::Ui, keys: &'static str, what: &'static str) {
 }
 
 /// One `buttons … action` row of the gamepad controls list.
-pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &'static str) {
+pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &str) {
     padui::glyphs(ui, spec, 20.0);
-    ui.add(egui::Label::new(RichText::new(tr(what)).font(caption()).color(TEXT)).truncate());
+    ui.add(egui::Label::new(RichText::new(what).font(caption()).color(TEXT)).truncate());
     ui.end_row();
 }
-
-/// The gamepad, flying: (buttons, what they do).
-pub const PAD_FLYING: &[(&str, &str)] = &[
-    ("LS", "pitch and roll"),
-    ("LT / RT", "rudder left / right"),
-    ("A / B", "throttle up / down (hold)"),
-    ("X", "wheel brakes (hold)"),
-    ("Y + B", "parking brake on / off"),
-    ("Y + Up / Down", "trim nose down / up"),
-    ("LB / RB", "flaps up / down a notch"),
-    ("L3", "landing gear"),
-    ("RS", "look around"),
-    ("R3", "reset the view"),
-    ("Dpad", "quick views"),
-    ("View", "chase / cockpit camera"),
-    ("A", "fly again after a crash"),
-];
 
 /// The gamepad, in the menus and on the globe.
 pub const PAD_MENUS: &[(&str, &[(&str, &str)])] = &[
     ("GAMEPAD · MENUS", &[
         ("Menu", "pause menu"),
-        ("Y + View", "flight panel (beside the flying)"),
         ("Dpad", "move between choices"),
+        ("RS", "scroll"),
         ("A", "press / choose"),
         ("Left / Right", "slide a slider"),
         ("LB / RB", "turn the page"),
@@ -1009,15 +1018,16 @@ pub fn controls_list(ui: &mut egui::Ui) {
         ui.columns(2, |cols| {
             heading(&mut cols[0], tr("GAMEPAD · FLYING"));
             egui::Grid::new("pad_fly").num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[0], |ui| {
-                for (k, w) in PAD_FLYING {
-                    pad_row(ui, k, w);
+                // (as Settings › Controls › Gamepad has it)
+                for (k, w) in crate::padmap::flying_rows() {
+                    pad_row(ui, &k, &w);
                 }
             });
             for (title, rows) in PAD_MENUS {
                 heading(&mut cols[1], tr(title));
                 egui::Grid::new(("pad", *title)).num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[1], |ui| {
                     for (k, w) in rows.iter() {
-                        pad_row(ui, k, w);
+                        pad_row(ui, k, tr(w));
                     }
                 });
                 cols[1].add_space(4.0);

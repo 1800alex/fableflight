@@ -13,6 +13,7 @@
 //! plane.wgsl / deck747.wgsl from the `pat::LEGEND` quads placed here), the
 //! knobs a cream plastic, the lining an off-white. What is shown on the
 //! displays is drawn in the shader from the instrument readings.
+use crate::aircraft::Hotspot;
 use super::*;
 use glam::{Mat3, Quat, Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -82,6 +83,7 @@ pub mod screen {
 /// Every string a legend or a display can print, looked up by index. The
 /// shader gets them as a table (`strings_wgsl`); index 0 means "made-up text".
 pub const STRINGS: &[&str] = &[
+
     "", "IAS/MACH", "HDG", "ALT", "VERT SPD", "LNAV", "VNAV", "FL CH", "HOLD", "A/T ARM", "F/D", "APP", "LOC", "BANK LIMIT", "CMD", "DISENGAGE",
     "MINS", "BARO", "MAP", "PLN", "VOR", "RANGE", "WXR", "STA", "WPT", "ARPT", "DATA", "POS", "TERR", "FUEL CONTROL", "RUN", "CUTOFF",
     "STAB TRIM", "AUTO", "ALTN", "GEAR", "UP", "DN", "OFF", "AUTOBRAKES", "RTO", "DISARM", "MAX AUTO", "GND PROX", "FLAP", "OVRD", "SOURCE", "IRS",
@@ -103,6 +105,7 @@ pub const STRINGS: &[&str] = &[
     "DANGER", "FIRE", "MASTER CAUTION", "EXTGH", "A/A", "A/G", "MASTER ARM", "EMERG JETT", "APU FIRE", "IR COOL", "HMD", "SPIN", "NIGHT", "CONT", "5", "6", "7", "8", "9", "0", "ENT", "I/P", "ADF", "VOL", "COMM 1", "COMM 2", "EMCON", "A/P", "IFF", "TCN", "ILS", "D/L", "BCN", "ON/OFF", "DAY", "BLK LVL", "W/B", "BAL", "AOA", "INS", "LOCK", "SHOOT", "MODE", "QTY", "ZONE", "INT", "CRS", "ECM", "LDG GEAR", "NOSE", "LEFT", "RIGHT", "HALF", "FULL", "EXT LT", "FCS", "COMM", "INTR LT", "SNSR", "KY-58", "DEFOG", "IDLE", "MIL", "MAX", "CANOPY", "EJECTION SEAT", "UPPER", "RWS", "TWS", "STT", "RSET", "SIL", "AZ", "EL", "OPR", "ADI", "HSI", "SA", "STORES", "SUPT", "BIT", "FPAS", "CHKLST", "UFC", "TAC", "WYPT", "SEQ1", "SCL", "DCLTR", "MK-82", "AIM-9X", "AIM-120", "GUN", "PRGM", "T/R", "RCV", "X", "Y", "71X", "M", "RPM", "TEMP", "NOZ", "OIL", "BINGO", "T", "I", "L", "R", "G", "N", "E", "S", "W", "DIST", "RNG", "40",
     // The Blackbird's cockpits (sr71/pit.rs).
     "TEB", "OXY", "UHF", "TACAN", "LIGHTS", "DEF", "SAS", "AUTOPILOT", "SPIKE", "FWD BYPASS", "AFT BYPASS", "L UNSTART", "R UNSTART", "CIT", "FUEL LOW", "CG", "PITOT HEAT", "OIL PRESS", "SENSOR", "VIEWSIGHT", "RADAR", "MAP PROJ",
+    "ALT AUTO", "FIXED PROP", "THR PROP MIX", "COWL FLAPS", "SPARE", "SUCTION", "BOTH", "MIXTURE", "THROTTLE", "IGNITION", "BOOST", "BAT", "FUEL PUMP", "PITOT HT",
 ];
 
 /// Index of a string in `STRINGS` (panics if it is missing: a typo in the layout).
@@ -564,11 +567,11 @@ pub fn build(b: &mut Builder) {
     let mut m = Mesh::default();
     let mf = main_panel(&mut m);
     glareshield(&mut m, &mf);
-    pedestal_fixed(&mut m);
+    pedestal_fixed(&mut m, b);
     b.fixed("flight deck panels", G_ENGINE, m);
 
     let mut o = Mesh::default();
-    overhead(&mut o);
+    overhead(&mut o, b);
     b.fixed("overhead panel", G_ENGINE, o);
 
     let mut s = Mesh::default();
@@ -1548,7 +1551,7 @@ fn cdu(m: &mut Mesh, f: &Face, id: f32, seed: f32) {
 
 /// The pedestal: its forward part (CDUs and the thrust lever quadrant) and
 /// the aft part with the fuel control switches and the radio panels.
-fn pedestal_fixed(m: &mut Mesh) {
+fn pedestal_fixed(m: &mut Mesh, b: &mut Builder) {
     let f = main_face();
     let base = f.at(0.0, -0.43);
     // Forward pedestal body.
@@ -1634,20 +1637,29 @@ fn pedestal_fixed(m: &mut Mesh) {
     plate(m, &ft, -0.225, -0.05, 0.225, 0.055, 400.0);
     let g = ft.sub(0.0, 0.0, 0.0043);
     label(m, &g, -0.035, 0.038, 0.05, 0.0045, style::TEXT, sid("FUEL CONTROL"));
+    // The four switches are one mouse target: RUN or CUTOFF together (the
+    // simulator has one fuel control for all four engines; they do not move).
+    let mut sw = Mesh::default();
     for k in 0..4 {
         let u = -0.11 + k as f32 * 0.05;
         let c = g.at(u, 0.0);
-        m.lathe(&CHROME, c, g.n(), &[[0.009, 0.0], [0.009, 0.004], [0.004, 0.006], [0.004, 0.018]], 12, false);
-        m.dome(&BTN, c + g.n() * 0.02 + g.ay * 0.006, g.n(), 0.011, 0.014, 14, 0.0);
+        sw.lathe(&CHROME, c, g.n(), &[[0.009, 0.0], [0.009, 0.004], [0.004, 0.006], [0.004, 0.018]], 12, false);
+        sw.dome(&BTN, c + g.n() * 0.02 + g.ay * 0.006, g.n(), 0.011, 0.014, 14, 0.0);
         label(m, &g, u, -0.032, 0.008, 0.005, style::TEXT, sid(["1", "2", "3", "4"][k]));
     }
+    let piece = b.fixed("fuel control switches", G_ENGINE, sw);
+    b.pieces[piece].hotspot = Some(Hotspot::click(g.at(-0.035, 0.0) + g.n() * 0.02, 0.055, "ignition"));
     word(m, &g, -0.035, 0.022, 0.004, "RUN");
     word(m, &g, -0.035, -0.04, 0.004, "CUTOFF");
     for k in 0..2 {
         guarded(m, &g, 0.09 + k as f32 * 0.03, 0.0, true);
     }
     label(m, &g, 0.105, 0.035, 0.03, 0.004, style::TEXT, sid("STAB TRIM"));
-    toggle(m, &g, 0.175, 0.0, false);
+    // The alternate stabiliser trim switch: the wheel over it trims.
+    let mut alt = Mesh::default();
+    toggle(&mut alt, &g, 0.175, 0.0, false);
+    let piece = b.fixed("alternate stab trim switch", G_ENGINE, alt);
+    b.pieces[piece].hotspot = Some(Hotspot::wheel(g.at(0.175, 0.0) + g.n() * 0.006, 0.02, "trim_down", "trim_up"));
     label(m, &g, 0.175, 0.03, 0.02, 0.0035, style::TEXT, sid("ALTN"));
 
     // The aft electronic panels: radio tuning, audio, the third CDU, weather
@@ -1750,24 +1762,28 @@ fn levers(b: &mut Builder) {
         m.tube(&ALU, &arm, &|_| 0.0055, 8, false);
         let kc = piv + Vec3::new(0.0, 0.352, -0.01);
         m.lathe(&mt(mat::PLASTIC, 0.70, 0.67, 0.58), kc - Vec3::X * 0.024, Vec3::X, &[[0.0, 0.0], [0.016, 0.0], [0.018, 0.004], [0.014, 0.012], [0.013, 0.024], [0.014, 0.036], [0.018, 0.044], [0.016, 0.048], [0.0, 0.048]], 18, true);
-        b.add("thrust lever", G_ENGINE, m, Anim::hinge(Drive::new(Input::Throttle, -0.55).offset(0.28)), piv, Vec3::X, None);
+        let piece = b.add("thrust lever", G_ENGINE, m, Anim::hinge(Drive::new(Input::Throttle, -0.55).offset(0.28)), piv, Vec3::X, None);
+        b.pieces[piece].hotspot = Some(Hotspot::wheel(kc - piv, 0.018, "throttle_up", "throttle_down"));
         let mut r = Mesh::default();
         let rp = piv + Vec3::new(0.0, 0.27, -0.03);
         r.rbox(&BTN, rp + Vec3::new(0.0, 0.02, -0.005), Vec3::new(0.006, 0.03, 0.006), 0.003, Quat::IDENTITY);
         r.rbox(&BTN.pat(pat::KNURL), rp + Vec3::new(0.0, 0.05, -0.012), Vec3::new(0.012, 0.01, 0.008), 0.004, Quat::IDENTITY);
-        b.add("reverse lever", G_ENGINE, r, Anim::hinge2(Drive::new(Input::Throttle, -0.55).offset(0.28), Drive::new(Input::Reverser, 0.9)), piv, Vec3::X, None);
+        let piece = b.add("reverse lever", G_ENGINE, r, Anim::hinge2(Drive::new(Input::Throttle, -0.55).offset(0.28), Drive::new(Input::Reverser, 0.9)), piv, Vec3::X, None);
+        b.pieces[piece].hotspot = Some(Hotspot::hold(rp + Vec3::new(0.0, 0.05, -0.012) - piv, 0.014, "reversers"));
     }
     // Speedbrake lever (left of the quadrant) and flap lever (right).
     let mut s = Mesh::default();
     let sp = Vec3::new(-0.125, qc.y, qc.z);
     s.tube(&ALU, &[sp + Vec3::Y * 0.2, sp + Vec3::new(0.0, 0.32, 0.0)], &|_| 0.004, 8, false);
     s.rbox(&mt(mat::PLASTIC, 0.72, 0.70, 0.66), sp + Vec3::new(0.0, 0.335, -0.004), Vec3::new(0.008, 0.032, 0.008), 0.006, Quat::from_rotation_x(-0.2));
-    b.add("speedbrake lever", G_ENGINE, s, Anim::hinge(Drive::new(Input::Spoiler(-1.0), 0.75).offset(-0.38)), sp, Vec3::X, None);
+    let piece = b.add("speedbrake lever", G_ENGINE, s, Anim::hinge(Drive::new(Input::Spoiler(-1.0), 0.75).offset(-0.38)), sp, Vec3::X, None);
+    b.pieces[piece].hotspot = Some(Hotspot::click(Vec3::new(0.0, 0.335, -0.004), 0.020, "speedbrake"));
     let mut fl = Mesh::default();
     let fp = Vec3::new(0.125, qc.y, qc.z);
     fl.tube(&ALU, &[fp + Vec3::Y * 0.2, fp + Vec3::new(0.0, 0.31, 0.0)], &|_| 0.0045, 8, false);
     fl.rbox(&mt(mat::PLASTIC, 0.72, 0.70, 0.66), fp + Vec3::new(0.0, 0.322, 0.0), Vec3::new(0.016, 0.012, 0.022), 0.006, Quat::IDENTITY);
-    b.add("flap lever", G_ENGINE, fl, Anim::hinge(Drive::new(Input::FlapLever, 0.78).offset(-0.38)), fp, Vec3::X, None);
+    let piece = b.add("flap lever", G_ENGINE, fl, Anim::hinge(Drive::new(Input::FlapLever, 0.78).offset(-0.38)), fp, Vec3::X, None);
+    b.pieces[piece].hotspot = Some(Hotspot::wheel(Vec3::Y * 0.322, 0.020, "flaps_up", "flaps_down"));
 
     // The gear lever: a wheel-shaped knob on an arm that moves up and down.
     let f2 = main_face();
@@ -1775,7 +1791,17 @@ fn levers(b: &mut Builder) {
     let mut g = Mesh::default();
     g.tube(&ALU, &[gp - f2.n() * 0.02, gp + f2.n() * 0.03], &|_| 0.005, 8, false);
     g.lathe(&mt(mat::PLASTIC, 0.08, 0.075, 0.07), gp + f2.n() * 0.03 - Vec3::X * 0.014, Vec3::X, &[[0.0, 0.0], [0.016, 0.0], [0.02, 0.004], [0.02, 0.024], [0.016, 0.028], [0.0, 0.028]], 20, false);
-    b.add("gear lever", G_ENGINE, g, Anim::slide(Drive::new(Input::GearHandle, -0.055), f2.ay), gp, Vec3::X, None);
+    let piece = b.add("gear lever", G_ENGINE, g, Anim::slide(Drive::new(Input::GearHandle, -0.055), f2.ay), gp, Vec3::X, None);
+    b.pieces[piece].hotspot = Some(Hotspot::click(f2.n() * 0.03, 0.021, "gear"));
+
+    // The parking brake: a red T-handle on the pedestal, behind the
+    // speedbrake lever at the quadrant's aft corner, pulled up to set.
+    let pb = Vec3::new(-0.15, ytq, zm + 0.005);
+    let mut p = Mesh::default();
+    p.tube(&CHROME, &[pb - Vec3::Y * 0.02, pb + Vec3::Y * 0.05], &|_| 0.0035, 8, false);
+    p.rbox(&mt(mat::PLASTIC, 0.55, 0.06, 0.04), pb + Vec3::Y * 0.055, Vec3::new(0.022, 0.006, 0.007), 0.004, Quat::IDENTITY);
+    let piece = b.add("parking brake", G_ENGINE, p, Anim::slide(Drive::new(Input::ParkingBrake, 0.025), Vec3::Y), pb, Vec3::Y, None);
+    b.pieces[piece].hotspot = Some(Hotspot::click(Vec3::Y * 0.055, 0.022, "parking_brake"));
 }
 
 fn columns(b: &mut Builder) {
@@ -1818,7 +1844,8 @@ fn columns(b: &mut Builder) {
             let tilt = Quat::from_rotation_x(-0.35);
             p.rbox(&mt(mat::ALU, 0.35, 0.35, 0.36), pc + Vec3::new(0.0, 0.0, 0.01), Vec3::new(0.045, 0.085, 0.008), 0.006, tilt);
             p.rbox(&RUBBER.pat(pat::KNURL), pc + Vec3::new(0.0, 0.0, 0.019), Vec3::new(0.04, 0.075, 0.0025), 0.002, tilt);
-            b.add("rudder pedal", G_ENGINE, p, Anim::hinge(Drive::new(Input::Yaw, dx.signum() * 0.18)), pv, Vec3::X, None);
+            let piece = b.add("rudder pedal", G_ENGINE, p, Anim::hinge2(Drive::new(Input::Yaw, dx.signum() * 0.18), Drive::new(Input::Brake(dx.signum()), 0.14)), pv, Vec3::X, None);
+            b.pieces[piece].hotspot = Some(Hotspot::hold(pc - pv, 0.038, if dx < 0.0 { "brake_left" } else { "brake_right" }));
         }
     }
     // The nose wheel tiller on the captain's side console.
@@ -1831,7 +1858,7 @@ fn columns(b: &mut Builder) {
 
 // ---------------------------------------------------------------- overhead panel
 
-fn overhead(m: &mut Mesh) {
+fn overhead(m: &mut Mesh, b: &mut Builder) {
     // A box hanging from the ceiling from just behind the windshield to over
     // the seats: its forward face sloping, the aft one nearly level.
     let hw = 0.40;
@@ -1881,12 +1908,16 @@ fn overhead(m: &mut Mesh) {
                 label(m, &g, u, lf - 0.085, 0.014, 0.005, style::TEXT, sid(["1", "2", "3", "4"][k]));
             }
             plate(m, &fwd, u0, lf - 0.20, u1, lf - 0.10, 601.0);
+            // The four engine start switches, one mouse target: held, the starters turn.
+            let mut st = Mesh::default();
             for k in 0..4 {
                 let u = u0 + 0.035 + k as f32 * 0.0615;
-                m.lathe(&BTN, g.at(u, lf - 0.125), g.n(), &[[0.011, 0.0], [0.011, 0.006], [0.009, 0.008], [0.009, 0.02], [0.0, 0.021]], 14, false);
+                st.lathe(&BTN, g.at(u, lf - 0.125), g.n(), &[[0.011, 0.0], [0.011, 0.006], [0.009, 0.008], [0.009, 0.02], [0.0, 0.021]], 14, false);
                 label(m, &g, u, lf - 0.108, 0.006, 0.0045, style::TEXT, sid(["1", "2", "3", "4"][k]));
                 knob(m, &g, u, lf - 0.17, 0.0062, 610.0 + k as f32, true);
             }
+            let piece = b.fixed("engine start switches", G_ENGINE, st);
+            b.pieces[piece].hotspot = Some(Hotspot::hold(g.at(u0 + 0.035 + 1.5 * 0.0615, lf - 0.125) + g.n() * 0.01, 0.06, "starter"));
             label(m, &g, *cu, lf - 0.145, 0.03, 0.004, style::TEXT, sid("ENG START"));
             // Fuel panel with its flow lines.
             plate(m, &fwd, u0, -lf + 0.11, u1, lf - 0.20, 602.0);
@@ -1903,6 +1934,24 @@ fn overhead(m: &mut Mesh) {
             }
             plate(m, &fwd, u0, -lf + 0.005, u1, -lf + 0.11, 603.0);
             populate(m, &g, u0 + 0.004, -lf + 0.009, u1 - 0.004, -lf + 0.106, 604.0);
+        } else if ci == 0 {
+            // The battery pushbutton is on the left electrical panel.
+            let bottom = lf - 0.12;
+            panel_run(m, &fwd, u0, -lf + 0.005, u1, bottom, 1, 4, 620.0);
+            plate(m, &fwd, u0, bottom, u1, lf - 0.005, 632.0);
+            let g = fwd.sub(0.0, 0.0, 0.0043);
+            let u = u0 + 0.038;
+            let v = lf - 0.064;
+            label(m, &g, u, v + 0.024, 0.023, 0.005, style::TEXT, sid("BATTERY"));
+            let face = g.at_h(u, v, 0.008);
+            let mut button = Mesh::default();
+            button.rbox(&BTN, face - g.n() * 0.004, Vec3::new(0.012, 0.014, 0.004), 0.0015, g.rot());
+            let piece = b.add("battery switch", G_ENGINE, button, Anim::slide(Drive::new(Input::Master, -0.002), g.n()), face, g.n(), None);
+            b.pieces[piece].hotspot = Some(Hotspot::click(Vec3::ZERO, 0.014, "master"));
+            let mut on = Mesh::default();
+            rect(&mut on, &legend_mat(style::TEXT, sid("ON"), Vec3::splat(0.9)), face - g.n() * 0.001, g.ax, g.ay, 0.008, 0.004);
+            b.add("battery ON legend", G_ENGINE, on, Anim::slide(Drive::new(Input::Master, 0.002), g.n()), face, g.n(), Some(piece));
+            populate(m, &g, u + 0.034, bottom + 0.004, u1 - 0.004, lf - 0.009, 633.0);
         } else {
             panel_run(m, &fwd, u0, -lf + 0.005, u1, lf - 0.005, 1, 5, 620.0 + ci as f32 * 31.0);
         }

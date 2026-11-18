@@ -44,6 +44,8 @@ pub struct Warn {
     pub gear: bool,
     /// the missile seeker's growl: 0 silent, 0.1 searching, up to 1 locked
     pub seeker: f32,
+    /// the autopilot has just let go: its disconnect tone
+    pub ap_off: bool,
 }
 
 /// What the sound is made from, set once a frame.
@@ -1057,12 +1059,14 @@ struct Alarms {
     gear_env: f32,
     seek_ph: f32,
     seek_env: f32,
+    ap_ph: f32,
+    ap_env: f32,
     env_k: f32,
 }
 
 impl Alarms {
     fn new() -> Self {
-        Self { t: 0.0, beep_ph: 0.0, beep_f: 1000.0, beep_env: 0.0, horn_ph: 0.0, horn_env: 0.0, vib: 0.0, clack_ph: 0.0, clack: [Bq::new(Bq::ring, 2400.0, 22.0), Bq::new(Bq::ring, 950.0, 14.0)], gear_ph: 0.0, gear_env: 0.0, seek_ph: 0.0, seek_env: 0.0, env_k: kf(80.0) }
+        Self { t: 0.0, beep_ph: 0.0, beep_f: 1000.0, beep_env: 0.0, horn_ph: 0.0, horn_env: 0.0, vib: 0.0, clack_ph: 0.0, clack: [Bq::new(Bq::ring, 2400.0, 22.0), Bq::new(Bq::ring, 950.0, 14.0)], gear_ph: 0.0, gear_env: 0.0, seek_ph: 0.0, seek_env: 0.0, ap_ph: 0.0, ap_env: 0.0, env_k: kf(80.0) }
     }
     fn sample(&mut self, w: &Warn) -> f32 {
         self.t = (self.t + DT) % 240.0;
@@ -1116,6 +1120,14 @@ impl Alarms {
             self.gear_ph = (self.gear_ph + 480.0 * DT).fract();
             let x = TAU * self.gear_ph;
             out += (x.sin() + 0.33 * (3.0 * x).sin() + 0.2 * (5.0 * x).sin()) * self.gear_env * 0.3;
+        }
+        // Autopilot disconnect: three falling notes over and over, while it sounds.
+        self.ap_env += (w.ap_off as u8 as f32 - self.ap_env) * self.env_k;
+        if self.ap_env > 1e-4 {
+            let f = [1320.0, 1100.0, 880.0][((t * 9.0) as usize) % 3];
+            self.ap_ph = (self.ap_ph + f * DT).fract();
+            let x = TAU * self.ap_ph;
+            out += (x.sin() + 0.25 * (2.0 * x).sin()) * self.ap_env * 0.28;
         }
         // Missile seeker: a low growl that gate-flickers while searching and
         // turns into a steady higher note once the target is locked.

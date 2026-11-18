@@ -34,6 +34,13 @@ running
 cargo run --release
 ```
 
+# Arcade mode
+FableFlight is a simulator first: by default, the aircraft fly as they really do. **Arcade mode** (Settings › General, or `--arcade` for one run) turns on the game's fun features:
+- the F/A-18's Sidewinders (master arm, lock and fire on keys 3, 4 and 5);
+- boost on aircraft that have none in reality: the piston singles and the 747. Real afterburners and reheat (F/A-18, F-4, F-22, SR-71, Concorde) work in both modes;
+- respawning in flight at any time with R. In simulation mode R only works after a crash;
+- the weather and time keys in flight: T/Y for the time, N/M for the clouds. The weather panel and Go to work in both modes.
+
 # Language
 The interface is in English or French. It follows the system language, can be changed in Settings (start screen or pause menu), and is remembered. For one run: `cargo run --release -- --lang fr`.
 
@@ -52,6 +59,23 @@ The fuel and the payload (crew, passengers, baggage: set on the start screen) ma
 # Electrics and failures
 A battery behind the master switch (Ins) and an alternator (the jets' generators) that charges it once the engine turns fast enough: the starter, the radios, the electric gauges and the lights need power, the engine itself runs on its magnetos. The pause menu's Failures page sets failures by hand or at random (about every N minutes): engine, alternator, flat battery, vacuum pump (the attitude and heading gyros run down), blocked pitot (the airspeed indicator turns into an altimeter) or static port (altimeter and VSI freeze), fuel leak. The flight panel shows the volts, battery and current, and the HUD warns LOW VOLTS and VACUUM.
 
+# Clickable cockpits
+
+In cockpit view, hover over a working control to see its action and setting. Click a switch, roll the mouse wheel over a lever, or hold a toe brake. Drag elsewhere to look around. Middle-drag to lean sideways or down around a yoke or panel, and middle-click to sit upright again. The target follows the visible part as it moves.
+
+| Aircraft | Controls available from the pilot seat |
+| --- | --- |
+| Cessna 172RG | Battery, magnetos and starter key, throttle, propeller RPM, mixture, cowl flaps, tank selector, landing lights, gear, flaps, parking brake, toe brakes, trim wheel and yoke trim, NAV and ADF tuning, OBS, heading sync and altimeter setting |
+| Robin DR400/180 Régent | Battery, magnetos, separate starter button, throttle, mixture, tank selector, landing light, parking brake, toe brakes, trim wheel, flap lever and sliding canopy handle |
+| Boeing 747-400 | Overhead battery pushbutton and engine start switches, four thrust levers and reverse levers, fuel control switches, landing gear, flaps, speedbrake, alternate stabiliser trim, parking brake and toe brakes |
+| Concorde | Four thrust levers, gear, toe brakes and the nose/visor selector with up, visor down, 5° and 12.5° positions |
+| F/A-18C | Twin throttles, landing gear, flap selector, canopy switch and toe brakes |
+| F-4E | Twin throttles, landing gear, slats/flaps selector and toe brakes |
+| F-22A | Twin throttles, landing gear, canopy switch and toe brakes |
+| SR-71A | Twin throttles, landing gear, drag chute handle and toe brakes |
+
+The multi-engine aircraft share a thrust setting across engines. The piston aircraft have four fuel selector positions and a shared fuel quantity. Selecting OFF cuts fuel to the engine. The navigator and systems-operator stations, many panel switches and avionics pages remain simplified. Starship is uncrewed. [Cockpit references and modeling notes](docs/cockpits.md)
+
 # In-flight map
 
 A round minimap in the lower-left corner, stacked above the info panel, follows the aircraft; ` (backquote, the tilde key) shows or hides it. Choose **Satellite** or **Map** (a light road map), and **North** to keep north at the top or **Heading** to keep the nose pointing up. The controls, hints and status messages follow the game language (English/French). Place names use the corresponding translation when supplied by the map data, falling back to the local name; changing language also updates already loaded labels. City, town and village names stay upright on both backgrounds, with smaller places appearing as you zoom in and overlapping labels hidden. Use **+ / -** or the mouse wheel over the map to zoom. The compact toolbar sits under the map: click the orientation/background buttons to toggle them, or **x** to collapse it to a **Map** button. Drag the knob on the upper-right of the rim to resize it (240-640 logical pixels across, shrunk to fit between the HUD panels); the size is remembered and can also be set in the pause menu Settings. The map follows HUD visibility and remains visible beside the flight panel and temporarily hides while the pause menu is open. Visibility, background, orientation and zoom are remembered.
@@ -62,6 +86,20 @@ The minimap shares the terrain imagery and OpenFreeMap vector data caches. It lo
 
 # Radio navigation
 VORs and NDBs from [OurAirports](https://ourairports.com/data/) (public domain), and an ILS on every paved runway end of 1500 m or more at medium and large airports. Tune NAV 1 (VOR or ILS) and the ADF on the flight panel's Radio page (Tab); J shows the instruments: a course deviation indicator with TO/FROM, the glide slope on an ILS and DME, and an ADF needle. [ and ] turn the OBS. Starting on a final approach tunes the runway's ILS. The altimeter is set to the QNH (from the METAR when the weather is real) unless you set it yourself; X sets it back. Courses are true: the world has no magnetic variation. `assets/mknav.py` rebuilds `assets/navaids.tsv.gz` from OurAirports' `navaids.csv`.
+
+# Autopilot
+Every aircraft has one, on its page of the flight toolbar (the attitude-indicator icon) and on keys you can rebind:
+- **F5**: engage or disconnect it. It starts by holding the heading and altitude of the moment.
+- **7 HDG**: fly the heading bug, moved with **−** / **=**.
+- **8 NAV**: track NAV 1, a VOR radial or a localizer.
+- **9 APR**: fly an ILS, localizer then glide slope.
+- **0 ALT**: hold the altitude.
+- **; / '**: move the preselected altitude.
+- On the page: **VS** climbs or descends at a set rate and levels off at the preselected altitude; **AT**, the autothrottle, holds an airspeed.
+
+NAV and APR can be armed before the signal comes in: they fly the heading bug until they capture the course, and APR captures the glide slope from below or from above. The modes show on a strip above the instruments, green when flying them, grey when armed.
+
+It gives up the vertical speed rather than stall the aircraft (MIN SPD), and climbs rather than pass the never-exceed speed (MAX SPD). A firm push on the controls, the ground, a stall or an unusual attitude disconnects it, with a warning tone. The AI copilot (docs/mcp.md) can set it too, with `set_autopilot`.
 
 # More aircraft: FlightGear's collection
 Click the aircraft picture on the start screen (or **All aircraft**) to see every aircraft you can fly as a gallery; **Get more…** opens [FlightGear's aircraft collection](https://wiki.flightgear.org/FGAddon) (its 2020 catalogue, about 650 aircraft). Pick one to read its files from FGAddon: its flight model, author, the license its JSBSim file states (else FGAddon's GNU GPL v2 or later), and what it becomes here; the ones that can't be flown are hidden once read (tick **Show all**). **Download** takes its package from a FlightGear mirror and unpacks it, without sounds, scripts and splash screens, into `~/.local/share/fablegame/aircraft/<folder>/` (with a `source.json` recording the source, revision and license), and it joins the list. Nothing from FlightGear ships with the game.

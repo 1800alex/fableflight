@@ -15,7 +15,7 @@
 //! Google key (gmaps.rs).
 use crate::menu::{self, ACCENT, DIM, TEXT};
 use crate::padui::{self, Hint};
-use crate::{bind, geo, gmaps, i18n, mp, mp_proto, t, tiles3d, Game};
+use crate::{bind, geo, gmaps, i18n, mp, mp_proto, padmap, t, tiles3d, Game};
 use egui::{pos2, vec2, Align, Align2, Color32, Layout, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui};
 
 /// The widest the content column gets, however wide the window.
@@ -63,7 +63,7 @@ impl Section {
 
     fn blurb(self) -> &'static str {
         match self {
-            Section::General => t!("Language, the HUD, the minimap and live traffic.", "Langue, HUD, mini-carte et trafic réel."),
+            Section::General => t!("Language, the HUD, the minimap, live traffic and arcade mode.", "Langue, HUD, mini-carte, trafic réel et mode arcade."),
             Section::Graphics => t!("How hard the renderer works. Changes apply at once.", "L'effort demandé au rendu. Les changements s'appliquent aussitôt."),
             Section::Sound => t!("Engine, wind, warnings and the world around you.", "Moteur, vent, alarmes et le monde autour de vous."),
             Section::Camera => t!("Where the camera starts and how wide the cockpit view is.", "Le point de vue de départ et l'ouverture de la vue cockpit."),
@@ -374,6 +374,11 @@ impl Game {
                 menu::switch(ui, &mut self.minimap.landing_guidance);
             });
         });
+        card(ui, t!("Mode", "Mode"), |ui| {
+            row(ui, t!("Arcade mode", "Mode arcade"), t!("missiles, boost on any aircraft, respawn at will, weather and time keys", "missiles, boost sur tous les avions, réapparition à volonté, touches météo et heure"), |ui| {
+                menu::switch(ui, &mut self.arcade);
+            });
+        });
         card(ui, t!("Air traffic", "Trafic aérien"), |ui| {
             row(ui, t!("Live air traffic", "Trafic aérien réel"), t!("real aircraft around you, from adsb.lol", "les vrais avions autour de vous, via adsb.lol"), |ui| {
                 let mut on = self.live.enabled();
@@ -433,7 +438,8 @@ impl Game {
             });
         });
         card(ui, t!("Connected devices", "Périphériques connectés"), |ui| self.binds_devices(ui));
-        card(ui, t!("Axes", "Axes"), |ui| self.binds_axes(ui));
+        card(ui, t!("Gamepad", "Manette"), |ui| self.binds_pad(ui));
+        card(ui, t!("Joystick axes", "Axes du joystick"), |ui| self.binds_axes(ui));
         card(ui, t!("Buttons (joystick, throttle, wheel)", "Boutons (joystick, manette des gaz, volant)"), |ui| self.binds_buttons(ui));
         card(ui, t!("Keyboard", "Clavier"), |ui| self.binds_keys(ui));
         if ui.add_enabled(self.binds.capture.is_none(), egui::Button::new(t!("Reset all bindings", "Tout réinitialiser"))).clicked() {
@@ -785,7 +791,12 @@ impl Game {
             Capture::Axis(a) => a.how().to_string(),
             Capture::Button(id) => t!("Press the button for: {}", "Appuyez sur le bouton pour : {}", label(id)),
             Capture::Key(id) => t!("Press the key for: {}  (Esc: cancel)", "Appuyez sur la touche pour : {}  (Échap : annuler)", label(id)),
+            Capture::Pad(id) => t!("Press a button for: {}. Or hold Y and press one.", "Appuyez sur un bouton pour : {}. Ou maintenez Y et appuyez sur un bouton.", padmap::label(id)),
+            Capture::PadAxis(a) => format!("{}: {}", a.label(), a.how()),
         };
+        // From the pad: B held calls it off (a tap of B binds B), and how far through that is.
+        let from_pad = c.from_pad();
+        let cancelling = self.binds.pad_catch.cancelling(self.real);
         egui::Frame::new().fill(ACCENT.gamma_multiply(0.22)).corner_radius(menu::R_PANEL).inner_margin(10.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -794,8 +805,15 @@ impl Game {
                     if ui.button(t!("Cancel", "Annuler")).clicked() {
                         self.binds.capture = None;
                     }
+                    if from_pad {
+                        ui.label(RichText::new(t!("hold to cancel", "maintenir pour annuler")).font(menu::caption()).color(Color32::WHITE));
+                        padui::glyphs(ui, "B", 20.0);
+                    }
                 });
             });
+            if cancelling > 0.0 {
+                ui.add(egui::ProgressBar::new(cancelling).desired_height(4.0));
+            }
         });
         ui.add_space(12.0);
     }
@@ -822,7 +840,79 @@ impl Game {
                 });
             });
         }
-        note(ui, t!("A device with anything bound to it no longer works as a gamepad.", "Un périphérique dès qu'on lui assigne quelque chose ne sert plus de manette de jeu."));
+        note(ui, t!("A gamepad has its own layout (Gamepad, below). A joystick, pedals or a throttle take the axes and buttons bound to them; a pad given any of those no longer works as a gamepad.", "Une manette a sa propre disposition (Manette, ci-dessous). Joystick, palonnier ou manette des gaz prennent les axes et boutons qu'on leur assigne ; une manette à qui l'on en assigne ne sert plus de manette de jeu."));
+    }
+
+    /// The gamepad's flying layout (padmap.rs): the sticks and triggers,
+    /// then every action, each bound from the pad itself.
+    fn binds_pad(&mut self, ui: &mut Ui) {
+        use bind::Capture;
+        use padmap::{AxisSrc, PadAxis};
+        let busy = self.binds.capture.is_some();
+        note(ui, t!("In the menus the pad stays as it is: the d-pad moves, A presses, B goes back, LB / RB turn the page, the right stick scrolls. Menu pauses. The rest is yours: pick Change, then press a button, or hold Y and press one.", "Dans les menus, la manette ne change pas : la croix déplace, A appuie, B revient, LB / RB tournent la page, le stick droit fait défiler. Menu met en pause. Le reste est à vous : choisissez Changer, puis appuyez sur un bouton, ou maintenez Y et appuyez sur un bouton."));
+        if self.pad_note.1 > self.real {
+            ui.add_space(4.0);
+            ui.label(RichText::new(&self.pad_note.0).font(menu::caption()).color(ACCENT));
+        }
+        ui.add_space(8.0);
+        let cw = ui.available_width();
+        let mut lost = Vec::new();
+        bind_grid(ui, "pad_binds", |ui| {
+            for a in PadAxis::ALL {
+                let src = self.binds.pad.axis(a);
+                grid_label(ui, a.label(), cw);
+                pad_cell(ui, src.map(|s| s.stick.spec()), self.binds.pad.axis_moved(a));
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(t!("Change", "Changer"))).clicked() {
+                        self.binds.start_capture(Capture::PadAxis(a));
+                    }
+                    if src.is_some() && ui.add_enabled(!busy, egui::Button::new(t!("Clear", "Effacer"))).clicked() {
+                        lost = self.binds.pad.set_axis(a, None);
+                    }
+                    if self.binds.pad.axis_moved(a) && ui.add_enabled(!busy, egui::Button::new(t!("Default", "Par défaut"))).clicked() {
+                        lost = self.binds.pad.reset_axis(a);
+                    }
+                    if let Some(s) = src {
+                        let mut inv = s.inverted(a);
+                        if menu::toggle(ui, &mut inv, t!("Invert", "Inverser")).changed() {
+                            self.binds.pad.set_axis(a, Some(AxisSrc { sign: -s.sign, ..s }));
+                        }
+                    }
+                });
+                ui.end_row();
+            }
+            // (one grid for both, so the columns line up)
+            for _ in 0..3 {
+                ui.add_space(4.0);
+            }
+            ui.end_row();
+            for &(id, _) in padmap::actions() {
+                let moved = self.binds.pad.is_moved(id);
+                let chord = self.binds.pad.chord(id);
+                grid_label(ui, padmap::label(id), cw);
+                pad_cell(ui, chord.map(|c| if c == padmap::Y_ALONE { t!("Y (let go)", "Y (relâché)").to_string() } else { c.spec() }), moved);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(t!("Change", "Changer"))).clicked() {
+                        self.binds.start_capture(Capture::Pad(id));
+                    }
+                    if chord.is_some() && ui.add_enabled(!busy, egui::Button::new(t!("Clear", "Effacer"))).clicked() {
+                        self.binds.pad.clear(id);
+                    }
+                    if moved && ui.add_enabled(!busy, egui::Button::new(t!("Default", "Par défaut"))).clicked() {
+                        lost = self.binds.pad.reset(id);
+                    }
+                });
+                ui.end_row();
+            }
+        });
+        if !lost.is_empty() {
+            self.pad_note = (t!("No longer bound: {}", "Plus assigné : {}", lost.join(", ")), self.real + 8.0);
+        }
+        ui.add_space(8.0);
+        if ui.add_enabled(!busy && !self.binds.pad.is_default(), egui::Button::new(t!("Back to the Flight Simulator layout", "Revenir à la disposition de Flight Simulator"))).clicked() {
+            self.binds.pad = padmap::PadMap::default();
+            self.pad_note = (String::new(), 0.0);
+        }
     }
 
     fn binds_axes(&mut self, ui: &mut Ui) {
@@ -930,6 +1020,25 @@ fn binding_cell(ui: &mut Ui, what: Option<String>, moved: bool) {
                 let r = menu::key_cap(ui, &w);
                 if moved {
                     ui.painter().rect_stroke(r.rect, menu::R_WIDGET, Stroke::new(1.0, ACCENT), egui::StrokeKind::Outside);
+                }
+            }
+            None => {
+                ui.label(RichText::new(t!("Not bound", "Non assigné")).font(menu::caption()).color(menu::FAINT));
+            }
+        }
+    });
+}
+
+/// What a pad action is bound to, drawn as the pad's buttons, in the same
+/// column as `binding_cell`. `moved`: changed from the default.
+fn pad_cell(ui: &mut Ui, spec: Option<String>, moved: bool) {
+    ui.allocate_ui_with_layout(vec2(180.0, 26.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_width(180.0);
+        match spec {
+            Some(s) => {
+                let r = padui::glyphs(ui, &s, 22.0);
+                if moved {
+                    ui.painter().rect_stroke(r.rect.expand(3.0), menu::R_WIDGET, Stroke::new(1.0, ACCENT), egui::StrokeKind::Outside);
                 }
             }
             None => {
