@@ -90,6 +90,9 @@ pub const UI_MIN_H: f32 = 860.0;
 pub const HUD_H: f32 = 226.0;
 /// and its width
 pub const HUD_W: f32 = 410.0;
+/// how long a damage/failure flash stays at full strength, then how long it takes to fade (s)
+const FLASH_HOLD: f64 = 1.2;
+const FLASH_FADE: f64 = 0.8;
 
 /// What was chosen in the in-flight menu, carried out once the UI is drawn.
 #[derive(Copy, Clone)]
@@ -7163,7 +7166,7 @@ impl Game {
             })
         } else { None };
         self.src.google.update_attribution(lat.to_degrees(), lon.to_degrees(), agl);
-        self.flash.retain(|(_, t)| self.real - t < 4.0);
+        self.flash.retain(|(_, t)| self.real - t < FLASH_HOLD + FLASH_FADE);
         let out = self.egui_ctx.clone().run_ui(raw, |root| {
             let ctx = &root.ctx().clone();
             self.pad_pass(ctx);
@@ -7373,7 +7376,13 @@ impl Game {
                             flightui::glass().show(ui, |ui| {
                                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                                 ui.label(menu::section_text(t!("Damage", "Dégâts")).color(amber));
-                                for l in &report {
+                                // (no lower than half the screen: past that, just say how many more)
+                                let floor = ctx.content_rect().height() * 0.5;
+                                for (k, l) in report.iter().enumerate() {
+                                    if ui.cursor().top() + 40.0 > floor && k + 1 < report.len() {
+                                        ui.label(RichText::new(format!("+{}", report.len() - k)).font(menu::label()).color(menu::DIM));
+                                        break;
+                                    }
                                     ui.label(RichText::new(l.as_str()).font(menu::label()).color(menu::TEXT));
                                 }
                             });
@@ -7382,15 +7391,24 @@ impl Game {
                 });
             }
             if !self.flash.is_empty() && !self.crashed {
-                // Each new loss: a red plate in the middle of the view, fading after a few seconds.
-                egui::Area::new(egui::Id::unique("flash")).anchor(Align2::CENTER_TOP, [0.0, 150.0]).interactable(false).show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        for (s, t0) in &self.flash {
-                            let a = (1.0 - ((self.real - t0 - 2.5) / 1.5).max(0.0)).clamp(0.0, 1.0) as f32;
+                // Each new loss: a small red plate down the left edge (under the systems card,
+                // if any), newest on top, fading quickly. A crash sheds many pieces at once, so
+                // the stack stops at half the screen height rather than covering the view.
+                let top = if self.hud_on() { self.minimap.top } else { 0.0 } + 14.0;
+                let floor = ctx.content_rect().height() * 0.5;
+                egui::Area::new(egui::Id::unique("flash")).anchor(Align2::LEFT_TOP, [14.0, top]).interactable(false).show(ctx, |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        for (s, t0) in self.flash.iter().rev() {
+                            // (a plate is about 24 px tall: start one only if it ends above the floor)
+                            if ui.cursor().top() + 24.0 > floor {
+                                break;
+                            }
+                            let a = (1.0 - ((self.real - t0 - FLASH_HOLD) / FLASH_FADE).max(0.0)).clamp(0.0, 1.0) as f32;
                             ui.scope(|ui| {
                                 ui.multiply_opacity(a);
-                                egui::Frame::new().fill(menu::BAD.gamma_multiply(0.2)).stroke(egui::Stroke::new(1.0, menu::BAD)).corner_radius(menu::R_WIDGET).inner_margin(egui::Margin::symmetric(16, 6)).show(ui, |ui| {
-                                    ui.label(RichText::new(i18n::caps(s)).font(menu::bold(24.0)).color(menu::BAD).extra_letter_spacing(1.0));
+                                egui::Frame::new().fill(menu::BAD.gamma_multiply(0.2)).stroke(egui::Stroke::new(1.0, menu::BAD)).corner_radius(menu::R_WIDGET).inner_margin(egui::Margin::symmetric(9, 3)).show(ui, |ui| {
+                                    ui.label(RichText::new(i18n::caps(s)).font(menu::bold(14.0)).color(menu::BAD).extra_letter_spacing(0.6));
                                 });
                             });
                         }
