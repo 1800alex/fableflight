@@ -25,7 +25,7 @@ const KT: f64 = 1.0 / 1.94384;
 const V_NONE: f64 = 1e9;
 
 const fn leg(at: DVec3, r: f32, travel: f64, steer: f64, fold_vn: f64, fold_kick: DVec3, name: &'static str) -> Leg {
-    Leg { at, wheel_r: r as f64, travel, k: 70_000.0, c: 7_000.0, nf_max: 120_000.0, steer, brakes: true, side_k: 5000.0, side_mu: 0.9, roll_k: 80.0, roll_mu: 0.025, brake_k: 2500.0, brake_mu: 0.55, fold_vn, fold_kick, name }
+    Leg { at, wheel_r: r as f64, travel, k: 70_000.0, c: 7_000.0, nf_max: 120_000.0, steer, brakes: at.x != 0.0, side_k: 5000.0, side_mu: 0.9, roll_k: 80.0, roll_mu: 0.025, brake_k: 2500.0, brake_mu: 0.55, fold_vn, fold_kick, name }
 }
 
 pub static SPEC: Spec = Spec {
@@ -62,6 +62,7 @@ pub static SPEC: Spec = Spec {
     eye: EYE,
     eye2: None,
     sees_inside: cabin::sees_inside,
+    hotspots: cabin::HOTSPOTS,
     contacts: &[
         ([0.0, -0.035, -3.17], Part::Nose),
         ([0.0, -0.60, -2.6], Part::Nose),

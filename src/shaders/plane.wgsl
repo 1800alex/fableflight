@@ -1103,6 +1103,17 @@ fn card_code(k: i32) -> vec2u {
 
 // The face of an instrument: rgb albedo, a = how much of it is luminous paint.
 fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
+  if (id == 31u || id == 32u) {
+    let value = select(G.cockpit[2].y, O.params[4].w / 30.0, id == 32u);
+    let notch = clamp(round((0.85-uv.y)/1.7*3.0),0.0,3.0);
+    let mark = 0.85-1.7*notch/3.0;
+    let ticks = (1.0 - smoothstep(0.02, 0.04, abs(uv.y-mark))) * step(0.2, uv.x);
+    var ink = ticks;
+    if (id == 32u) { let code=num_code(u32(notch)*10u); ink=max(ink,label_code(uv,vec2f(0.0,mark+0.08),code.x,code.y,0.18,px)); }
+    let pointer = (1.0 - smoothstep(0.025, 0.055, abs(uv.y - (0.85 - 1.7 * value)))) * step(uv.x, -0.2);
+    let col = mix(vec3f(0.025), vec3f(0.8), ink);
+    return vec4f(mix(col, vec3f(0.9,0.55,0.08), pointer), pointer);
+  }
   let P0 = O.params[0];
   let P1 = O.params[1];
   let P2 = O.params[2];
@@ -1167,7 +1178,9 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       nn = 3;
       let kb = abs(uv - vec2f(0.52, 0.0)) - vec2f(0.2, 0.07);
       if (max(kb.x, kb.y) < 0.0) { bg = vec3f(0.0); ln = 0.0; tn = 0.0; }
-      tc = vec2f(0.52, 0.0); tcode = pack(2u, 9u, 9u, 2u, 0u, 0u); tlen = 4u; th = 0.09;
+      tc = vec2f(0.52, 0.0);
+      let pressure = u32(round(G.cockpit[0].x));
+      tcode = pack(pressure / 1000u, pressure / 100u % 10u, 14u, pressure / 10u % 10u, pressure % 10u, 0u); tlen = 5u; th = 0.08;
     }
     case 5u: { // vertical speed
       a0 = rad(-260.0); a1 = rad(80.0); vmin = -2000.0; vmax = 2000.0; tn = 40.0; tper = 5.0;
@@ -1255,7 +1268,7 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       nd[0] = vec4f(dial(P2.x, 0.0, vmax, a0, a1), 0.86, 0.035, 0.18); nn = 1;
       let hb = abs(uv - vec2f(0.0, -0.45)) - vec2f(0.2, 0.065);
       if (max(hb.x, hb.y) < 0.0) { bg = vec3f(0.0); tn = 0.0; ln = 0.0; }
-      tc = vec2f(0.0, -0.45); tcode = pack(1u, 8u, 3u, 4u, 0u, 0u); tlen = 4u; th = 0.085;
+      tc = vec2f(0.0, -0.45); tcode = num_code(u32(G.cockpit[2].w)).x; tlen = 4u; th = 0.085;
     }
     case 7u: { // manifold pressure
       a0 = rad(-135.0); a1 = rad(135.0); vmin = 10.0; vmax = 35.0; tn = 25.0; tper = 5.0;
@@ -1267,14 +1280,14 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       a0 = rad(-60.0); a1 = rad(60.0); tn = 10.0; tper = 5.0;
       q = (uv + vec2f(0.0, 0.35)) * 0.78;
       var v = 0.0; var g0 = 0.0; var g1 = 0.0;
-      if (id == 8u) { v = P2.z; vmax = 26.0; g0 = 2.0; g1 = 26.0; }
-      if (id == 9u) { v = P2.w; vmax = 26.0; g0 = 2.0; g1 = 26.0; }
+      if (id == 8u) { v = P2.z; vmax = select(26.0, max(G.cockpit[0].w, 1.0), kind() == 0u); g0 = 2.0; g1 = vmax; }
+      if (id == 9u) { v = P2.w; vmax = select(26.0, max(G.cockpit[0].w, 1.0), kind() == 0u); g0 = 2.0; g1 = vmax; }
       if (id == 10u) { v = P3.x; vmin = 100.0; vmax = 250.0; g0 = 100.0; g1 = 240.0; }
       if (id == 11u) { v = P3.y; vmax = 115.0; g0 = 60.0; g1 = 90.0; redline = 114.0; }
       if (id == 12u) { v = P3.w; vmin = -60.0; vmax = 60.0; g0 = -5.0; g1 = 60.0; }
       if (id == 13u) { v = P4.x; vmin = 3.0; vmax = 7.0; g0 = 4.5; g1 = 5.5; }
       if (id == 16u) { v = P3.z; g0 = 0.5; g1 = 0.8; }
-      if (id == 18u) { v = P3.x * 1.6 + 30.0; vmin = 200.0; vmax = 500.0; g0 = 200.0; g1 = 460.0; }
+      if (id == 18u) { v = select(P3.x * 1.6 + 30.0, G.cockpit[2].x, kind() == 0u); vmin = 200.0; vmax = 500.0; g0 = 200.0; g1 = 460.0; }
       arcs[0] = vec4f(g0, g1, 0.86, 0.95); arc_col[0] = green;
       if (id == 8u || id == 9u) {
         arcs[1] = vec4f(vmin, 2.0, 0.86, 0.95); arc_col[1] = vec3f(0.6, 0.02, 0.01);
@@ -1400,6 +1413,16 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       cov = max(max(index, tf), max(flag, gflag));
       hub = false;
     }
+    case 30u: { // ADF: bearing relative to the nose, independent of NAV 1's OBS.
+      a0 = 0.0; a1 = rad(360.0); vmax = 360.0; tn = 36.0; tper = 3.0;
+      ln = 12.0; lfirst = 0.0; lstep = 30.0; ldiv = 10.0; lr = 0.68; lh = 0.14;
+      if (G.cockpit[1].w > 0.5) {
+        nd[0] = vec4f(rad(G.cockpit[1].z), 0.78, 0.025, 0.48); nn = 1;
+      } else {
+        col = vec3f(0.65,0.02,0.01) * step(abs(uv.x),0.16) * step(abs(uv.y-0.25),0.07);
+        cov = max(col.r,0.0);
+      }
+    }
     case 17u: { // magnetic compass: a card seen edge-on through a window
       let hdg = O.params[5].x % 1000.0;
       let x = uv.x * 32.0 + hdg;
@@ -1422,10 +1445,12 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       arcs[0] = vec4f(-40.0, 0.0, 0.88, 0.95); arc_col[0] = vec3f(0.05, 0.15, 0.5);
       nd[0] = vec4f(dial(15.0 - 1.98 * P0.y / 1000.0, vmin, vmax, a0, a1), 0.84, 0.045, 0.15); nn = 1;
     }
-    case 19u: { // fuel selector plate
-      let arrow = step(abs(uv.x), (0.8 - uv.y) * 0.35) * step(-0.2, uv.y);
-      ink = max(arrow, 1.0 - smoothstep(0.0, px, abs(r - 0.85) - 0.02));
-      tp = vec2f(abs(uv.x), uv.y); tc = vec2f(0.6, -0.1); tcode = select(2u, 1u, uv.x < 0.0); tlen = 1u; th = 0.22;
+    case 19u, 33u: { // 172RG and DR400 fuel selector plates
+      ink = 1.0 - smoothstep(0.0, px, abs(r - 0.92) - 0.02);
+      ink = max(ink, str_at(uv, vec2f(0.0,0.62), select(S_BOTH, S_MAIN, id == 33u), 0.17, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(-0.62,0.0), S_L, 0.17, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(0.62,0.0), S_R, 0.17, px, 0.0));
+      ink = max(ink, str_at(uv, vec2f(0.0,-0.65), S_OFF, 0.17, px, 0.0));
       hub = false;
     }
     default: {}
@@ -1484,31 +1509,50 @@ fn display(id: u32, uv: vec2f, px: f32) -> vec3f {
   var bg = vec3f(0.0);
   switch id {
     case 0u: { // nav-com: active and standby
-      c0 = vec2f(-0.023, 0.0); k0 = pack(1u, 2u, 2u, 14u, 8u, 0u); n0 = 6u; col0 = vec3f(0.35, 1.0, 0.45);
-      c1 = vec2f(0.024, 0.0); k1 = pack(1u, 2u, 1u, 14u, 5u, 0u); n1 = 6u; col1 = vec3f(0.2, 0.55, 0.25);
+      let freq = u32(round(G.cockpit[1].x * 100.0));
+      c0 = vec2f(-0.023, 0.0); k0 = pack(freq / 10000u, freq / 1000u % 10u, freq / 100u % 10u, 14u, freq / 10u % 10u, freq % 10u); n0 = 6u; col0 = vec3f(0.35, 1.0, 0.45);
+      if (freq == 0u) {
+        n0 = 0u;
+        bg = vec3f(0.2,0.7,0.3) * str_at(uv,vec2f(-0.45,0.0),select(S_OFF,S_ILS,G.cockpit[3].z>0.5),0.75,px*100.0,0.0);
+      }
+      let adf = num_code(u32(G.cockpit[1].y));
+      c1 = vec2f(0.024, 0.0); k1 = adf.x; n1 = adf.y; col1 = vec3f(0.2, 0.55, 0.25);
     }
-    case 1u: { // autopilot altitude
-      c0 = vec2f(0.015, 0.0); k0 = pack(4u, 5u, 0u, 0u, 0u, 0u); n0 = 4u; col0 = vec3f(1.0, 0.55, 0.1);
+    case 1u: { // No simulated GA autopilot: do not display a fictitious selected altitude.
+      bg = vec3f(0.25,0.14,0.025) * str_at(uv,vec2f(0.0),S_OFF,0.8,px*100.0,0.0);
     }
     case 2u: { // transponder: code and pressure altitude
       c0 = vec2f(0.012, 0.0); k0 = pack(1u, 2u, 0u, 0u, 0u, 0u); n0 = 4u; col0 = vec3f(1.0, 0.55, 0.1);
-      let a = num_code(u32(max(O.params[0].y, 0.0) / 100.0));
+      let a = num_code(u32(max(G.cockpit[0].y, 0.0)));
       c1 = vec2f(-0.025, 0.0); k1 = a.x; n1 = a.y; h1 = 0.007; col1 = vec3f(0.6, 0.33, 0.06);
     }
     case 3u: { // GPS: a heading-up moving map, ground speed in the corner
       size = vec2f(0.052, 0.027);
-      let m = rot2(uv * vec2f(1.0, 0.52), -rad(O.params[0].w));
-      let land = nz(vec3f(m * 0.3, 0.37)).g;
-      bg = mix(vec3f(0.02, 0.05, 0.14), vec3f(0.12, 0.2, 0.08), smoothstep(0.45, 0.5, land));
-      bg = mix(bg, vec3f(0.9, 0.1, 0.8), (1.0 - smoothstep(0.0, px * 60.0, abs(uv.x) - 0.012)) * step(0.0, uv.y));
-      bg = mix(bg, vec3f(1.0), step(abs(uv.x), (0.12 - uv.y) * 0.6) * step(-0.12, uv.y));
-      bg = mix(bg, vec3f(0.0), step(0.78, uv.y));
-      let gs = num_code(u32(O.params[0].x));
-      c0 = vec2f(-0.04, 0.021); k0 = gs.x; n0 = gs.y; h0 = 0.006; col0 = vec3f(1.0);
+      // Heading-up navigation plot, 10 NM to the edge: actual relative station positions.
+      let heading = rad(O.params[0].w);
+      let grid = 1.0 - smoothstep(0.005, 0.012, min(abs(fract(uv.x * 2.0 + 0.5)-0.5), abs(fract(uv.y * 2.0 + 0.5)-0.5)));
+      bg = vec3f(0.015,0.035,0.045) + vec3f(0.025) * grid;
+      let waypoint = rot2(G.cockpit[3].xy, -heading);
+      if (G.cockpit[3].z > 0.5) {
+        let delta = uv - waypoint;
+        let dotmark = 1.0 - smoothstep(0.025,0.045,length(delta));
+        let along = clamp(dot(uv,waypoint)/max(dot(waypoint,waypoint),0.0001),0.0,1.0);
+        let route = 1.0-smoothstep(0.008,0.014,length(uv-waypoint*along));
+        bg = mix(bg,vec3f(0.8,0.1,0.8),max(dotmark,route)*0.9);
+      }
+      for (var i=4u; i<8u; i++) {
+        let station = rot2(G.cockpit[i].xy,-heading);
+        let dotmark = (1.0-smoothstep(0.015,0.025,length(uv-station))) * G.cockpit[i].z;
+        bg = mix(bg,vec3f(0.3,0.7,0.9),dotmark);
+      }
+      let own = step(abs(uv.x),(0.12-uv.y)*0.5)*step(-0.08,uv.y);
+      bg = mix(bg,vec3f(0.9),own);
+      let gs = num_code(u32(G.cockpit[0].z));
+      c0 = vec2f(-0.04,0.021); k0=gs.x; n0=gs.y; h0=0.006; col0=vec3f(1.0);
     }
     case 5u: { // hour meter
       size = vec2f(0.021, 0.0065);
-      c0 = vec2f(0.0); k0 = pack(1u, 8u, 3u, 4u, 14u, 6u); n0 = 6u; h0 = 0.008; col0 = vec3f(0.9);
+      c0 = vec2f(0.0); k0 = num_code(u32(G.cockpit[2].w * 10.0)).x; n0 = 5u; h0 = 0.008; col0 = vec3f(0.9);
     }
     default: {}
   }
@@ -2079,8 +2123,8 @@ fn surface(in: VOut) -> Shaded {
         case 3u: { on = P5.y; k = mix(3.0, 3.5, night); }
         case 4u: { on = P5.z; k = mix(0.5, 1.2, night); }
         case 5u: { on = P5.w; k = mix(0.3, 2.0, night); }
-        case 6u: { on = step(0.999, P4.z); k = mix(0.05, 0.01, night); }
-        case 7u: { on = step(P4.z, 0.001); k = mix(0.05, 0.01, night); }
+        case 6u: { on = step(0.999, P4.z) * select(1.0, G.cockpit[2].z, kind() == 0u); k = mix(0.05, 0.01, night); }
+        case 7u: { on = step(P4.z, 0.001) * select(1.0, G.cockpit[2].z, kind() == 0u); k = mix(0.05, 0.01, night); }
         // Formation light strips: pale panels by day, a soft green glow with the navigation lights at night.
         case 9u: { on = step(999.0, P5.x); k = 0.012 * night; }
         default: { on = 1.0; k = 0.004; }
@@ -2240,7 +2284,7 @@ fn surface(in: VOut) -> Shaded {
         rough = 0.12;
         ssr = 0.3;
       } else {
-      emit = display(did, in.uv, max(duv * 0.012, 0.00015)) * G.sun_dir.w * mix(0.09, 0.012, night);
+      emit = display(did, in.uv, max(duv * 0.012, 0.00015)) * G.sun_dir.w * mix(0.09, 0.012, night) * G.cockpit[2].z;
       }
     }
     case 18u: { // a downloaded aircraft's surface: its texture times its material colour

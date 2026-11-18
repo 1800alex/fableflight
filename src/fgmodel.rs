@@ -876,7 +876,7 @@ impl Ext {
                         let d = &ld.anims[id];
                         let (anim, pivot, axis) = to_anim(d, self.origin);
                         let role = if d.prop { Role::Prop } else if let Some(l) = d.gear_leg { Role::Gear(l.min(crate::aircraft::MAX_GEAR as u8 - 1)) } else { d.surface.unwrap_or(Role::Other) };
-                        pieces.push(Piece { name: "fg", mesh: Mesh::default(), group, parent, pivot, axis, anim, role, vis: Vis::Always, glass: false, occluder: true });
+                        pieces.push(Piece { hotspot: None, name: "fg", mesh: Mesh::default(), group, parent, pivot, axis, anim, role, vis: Vis::Always, glass: false, occluder: true });
                         node_of.insert(k, pieces.len() - 1);
                         pieces.len() - 1
                     }
@@ -890,7 +890,7 @@ impl Ext {
                 // Merge into a piece with the same parent, group, glass and visibility.
                 match pieces.iter().position(|p| p.name == "fg mesh" && p.parent == parent && p.group == group && p.glass == is_glass && p.vis == vis && p.role == role) {
                     Some(i) => pieces[i].mesh.append(&mesh),
-                    None => pieces.push(Piece { name: "fg mesh", mesh, group, parent, pivot: Vec3::ZERO, axis: Vec3::X, anim: Anim::Fixed, role, vis, glass: is_glass, occluder: !is_glass }),
+                    None => pieces.push(Piece { hotspot: None, name: "fg mesh", mesh, group, parent, pivot: Vec3::ZERO, axis: Vec3::X, anim: Anim::Fixed, role, vis, glass: is_glass, occluder: !is_glass }),
                 }
             }
         }

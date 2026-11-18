@@ -97,6 +97,7 @@ pub static SPEC: Spec = Spec {
         stab_tip: DVec3::new(1.60, 0.06, 3.95 + DZ64),
     },
     eye: Vec3::new(EYE.x, EYE.y, EYE.z + DZ),
+    hotspots: &[super::Hotspot { at: [0.0, cabin::FLOOR_Y + 0.15, -0.66 + DZ], r: 0.018, click: None, hold: None, wheel: Some(("trim_down", "trim_up")) }],
     eye2: None,
     sees_inside: |eye, d| cabin::sees_inside(eye - Vec3::Z * DZ, d),
     // (Body frame: the design frame's z + 0.55.)
@@ -1063,4 +1064,3 @@ mod tests {
         assert!((MAIN_AXLE.y - MAIN_R - GROUND_Y).abs() < 1e-6);
     }
 }
-

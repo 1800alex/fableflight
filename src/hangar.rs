@@ -1035,6 +1035,8 @@ fn fit(j: &jsbsim::Aircraft, parts: &[(Option<Part>, Option<Part>)], folder: &st
 /// the JSBSim file's reference points and contacts), and scales what of the
 /// stand-in's geometry is left (ground contacts, camera) to its size.
 fn own_geometry(s: &mut Spec, base: &Spec, j: &jsbsim::Aircraft, fg: &FgFiles, folder: &str, mass: f64, m: f64, span: f64) {
+    // The stand-in's controls belong to its cockpit, not this imported model.
+    s.hotspots = &[];
     let cg = j.cg.unwrap_or([0.0; 3]);
     // structural frame (x aft, y right, z up; feet) to ours (x right, y up, z aft; metres from the CG)
     let body = |p: [f64; 3]| glam::DVec3::new((p[1] - cg[1]) * FT, (p[2] - cg[2]) * FT, (p[0] - cg[0]) * FT);
@@ -1470,6 +1472,17 @@ pub fn fit_report(files: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_model_does_not_inherit_stand_in_hotspots() {
+        let base = &aircraft::c172::SPEC;
+        let mut s = base.clone();
+        assert!(!s.hotspots.is_empty());
+        let fg = FgFiles { dir: PathBuf::new(), model: PathBuf::from("Models/test.xml"), still: None, eye: None };
+        own_geometry(&mut s, base, &jsbsim::Aircraft::default(), &fg, "test", base.mass, 1.0, base.b);
+        assert!(s.ext.is_some());
+        assert!(s.hotspots.is_empty());
+    }
 
     #[test]
     fn license_from_comments_and_repository() {

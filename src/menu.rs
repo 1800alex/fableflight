@@ -115,6 +115,8 @@ pub struct Menu {
     pub screen: Screen,
     /// where the aircraft screen goes back to (the main menu or the globe)
     pub air_back: Screen,
+    /// where the settings screen goes back to (the main menu, or the globe)
+    pub set_back: Screen,
     /// the aircraft looked at on the aircraft screen (index into `aircraft::list()`)
     pub air_view: usize,
     spin: f64,
@@ -193,7 +195,7 @@ pub enum Start {
 
 impl Menu {
     pub fn new(lat: f64, lon: f64, hour: f64) -> Self {
-        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, screen: Screen::Main, air_back: Screen::Main, air_view: 0, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, air_tab: crate::hangar_ui::Tab::Mine, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
+        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, screen: Screen::Main, air_back: Screen::Main, set_back: Screen::Main, air_view: 0, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, air_tab: crate::hangar_ui::Tab::Mine, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
     }
 
     pub fn look_at(&mut self, lat: f64, lon: f64, alt: f64) {
@@ -639,6 +641,7 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
     ("VIEW", &[
         ("C", "chase / cockpit camera"),
         ("Mouse drag", "look around"),
+        ("Click / wheel", "cockpit: work a switch, turn a knob (Cessna)"),
         ("Mouse wheel", "camera distance / cockpit zoom"),
         ("H", "hide / show the HUD"),
         ("`", "hide / show the minimap"),
@@ -674,6 +677,15 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("View", "chase / cockpit camera"),
         ("Menu", "pause menu (B closes it)"),
         ("Y + View", "flight panel"),
+        ("Y + A", "afterburner / boost (hold)"),
+        ("Y + X", "thrust reversers (hold)"),
+        ("Y + LB", "speedbrake"),
+        ("Y + RB", "autopilot on / off"),
+        ("Y + Left stick click", "start / stop the engine"),
+        ("Y + Right stick click", "hide / show the HUD"),
+        ("Y + Menu", "canopy open / shut"),
+        ("Y + D-pad left / right", "master arm, lock a target"),
+        ("Y (let go)", "fire at a locked target"),
         ("A after a crash", "fly again"),
 ]),
 ];
@@ -973,35 +985,18 @@ pub fn key_row(ui: &mut egui::Ui, keys: &'static str, what: &'static str) {
 }
 
 /// One `buttons … action` row of the gamepad controls list.
-pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &'static str) {
+pub fn pad_row(ui: &mut egui::Ui, spec: &str, what: &str) {
     padui::glyphs(ui, spec, 20.0);
-    ui.add(egui::Label::new(RichText::new(tr(what)).font(caption()).color(TEXT)).truncate());
+    ui.add(egui::Label::new(RichText::new(what).font(caption()).color(TEXT)).truncate());
     ui.end_row();
 }
-
-/// The gamepad, flying: (buttons, what they do).
-pub const PAD_FLYING: &[(&str, &str)] = &[
-    ("LS", "pitch and roll"),
-    ("LT / RT", "rudder left / right"),
-    ("A / B", "throttle up / down (hold)"),
-    ("X", "wheel brakes (hold)"),
-    ("Y + B", "parking brake on / off"),
-    ("Y + Up / Down", "trim nose down / up"),
-    ("LB / RB", "flaps up / down a notch"),
-    ("L3", "landing gear"),
-    ("RS", "look around"),
-    ("R3", "reset the view"),
-    ("Dpad", "quick views"),
-    ("View", "chase / cockpit camera"),
-    ("A", "fly again after a crash"),
-];
 
 /// The gamepad, in the menus and on the globe.
 pub const PAD_MENUS: &[(&str, &[(&str, &str)])] = &[
     ("GAMEPAD · MENUS", &[
         ("Menu", "pause menu"),
-        ("Y + View", "flight panel (beside the flying)"),
         ("Dpad", "move between choices"),
+        ("RS", "scroll"),
         ("A", "press / choose"),
         ("Left / Right", "slide a slider"),
         ("LB / RB", "turn the page"),
@@ -1023,15 +1018,16 @@ pub fn controls_list(ui: &mut egui::Ui) {
         ui.columns(2, |cols| {
             heading(&mut cols[0], tr("GAMEPAD · FLYING"));
             egui::Grid::new("pad_fly").num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[0], |ui| {
-                for (k, w) in PAD_FLYING {
-                    pad_row(ui, k, w);
+                // (as Settings › Controls › Gamepad has it)
+                for (k, w) in crate::padmap::flying_rows() {
+                    pad_row(ui, &k, &w);
                 }
             });
             for (title, rows) in PAD_MENUS {
                 heading(&mut cols[1], tr(title));
                 egui::Grid::new(("pad", *title)).num_columns(2).min_row_height(23.0).spacing([10.0, 3.0]).show(&mut cols[1], |ui| {
                     for (k, w) in rows.iter() {
-                        pad_row(ui, k, w);
+                        pad_row(ui, k, tr(w));
                     }
                 });
                 cols[1].add_space(4.0);

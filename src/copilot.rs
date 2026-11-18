@@ -229,7 +229,7 @@ impl Game {
             "gear_handle_down": p.gear_down,
             "speedbrake": num(p.speedbrake),
             "spoilers": num(p.spoilers),
-            "parking_brake": self.parking_brake,
+            "parking_brake": p.parking_brake,
             "mixture": num(p.mixture),
             "trim_deg": num(p.trim.to_degrees()),
             "reverser": num(p.reverser),
@@ -840,7 +840,7 @@ impl Game {
         }
         if let Some(on) = args.parking_brake {
             any = true;
-            self.parking_brake = on;
+            p.parking_brake = on;
         }
         if let Some(mixture) = args.mixture {
             any = true;

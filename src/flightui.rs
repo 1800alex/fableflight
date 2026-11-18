@@ -10,7 +10,7 @@
 //! - a systems card at the top left, only for the aircraft that have
 //!   something to show there: a rocket's flight figures, a fighter's weapons.
 use crate::menu::{self, Icon, Page, ACCENT, DIM, TEXT};
-use crate::{padui, t, tr, Game};
+use crate::{padui, t, Game};
 use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke};
 
 /// What the toolbar asked for this frame.
@@ -97,7 +97,12 @@ impl Game {
                 });
             });
             // what opens it from the keyboard or the gamepad, under the bar
-            let hint = if padui::active() { tr("Y + View: flight panel   Menu: pause") } else { t!("Tab: flight panel   Esc: pause", "Tab : panneau de vol   Échap : pause") };
+            let hint = if padui::active() {
+                match crate::padmap::spec_of("flight_panel") {
+                    k if k.is_empty() => t!("Menu: pause", "Menu : pause").to_string(),
+                    k => t!("{}: flight panel   Menu: pause", "{} : panneau de vol   Menu : pause", k),
+                }
+            } else { t!("Tab: flight panel   Esc: pause", "Tab : panneau de vol   Échap : pause").to_string() };
             let r = ui.min_rect();
             ui.painter().text(pos2(r.center().x, r.bottom() + 12.0), Align2::CENTER_CENTER, hint, menu::caption(), Color32::from_white_alpha(170));
         });

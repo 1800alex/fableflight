@@ -28,6 +28,8 @@ mod jsbsim;
 mod live;
 mod radar;
 mod livewx;
+mod mp;
+mod mp_proto;
 mod nav;
 mod settings;
 mod settings_ui;
@@ -44,6 +46,7 @@ mod flightui;
 mod mainmenu;
 mod menu;
 mod minimap;
+mod padmap;
 mod padui;
 mod pave;
 mod photonight;
@@ -118,6 +121,10 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+/// The other players on the start screen's globe (multiplayer): a pink
+/// that no city, airport or the chosen spot uses, and that shows on sea and land.
+const MP_COLOUR: egui::Color32 = egui::Color32::from_rgb(255, 112, 186);
 
 const SUN_E: f32 = 10.0;
 /// Exposure of the start screen's globe seen from orbit (a day-lit planet in
@@ -233,6 +240,16 @@ impl Loaded {
     }
 }
 
+/// A scripted mouse event (--click, --wheel), for screenshots and checks:
+/// when, where the mouse goes first, and what it does (0 button up, 1 down,
+/// 100 + n the wheel turned n notches).
+#[derive(Clone, Copy, Debug)]
+struct MouseScript {
+    t: f64,
+    at: Option<(f64, f64)>,
+    ev: f64,
+}
+
 struct Args {
     lat: f64,
     lon: f64,
@@ -303,7 +320,18 @@ struct Args {
     /// how much of the 3D tiles to stream
     photo_detail: Option<gmaps::Detail>,
     cam: Option<(f64, f64, f64)>,
+    /// for scripted screenshots: the mouse at (x, y) window pixels, and the
+    /// left button pressed and released at these times (s)
+    cursor: Option<(f64, f64)>,
+    clicks: Vec<MouseScript>,
     cockpit: bool,
+    /// --mp server[,name]: multiplayer on, through this relay
+    mp: Option<(String, Option<String>)>,
+    /// --mp-list URL: read the server list from there (testing a relay)
+    mp_list: Option<String>,
+    /// --mp-mirror: a copy of our own aircraft flies 25 m off the left wing as
+    /// another player would be drawn (to check the drawing, no network)
+    mp_mirror: bool,
     /// cockpit vertical field of view (deg)
     fov: Option<f32>,
     mute: bool,
@@ -390,6 +418,11 @@ fn parse_args() -> Args {
         shots: Vec::new(),
         record: None,
         crash_at: None,
+        mp: None,
+        mp_mirror: false,
+        mp_list: None,
+        cursor: None,
+        clicks: Vec::new(),
         boost_at: None,
         ap_script: Vec::new(),
         stage_at: None,
@@ -623,6 +656,28 @@ fn parse_args() -> Args {
                     a.cam = Some((p[0], p[1], p[2]));
                 }
             }
+            "--cursor" => {
+                // x,y window pixels: the mouse, for scripted screenshots
+                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if p.len() == 2 {
+                    a.cursor = Some((p[0], p[1]));
+                }
+            }
+            "--click" | "--wheel" => {
+                // --click seconds[,held seconds[,x,y]]: a left click (at --cursor, or x,y)
+                // --wheel seconds,notches[,x,y]: the mouse wheel turned
+                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                let at = (p.len() >= 4).then(|| (p[2], p[3]));
+                if let Some(&t) = p.first() {
+                    if v[i] == "--click" {
+                        a.clicks.push(MouseScript { t, at, ev: 1.0 });
+                        a.clicks.push(MouseScript { t: t + p.get(1).copied().unwrap_or(0.1), at: None, ev: 0.0 });
+                    } else {
+                        a.clicks.push(MouseScript { t, at, ev: 100.0 + p.get(1).copied().unwrap_or(1.0) });
+                    }
+                    a.clicks.sort_by(|x, y| x.t.total_cmp(&y.t));
+                }
+            }
             "--shot" => {
                 // path@seconds[@yaw,pitch,distance]
                 let f: Vec<&str> = v.get(i + 1).map(|s| s.split('@').collect()).unwrap_or_default();
@@ -710,6 +765,20 @@ fn parse_args() -> Args {
                     eprintln!("--lang takes en or fr");
                     std::process::exit(2)
                 }));
+            }
+            "--mp" => {
+                if let Some(s) = v.get(i + 1) {
+                    let (server, name) = match s.split_once(',') {
+                        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                        None => (s.to_string(), None),
+                    };
+                    a.mp = Some((server, name));
+                }
+            }
+            "--mp-list" => a.mp_list = v.get(i + 1).cloned(),
+            "--mp-mirror" => {
+                a.mp_mirror = true;
+                used = 1;
             }
             "--offline" => {
                 a.offline = true;
@@ -840,7 +909,24 @@ struct Game {
     egui_state: egui_winit::State,
     keys: HashSet<KeyCode>,
     drag: bool,
+    lean_drag: Option<(f64, f64)>,
     last_cursor: Option<(f64, f64)>,
+    /// where the mouse is in the window (pixels), whatever it is doing
+    cursor: Option<(f64, f64)>,
+    /// the mouse pinned by --cursor (scripted screenshots)
+    script_cursor: Option<(f64, f64)>,
+    /// scripted mouse events (--click, --wheel)
+    script_clicks: Vec<MouseScript>,
+    /// a cockpit hotspot the left button went down on: which, when, and
+    /// whether its `hold` action has taken over (the key turned to START)
+    hot_press: Option<(usize, f64, bool)>,
+    /// keys held for a moment by the mouse wheel over a hotspot (until when)
+    wheel_hold: Vec<(KeyCode, f64)>,
+    /// wheel movement not yet a whole notch (trackpads)
+    wheel_acc: cockpit::WheelSteps,
+    hot_keys: HashSet<KeyCode>,
+    cockpit_controls: Vec<(aircraft::Hotspot, Option<usize>)>,
+    pit_blocks: Vec<(usize, Vec3, Vec3)>,
     cam_yaw: f64,
     cam_pitch: f64,
     cam_dist: f64,
@@ -909,8 +995,6 @@ struct Game {
     pad_id: Option<gilrs::GamepadId>,
     /// pads already given the Xbox layout (so a pad it does not take on is not reopened forever)
     pad_fixed: Vec<[u8; 16]>,
-    /// set with Y + B on a gamepad: holds the wheel brakes on until released
-    parking_brake: bool,
     /// the autopilot (autopilot.rs), and when it last let go (its warning)
     ap: autopilot::Autopilot,
     ap_off_t: f64,
@@ -928,6 +1012,13 @@ struct Game {
     /// another button since: a Y chord arms or locks; Y alone fires.
     pad_y: bool,
     pad_y_combo: bool,
+    /// the pad's flying actions held now, and the key each holds
+    pad_held: Vec<(&'static str, Option<KeyCode>)>,
+    /// a word from binding the pad (what lost its binding), until when
+    pad_note: (String, f64),
+    /// the pad was used last, not the mouse: the middle of the cockpit view
+    /// picks out the controls (see `pad_aim_at`)
+    pad_aim: bool,
     /// the camera look the view starts out at (right stick click goes back to it)
     cam_home: (f64, f64),
     rng: crash::Rng,
@@ -1033,6 +1124,28 @@ struct Game {
     /// (view-projection, position) to put labels on it
     live: live::Live,
     live_view: Option<(Mat4, DVec3)>,
+    /// multiplayer (mp.rs): switched on, the relay and our name (settings),
+    /// the connection while flying, and the other players this frame
+    mp_on: bool,
+    mp_server: String,
+    mp_name: String,
+    mp: Option<mp::Mp>,
+    mp_players: Vec<mp::Remote>,
+    /// on the start screen: the network's players for the globe (coarse),
+    /// how many fly in all, and whether the relay sends a world map at all
+    mp_world: Vec<mp_proto::Spot>,
+    mp_world_total: u32,
+    mp_world_known: bool,
+    /// the network's servers (started when first wanted: settings, or "auto")
+    mp_dir: Option<mp::Directory>,
+    /// the server is typed in (not picked from the list)
+    mp_custom: bool,
+    /// where the server list is read from, in turn (--mp-list first)
+    mp_list: Vec<String>,
+    /// the near ones' stand-in aircraft, for posing their models (by player id)
+    mp_puppets: std::collections::HashMap<u32, Plane>,
+    /// --mp-mirror (see Args)
+    mp_mirror: bool,
     /// real weather (sets `wx` while `wx.live` is on)
     livewx: livewx::LiveWx,
     /// the real clouds on the start screen's globe
@@ -1233,13 +1346,15 @@ impl Game {
         // everything within the aircraft's bounds, and a little around them
         // for the gear, flaps and control surfaces as they move.
         let (cy, cp, cd) = args.cam.unwrap_or((0.0, 0.2, spec.cam_dist));
+        let cockpit_controls = aircraft::cockpit_controls(spec, &model.pieces);
+        let pit_blocks = cockpit::blockers(&model.pieces);
         let mut g = Self {
-            gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: std::collections::HashMap::new(), window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
+            gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: std::collections::HashMap::new(), window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, lean_drag: None, last_cursor: None,
             minimap: minimap::Minimap::new(&prefs),
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
-status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, parking_brake: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
+            status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
@@ -1250,7 +1365,29 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
             live: live::Live::new(prefs.live_traffic),
+            mp_on: prefs.multiplayer || args.mp.is_some(),
+            mp_server: args.mp.as_ref().map_or(prefs.mp_server.clone(), |m| m.0.clone()),
+            mp_name: args.mp.as_ref().and_then(|m| m.1.clone()).unwrap_or(prefs.mp_name.clone()),
+            mp: None,
+            mp_players: Vec::new(),
+            mp_world: Vec::new(),
+            mp_world_total: 0,
+            mp_world_known: false,
+            mp_dir: None,
+            mp_custom: false,
+            mp_list: args.mp_list.iter().cloned().chain(mp::DIRECTORY_URLS.iter().map(|u| u.to_string())).collect(),
+            mp_puppets: std::collections::HashMap::new(),
+            mp_mirror: args.mp_mirror,
             live_view: None,
+            cursor: args.cursor,
+            script_cursor: args.cursor,
+            script_clicks: args.clicks.clone(),
+            hot_press: None,
+            wheel_hold: Vec::new(),
+            wheel_acc: cockpit::WheelSteps::default(),
+            hot_keys: HashSet::new(),
+            cockpit_controls,
+            pit_blocks,
             livewx: livewx::LiveWx::new(),
             gclouds: globeclouds::GlobeClouds::default(),
             menu_time_set: set_time,
@@ -1351,6 +1488,8 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
     /// a session) and swapped in.
     /// The next view: outside, the cockpit, and the other cockpit of a type that has two.
     fn next_view(&mut self) {
+        self.cancel_cockpit_input();
+        self.head.center_seat();
         if self.cam_mode == 1 && !self.head.rear && self.spec.eye2.is_some() {
             self.head.rear = true;
         } else {
@@ -1364,6 +1503,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             return;
         }
         self.head.rear = false;
+        self.head.center_seat();
         self.restore_wreck_meshes();
         self.sheds.items.clear();
         let next = match self.hangar.iter().position(|l| std::ptr::eq(l.spec, spec)) {
@@ -1394,6 +1534,9 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         self.hangar.push(old);
         self.r.set_paint(spec.paint.as_ref());
         self.spec = spec;
+        self.cancel_cockpit_input();
+        self.cockpit_controls = aircraft::cockpit_controls(spec, &self.model.pieces);
+        self.pit_blocks = cockpit::blockers(&self.model.pieces);
         self.weapons.reset(spec, &self.model.pieces);
         self.cam_dist = spec.cam_dist;
         self.menu.aircraft = aircraft::index_of(spec);
@@ -1470,7 +1613,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                 [p.n1 as f32, egt as f32, ff as f32, fuel as f32],
                 [mach as f32, gs as f32, (agl * 3.28084) as f32, tat as f32],
                 [p.throttle as f32, local as f32, p.gear as f32, p.flap_deg() as f32],
-                [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if p.gear_down { 1.0 } else { 0.0 }],
+                [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if (self.spec.id != 0 && p.gear_down || self.spec.id == 0 && p.landing_lights) && p.sys.powered() { 1.0 } else { 0.0 }],
             ];
         }
         // Row 5's first slot carries the nav lights (on above 1000) and the compass card.
@@ -1480,7 +1623,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             g[2],
             g[3],
             [g[4][0], local as f32, p.gear as f32, p.flap_deg() as f32],
-            [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if p.gear_down { 1.0 } else { 0.0 }],
+            [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if (self.spec.id != 0 && p.gear_down || self.spec.id == 0 && p.landing_lights) && p.sys.powered() { 1.0 } else { 0.0 }],
         ]
     }
 
@@ -1605,9 +1748,10 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
     }
 
     fn respawn_at(&mut self, lat: f64, lon: f64, alt: f64, heading: f64, speed: f64) {
+        self.cancel_cockpit_input();
         self.ap.disengage();
         self.hold_spot = None;
-        self.parking_brake = false;
+        self.plane.parking_brake = false;
         self.mcp_throttle = None;
         self.plane = Plane::spawn(self.spec, lat, lon, alt, heading, speed);
         // Rain set by hand comes along to a new place (its deck closes in there).
@@ -1808,8 +1952,512 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
     }
 
 
+    /// Multiplayer, once a frame: connected while it is switched on (to the
+    /// relay and under the name in the settings). In flight our aircraft is
+    /// sent and the others near us taken in; in the menus nothing of ours
+    /// goes out and the whole network's players come in for the globe.
+    fn update_mp(&mut self, in_menu: bool) {
+        if self.mp_mirror {
+            self.mp_players = if in_menu { Vec::new() } else { vec![self.mirror_player()] };
+            return;
+        }
+        // "auto": the server that answers fastest, kept once chosen.
+        let auto = self.mp_auto();
+        let target = if !self.mp_on {
+            None
+        } else if auto {
+            match &self.mp {
+                Some(m) if m.auto => Some(m.server.clone()),
+                _ => self.mp_directory().best().map(|s| s.address),
+            }
+        } else {
+            Some(self.mp_server.trim().to_string()).filter(|s| !s.is_empty())
+        };
+        let stale = self.mp.as_ref().is_some_and(|m| Some(&m.server) != target.as_ref() || m.auto != auto || m.name != mp_proto::clean_name(&self.mp_name));
+        if target.is_none() || stale {
+            self.mp = None;
+            self.mp_players.clear();
+            self.mp_world.clear();
+            (self.mp_world_total, self.mp_world_known) = (0, false);
+        }
+        let Some(target) = target else { return };
+        if in_menu {
+            // (the server list names the servers in the menus, and tells how many fly on each)
+            self.mp_directory();
+        }
+        let name = self.mp_name.clone();
+        let m = self.mp.get_or_insert_with(|| {
+            let mut m = mp::Mp::start(&target, &name);
+            m.auto = auto;
+            m
+        });
+        m.set_watching(in_menu);
+        if in_menu {
+            self.mp_players.clear();
+            (self.mp_world, self.mp_world_total, self.mp_world_known) = m.world();
+            return;
+        }
+        self.mp_world.clear();
+        let p = &self.plane;
+        let q = p.rot.as_quat();
+        let byte = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let axis = |x: f64| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
+        let pw = p.sys.powered();
+        let mut flags = 0;
+        if pw {
+            flags |= mp_proto::F_NAV | mp_proto::F_STROBE | mp_proto::F_BEACON;
+        }
+        if pw && p.gear_down {
+            flags |= mp_proto::F_LANDING;
+        }
+        if p.on_ground {
+            flags |= mp_proto::F_GROUND;
+        }
+        if self.crashed {
+            flags |= mp_proto::F_CRASHED;
+        }
+        m.set_state(mp_proto::PlayerState {
+            seq: 0,
+            aircraft: self.spec.id as u8,
+            pos: p.pos.to_array(),
+            rot: [q.x, q.y, q.z, q.w],
+            vel: p.vel.as_vec3().to_array(),
+            flaps: byte(p.flaps),
+            gear: byte(p.gear),
+            throttle: byte(p.throttle),
+            canopy: 0,
+            pitch: axis(p.stick.x),
+            roll: axis(p.stick.z),
+            yaw: axis(p.stick.y),
+            flags,
+        });
+        self.mp_players = m.players();
+    }
+
+    /// --mp-mirror: our own aircraft as another player, 25 m off the left wing.
+    fn mirror_player(&self) -> mp::Remote {
+        let p = &self.plane;
+        let q = p.rot.as_quat();
+        let byte = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let axis = |x: f64| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
+        let pos = p.pos - p.right() * 25.0;
+        let flags = mp_proto::F_NAV | mp_proto::F_STROBE | mp_proto::F_BEACON | if p.on_ground { mp_proto::F_GROUND } else { 0 };
+        let state = mp_proto::PlayerState { seq: 0, aircraft: self.spec.id as u8, pos: pos.to_array(), rot: [q.x, q.y, q.z, q.w], vel: p.vel.as_vec3().to_array(), flaps: byte(p.flaps), gear: byte(p.gear), throttle: byte(p.throttle), canopy: 0, pitch: axis(p.stick.x), roll: axis(p.stick.z), yaw: axis(p.stick.y), flags };
+        mp::Remote { id: 999, name: "Mirror".into(), aircraft: state.aircraft, pos, rot: p.rot, vel: p.vel, gear: p.gear as f32, flags, state }
+    }
+
+    /// Whether `spec`'s model is ready to draw (it is flown, or waits in the
+    /// hangar); if not, it is built in the background, as for the menu.
+    fn fleet_ready(&mut self, spec: &'static aircraft::Spec) -> bool {
+        if std::ptr::eq(spec, self.spec) || self.hangar.iter().any(|l| std::ptr::eq(l.spec, spec)) {
+            return true;
+        }
+        match self.building.iter().position(|(s, _)| std::ptr::eq(*s, spec)) {
+            Some(i) => match self.building[i].1.try_recv() {
+                Ok(m) => {
+                    self.building.swap_remove(i);
+                    let l = Loaded::upload(spec, m, &mut self.r);
+                    self.hangar.push(l);
+                    true
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => false,
+                Err(_) => {
+                    self.building.swap_remove(i);
+                    false
+                }
+            },
+            None => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Loaded::make(spec));
+                });
+                self.building.push((spec, rx));
+                false
+            }
+        }
+    }
+
+    /// The other players near enough to be worth it, drawn with their
+    /// aircraft's own model: a stand-in `Plane` takes their controls, flaps,
+    /// gear and throttle, and poses the pieces as our own aircraft's are.
+    /// Returns which players were drawn so (the rest stay traffic models).
+    fn draw_mp_planes(&mut self, cam: DVec3, dt: f64, objs: &mut Vec<DrawObj>) -> Vec<bool> {
+        const FULL_DIST: f64 = 4000.0;
+        let players = std::mem::take(&mut self.mp_players);
+        let mut full = vec![false; players.len()];
+        self.mp_puppets.retain(|id, _| players.iter().any(|p| p.id == *id));
+        for (k, rp) in players.iter().enumerate() {
+            if (rp.pos - cam).length() > FULL_DIST || rp.flags & mp_proto::F_CRASHED != 0 {
+                continue;
+            }
+            let Some(spec) = aircraft::BUILTIN.iter().copied().find(|s| s.id == rp.aircraft as u32) else { continue };
+            if spec.rocket().is_some() || !self.fleet_ready(spec) {
+                continue;
+            }
+            let pup = self.mp_puppets.entry(rp.id).or_insert_with(|| Plane::spawn(spec, 0.0, 0.0, 1000.0, 0.0, 50.0));
+            if !std::ptr::eq(pup.spec, spec) {
+                *pup = Plane::spawn(spec, 0.0, 0.0, 1000.0, 0.0, 50.0);
+            }
+            let st = &rp.state;
+            (pup.pos, pup.rot, pup.vel) = (rp.pos, rp.rot, rp.vel);
+            pup.flaps = st.flaps as f64 / 255.0;
+            pup.gear = st.gear as f64 / 255.0;
+            pup.gear_down = st.gear > 127;
+            pup.throttle = st.throttle as f64 / 255.0;
+            pup.stick = DVec3::new(st.pitch as f64, st.yaw as f64, st.roll as f64) / 127.0;
+            pup.on_ground = st.flags & mp_proto::F_GROUND != 0;
+            // The propeller: idling on the ground, faster with the throttle.
+            pup.prop_rate = 75.0 + 200.0 * pup.throttle;
+            pup.prop = (pup.prop + pup.prop_rate * dt).rem_euclid(std::f64::consts::TAU * 1000.0);
+            pup.t += dt;
+            let (model, mesh, cut) = if std::ptr::eq(spec, self.spec) {
+                (&self.model, &self.piece_mesh, &self.piece_cut)
+            } else {
+                let l = self.hangar.iter().find(|l| std::ptr::eq(l.spec, spec)).unwrap();
+                (&l.model, &l.piece_mesh, &l.piece_cut)
+            };
+            // (Room for all of it, or it stays a traffic model: never half an aircraft.)
+            if objs.len() + model.pieces.len() + 48 > render::MAX_OBJS as usize {
+                continue;
+            }
+            let pose = pup.pose(&model.pieces);
+            let base = Mat4::from_rotation_translation(rp.rot.as_quat(), (rp.pos - cam).as_vec3());
+            let blur = ((pup.prop_rate - 30.0) / 25.0).clamp(0.0, 1.0) as f32;
+            // Its lights (plane.wgsl reads them from the instruments' last row).
+            let t = self.time + rp.id as f64 * 0.37;
+            let strobe = { let s = t.rem_euclid(1.3); if s < 0.045 || (s > 0.16 && s < 0.2) { 1.0 } else { 0.0 } };
+            let beacon = (1.0 - ((t * 1.1).rem_euclid(1.0) - 0.15).abs() * 7.0).max(0.0) as f32;
+            let on = |f: u8| (st.flags & f != 0) as u8 as f32;
+            let mut params = [[0.0f32; 4]; 6];
+            params[5] = [1000.0 * on(mp_proto::F_NAV), strobe * on(mp_proto::F_STROBE), beacon * on(mp_proto::F_BEACON), on(mp_proto::F_LANDING)];
+            for (i, p) in model.pieces.iter().enumerate() {
+                let hide = match p.vis {
+                    airframe::Vis::Always => false,
+                    airframe::Vis::SlowProp => blur >= 1.0,
+                    airframe::Vis::FastProp => blur <= 0.0,
+                    airframe::Vis::Chute => true,
+                };
+                if hide {
+                    continue;
+                }
+                objs.push(DrawObj { mesh: mesh[i], model: base * pose[i], tint: [blur, 0.0, 0.0, 0.0], glow: [0.0, spec.id as f32, 0.0, 0.0], params, cast: 0b11, glass: p.glass, cut: cut[i], ..DrawObj::DEFAULT });
+            }
+            full[k] = true;
+        }
+        self.mp_players = players;
+        full
+    }
+
+    fn mp_auto(&self) -> bool {
+        self.mp_server.trim().is_empty() || self.mp_server.trim().eq_ignore_ascii_case("auto")
+    }
+    /// The network's server list (read in the background from the first call on).
+    fn mp_directory(&mut self) -> &mp::Directory {
+        let (src, url) = (self.src.clone(), self.mp_list.clone());
+        let cache = dirs::config_dir().map(|d| d.join("fablegame")).inspect(|d| {
+            let _ = std::fs::create_dir_all(d);
+        }).map(|d| d.join("mp_servers.json"));
+        self.mp_dir.get_or_insert_with(|| mp::Directory::start(src, url, cache))
+    }
+    /// A server's name in the list, by its address (else the address itself).
+    fn mp_server_name(&self, address: &str) -> String {
+        let a = mp::with_port(address);
+        self.mp_dir.as_ref().and_then(|d| d.servers().into_iter().find(|s| s.address == a).map(|s| s.name)).unwrap_or_else(|| address.to_string())
+    }
+
+    /// The cockpit view's ray through (x, y) window pixels, in the aircraft's
+    /// body frame (from the eye, unit length), with the pose and the hotspots
+    /// where they are now: in the cockpit view, flying, nothing open.
+    fn cockpit_ray(&self, x: f64, y: f64) -> Option<(Vec3, Vec3, Vec<Mat4>, Vec<aircraft::Hotspot>)> {
+        if self.mode != Mode::Fly || self.cam_mode != 1 || self.pause_open || self.crashed || self.cockpit_controls.is_empty() {
+            return None;
+        }
+        let (vp, cam) = self.live_view?;
+        let s = self.window.inner_size();
+        let (w, h) = (s.width.max(1) as f64, s.height.max(1) as f64);
+        let ndc = glam::Vec4::new((x / w * 2.0 - 1.0) as f32, (1.0 - y / h * 2.0) as f32, 0.5, 1.0);
+        let p = vp.inverse() * ndc;
+        let d = (p.truncate() / p.w).as_dvec3().normalize();
+        let inv = self.plane.rot.inverse();
+        let o = (inv * (cam - self.plane.model_pos())).as_vec3();
+        let d = (inv * d).as_vec3();
+        let pose = self.plane.pose(&self.model.pieces);
+        let hs = self.cockpit_hotspots(&pose);
+        Some((o, d, pose, hs))
+    }
+    /// The cockpit control under the mouse at (x, y) window pixels (an index
+    /// into the loaded cockpit controls): in the cockpit view, flying, nothing open.
+    fn hotspot_at(&self, x: f64, y: f64) -> Option<usize> {
+        let (o, d, pose, hs) = self.cockpit_ray(x, y)?;
+        let i = aircraft::pick(&hs, o, d)?;
+        let depth = (Vec3::from(hs[i].at) - o).dot(d) - hs[i].r - 0.005;
+        (!cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, d, depth)).then_some(i)
+    }
+    /// Looking about the cockpit with the pad: the control the middle of the
+    /// view is on, if any, and how near the nearest one in sight is (1 on
+    /// it, falling to 0 at `AIM_NEAR` off it). None: not aiming with the pad.
+    fn pad_aim_at(&self) -> Option<(Option<usize>, f32)> {
+        /// how far off a control (radians, past its edge) the aim dot shows
+        const AIM_NEAR: f32 = 0.14;
+        if !self.pad_aim || self.info_open {
+            return None;
+        }
+        let s = self.window.inner_size();
+        let (o, d, pose, hs) = self.cockpit_ray(s.width as f64 * 0.5, s.height as f64 * 0.5)?;
+        let on = aircraft::pick(&hs, o, d).filter(|&i| {
+            let depth = (Vec3::from(hs[i].at) - o).dot(d) - hs[i].r - 0.005;
+            !cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, d, depth)
+        });
+        if on.is_some() {
+            return Some((on, 1.0));
+        }
+        // The angle from the middle of the view to each control's edge: the
+        // nearest few checked for being in sight (not behind the panel).
+        let mut near: Vec<(f32, usize)> = hs.iter().enumerate().filter_map(|(i, h)| {
+            let c = Vec3::from(h.at) - o;
+            let l = c.length();
+            (l > h.r && c.dot(d) > 0.0).then(|| (d.angle_between(c) - (h.r / l).asin(), i))
+        }).filter(|&(a, _)| a < AIM_NEAR).collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let seen = near.iter().take(4).find(|&&(_, i)| {
+            let c = Vec3::from(hs[i].at) - o;
+            let l = c.length();
+            !cockpit::occluded(&self.model.pieces, &pose, &self.pit_blocks, o, c / l, l - hs[i].r - 0.005)
+        });
+        Some((None, seen.map_or(0.0, |&(a, _)| 1.0 - (a / AIM_NEAR).clamp(0.0, 1.0))))
+    }
+    fn hotspot_under_mouse(&self) -> Option<usize> {
+        if self.drag || self.lean_drag.is_some() {
+            return None;
+        }
+        self.cursor.and_then(|(x, y)| self.hotspot_at(x, y))
+    }
+    /// The key an action stands for (its default: what `key` understands).
+    fn action_key(id: &str) -> Option<KeyCode> {
+        bind::ACTIONS.iter().find(|a| a.id == id).map(|a| a.key)
+    }
+    /// The left button going down (or up) on a cockpit hotspot: a click does
+    /// what the action's key does; a hotspot with a `hold` action waits to
+    /// see whether it is a click or held (see `mouse_holds`).
+    fn hot_click(&mut self, down: bool) {
+        if down {
+            let Some(i) = self.hotspot_under_mouse() else { return };
+            let h = self.cockpit_controls[i].0;
+            if h.hold.is_none() {
+                if let Some(k) = h.click.and_then(Self::action_key) {
+                    self.key(k);
+                } else if let Some(id) = h.click { self.cockpit_action(id); }
+            }
+            self.hot_press = Some((i, self.real, false));
+        } else if let Some((i, _, held)) = self.hot_press.take() {
+            let Some(h) = self.cockpit_controls.get(i).map(|e| e.0) else { return };
+            if held {
+                if let Some(k) = h.hold.and_then(Self::action_key) {
+                    self.hot_keys.remove(&k);
+                }
+            } else if h.hold.is_some() {
+                if let Some(k) = h.click.and_then(Self::action_key) {
+                    self.key(k);
+                }
+            }
+        }
+    }
+    /// The mouse wheel over a cockpit hotspot: each notch presses its "up"
+    /// or "down" action once and holds it a moment. False: no hotspot there.
+    fn hot_wheel(&mut self, d: f64) -> bool {
+        let Some(i) = self.hotspot_under_mouse() else { return false };
+        let Some((up, down)) = self.cockpit_controls[i].0.wheel else { return false };
+        let steps = self.wheel_acc.steps(i, d);
+        for _ in 0..steps.unsigned_abs() {
+            let id = if steps > 0 { up } else { down };
+            if let Some(k) = Self::action_key(id) {
+                if let Some(opposite) = Self::action_key(if steps > 0 { down } else { up }) {
+                    self.hot_keys.remove(&opposite);
+                    self.wheel_hold.retain(|(q, _)| *q != opposite);
+                }
+                self.key(k);
+                self.hot_keys.insert(k);
+                let until = self.real + 0.12;
+                match self.wheel_hold.iter_mut().find(|(q, _)| *q == k) {
+                    Some(e) => e.1 = e.1.max(self.real) + 0.12,
+                    None => self.wheel_hold.push((k, until)),
+                }
+            } else { self.cockpit_action(id); }
+        }
+        true
+    }
+    /// What the mouse holds: a hotspot's `hold` action once the button has
+    /// been down a moment, and the keys the wheel holds until their time is up.
+    fn mouse_holds(&mut self) {
+        while let Some(&e) = self.script_clicks.first() {
+            if self.real < e.t {
+                break;
+            }
+            self.script_clicks.remove(0);
+            if let Some(p) = e.at {
+                (self.cursor, self.script_cursor) = (Some(p), Some(p));
+            }
+            if e.ev >= 50.0 {
+                self.hot_wheel(e.ev - 100.0);
+            } else {
+                self.hot_click(e.ev > 0.5);
+            }
+        }
+        if let Some((i, t0, false)) = self.hot_press {
+            if let Some(k) = self.cockpit_controls.get(i).and_then(|e| e.0.hold).and_then(Self::action_key) {
+                if self.real - t0 > 0.35 {
+                    self.key(k);
+                    self.hot_keys.insert(k);
+                    self.hot_press = Some((i, t0, true));
+                }
+            }
+        }
+        let now = self.real;
+        let mut done = Vec::new();
+        self.wheel_hold.retain(|&(k, until)| {
+            if until > now {
+                return true;
+            }
+            done.push(k);
+            false
+        });
+        for k in done {
+            self.hot_keys.remove(&k);
+        }
+    }
+    /// The state a cockpit control is in, for the label beside the mouse.
+    fn hot_state(&self, id: &str) -> Option<String> {
+        let p = &self.plane;
+        let on_off = |b: bool| if b { "ON" } else { "OFF" };
+        Some(match id {
+            "master" => on_off(p.sys.elec.master).into(),
+            "ignition" => format!("{}{}", on_off(p.ignition), if p.starter_on || p.cranking { " · START" } else { "" }),
+            "parking_brake" => on_off(p.parking_brake).into(),
+            "mixture_rich" => format!("{:.0} %", p.mixture * 100.0),
+            "throttle_up" => format!("{:.0} %", p.throttle * 100.0),
+            "flaps_up" if self.spec.lever.is_some() => self.spec.lever.as_ref()?.notch(p.flap_set).into(),
+            "speedbrake" if self.spec.chute.is_some() => if p.chute_spent { "JETTISONED" } else if p.speedbrake > 0.0 { "DEPLOYED" } else { "PACKED" }.into(),
+            "flaps_up" => format!("{:.0}°", self.spec.flaps.get(p.flap_set as usize).copied().unwrap_or(0.0)),
+            "trim_down" => format!("{:+.1}°", p.trim.to_degrees()),
+            "obs_right" => format!("OBS {:03.0}°", self.radios.obs),
+            "gear" => if p.gear_down { t!("down", "sorti") } else { t!("up", "rentré") }.into(),
+            "prop_up" => format!("{:.0} RPM", 1800.0 + 900.0 * p.propeller),
+            "cowl_open" => format!("{:.0} %", p.cowl_flaps * 100.0),
+            "landing_lights" => on_off(p.landing_lights).into(),
+            "fuel_valve" | "fuel_next" => match p.fuel_selector {
+                plane::FuelSelector::Center if std::ptr::eq(self.spec, &aircraft::dr400::SPEC) => "MAIN",
+                plane::FuelSelector::Center => "BOTH",
+                plane::FuelSelector::Right => "RIGHT",
+                plane::FuelSelector::Left => "LEFT",
+                plane::FuelSelector::Off => "OFF",
+            }.into(),
+            "nav_next" => self.radios.nav.as_ref().map(|s| format!("{} {}", s.freq_text(), s.label())).unwrap_or_else(|| "OFF".into()),
+            "adf_next" => self.radios.adf.as_ref().map(|s| format!("{} {}", s.freq_text(), s.label())).unwrap_or_else(|| "OFF".into()),
+            "baro_qnh" => format!("{:.0} hPa", self.radios.setting(self.wx.qnh)),
+            _ => return None,
+        })
+    }
+    /// The cockpit control under the mouse: a ring round it, what it is, how
+    /// it is set, and the pointing hand.
+    ///
+    /// Looking about with the pad it is the middle of the view that points:
+    /// a faint dot there once a control is near it, filling in on one, and
+    /// beside it the pad buttons that work the control.
+    fn hotspot_overlay(&self, ctx: &egui::Context) {
+        use egui::{Align2, Color32, FontId};
+        let screen = ctx.content_rect();
+        let aim = self.pad_aim_at();
+        if let Some((on, near)) = aim {
+            if near > 0.0 {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let c = screen.center();
+                // (Faint at the edge of the range, firmer as it closes in.)
+                let a = 0.35 + 0.45 * near;
+                if on.is_some() {
+                    painter.circle_filled(c, 5.0, Color32::from_rgba_unmultiplied(255, 210, 90, 220));
+                    painter.circle_stroke(c, 5.0, egui::Stroke::new(1.0, Color32::from_black_alpha(140)));
+                } else {
+                    painter.circle_filled(c, 4.5, Color32::from_white_alpha((a * 255.0) as u8));
+                    painter.circle_stroke(c, 4.5, egui::Stroke::new(1.0, Color32::from_black_alpha((a * 160.0) as u8)));
+                }
+            }
+        }
+        let Some(i) = (match aim { Some((on, _)) => on, None => self.hotspot_under_mouse() }) else { return };
+        let Some((vp, cam)) = self.live_view else { return };
+        if aim.is_none() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let h = self.cockpit_hotspots(&self.plane.pose(&self.model.pieces))[i];
+        let to_screen = |b: Vec3| -> Option<egui::Pos2> {
+            let w = self.plane.model_pos() + self.plane.rot * b.as_dvec3();
+            let c = vp * (w - cam).as_vec3().extend(1.0);
+            (c.w > 0.0).then(|| egui::pos2(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height()))
+        };
+        let at = Vec3::from(h.at);
+        let (Some(c), Some(e)) = (to_screen(at), to_screen(at + Vec3::Y * h.r)) else { return };
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let ring = Color32::from_rgba_unmultiplied(255, 210, 90, 200);
+        painter.circle_stroke(c, (e - c).length().max(6.0), egui::Stroke::new(1.5, ring));
+        let label = |id: &'static str| match id {
+            "flaps_up" if self.spec.lever.is_some() => t!("Raise nose / visor", "Relever nez / visière"),
+            "flaps_down" if self.spec.lever.is_some() => t!("Lower nose / visor", "Abaisser nez / visière"),
+            "speedbrake" if self.spec.chute.is_some() => t!("Drag chute", "Parachute-frein"),
+            _ => bind::ACTIONS.iter().find(|a| a.id == id).map(|a| a.label()).unwrap_or_else(|| aircraft::c172::cabin::action_label(id)),
+        };
+        if aim.is_some() {
+            // The pad: each action with the buttons that do it (none: not on the pad).
+            let mut rows: Vec<(String, String)> = Vec::new();
+            let mut add = |id: &'static str, extra: &str| rows.push((padmap::spec_of(id), format!("{}{extra}", label(id))));
+            if let Some(id) = h.click { add(id, ""); }
+            if let Some(id) = h.hold { add(id, &if h.click.is_none() { format!(" ({})", t!("hold", "maintenir")) } else { String::new() }); }
+            if let Some((up, down)) = h.wheel { add(up, ""); add(down, ""); }
+            rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+            if let Some(st) = h.click.or(h.wheel.map(|w| w.0)).and_then(|id| self.hot_state(id)) {
+                rows.push((String::new(), st));
+            }
+            let p = ctx.layer_painter(egui::LayerId::background());
+            let x0 = screen.center().x + 18.0;
+            let y0 = screen.center().y + 16.0;
+            let gw = rows.iter().map(|r| if r.0.is_empty() { 0.0 } else { padui::spec_width(&p, &r.0, 18.0) + 6.0 }).fold(0.0, f32::max);
+            for (k, (spec, text)) in rows.iter().enumerate() {
+                let y = y0 + 22.0 * k as f32;
+                if !spec.is_empty() {
+                    padui::paint_spec(&p, x0, y, spec, 18.0, Color32::WHITE);
+                }
+                let pos = egui::pos2(x0 + gw, y);
+                p.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_CENTER, text, FontId::proportional(13.5), Color32::from_black_alpha(200));
+                p.text(pos, Align2::LEFT_CENTER, text, FontId::proportional(13.5), Color32::WHITE);
+            }
+            return;
+        }
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(id) = h.click {
+            let hold = h.hold.map(|k| t!("  (hold: {})", "  (maintenir : {})", label(k))).unwrap_or_default();
+            lines.push(format!("{}{hold}", label(id)));
+        }
+        if h.click.is_none() {
+            if let Some(id) = h.hold { lines.push(format!("{} ({})", label(id), t!("hold", "maintenir"))); }
+        }
+        if let Some((up, down)) = h.wheel {
+            lines.push(format!("{} {} / {}", t!("Wheel:", "Molette :"), label(up), label(down)));
+        }
+        if let Some(s) = h.click.or(h.wheel.map(|w| w.0)).and_then(|id| self.hot_state(id)) {
+            lines.push(s);
+        }
+        let mouse = self.cursor.map(|(x, y)| egui::pos2(x as f32 / ctx.pixels_per_point(), y as f32 / ctx.pixels_per_point())).unwrap_or(c);
+        // (On the right of the screen the label goes left of the mouse, so it stays on it.)
+        let left = mouse.x > screen.center().x;
+        let (align, dx) = if left { (Align2::RIGHT_TOP, -16.0) } else { (Align2::LEFT_TOP, 16.0) };
+        for (k, s) in lines.iter().enumerate() {
+            let pos = mouse + egui::vec2(dx, 6.0 + 16.0 * k as f32);
+            painter.text(pos + egui::vec2(1.0, 1.0), align, s, FontId::proportional(13.5), Color32::from_black_alpha(200));
+            painter.text(pos, align, s, FontId::proportional(13.5), Color32::WHITE);
+        }
+    }
+
     fn controls(&mut self, dt: f64) -> Controls {
-        let k = |c: KeyCode| self.keys.contains(&c);
+        self.mouse_holds();
+        let k = |c: KeyCode| self.keys.contains(&c) || self.hot_keys.contains(&c);
         let ax = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f64;
         let mut c = Controls {
             pitch: ax(k(KeyCode::KeyS) || k(KeyCode::ArrowDown), k(KeyCode::KeyW) || k(KeyCode::ArrowUp)),
@@ -1817,6 +2465,8 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             yaw: ax(k(KeyCode::KeyE), k(KeyCode::KeyQ)),
             throttle: ax(k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight), k(KeyCode::ControlLeft) || k(KeyCode::ControlRight)),
             brake: k(KeyCode::KeyB),
+            brake_left: if self.hot_press.is_some_and(|(i, _, _)| self.cockpit_controls[i].0.hold == Some("brake_left")) { 1.0 } else { 0.0 },
+            brake_right: if self.hot_press.is_some_and(|(i, _, _)| self.cockpit_controls[i].0.hold == Some("brake_right")) { 1.0 } else { 0.0 },
             // (The game's own boost is arcade mode's; real afterburners always work.)
             boost: k(KeyCode::Space) && (self.arcade || self.spec.real_boost()),
             reverse: k(KeyCode::KeyZ),
@@ -1838,7 +2488,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         self.gamepad(dt, &mut c);
         self.joystick(&mut c);
         self.autopilot(dt, &mut c);
-        c.brake |= self.parking_brake;
+        c.brake |= self.plane.parking_brake;
         if let Some(t) = self.crash_at {
             if self.real > t && !self.crashed {
                 c.pitch = -1.0;
@@ -1859,8 +2509,9 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         c
     }
 
-    /// An Xbox-style gamepad, laid out as Microsoft Flight Simulator (2020)
-    /// sets one up by default:
+    /// An Xbox-style gamepad. Its flying layout can be moved about in
+    /// Settings › Controls › Gamepad (padmap.rs); it starts as Microsoft
+    /// Flight Simulator (2020) sets one up by default:
     ///
     /// | input | does |
     /// |---|---|
@@ -1877,27 +2528,55 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
     /// | d-pad | quick views: ahead, panel, left, right |
     /// | View | cockpit / chase camera |
     /// | Menu | pause menu |
+    /// | Y + View | flight panel |
     ///
-    /// In the menus A starts the flight and B closes the pause menu; after a
-    /// crash A starts again.
+    /// Y with another button reaches what the layout above leaves out:
+    ///
+    /// | input | does |
+    /// |---|---|
+    /// | Y + A (hold) | afterburner / boost |
+    /// | Y + X (hold) | thrust reversers |
+    /// | Y + LB | speedbrake |
+    /// | Y + RB | autopilot on / off (a rocket: the ship lands itself) |
+    /// | Y + left stick click | start / stop the engine |
+    /// | Y + right stick click | hide / show the HUD |
+    /// | Y + Menu | canopy open / shut |
+    /// | Y + d-pad left / right | master arm, lock a target (a rocket: which engines burn, drop the booster) |
+    /// | Y alone, let go | fire at a locked target |
+    ///
+    /// Those are the defaults; the menu buttons below are fixed, and so is
+    /// Menu (pause) and A after a crash.
+    ///
+    /// In the menus the d-pad (and the left stick, off the globe) moves, A
+    /// presses, B steps back and the right stick scrolls; the flight panel
+    /// takes the d-pad, A, B, the bumpers and the right stick while it is
+    /// open. A skips the loading screen, and after a crash starts again.
     fn gamepad(&mut self, dt: f64, c: &mut Controls) {
         use gilrs::{Axis, Button, EventType};
+        padmap::publish(&self.binds.pad);
         let Some(g) = self.gilrs.as_mut() else { return };
         let (mut pressed, mut released, mut relayout) = (Vec::new(), Vec::new(), false);
+        // A joystick capture (Settings › Controls › Buttons, Axes) takes every device but the pads.
+        let stick_capture = self.binds.capture.as_ref().is_some_and(|c| !c.from_pad() && !matches!(c, bind::Capture::Key(_)));
         while let Some(ev) = g.next_event() {
             // Every device's axes and buttons go to the bindings (joysticks,
             // pedals, throttles); one with something bound is not the gamepad.
-            let (uuid, name) = {
+            // A pad gilrs knows the layout of is left out unless it has been
+            // bound already, so binding a joystick button cannot take it by mistake.
+            let (uuid, name, pad_like) = {
                 let p = g.gamepad(ev.id);
-                (p.uuid(), p.name().to_string())
+                (p.uuid(), p.name().to_string(), p.mapping_source() == gilrs::MappingSource::SdlMappings)
             };
-            match ev.event {
-                EventType::AxisChanged(_, v, code) => self.binds.axis_event(uuid, &name, code.into_u32(), v),
-                EventType::ButtonPressed(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), true),
-                EventType::ButtonReleased(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), false),
-                _ => {}
+            let bound = self.binds.uses(&uuid);
+            if bound || !pad_like {
+                match ev.event {
+                    EventType::AxisChanged(_, v, code) => self.binds.axis_event(uuid, &name, code.into_u32(), v),
+                    EventType::ButtonPressed(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), true),
+                    EventType::ButtonReleased(_, code) => self.binds.button_event(uuid, &name, code.into_u32(), false),
+                    _ => {}
+                }
             }
-            if self.binds.uses(&uuid) || self.binds.capture.is_some() {
+            if bound || (stick_capture && !pad_like) {
                 continue;
             }
             match ev.event {
@@ -1938,11 +2617,69 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         let Some(pad) = id.and_then(|id| g.connected_gamepad(id)) else {
             self.pad = Controls::default();
             padui::set_active(false);
+            self.pad_aim = false;
             self.pad_rep = None;
             (self.pad_y, self.pad_y_combo) = (false, false);
+            self.pad_release_all();
+            if self.binds.capture.as_ref().is_some_and(|c| c.from_pad()) {
+                self.binds.capture = None;
+            }
             return;
         };
         padui::set_active(true);
+        // Binding from the pad (Settings › Controls › Gamepad): its buttons
+        // and sticks go to that alone.
+        if let Some(cap) = self.binds.capture.clone().filter(|c| c.from_pad()) {
+            use padmap::{Caught, PadBtn};
+            let trig = |b: Button, z: Axis| match (pad.button_data(b), pad.axis_data(z)) {
+                (Some(d), _) => d.value(),
+                (None, Some(a)) => ((a.value() + 1.0) * 0.5).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            let sticks = [pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY), pad.value(Axis::RightStickX), pad.value(Axis::RightStickY), trig(Button::RightTrigger2, Axis::RightZ) - trig(Button::LeftTrigger2, Axis::LeftZ)];
+            let y_held = pad.is_pressed(Button::North);
+            let now = self.real;
+            let c = &mut self.binds.pad_catch;
+            let mut got = Caught::Wait;
+            let evs = pressed.iter().map(|b| (*b, true)).chain(released.iter().map(|b| (*b, false)));
+            for (b, down) in evs {
+                if let Some(pb) = PadBtn::from_gilrs(b) {
+                    match c.button(pb, down, y_held || (down && pb == PadBtn::Y), now) {
+                        Caught::Wait => {}
+                        r => got = r,
+                    }
+                }
+            }
+            if got == Caught::Wait {
+                got = c.tick(now);
+            }
+            if let (Caught::Wait, bind::Capture::PadAxis(_)) = (&got, &cap) {
+                got = c.sticks(sticks);
+            }
+            let lost = match (got, cap) {
+                (Caught::Wait, _) => None,
+                (Caught::Cancel, _) => Some(Vec::new()),
+                (Caught::Refused(_), _) => {
+                    self.pad_note = (t!("Menu pauses: it cannot be given anything else.", "Menu met en pause : on ne peut rien lui donner d'autre.").into(), self.real + 6.0);
+                    None
+                }
+                (Caught::Button(ch), bind::Capture::Pad(id)) => Some(self.binds.pad.set(id, ch)),
+                (Caught::Axis(src), bind::Capture::PadAxis(a)) => Some(self.binds.pad.set_axis(a, Some(src))),
+                // (a stick moved while waiting for a button, or the other way round)
+                _ => None,
+            };
+            if let Some(lost) = lost {
+                self.binds.capture = None;
+                if !lost.is_empty() {
+                    self.pad_note = (t!("No longer bound: {}", "Plus assigné : {}", lost.join(", ")), self.real + 8.0);
+                }
+            }
+            self.pad = Controls::default();
+            self.pad_rep = None;
+            (self.pad_y, self.pad_y_combo) = (false, false);
+            padui::set_scroll(0.0);
+            return;
+        }
         // Where the pad's buttons go: the globe, the pause menu, the flight
         // panel (which then has the d-pad, A, B and the bumpers), or the aircraft.
         let nav = if self.mode == Mode::Menu {
@@ -1969,27 +2706,32 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         };
         let modifier = pad.is_pressed(Button::North);
         let flying = self.mode == Mode::Fly && !self.pause_open;
-        self.pad = Controls {
-            pitch: -dz(pad.value(Axis::LeftStickY)),
-            roll: dz(pad.value(Axis::LeftStickX)),
-            yaw: (trig(Button::RightTrigger2, Axis::RightZ) - trig(Button::LeftTrigger2, Axis::LeftZ)).clamp(-1.0, 1.0),
-            // A and B work the flight panel while it is open.
-            throttle: if nav == Nav::Panel { 0.0 } else { ax_pad(pad.is_pressed(Button::South), pad.is_pressed(Button::East) && !modifier) },
-            brake: pad.is_pressed(Button::West),
-            boost: false,
-            reverse: false,
-            throttle_set: None,
-            starter: false,
+        // The globe itself is only on the start screen's Fly page; the main
+        // menu, aircraft and settings pages cover it.
+        let globe = nav == Nav::Globe && self.menu.screen == menu::Screen::Fly;
+        // The flying axes, wherever Settings › Controls › Gamepad has put them.
+        let map = &self.binds.pad;
+        let stick = |s: padmap::Stick| match s {
+            padmap::Stick::LX => dz(pad.value(Axis::LeftStickX)),
+            padmap::Stick::LY => dz(pad.value(Axis::LeftStickY)),
+            padmap::Stick::RX => dz(pad.value(Axis::RightStickX)),
+            padmap::Stick::RY => dz(pad.value(Axis::RightStickY)),
+            padmap::Stick::Trig => (trig(Button::RightTrigger2, Axis::RightZ) - trig(Button::LeftTrigger2, Axis::LeftZ)).clamp(-1.0, 1.0),
         };
-        let (look_x, look_y) = (dz(pad.value(Axis::RightStickX)), dz(pad.value(Axis::RightStickY)));
-        let trim = if modifier && nav != Nav::Panel { ax_pad(pad.is_pressed(Button::DPadDown), pad.is_pressed(Button::DPadUp)) } else { 0.0 };
+        let axis = |a: padmap::PadAxis| map.axis(a).map(|s| stick(s.stick) * s.sign as f64).unwrap_or(0.0);
+        self.pad = Controls { pitch: axis(padmap::PadAxis::Pitch), roll: axis(padmap::PadAxis::Roll), yaw: axis(padmap::PadAxis::Rudder), throttle: axis(padmap::PadAxis::Throttle), ..Controls::default() };
+        let (look_x, look_y) = (axis(padmap::PadAxis::LookX), axis(padmap::PadAxis::LookY));
+        // The buttons held now, for the flying actions held with them.
+        let down: Vec<padmap::PadBtn> = padmap::PadBtn::ALL.into_iter().filter(|b| pad.is_pressed(b.gilrs())).collect();
+        let ry = dz(pad.value(Axis::RightStickY));
 
-        // Moving about the menus: the d-pad (and in the pause menu the left
-        // stick too), repeating while held.
+        // Moving about the menus: the d-pad (and the left stick too, except
+        // where it turns the globe or flies), repeating while held.
         let dirs = [(Button::DPadUp, egui::Key::ArrowUp), (Button::DPadDown, egui::Key::ArrowDown), (Button::DPadLeft, egui::Key::ArrowLeft), (Button::DPadRight, egui::Key::ArrowRight)];
         let mut held = dirs.iter().find(|(b, _)| pad.is_pressed(*b)).map(|d| d.1);
         let (lx, ly) = (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
-        if held.is_none() && nav == Nav::Pause && lx.abs().max(ly.abs()) > 0.6 {
+        let stick_nav = nav == Nav::Pause || (nav == Nav::Globe && !globe);
+        if held.is_none() && stick_nav && lx.abs().max(ly.abs()) > 0.6 {
             held = Some(if ly.abs() > lx.abs() { if ly > 0.0 { egui::Key::ArrowUp } else { egui::Key::ArrowDown } } else if lx > 0.0 { egui::Key::ArrowRight } else { egui::Key::ArrowLeft });
         }
         let tap = pressed.iter().find_map(|b| dirs.iter().find(|d| d.0 == *b).map(|d| d.1));
@@ -2018,7 +2760,10 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         for k in nav_keys {
             self.pad_key(k);
         }
-        if nav == Nav::Globe {
+        // The right stick scrolls the menus and the flight panel: squared,
+        // for slow reading near the centre, fast at full tilt.
+        padui::set_scroll(if nav == Nav::Off { 0.0 } else { (ry * ry.abs() * 1600.0 * dt) as f32 });
+        if globe {
             // Left stick turns the globe (squared, for a fine touch), the triggers zoom.
             let h = self.window.inner_size().height.max(1) as f64;
             let sq = |v: f64| v * v.abs();
@@ -2036,27 +2781,28 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         c.roll = (c.roll + self.pad.roll).clamp(-1.0, 1.0);
         c.yaw = (c.yaw + self.pad.yaw).clamp(-1.0, 1.0);
         c.throttle = (c.throttle + self.pad.throttle).clamp(-1.0, 1.0);
-        c.brake |= self.pad.brake;
 
-        if flying {
+        // (With the flight panel open the right stick scrolls it instead.)
+        if flying && nav != Nav::Panel {
             // Right stick: look around, as fast as a quick head turn at full deflection.
             // Pushed right the view swings right, in the cockpit and outside.
             let rate = 2.2 * self.look_sens * dt;
             let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
             self.cam_yaw += look_x * rate * side;
             self.cam_pitch = (self.cam_pitch - look_y * rate * 0.8).clamp(-1.2, 1.4);
-            if trim != 0.0 && !self.crashed {
-                // Winds the trim (the angle of attack the elevator holds) at about 2 degrees a second.
-                self.plane.trim = (self.plane.trim + trim * 0.035 * dt).clamp(-0.05, 0.24);
-            }
+        }
+        // Looking or flying with the pad: the middle of the view aims at the cockpit's controls.
+        if look_x != 0.0 || look_y != 0.0 || self.pad.pitch != 0.0 || self.pad.roll != 0.0 || !pressed.is_empty() {
+            self.pad_aim = true;
         }
 
+        // Y held before this frame, or pressed in it: what the buttons pressed now mean.
+        let y_now = self.pad_y || pressed.contains(&Button::North);
         for &b in &pressed {
             self.pad_button(nav, b, modifier);
         }
-        // Y is the weapon chord: Y + left/right arms or locks and uses the
-        // chord up, so releasing Y alone only fires when it was not used with
-        // another button. Y on its own fires at a locked target.
+        self.pad_fly_buttons(nav, &down, &pressed, y_now);
+        // Y on its own, let go without having been used with another button.
         if pressed.contains(&Button::North) {
             self.pad_y = true;
             self.pad_y_combo = false;
@@ -2065,11 +2811,120 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             self.pad_y_combo = true;
         }
         if released.contains(&Button::North) {
-            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && !self.crashed && self.mode == Mode::Fly && !self.pause_open && self.missiles_ok() && self.weapons.lock >= 1.0 {
-                self.weapons.request_fire();
+            if self.pad_y && !self.pad_y_combo && nav == Nav::Off && self.mode == Mode::Fly && !self.pause_open {
+                if let Some(id) = self.binds.pad.action_at(padmap::Y_ALONE) {
+                    // A tap of Y fires only at a locked target: no complaint otherwise.
+                    let quiet = id == "fire_missile" && (self.crashed || !self.missiles_ok() || self.weapons.lock < 1.0);
+                    if !quiet {
+                        self.pad_do(id, false);
+                    }
+                }
             }
             self.pad_y = false;
             self.pad_y_combo = false;
+        }
+    }
+
+    /// The pad's flying buttons, as Settings › Controls › Gamepad has them:
+    /// each action pressed with its button and held while it is (its key
+    /// held for the controls that read keys, like the throttle and brakes).
+    /// `down`: the buttons held now; `pressed`: those pressed this frame
+    /// (a tap quicker than a frame still counts); `y`: Y held for them.
+    fn pad_fly_buttons(&mut self, nav: Nav, down: &[padmap::PadBtn], pressed: &[gilrs::Button], y: bool) {
+        use padmap::{Chord, PadBtn};
+        let mut now: Vec<&'static str> = Vec::new();
+        let mut taps: Vec<&'static str> = Vec::new();
+        if matches!(nav, Nav::Off | Nav::Panel) && self.mode == Mode::Fly && !self.pause_open {
+            let map = &self.binds.pad;
+            // The flight panel keeps A, B, the d-pad and the bumpers while it is open.
+            let panel = |c: Chord| nav == Nav::Panel && !c.y && matches!(c.btn, PadBtn::A | PadBtn::B | PadBtn::LB | PadBtn::RB | PadBtn::Up | PadBtn::Down | PadBtn::Left | PadBtn::Right);
+            // While Y is held a button with a Y binding does that, not its own.
+            let live = |c: Chord, held: bool| held && c != padmap::Y_ALONE && !panel(c) && if c.y { y } else { !(y && map.has_y(c.btn)) };
+            for (id, c) in map.bound() {
+                if live(c, down.contains(&c.btn)) {
+                    now.push(id);
+                } else if live(c, pressed.contains(&c.btn.gilrs())) {
+                    taps.push(id);
+                }
+            }
+            // A after a crash flies again (pad_button), and skips the loading screen.
+            let skip_a = self.crashed || self.loading.as_ref().is_some_and(|l| l.done.is_none());
+            if skip_a {
+                let a = map.action_at(padmap::Chord { btn: PadBtn::A, y: false });
+                now.retain(|id| Some(*id) != a);
+                taps.retain(|id| Some(*id) != a);
+            }
+        }
+        let gone: Vec<_> = self.pad_held.iter().filter(|(id, _)| !now.contains(id)).copied().collect();
+        for (_, k) in gone {
+            if let Some(k) = k {
+                self.keys.remove(&k);
+            }
+        }
+        self.pad_held.retain(|(id, _)| now.contains(id));
+        for id in now {
+            match self.pad_held.iter().find(|(h, _)| *h == id) {
+                // (put back if the window losing focus let go of the keys)
+                Some((_, Some(k))) => {
+                    self.keys.insert(*k);
+                }
+                Some(_) => {}
+                None => {
+                    let k = self.pad_do(id, true);
+                    self.pad_held.push((id, k));
+                }
+            }
+        }
+        for id in taps {
+            self.pad_do(id, false);
+        }
+    }
+
+    /// A pad action pressed: what its key does (returned, to be let go of
+    /// later when `held`), or one of the pad's views.
+    fn pad_do(&mut self, id: &'static str, held: bool) -> Option<KeyCode> {
+        use padmap::{Does, View};
+        match padmap::does(id, self.spec.rocket().is_some())? {
+            Does::View(v) => {
+                // Quick views. Outside, left and right look at that side of the aircraft.
+                let (home_y, home_p) = self.cam_home;
+                let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
+                (self.cam_yaw, self.cam_pitch) = match v {
+                    View::Ahead => (home_y, home_p),
+                    View::Down if self.cam_mode == 1 => (home_y, 0.55),
+                    View::Down => (home_y + std::f64::consts::PI, home_p),
+                    View::Left => (home_y - side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
+                    View::Right => (home_y + side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
+                    View::Reset => {
+                        self.head.zoom = 1.0;
+                        (home_y, home_p)
+                    }
+                };
+                None
+            }
+            Does::Key(KeyCode::Tab) => {
+                // The flight panel, with its first choice picked out for the pad.
+                self.info_open = !self.info_open;
+                self.pad_home = self.info_open;
+                None
+            }
+            Does::Key(k) => {
+                self.key(k);
+                if held {
+                    self.keys.insert(k);
+                    return Some(k);
+                }
+                None
+            }
+        }
+    }
+
+    /// Lets go of every key the pad's buttons were holding.
+    fn pad_release_all(&mut self) {
+        for (_, k) in std::mem::take(&mut self.pad_held) {
+            if let Some(k) = k {
+                self.keys.remove(&k);
+            }
         }
     }
 
@@ -2103,9 +2958,8 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         } else {
             self.throttle_axis = None;
         }
-        if b.axis(A::BrakeLeft).unwrap_or(0.0).max(b.axis(A::BrakeRight).unwrap_or(0.0)) > 0.3 {
-            c.brake = true;
-        }
+        c.brake_left = c.brake_left.max(b.axis(A::BrakeLeft).unwrap_or(0.0).clamp(0.0, 1.0));
+        c.brake_right = c.brake_right.max(b.axis(A::BrakeRight).unwrap_or(0.0).clamp(0.0, 1.0));
         for (id, down) in self.binds.take_edges() {
             let Some(a) = bind::ACTIONS.iter().find(|a| a.id == id) else { continue };
             if down {
@@ -2535,6 +3389,64 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         ui.label(dim(t!("The altimeter reads {:.0} ft (true altitude {:.0} ft).", "L'altimètre indique {:.0} ft (altitude vraie {:.0} ft).", true_ft + self.radios.alt_error_ft(qnh), true_ft)));
     }
 
+    fn cockpit_globals(&self) -> [[f32; 4]; 8] {
+        let p = &self.plane;
+        let (lat, lon, h) = geo::pos_to_lla(p.pos);
+        let (east, north, up) = geo::enu(p.pos);
+        let gs = (p.vel - up * p.vel.dot(up)).length() * 1.94384;
+        let hdg = p.forward().dot(east).atan2(p.forward().dot(north));
+        let mut data = [[0.0; 4]; 8];
+        data[0] = [(self.radios.setting(self.wx.qnh) * 0.029529983 * 100.0) as f32,
+            ((h * 3.28084 + (1013.25 - self.wx.qnh) * 27.3) / 100.0) as f32,
+            gs as f32, (p.spec.fuel_kg / 0.72 / 3.785 / 2.0) as f32];
+        let adf = self.radios.adf.as_ref().and_then(|s| nav::adf_bearing(s, p.pos, hdg.to_degrees())).filter(|_| p.sys.powered());
+        data[1] = [self.radios.nav.as_ref().map(|s| s.freq_khz as f32 / 1000.0).unwrap_or(0.0),
+            self.radios.adf.as_ref().map(|s| s.freq_khz as f32).unwrap_or(0.0), adf.unwrap_or(0.0) as f32, if adf.is_some() { 1.0 } else { 0.0 }];
+        data[2] = [self.gauges.cylinder_head_f(), ((p.trim + 0.05) / 0.29) as f32, if p.sys.powered() { 1.0 } else { 0.0 }, p.engine_hours as f32];
+        let plot = |pos: DVec3| { let v = pos - p.pos; [v.dot(east) as f32 / 18520.0, v.dot(north) as f32 / 18520.0, 1.0, 0.0] };
+        if let Some(st) = &self.radios.nav { data[3] = plot(st.pos()); }
+        for (dst, (st, _)) in data[4..].iter_mut().zip(nav::near(lat.to_degrees(), lon.to_degrees(), 18520.0, nav::Kind::Vor).iter().take(4)) { *dst = plot(st.pos()); }
+        data
+    }
+
+    fn cancel_cockpit_input(&mut self) {
+        self.hot_press = None;
+        self.lean_drag = None;
+        self.hot_keys.clear();
+        self.wheel_hold.clear();
+        self.wheel_acc = cockpit::WheelSteps::default();
+    }
+
+    fn cockpit_hotspots(&self, pose: &[Mat4]) -> Vec<aircraft::Hotspot> {
+        aircraft::animated_hotspots(&self.cockpit_controls, pose)
+    }
+
+    fn cockpit_action(&mut self, id: &str) {
+        match id {
+            "prop_up" => self.plane.propeller = (self.plane.propeller + 0.05).min(1.0),
+            "prop_down" => self.plane.propeller = (self.plane.propeller - 0.05).max(0.0),
+            "cowl_open" => self.plane.cowl_flaps = (self.plane.cowl_flaps + 0.1).min(1.0),
+            "cowl_close" => self.plane.cowl_flaps = (self.plane.cowl_flaps - 0.1).max(0.0),
+            "landing_lights" => self.plane.landing_lights = !self.plane.landing_lights,
+            "fuel_valve" | "fuel_next" | "fuel_prev" => {
+                self.plane.fuel_selector = self.plane.fuel_selector.turn(id != "fuel_prev");
+            }
+            "nav_next" | "nav_prev" | "adf_next" | "adf_prev" => {
+                let adf = id.starts_with("adf");
+                let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
+                let mut list = nav::near(lat.to_degrees(), lon.to_degrees(), if adf { 150_000.0 } else { 200_000.0 }, if adf { nav::Kind::Ndb } else { nav::Kind::Vor });
+                if !adf { list.extend(nav::near(lat.to_degrees(), lon.to_degrees(), 40_000.0, nav::Kind::Ils)); }
+                list.sort_by(|a,b| a.1.total_cmp(&b.1));
+                let current = if adf { &self.radios.adf } else { &self.radios.nav };
+                let slot = current.as_ref().and_then(|s| list.iter().position(|(q, _)| q == s)).map(|i| i + 1).unwrap_or(0);
+                let next = (slot as isize + if id.ends_with("next") { 1 } else { -1 }).rem_euclid(list.len() as isize + 1) as usize;
+                let station = next.checked_sub(1).map(|i| list[i].0.clone());
+                if adf { self.radios.adf = station; } else if let Some(st) = station { let show = self.radios.show; self.radios.tune_nav(st, self.plane.pos); self.radios.show = show; } else { self.radios.nav = None; }
+            }
+            _ => {}
+        }
+    }
+
     /// NAV 1 as the cockpit's course deviation indicators show it (Globals::nav).
     fn nav_globals(&self) -> [f32; 4] {
         let obs = self.radios.obs as f32;
@@ -2702,64 +3614,20 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                 self.pad_home = true;
             }
             (Nav::Pause, _) => {}
-            // The flight panel, open beside the flying: the same, and B (or Y + View) closes it.
-            (Nav::Panel, Button::South) => self.pad_key(egui::Key::Enter),
-            (Nav::Panel, Button::East) => self.info_open = false,
-            (Nav::Panel, Button::Select) if modifier => self.info_open = false,
-            (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) => {
+            // The flight panel, open beside the flying: the same, and B closes it.
+            // (Its other buttons, and Y with any, still fly: pad_fly_buttons.)
+            (Nav::Panel, Button::South) if !modifier => self.pad_key(egui::Key::Enter),
+            (Nav::Panel, Button::East) if !modifier => self.info_open = false,
+            (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) if !modifier => {
                 self.info_page = menu::Page::cycle(&menu::Page::INFO, self.info_page, b == Button::RightTrigger);
                 self.pad_home = true;
             }
-            (Nav::Panel, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) => {}
-            // Y and the d-pad: master arm and target lock.
-            (Nav::Off, Button::DPadLeft) if modifier => {
-                if !self.missiles_ok() {
-                    self.status = self.missiles_refusal().into();
-                } else {
-                    let on = self.weapons.toggle_arm();
-                    self.status = if on { t!("Master arm on", "Armement maître sur ON") } else { t!("Master arm off", "Armement maître sur OFF") }.into();
-                }
-                self.status_until = self.real + 3.0;
-            }
-            (Nav::Off, Button::DPadRight) if modifier => {
-                if !self.missiles_ok() {
-                    self.status = self.missiles_refusal().into();
-                } else {
-                    self.weapons.request_cycle();
-                }
-                self.status_until = self.real + 3.0;
-            }
-            (_, Button::Start) => self.set_pause_menu(true),
+            // A skips the loading screen (the scenery goes on loading), as Enter does.
+            (_, Button::South) if self.loading.as_ref().is_some_and(|l| l.done.is_none()) => self.key(KeyCode::Enter),
             (_, Button::South) if self.crashed => self.respawn_here(),
-            (_, Button::Select) if modifier => {
-                self.info_open = true;
-                self.pad_home = true;
-            }
-            (_, Button::Select) => self.next_view(),
-            (_, Button::RightThumb) => {
-                (self.cam_yaw, self.cam_pitch) = self.cam_home;
-                self.head.zoom = 1.0;
-            }
-            (_, Button::East) if modifier => {
-                self.parking_brake = !self.parking_brake;
-                self.status = if self.parking_brake { t!("Parking brake set", "Frein de parc serré") } else { t!("Parking brake released", "Frein de parc desserré") }.into();
-                self.status_until = self.real + 2.0;
-            }
-            (_, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) if !modifier => {
-                // Quick views. Outside, left and right look at that side of the aircraft.
-                let (home_y, home_p) = self.cam_home;
-                let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
-                (self.cam_yaw, self.cam_pitch) = match b {
-                    Button::DPadUp => (home_y, home_p),
-                    Button::DPadDown if self.cam_mode == 1 => (home_y, 0.55),
-                    Button::DPadDown => (home_y + std::f64::consts::PI, home_p),
-                    Button::DPadLeft => (home_y - side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
-                    _ => (home_y + side * std::f64::consts::FRAC_PI_2, home_p.min(0.15)),
-                };
-            }
-            (_, Button::LeftTrigger) if !self.crashed => self.plane.set_flaps(-1),
-            (_, Button::RightTrigger) if !self.crashed => self.plane.set_flaps(1),
-            (_, Button::LeftThumb) if !self.crashed => self.plane.toggle_gear(),
+            // Menu pauses, unless Y + Menu is given something to do.
+            (_, Button::Start) if !(modifier && self.binds.pad.has_y(padmap::PadBtn::Menu)) => self.set_pause_menu(true),
+            // Everything else that flies is in Settings › Controls › Gamepad (pad_fly_buttons).
             _ => {}
         }
     }
@@ -2952,8 +3820,8 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                 self.status_until = self.real + 3.0;
             }
             KeyCode::Period => {
-                self.parking_brake = !self.parking_brake;
-                self.status = if self.parking_brake { t!("Parking brake set", "Frein de parc serré") } else { t!("Parking brake released", "Frein de parc desserré") }.into();
+                self.plane.parking_brake = !self.plane.parking_brake;
+                self.status = if self.plane.parking_brake { t!("Parking brake set", "Frein de parc serré") } else { t!("Parking brake released", "Frein de parc desserré") }.into();
                 self.status_until = self.real + 2.0;
             }
             KeyCode::F5 if !self.crashed => self.ap_toggle(),
@@ -3003,7 +3871,8 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         match self.menu.screen {
             Screen::Main => return,
             Screen::Aircraft => self.aircraft_back(),
-            Screen::Fly | Screen::Settings => self.menu.screen = Screen::Main,
+            Screen::Fly => self.menu.screen = Screen::Main,
+            Screen::Settings => self.menu.screen = self.menu.set_back,
         }
         self.pad_home = true;
         self.egui_ctx.memory_mut(|m| {
@@ -3018,6 +3887,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         if open == self.pause_open || self.mode != Mode::Fly {
             return;
         }
+        self.cancel_cockpit_input();
         self.pause_open = open;
         self.pause_page = menu::Page::Game;
         self.pad_home = open;
@@ -3100,6 +3970,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
     /// box would otherwise keep left and right from the slider. (A widget
     /// only shows as a text box the pass after it takes the focus.)
     fn pad_pass(&mut self, ctx: &egui::Context) {
+        padui::begin_pass();
         if let Some(d) = self.pad_move.take() {
             ctx.memory_mut(|m| m.move_focus(d));
         }
@@ -3625,7 +4496,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             !landing && (tti <= 5.0 || closing < 5.0),
             !landing && (tti <= 10.0 || (agl < 46.0 && vs < -1.5 && p.gear < 1.0)),
             !landing && agl < 600.0 && vs < -12.0,
-            p.gear < 1.0 && agl < 150.0 && p.throttle < 0.35,
+            p.sys.powered() && p.gear < 1.0 && (agl < 150.0 && p.throttle < 0.35 || p.spec.id == 0 && p.flap_deg() > 20.0),
         ];
         for (t, on) in self.warn_t.iter_mut().zip(trip) {
             if on {
@@ -3728,12 +4599,13 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone() }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone(), multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
     /// so dragging a slider does not write the file every frame).
     fn keep_settings(&mut self, now: bool) {
+        if std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record") { return; }
         if !now && self.real - self.prefs_t < 1.0 {
             return;
         }
@@ -4599,6 +5471,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             glow_n: glow[2],
             spot: [[0.0; 4]; 3],
             nav: self.nav_globals(),
+            cockpit: self.cockpit_globals(),
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -4859,6 +5732,11 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         if !in_menu {
             self.live.instances(cam, &mut insts, &mut air_lights);
         }
+        self.update_mp(in_menu);
+        if !in_menu {
+            let full = self.draw_mp_planes(cam, dt_real, &mut objs);
+            mp::instances(&self.mp_players, &full, cam, &mut insts, &mut air_lights);
+        }
         self.live_view = Some((vp, cam));
 
         // The globe's labels are placed in the window's pixels, not the (maybe smaller) 3D scene's.
@@ -4967,7 +5845,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                 }
                 menu::Screen::Settings => {
                     if settings_ui::show(ctx, self, false) {
-                        self.menu.screen = menu::Screen::Main;
+                        self.menu.screen = self.menu.set_back;
                         self.pad_home = true;
                     }
                     padui::focus_ring(ctx, menu::ACCENT);
@@ -5002,6 +5880,8 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                 painter.text(p + egui::vec2(1.0, 1.0), Align2::LEFT_CENTER, text, menu::medium(size), Color32::from_black_alpha(200));
                 painter.text(p, Align2::LEFT_CENTER, text, menu::medium(size), col);
             };
+            // (where the other players are on screen: city names give way to theirs)
+            let mp_at: Vec<egui::Pos2> = self.mp_world.iter().filter_map(|sp| project(sp.lat_deg(), sp.lon_deg())).collect();
             if alt > 25_000.0 {
                 // (a city right by the start marker gives way to its label)
                 let pick_at = self.menu.pick.and_then(|(la, lo)| project(la, lo));
@@ -5009,7 +5889,8 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                     if *tier > 1 && alt > 7.0e6 {
                         continue;
                     }
-                    if let Some(p) = project(*lat, *lon).filter(|p| pick_at.is_none_or(|k| (*p - k).length() > 70.0)) {
+                    let clear = |p: &egui::Pos2| pick_at.is_none_or(|k| (*p - k).length() > 70.0) && mp_at.iter().all(|m| (m.y - p.y).abs() > 16.0 || (m.x - p.x).abs() > 90.0);
+                    if let Some(p) = project(*lat, *lon).filter(clear) {
                         painter.circle_filled(p, 2.5, Color32::from_rgba_unmultiplied(255, 255, 255, 220));
                         label(p + egui::vec2(7.0, 0.0), tr(name), if *tier == 1 { 14.0 } else { 12.5 }, Color32::from_rgba_unmultiplied(255, 255, 255, 225));
                     }
@@ -5040,6 +5921,43 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                         if !chosen {
                             label(p + egui::vec2(6.0, 0.0), &a.ident, if a.kind == 2 { 13.0 } else { 12.0 }, col);
                         }
+                    }
+                }
+            }
+            // The other players (multiplayer, connected): an arrow each, the
+            // way they fly, with their name; more about them under the mouse.
+            if !self.mp_world.is_empty() {
+                let col = MP_COLOUR;
+                let shade = Color32::from_black_alpha(170);
+                let d = (alt / 111_000.0 * 0.03).clamp(0.002, 0.6);
+                let crowd = self.mp_world.len() > 24 && alt > 3.0e6;
+                // (a name that would overlap one already written is left to the mouse)
+                let mut named: Vec<egui::Rect> = Vec::new();
+                for sp in &self.mp_world {
+                    let (la, lo) = (sp.lat_deg(), sp.lon_deg());
+                    let Some(p) = project(la, lo) else { continue };
+                    let h = sp.heading_deg().to_radians();
+                    let ahead = project(la + d * h.cos(), lo + d * h.sin() / la.to_radians().cos().max(0.05));
+                    let dir = ahead.map(|a| a - p).filter(|v| v.length() > 0.05).map(|v| v.normalized()).unwrap_or(egui::vec2(0.0, -1.0));
+                    let side = egui::vec2(-dir.y, dir.x);
+                    let arrow = |k: f32| vec![p + dir * 8.0 * k, p - dir * 5.0 * k + side * 5.5 * k, p - dir * 2.0 * k, p - dir * 5.0 * k - side * 5.5 * k];
+                    let hover = ctx.pointer_hover_pos().is_some_and(|m| (m - p).length() < 12.0) || aim.is_some_and(|c| (c - p).length() < 20.0);
+                    let k = if hover { 1.35 } else { 1.0 };
+                    painter.add(egui::Shape::closed_line(arrow(k), egui::Stroke::new(3.0, shade)));
+                    // (two triangles: the arrowhead's notch makes it concave)
+                    let a = arrow(k);
+                    painter.add(egui::Shape::convex_polygon(vec![a[0], a[1], a[2]], col, egui::Stroke::NONE));
+                    painter.add(egui::Shape::convex_polygon(vec![a[0], a[2], a[3]], col, egui::Stroke::NONE));
+                    let at = p + egui::vec2(11.0, 0.0);
+                    let room = egui::Rect::from_min_size(at - egui::vec2(0.0, 9.0), egui::vec2(9.0 * sp.name.chars().count() as f32 + 8.0, 18.0));
+                    if hover || (!crowd && named.iter().all(|r| !r.intersects(room))) {
+                        label(at, &sp.name, 13.0, col);
+                        named.push(room);
+                    }
+                    if hover {
+                        let ac = mp_proto::AIRCRAFT.get(sp.aircraft as usize).copied().unwrap_or("?");
+                        let how = if sp.flags & mp_proto::F_GROUND != 0 { t!("on the ground", "au sol").to_string() } else { format!("{:.0} ft  ·  {} kt  ·  {:03.0}°", sp.alt_m() * 3.28084, sp.speed, sp.heading_deg()) };
+                        label(p + egui::vec2(11.0, 15.0), &format!("{ac}  ·  {how}"), 11.5, Color32::from_rgba_unmultiplied(255, 255, 255, 220));
                     }
                 }
             }
@@ -5097,6 +6015,41 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             });
             if back {
                 self.menu_back();
+            }
+            // Top middle, while multiplayer is on: how many fly (they are on
+            // the globe), or how the connection stands; it opens its settings.
+            if self.mp_on {
+                let (col, line) = self.mp_line();
+                let (title, sub) = match self.mp_flying() {
+                    Some(n) => (n, line),
+                    None => (line, String::new()),
+                };
+                let mut open = false;
+                egui::Area::new(egui::Id::unique("menu_mp")).anchor(Align2::CENTER_TOP, [0.0, M]).show(ctx, |ui| {
+                    let tg = ui.painter().layout_no_wrap(title.clone(), menu::label(), TEXT);
+                    let sg = ui.painter().layout_no_wrap(sub.clone(), menu::caption(), DIM);
+                    let w = (tg.size().x.max(sg.size().x) + 52.0).clamp(160.0, (screen.width() - 2.0 * (W + 2.0 * M)).max(160.0));
+                    let h = if sub.is_empty() { 34.0 } else { 46.0 };
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, t!("Multiplayer", "Multijoueur")));
+                    let lit = menu::ease(ctx, resp.id, resp.hovered() || resp.has_focus());
+                    let p = ui.painter().with_clip_rect(r);
+                    p.rect_filled(r, menu::R_WIDGET, menu::mix(menu::PANEL, Color32::from_rgba_premultiplied(40, 47, 58, 238), lit));
+                    p.rect_stroke(r, menu::R_WIDGET, egui::Stroke::new(1.0, menu::mix(menu::LINE_HI, Color32::from_white_alpha(70), lit)), egui::StrokeKind::Inside);
+                    p.circle_filled(egui::pos2(r.left() + 18.0, r.center().y), 4.0, col);
+                    if sub.is_empty() {
+                        p.galley(egui::pos2(r.left() + 32.0, r.center().y - tg.size().y * 0.5), tg, menu::mix(TEXT, Color32::WHITE, lit));
+                    } else {
+                        p.galley(egui::pos2(r.left() + 32.0, r.top() + 6.0), tg, menu::mix(TEXT, Color32::WHITE, lit));
+                        p.galley(egui::pos2(r.left() + 32.0, r.bottom() - 6.0 - sg.size().y), sg, DIM);
+                    }
+                    if resp.clicked() {
+                        open = true;
+                    }
+                });
+                if open {
+                    self.open_settings(settings_ui::Section::Multiplayer, menu::Screen::Fly);
+                }
             }
             let r = self.aircraft_window(ctx, W, egui::pos2(M, M + 34.0 + 10.0));
 
@@ -5810,7 +6763,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                             ui.add_space(6.0);
                             menu::heading(ui, t!("LIVE TRAFFIC", "TRAFIC RÉEL"));
                             if !self.live.enabled() {
-                                ui.label(RichText::new(t!("Off (pause menu, Settings).", "Désactivé (menu pause, Réglages).")).font(menu::caption()).color(DIM));
+                                ui.label(RichText::new(t!("Off (Esc, Settings, Multiplayer).", "Désactivé (Échap, Réglages, Multijoueur).")).font(menu::caption()).color(DIM));
                             } else if self.live.planes.is_empty() {
                                 let e = self.live.error();
                                 let msg = if e.is_empty() { t!("Waiting for aircraft…", "En attente d'avions…").to_string() } else { t!("No data: {}", "Pas de données : {}", e.chars().take(60).collect::<String>()) };
@@ -5828,6 +6781,39 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                                         ui.end_row();
                                     }
                                 });
+                            }
+                            ui.add_space(6.0);
+                            menu::heading(ui, t!("MULTIPLAYER", "MULTIJOUEUR"));
+                            match self.mp.as_ref().map(|m| m.status()) {
+                                None if self.mp_on => {
+                                    ui.label(RichText::new(t!("Looking for the fastest server…", "Recherche du serveur le plus rapide…")).size(12.0).color(DIM));
+                                }
+                                None => {
+                                    ui.label(RichText::new(t!("Off (Esc, Settings, Multiplayer).", "Désactivé (Échap, Réglages, Multijoueur).")).size(12.0).color(DIM));
+                                }
+                                Some(mp::Status::Error(e)) => {
+                                    ui.label(RichText::new(t!("No connection: {}", "Pas de connexion : {}", e.chars().take(60).collect::<String>())).size(12.0).color(DIM));
+                                }
+                                Some(mp::Status::Connecting) => {
+                                    let to = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
+                                    ui.label(RichText::new(t!("Connecting to {}…", "Connexion à {}…", to)).size(12.0).color(DIM));
+                                }
+                                Some(mp::Status::Connected) => {
+                                    let me = self.plane.pos;
+                                    let n = self.mp_players.len();
+                                    let on = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
+                                    ui.label(RichText::new(t!("Server: {}", "Serveur : {}", on)).size(12.0).color(TEXT));
+                                    ui.label(RichText::new(i18n::plural(n as u64, "other pilot nearby", "other pilots nearby", "autre pilote à proximité", "autres pilotes à proximité")).size(12.0).color(DIM));
+                                    egui::Grid::new("info_mp").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
+                                        for p in self.mp_players.iter().take(8) {
+                                            ui.label(RichText::new(&p.name).monospace().size(12.5).color(TEXT));
+                                            ui.label(RichText::new(mp_proto::AIRCRAFT.get(p.aircraft as usize).copied().unwrap_or("?")).monospace().size(12.0).color(DIM));
+                                            let alt = geo::pos_to_lla(p.pos).2 * 3.28084;
+                                            ui.label(RichText::new(format!("{:.1} km · {:.0} ft", (p.pos - me).length() / 1000.0, alt)).monospace().size(12.0).color(DIM));
+                                            ui.end_row();
+                                        }
+                                    });
+                                }
                             }
                             ui.add_space(4.0);
                             match engine_btn {
@@ -6130,7 +7116,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                 if p.spoilers > 0.05 {
                     chips.push(((if p.spec.chute.is_some() { t!("Chute", "Parachute") } else { t!("Speedbrake", "Aérofreins") }).to_string(), amber));
                 }
-                if self.parking_brake {
+                if self.plane.parking_brake {
                     chips.push((t!("Parking brake", "Frein de parc").to_string(), amber));
                 }
                 if !p.running {
@@ -6220,6 +7206,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
             if self.hud_on() && self.radios.show {
                 self.nav_overlay(ctx, hdg);
             }
+            self.hotspot_overlay(ctx);
             // Real traffic: a tag beside each aircraft within range.
             if let (true, Some((vp, cam))) = (self.hud_on() && self.live.enabled(), self.live_view) {
                 let screen = ctx.content_rect();
@@ -6248,6 +7235,34 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                     for (k, (s, size)) in [(p.call.as_str(), 12.5), (line2.as_str(), 11.0)].into_iter().enumerate() {
                         let pos = at + egui::vec2(9.0, -10.0 + 14.0 * k as f32);
                         painter.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_TOP, s, FontId::proportional(size), Color32::from_black_alpha(a / 2));
+                        painter.text(pos, Align2::LEFT_TOP, s, FontId::proportional(size), col);
+                    }
+                }
+            }
+            // The other players: a tag beside each.
+            if let (true, Some((vp, cam))) = (self.show_hud && !self.mp_players.is_empty(), self.live_view) {
+                let screen = ctx.content_rect();
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let col = Color32::from_rgb(255, 205, 90);
+                for p in &self.mp_players {
+                    let rel = p.pos - cam;
+                    let d = rel.length();
+                    if d > 60_000.0 || d < 15.0 {
+                        continue;
+                    }
+                    let c = vp * rel.as_vec3().extend(1.0);
+                    if c.w <= 0.0 {
+                        continue;
+                    }
+                    let at = egui::pos2(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height());
+                    if !screen.expand(40.0).contains(at) {
+                        continue;
+                    }
+                    painter.circle_stroke(at, 6.0, egui::Stroke::new(1.5, col));
+                    let line2 = format!("{}  {:.0} ft  {:.0} kt  {:.1} km", mp_proto::AIRCRAFT.get(p.aircraft as usize).copied().unwrap_or("?"), geo::pos_to_lla(p.pos).2 * 3.28084, p.vel.length() * 1.94384, d / 1000.0);
+                    for (k, (s, size)) in [(p.name.as_str(), 13.0), (line2.as_str(), 11.0)].into_iter().enumerate() {
+                        let pos = at + egui::vec2(10.0, -10.0 + 14.0 * k as f32);
+                        painter.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_TOP, s, FontId::proportional(size), Color32::from_black_alpha(160));
                         painter.text(pos, Align2::LEFT_TOP, s, FontId::proportional(size), col);
                     }
                 }
@@ -6396,7 +7411,10 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                             ui.label(RichText::new(t!("AIRCRAFT WRECKED", "AVION DÉTRUIT")).font(menu::bold(34.0)).color(Color32::from_rgb(255, 160, 80)).extra_letter_spacing(1.5));
                             ui.add_space(6.0);
                             if pad {
-                                padui::prompts(ui, &[("Y + View", tr("go somewhere else")), ("Menu", tr("menu: respawn, globe"))], 24.0, 16.0, white);
+                                let panel = padmap::spec_of("flight_panel");
+                                let mut items = vec![(panel.as_str(), tr("go somewhere else")), ("Menu", tr("menu: respawn, globe"))];
+                                items.retain(|i| !i.0.is_empty());
+                                padui::prompts(ui, &items, 24.0, 16.0, white);
                             } else {
                                 keys_line(ui, &[("R", t!("respawn", "réapparaître")), ("G", t!("go somewhere else", "aller ailleurs")), ("Esc", t!("menu", "menu"))]);
                             }
@@ -6408,7 +7426,10 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
                 egui::Area::new(egui::Id::unique("crash")).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ctx, |ui| {
                     flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)).show(ui, |ui| {
                         if pad {
-                            padui::prompts(ui, &[("A", tr("respawn")), ("Y + View", tr("go somewhere else")), ("Menu", tr("menu"))], 24.0, 16.0, white);
+                            let panel = padmap::spec_of("flight_panel");
+                            let mut items = vec![("A", tr("respawn")), (panel.as_str(), tr("go somewhere else")), ("Menu", tr("menu"))];
+                            items.retain(|i| !i.0.is_empty());
+                            padui::prompts(ui, &items, 24.0, 16.0, white);
                         } else {
                             keys_line(ui, &[("R", t!("respawn", "réapparaître")), ("G", t!("go somewhere else", "aller ailleurs")), ("Esc", t!("menu", "menu"))]);
                         }
@@ -6546,7 +7567,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 g.keep_settings(true);
-                g.src.google.save();
+                if !std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record") { g.src.google.save(); }
                 // Dropped here, while the event loop (and with it the Wayland
                 // connection) is still alive: egui's clipboard thread tears
                 // down its Wayland objects on drop, and if the game outlived
@@ -6565,7 +7586,7 @@ impl ApplicationHandler for App {
                 g.frame();
                 if g.quit {
                     g.keep_settings(true);
-                    g.src.google.save();
+                    if !std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record") { g.src.google.save(); }
                     // Worker threads may be mid-download, so the process just
                     // exits; but the GPU device is torn down first: exiting
                     // under the driver's shader compiler threads can crash it.
@@ -6574,6 +7595,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                g.cancel_cockpit_input();
                 g.keys.clear();
                 (g.pad_y, g.pad_y_combo) = (false, false);
             }
@@ -6667,6 +7689,18 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::MouseInput { state, button: MouseButton::Middle, .. }
+                if g.lean_drag.is_some() || (!consumed && g.mode == Mode::Fly && g.cam_mode == 1 && !g.pause_open && !g.crashed) => {
+                if state == ElementState::Pressed {
+                    g.lean_drag = g.last_cursor;
+                } else if let (Some((sx, sy)), Some((x, y))) = (g.lean_drag.take(), g.last_cursor) {
+                    if (sx - x).hypot(sy - y) < 3.0 { g.head.center_seat(); }
+                }
+            }
+            // In the cockpit, a click on a control works it (see `hot_click`).
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } if if state == ElementState::Pressed { !consumed && g.hotspot_under_mouse().is_some() } else { g.hot_press.is_some() } => {
+                g.hot_click(state == ElementState::Pressed);
+            }
             WindowEvent::MouseInput { state, button: MouseButton::Left | MouseButton::Right, .. } if !consumed => {
                 g.drag = state == ElementState::Pressed;
                 g.last_cursor = None;
@@ -6677,6 +7711,11 @@ impl ApplicationHandler for App {
                         let h = g.window.inner_size().height.max(1) as f64;
                         g.menu.drag(position.x - x, position.y - y, h, 60f64.to_radians());
                     }
+                } else if g.lean_drag.is_some() && !g.pause_open {
+                    if let Some((x, y)) = g.last_cursor {
+                        let scale = 0.85 / g.window.inner_size().height.max(1) as f64;
+                        g.head.lean_by((position.x - x) * scale, (y - position.y) * scale);
+                    }
                 } else if g.drag && !g.pause_open {
                     if let Some((x, y)) = g.last_cursor {
                         // Zoomed in, the view turns slower under the mouse.
@@ -6685,7 +7724,15 @@ impl ApplicationHandler for App {
                         g.cam_pitch = (g.cam_pitch + (position.y - y) * 0.004 * k).clamp(-1.2, 1.4);
                     }
                 }
+                // The mouse moved (not just a twitch): it points at the controls again, not the pad.
+                if g.cursor.is_none_or(|(x, y)| (position.x - x).abs() + (position.y - y).abs() > 3.0) {
+                    g.pad_aim = false;
+                }
                 g.last_cursor = Some((position.x, position.y));
+                // (--cursor pins it, for scripted screenshots.)
+                if g.script_cursor.is_none() {
+                    g.cursor = Some((position.x, position.y));
+                }
             }
             WindowEvent::MouseWheel { delta, .. } if !consumed => {
                 let d = match delta {
@@ -6696,6 +7743,8 @@ impl ApplicationHandler for App {
                     if g.menu.screen == menu::Screen::Fly {
                         g.menu.zoom(d);
                     }
+                } else if g.cam_mode == 1 && !g.crashed && g.hot_wheel(d) {
+                    // (A cockpit control under the mouse took it.)
                 } else if g.cam_mode == 1 && !g.crashed {
                     g.head.zoom_by(d);
                 } else {
@@ -7013,11 +8062,6 @@ fn write_wav(path: &std::path::Path, x: &[[f32; 2]], rate: u32) {
 fn smoothstep(a: f64, b: f64, x: f64) -> f64 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
-}
-
-/// +1, -1 or 0 from a pair of buttons.
-fn ax_pad(pos: bool, neg: bool) -> f64 {
-    (pos as i32 - neg as i32) as f64
 }
 
 /// The xpad driver's Xbox layout, in SDL's game controller mapping format.
