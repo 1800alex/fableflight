@@ -1,24 +1,14 @@
-//! The interface over the flying itself (the chase view's; the cockpit has
-//! its own panel and hides this unless asked): the HUD at the edges of the
-//! view (see `hud` below), notices at the top centre that fade (an airport
-//! as you arrive, the game's status messages), alerts at the bottom centre,
-//! and a systems card at the top left for the aircraft that have something
-//! to show there: a rocket's flight figures, a fighter's weapons.
+//! the hud over the flying, its notices, alerts and the flight panel's pieces.
 use crate::menu::{self, Icon, Page, DIM, TEXT};
 use crate::{padui, t, Game};
 use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke};
 
-// ---- the flight panel's pieces (its pages are in main.rs, radio_page and weather.rs)
-//
-// Every page is made of these, so they read alike: a section's tag and a
-// hairline; rows of a word and a value (words in Barlow at the left, values
-// in the instrument face at the right); tiles for the few numbers that
-// matter most; lists of things to pick; chips.
+// the flight panel's pieces.
 
-/// The panel's width (its content's).
+/// the panel's width.
 pub const PANEL_W: f32 = 344.0;
 
-/// A section of a page: its tag, a hairline under it.
+/// a section's tag and a hairline.
 pub fn pane_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(14.0);
     ui.label(tag_text(title));
@@ -27,7 +17,7 @@ pub fn pane_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
 }
 
-/// One row: a word at the left, its value at the right.
+/// a word at the left, its value at the right.
 pub fn kv(ui: &mut egui::Ui, key: &str, value: &str, col: Color32) {
     let w = ui.available_width();
     ui.allocate_ui_with_layout(vec2(w, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -39,7 +29,7 @@ pub fn kv(ui: &mut egui::Ui, key: &str, value: &str, col: Color32) {
     });
 }
 
-/// The numbers that matter most, as tiles two to a row: (tag, value, unit, colour).
+/// the key numbers as tiles, two to a row.
 pub fn tiles(ui: &mut egui::Ui, items: &[(&str, String, &str, Color32)]) {
     let gap = 8.0;
     let w = (ui.available_width() - gap) * 0.5;
@@ -62,8 +52,7 @@ pub fn tiles(ui: &mut egui::Ui, items: &[(&str, String, &str, Color32)]) {
     }
 }
 
-/// A small button of a page: a word, or a code in the instrument face; the
-/// chosen one in the accent.
+/// a small button, blue when chosen.
 pub fn chip(ui: &mut egui::Ui, text: &str, mono: bool, on: bool) -> egui::Response {
     let font = if mono { num_s() } else { menu::medium(13.5) };
     let g = ui.painter().layout_no_wrap(text.to_string(), font, TEXT);
@@ -81,9 +70,7 @@ pub fn chip(ui: &mut egui::Ui, text: &str, mono: bool, on: bool) -> egui::Respon
     resp
 }
 
-/// One entry of a list: a code and a name over a line of detail at the left,
-/// whatever `right` adds (chips, a value) at the right. The right part is laid
-/// out first, so the name is cut short to the room left, never under it.
+/// a list entry; the right part is laid out first so the name never runs under it.
 pub fn list_row(ui: &mut egui::Ui, code: &str, name: &str, detail: &str, right: impl FnOnce(&mut egui::Ui)) {
     let w = ui.available_width();
     ui.allocate_ui_with_layout(vec2(w, 42.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -111,7 +98,7 @@ pub fn list_row(ui: &mut egui::Ui, code: &str, name: &str, detail: &str, right: 
     ui.add_space(4.0);
 }
 
-/// A button as wide as `w` in the panel's chip style.
+/// a button `w` wide.
 pub fn pane_button(ui: &mut egui::Ui, text: &str, w: f32) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(w, 34.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
@@ -123,7 +110,7 @@ pub fn pane_button(ui: &mut egui::Ui, text: &str, w: f32) -> egui::Response {
     resp
 }
 
-/// What the toolbar asked for this frame.
+/// what the hud's buttons asked for.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Bar {
     Page(Page),
@@ -131,12 +118,12 @@ pub enum Bar {
     Camera,
 }
 
-/// How long an airport notice shows (s), the last of it fading.
+/// how long an airport notice shows (s), and its fade.
 const NOTE_SHOW: f64 = 7.0;
 const NOTE_FADE: f64 = 1.0;
 
 impl Game {
-    /// Carries out what the toolbar asked for.
+    /// does what the hud's buttons asked for.
     pub(crate) fn toolbar_act(&mut self, b: Bar) {
         match b {
             Bar::Page(p) => {
@@ -152,11 +139,9 @@ impl Game {
         }
     }
 
-    /// The notices at the top centre, and the guidance line over the
-    /// instruments. `airport`: `airport_hud`'s lines (name, runway and wind,
-    /// then the live line, coloured 1 good, 2 caution, 3 warning).
+    /// the notices at the top centre.
     pub(crate) fn notices(&mut self, ctx: &egui::Context, airport: Option<&[(String, u8)]>) {
-        // A new airport (or a new runway in use) brings its notice back.
+        // a new airport brings its notice back.
         let key = airport.map(|l| l.iter().take(2).map(|x| x.0.as_str()).collect::<Vec<_>>().join("|")).unwrap_or_default();
         if key != self.airport_note.0 {
             self.airport_note = (key.clone(), if key.is_empty() { -100.0 } else { self.real });
@@ -172,7 +157,7 @@ impl Game {
                 notes.push((a, v));
             }
         }
-        // (a status that only repeats the airport the notice above already names is left out)
+        // skip a status that repeats the airport notice.
         let airport_code = airport.and_then(|l| l.first()).and_then(|l| l.0.split_whitespace().next()).unwrap_or("\u{0}");
         let repeats = !notes.is_empty() && self.status.starts_with(airport_code);
         if self.real < self.status_until && !self.status.is_empty() && !repeats {
@@ -180,13 +165,13 @@ impl Game {
             notes.push((a, vec![(self.status.chars().take(90).collect(), menu::label(), Color32::WHITE)]));
         }
         if !notes.is_empty() {
-            // under the heading strip
+            // under the heading strip.
             let y = HEADING_H + 34.0;
             egui::Area::new(egui::Id::unique("notices")).anchor(Align2::CENTER_TOP, [0.0, y]).interactable(false).show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.vertical_centered(|ui| {
                     for (a, lines) in &notes {
-                        // (a scope, so each notice takes its own room in the stack)
+                        // a scope so each notice takes its own room.
                         ui.scope(|ui| {
                             ui.multiply_opacity(*a);
                             frosted(ui, glass().inner_margin(egui::Margin::symmetric(18, 10)), |ui| {
@@ -235,8 +220,7 @@ impl Game {
         });
     }
 
-    /// The systems card at the top left: a rocket's flight figures, or a
-    /// fighter's weapons. Nothing (None) for every other aircraft.
+    /// rocket figures or weapons, none for other aircraft.
     pub(crate) fn systems_card(&self, ctx: &egui::Context, vs: f64, base_up: f64) -> Option<Rect> {
         let p = &self.plane;
         let rocket = p.engines().is_some();
@@ -304,61 +288,38 @@ impl Game {
     }
 }
 
-// ---- the HUD over the flying, in the chase view (the cockpit has its own panel)
-//
-// Everything sits at the edges and leaves the middle of the view to the world:
-//
-//   heading strip ............ hangs from the top edge; the track, "heading"
-//                              and the aircraft in small capitals under it
-//   conditions card .......... top right: the time of day, the sky, the
-//                              temperature, the wind, the clock
-//   speed tape ............... on the left edge: the limit bands, a rolling
-//                              readout, the throttle; the ground speed over it
-//   altitude tape ............ on the right edge: a rolling readout, the climb
-//                              over it, and a column of buttons for the flight
-//                              panel's pages, the map, the camera and pause
-//   controls ................. bottom right: the engines' dials, and trim,
-//                              spoilers, flaps and gear in slots to drag
-//   flight-path marker ....... where the aircraft is actually going
-//   alerts ................... bottom centre: warnings, damage, the approach line
-//
-// One material, frosted glass: the world behind blurred (the renderer's
-// `frost` texture), a light veil over it and a bright hairline edge, with
-// round corners. One face, Barlow, for words and numbers alike (the rolling
-// readouts set their digits in fixed cells so they do not jitter); labels in
-// small spaced capitals.
+// the hud sits at the edges, in frosted glass, and leaves the middle to the world.
 
-/// Height of the heading strip at the top centre.
+/// the heading strip's height.
 pub const HEADING_H: f32 = 46.0;
-/// The edge tapes: height, the speed tape's width, the altitude tape's and its button column's.
+/// the tapes' sizes.
 const TAPE_H: f32 = 352.0;
 const SPEED_W: f32 = 124.0;
 const ALT_W: f32 = 104.0;
 const BTN_W: f32 = 66.0;
-/// Corner radii: panels, and the pieces inside them.
+/// corner radii.
 pub(crate) const R_HUD: u8 = 14;
 pub(crate) const R_IN: u8 = 7;
-/// Inset of everything inside a panel.
+/// inset inside a panel.
 const PAD: f32 = 12.0;
-/// What the flight panel leaves free at its right for the altitude tape.
+/// room the flight panel leaves for the altitude tape.
 pub const RIGHT_EDGE: f32 = ALT_W + BTN_W + 14.0;
-/// Height of the radio instruments at the bottom centre, when shown.
+/// the radio instruments' height.
 pub const NAV_H: f32 = 156.0;
 
 const AMBER: Color32 = Color32::from_rgb(255, 196, 80);
-/// The active button's light blue.
+/// the active light blue.
 pub const SKY: Color32 = Color32::from_rgb(56, 182, 240);
-/// Soft white: the HUD's secondary text, readable over bright sky and dark ground alike.
+/// soft white for secondary text.
 pub const SOFT: Color32 = Color32::from_rgba_premultiplied(184, 184, 184, 184);
-/// The readouts' dark boxes.
+/// the readouts' boxes.
 const BOX: Color32 = Color32::from_rgba_premultiplied(10, 12, 16, 225);
-/// White at a share, for the dim parts.
+/// white at a share.
 fn white(a: f32) -> Color32 {
     Color32::from_white_alpha((255.0 * a) as u8)
 }
 
-/// The HUD's faces: a readout's digits, a scale's figures (and their minor
-/// ones), small figures, and the small spaced capitals of the labels.
+/// the hud's faces.
 fn num_l() -> egui::FontId {
     menu::semibold(24.0)
 }
@@ -377,7 +338,7 @@ fn tag() -> egui::FontId {
 fn tag_text(s: &str) -> RichText {
     RichText::new(s.to_uppercase()).font(tag()).color(white(0.62)).extra_letter_spacing(1.1)
 }
-/// Small spaced capitals painted at a point.
+/// spaced capitals at a point.
 pub(crate) fn paint_tag(p: &egui::Painter, at: egui::Pos2, align: Align2, s: &str) {
     paint_tag_col(p, at, align, s, white(0.62));
 }
@@ -389,26 +350,26 @@ fn paint_tag_col(p: &egui::Painter, at: egui::Pos2, align: Align2, s: &str, col:
     p.galley(align.anchor_size(at, size).min, g, col);
 }
 
-/// What the HUD shows, measured once a frame by the caller.
+/// what the hud shows.
 pub struct HudIn {
     pub hdg: f64,
-    /// indicated airspeed (m/s), height above the sea and the ground (m), climb (m/s)
+    /// airspeed (m/s), heights (m), climb (m/s).
     pub ias: f64,
     pub alt: f64,
     pub agl: f64,
     pub vs: f64,
-    /// the local time of day (hours)
+    /// local time (h).
     pub local: f64,
 }
 
-// ---- the frosted glass
+// frosted glass.
 
-/// Where the blurred frame is, for the panels drawn this frame (set by the game).
+/// the blurred frame's texture for this frame.
 pub fn set_frost(ctx: &egui::Context, id: Option<egui::TextureId>) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::unique("flightui frost"), id));
 }
 
-/// The outline of a rounded rectangle, corner by corner.
+/// a rounded rectangle's outline.
 pub(crate) fn rounded(r: Rect, cr: egui::CornerRadius) -> Vec<egui::Pos2> {
     let mut pts = Vec::new();
     let corners = [
@@ -430,7 +391,7 @@ pub(crate) fn rounded(r: Rect, cr: egui::CornerRadius) -> Vec<egui::Pos2> {
     pts
 }
 
-/// Frosted glass in `r`: the world behind it blurred, a light veil, a bright edge.
+/// the world behind blurred, a light veil and a bright edge.
 fn frost_shapes(ctx: &egui::Context, r: Rect, cr: egui::CornerRadius) -> Vec<egui::Shape> {
     let mut out = Vec::new();
     let screen = ctx.content_rect();
@@ -449,25 +410,25 @@ fn frost_shapes(ctx: &egui::Context, r: Rect, cr: egui::CornerRadius) -> Vec<egu
         }
         out.push(egui::Shape::mesh(mesh));
     }
-    // the veil: lifts the blur a touch and quiets it, then the edge
+    // the veil, then the edge.
     out.push(egui::Shape::convex_polygon(pts.clone(), Color32::from_rgba_premultiplied(10, 14, 22, 82), Stroke::NONE));
     out.push(egui::Shape::closed_line(pts, Stroke::new(1.0, white(0.28))));
     out
 }
 
-/// Paints frosted glass in `r` with the painter.
+/// paints frosted glass in `r`.
 fn frost_rect(p: &egui::Painter, r: Rect, cr: egui::CornerRadius) {
     for s in frost_shapes(p.ctx(), r, cr) {
         p.add(s);
     }
 }
 
-/// A frame for the HUD's panels, its glass painted under it by `frosted`.
+/// a frame for the hud's panels.
 pub fn glass() -> egui::Frame {
     egui::Frame::new().corner_radius(R_HUD).inner_margin(PAD)
 }
 
-/// Shows `frame` with frosted glass behind its contents.
+/// shows `frame` with frosted glass behind it.
 pub fn frosted<R>(ui: &mut egui::Ui, frame: egui::Frame, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
     let slot = ui.painter().add(egui::Shape::Noop);
     let cr = frame.corner_radius;
@@ -476,13 +437,7 @@ pub fn frosted<R>(ui: &mut egui::Ui, frame: egui::Frame, add: impl FnOnce(&mut e
     resp
 }
 
-/// A rolling readout: a dark box with the leading figures steady in it, and
-/// beside them a taller drum (it stands out of the box above and below) on
-/// which the last figure, or the last two stepping by `roll_step` when that
-/// is 10 or more, turn with the value: the figure read in the middle, the next
-/// and the last ones half seen above and below. `lead`: figures to keep (the
-/// leading zeros dim); 0 shows only the figures the number has. Returns the
-/// box with the drum.
+/// a rolling readout: steady figures in a box, the last ones on a drum that turns.
 fn drum(p: &egui::Painter, at: egui::Pos2, align: Align2, value: f32, lead: usize, roll_step: i32, col: Color32) -> Rect {
     let big = num_l();
     let small = menu::semibold(17.0);
@@ -497,7 +452,7 @@ fn drum(p: &egui::Painter, at: egui::Pos2, align: Align2, value: f32, lead: usiz
     let n_lead = if lead > digits.len() { lead } else if top_part == 0.0 && lead == 0 { 0 } else { digits.len() };
     let shown = if n_lead == 0 { String::new() } else { format!("{:0w$}", top_part as i64, w = n_lead) };
     let pad = n_lead.saturating_sub(digits.len());
-    // sizes: the box holds the steady figures; the drum is a figure wider and taller
+    // the drum is a figure wider and taller than the box.
     let drum_w = sw * roll_digits as f32 + 10.0;
     let box_w = 12.0 + cw * shown.len().max(1) as f32 + drum_w + 4.0;
     let r = align.anchor_size(at, vec2(box_w, 40.0));
@@ -522,7 +477,7 @@ fn drum(p: &egui::Painter, at: egui::Pos2, align: Align2, value: f32, lead: usiz
     r.union(dr)
 }
 
-/// "12 480": thousands set apart with a thin space.
+/// thousands set apart with a thin space.
 fn grouped(v: f32) -> String {
     let n = v.round() as i64;
     let s = n.unsigned_abs().to_string();
@@ -536,7 +491,7 @@ fn grouped(v: f32) -> String {
     if n < 0 { format!("-{out}") } else { out }
 }
 
-/// The time of day as people say it.
+/// the time of day in words.
 fn period(h: f64) -> &'static str {
     match h.rem_euclid(24.0) {
         h if (5.0..11.0).contains(&h) => t!("Morning", "Matin"),
@@ -546,7 +501,7 @@ fn period(h: f64) -> &'static str {
     }
 }
 
-/// The conditions card's line icons, one stroke weight.
+/// the conditions card's icons.
 #[derive(Copy, Clone)]
 enum Glyph {
     Sun,
@@ -591,7 +546,7 @@ fn glyph(p: &egui::Painter, g: Glyph, c: egui::Pos2, s: f32, col: Color32) {
         }
         Glyph::WindFrom(deg) => {
             p.circle_stroke(c, u * 0.85, st);
-            // the arrow points where the wind goes
+            // the arrow points where the wind goes.
             let a = (deg + 180.0).to_radians();
             let d = vec2(a.sin(), -a.cos());
             p.line_segment([c - d * u * 0.4, c + d * u * 0.45], st);
@@ -616,10 +571,10 @@ fn glyph(p: &egui::Painter, g: Glyph, c: egui::Pos2, s: f32, col: Color32) {
 }
 
 impl Game {
-    /// The whole HUD (see above); the buttons' presses go into `bar`.
+    /// the whole hud.
     pub(crate) fn hud(&mut self, ctx: &egui::Context, h: &HudIn, bar: &mut Option<Bar>) {
         let screen = ctx.content_rect();
-        // the tapes' centre line, a little above the middle: the map goes under the speed tape
+        // the tapes' centre line, a little above the middle.
         let cy = screen.center().y - 36.0;
         self.heading_strip(ctx, h.hdg as f32);
         if !self.info_open {
@@ -640,7 +595,7 @@ impl Game {
             let (r, _) = ui.allocate_exact_size(vec2(w, HEADING_H + 26.0), Sense::hover());
             let strip = Rect::from_min_size(r.min, vec2(w, HEADING_H));
             let p = ui.painter();
-            // hanging from the top edge: only its lower corners are round
+            // only the lower corners are round.
             frost_rect(p, strip, egui::CornerRadius { nw: 0, ne: 0, sw: R_HUD, se: R_HUD });
             let clip = p.with_clip_rect(strip.shrink(2.0));
             const PPD: f32 = 8.4;
@@ -651,14 +606,14 @@ impl Game {
                 let dd = d.rem_euclid(360);
                 let edge = ((x - strip.left()).min(strip.right() - x) / 70.0).clamp(0.0, 1.0);
                 let near = 1.0 - ((x - strip.center().x).abs() / 42.0).min(1.0);
-                // the one under the index grows and brightens as it comes in
+                // the one under the index grows.
                 let font = egui::FontId::new(17.0 + 5.0 * near, egui::FontFamily::Name(if near > 0.5 { menu::SEMIBOLD } else { menu::MEDIUM }.into()));
                 let label = match dd { 0 => "N".to_string(), 90 => "E".to_string(), 180 => "S".to_string(), 270 => t!("W", "O").to_string(), _ => format!("{dd:03}") };
                 clip.text(pos2(x, y), Align2::CENTER_CENTER, label, font, white((0.7 + 0.3 * near) * edge));
             }
-            // the index: a short bar under the middle
+            // the index.
             p.rect_filled(Rect::from_center_size(pos2(strip.center().x, strip.bottom() - 4.0), vec2(34.0, 2.5)), 1, Color32::WHITE);
-            // and under the strip, its small capitals: track, the word, the aircraft
+            // track, heading and the aircraft under it.
             let ty = strip.bottom() + 12.0;
             let pl = &self.plane;
             let (e, n, _) = crate::geo::enu(pl.pos);
@@ -703,7 +658,7 @@ impl Game {
             let (r, _) = ui.allocate_exact_size(vec2(w, 126.0), Sense::hover());
             let p = ui.painter();
             frost_rect(p, r, R_HUD.into());
-            // the head: how to open the menu
+            // the head.
             let hy = r.top() + 19.0;
             glyph(p, Glyph::Menu, pos2(r.left() + 22.0, hy), 14.0, white(0.75));
             let hint = if padui::active() {
@@ -716,7 +671,7 @@ impl Game {
             };
             paint_tag(p, pos2(r.left() + 38.0, hy), Align2::LEFT_CENTER, &hint);
             p.hline(r.x_range(), r.top() + 38.0, Stroke::new(1.0, white(0.16)));
-            // the body: the sky, the time of day, the temperature
+            // the body.
             let by = r.top() + 70.0;
             let g = if cloudy { Glyph::Cloud } else if night { Glyph::Moon } else { Glyph::Sun };
             glyph(p, g, pos2(r.left() + 32.0, by), 32.0, Color32::WHITE);
@@ -724,7 +679,7 @@ impl Game {
             p.text(pos2(r.left() + 62.0, by + 11.0), Align2::LEFT_CENTER, sub, menu::caption(), white(0.68));
             glyph(p, Glyph::Thermometer, pos2(r.right() - 20.0, by - 9.0), 16.0, white(0.8));
             p.text(pos2(r.right() - 32.0, by - 9.0), Align2::RIGHT_CENTER, format!("{oat:.0}°C"), num_s(), Color32::WHITE);
-            // the foot: wind direction, its strength, the clock
+            // the foot.
             let fy = r.bottom() - 18.0;
             let mut x = r.left() + 22.0;
             glyph(p, Glyph::WindFrom(wx.wind_from as f32), pos2(x, fy), 16.0, white(0.8));
@@ -742,9 +697,7 @@ impl Game {
         let screen = ctx.content_rect();
         let p = &self.plane;
         let kt = |ms: f64| (ms * 1.943_84) as f32;
-        // The airspeed jitters a little frame to frame and the drum turns a
-        // figure per knot: the tape and readout follow it through a short
-        // low-pass (about a quarter of a second) so they glide.
+        // a quarter second low pass so the speed glides.
         let ias = {
             let raw = kt(h.ias).max(0.0);
             let id = egui::Id::unique("hud ias smooth");
@@ -758,17 +711,17 @@ impl Game {
         egui::Area::new(egui::Id::unique("hud_speed")).fixed_pos(panel.min - vec2(0.0, 24.0)).interactable(false).order(egui::Order::Background).show(ctx, |ui| {
             ui.allocate_exact_size(vec2(SPEED_W + 20.0, TAPE_H + 24.0), Sense::hover());
             let pt = ui.painter();
-            // over it: the ground speed
+            // ground speed over it.
             paint_tag(pt, pos2(panel.left() + 14.0, panel.top() - 12.0), Align2::LEFT_CENTER, &format!("G/S  {:.0}", kt(p.vel.length())));
             frost_rect(pt, panel, egui::CornerRadius { nw: 0, sw: 0, ne: R_HUD, se: R_HUD });
-            // the scale lives inside a padded window; figures fade out towards its ends
+            // figures fade towards the ends.
             let tape = Rect::from_min_max(pos2(panel.left(), panel.top() + 8.0), pos2(panel.right() - 46.0, panel.bottom() - 8.0));
             let clip = pt.with_clip_rect(tape);
             let c = pos2(tape.center().x, cy);
             const PPK: f32 = 6.0;
             let y_of = |v: f32| c.y - (v - ias) * PPK;
             let fade = |y: f32| ((y - tape.top()).min(tape.bottom() - y) / 36.0).clamp(0.0, 1.0);
-            // The limits, a strip along the screen's edge (the aircraft's own: stall, flaps, caution, never-exceed).
+            // the aircraft's speed limits along the edge.
             if p.spec.rocket().is_none() {
                 let (vs_now, vs_clean, vs_full) = (kt(p.stall_ias_at(p.flaps)), kt(p.stall_ias_at(0.0)), kt(p.stall_ias_at(1.0)));
                 let vne = kt(p.spec.vne);
@@ -786,7 +739,7 @@ impl Game {
                         band(vs_full, kt(vfe), tape.left() + 5.0, 3.0, white(0.9));
                     }
                 }
-                // below the stall: red hatching
+                // red hatching below the stall.
                 let (ya, yb) = (y_of(0.0).min(tape.bottom()), y_of(vs_now).max(tape.top()));
                 if ya > yb {
                     let hp = clip.with_clip_rect(Rect::from_min_max(pos2(tape.left(), yb), pos2(tape.left() + 7.0, ya)));
@@ -797,7 +750,7 @@ impl Game {
                     }
                 }
             }
-            // the scale: tens large and white, fives small and dim; nothing under the readout
+            // the scale, nothing under the readout.
             let lo = ((ias - 40.0) / 5.0).floor() as i32 * 5;
             for v in (lo.max(0)..=lo + 80).step_by(5) {
                 let y = y_of(v as f32);
@@ -813,7 +766,7 @@ impl Game {
                     clip.text(pos2(tape.left() + 26.0, y), Align2::LEFT_CENTER, format!("{v}"), num_minor(), white(0.5 * a));
                 }
             }
-            // the rolling readout, its pointer at the screen's edge
+            // the readout.
             let warn = p.stalled || p.overspeed() > 0.0 || (p.flaps > 0.25 && p.ias() > p.vfe());
             let col = if p.stalled { menu::BAD } else if warn { AMBER } else { Color32::WHITE };
             let rr = drum(pt, pos2(tape.left() + 12.0, c.y), Align2::LEFT_CENTER, ias, 0, 1, col);
@@ -821,7 +774,7 @@ impl Game {
             if warn {
                 pt.rect_stroke(rr, R_IN, Stroke::new(1.5, col), egui::StrokeKind::Outside);
             }
-            // the throttle: its own column at the right, a bar filling up, its share under it
+            // the throttle.
             let col_r = Rect::from_min_max(pos2(panel.right() - 40.0, panel.top() + 12.0), pos2(panel.right() - 12.0, panel.bottom() - 12.0));
             paint_tag(pt, pos2(col_r.center().x, col_r.top() + 6.0), Align2::CENTER_CENTER, t!("Thr", "Gaz"));
             let track = Rect::from_min_max(pos2(col_r.center().x - 3.0, col_r.top() + 20.0), pos2(col_r.center().x + 3.0, col_r.bottom() - 26.0));
@@ -843,7 +796,7 @@ impl Game {
         egui::Area::new(egui::Id::unique("hud_alt")).fixed_pos(panel.min - vec2(0.0, 24.0)).order(egui::Order::Background).show(ctx, |ui| {
             ui.allocate_exact_size(vec2(w, TAPE_H + 48.0), Sense::hover());
             let pt = ui.painter().clone();
-            // over it: the climb; under it, near the ground, the height above it
+            // climb over it, height above the ground under it.
             let vs_col = if vs_fpm < -1500.0 && agl < 2500.0 { menu::BAD } else { Color32::WHITE };
             let vy = panel.top() - 12.0;
             paint_tag(&pt, pos2(panel.right() - 14.0, vy), Align2::RIGHT_CENTER, "V/S");
@@ -879,10 +832,10 @@ impl Game {
                     clip.text(pos2(tape.right() - 20.0, y), Align2::RIGHT_CENTER, grouped(v as f32), num_minor(), white(0.5 * a));
                 }
             }
-            // the rolling readout, inside the tape's column, its pointer at the scale
+            // the readout.
             let rr = drum(&pt, pos2(tape.right() - 18.0, c.y), Align2::RIGHT_CENTER, alt, 3, 20, Color32::WHITE);
             pt.add(egui::Shape::convex_polygon(vec![pos2(tape.right() - 10.0, c.y), pos2(rr.right() - 0.5, c.y - 7.0), pos2(rr.right() - 0.5, c.y + 7.0)], BOX, Stroke::NONE));
-            // The buttons: the flight panel's pages, the map, the camera, the pause menu.
+            // the buttons.
             let items: [(Icon, &str, &str, Bar, bool); 7] = [
                 (Icon::Flight, t!("Flight", "Vol"), t!("Flight", "Vol"), Bar::Page(Page::Flight), self.info_open && self.info_page == Page::Flight),
                 (Icon::GoTo, t!("Go to", "Aller"), t!("Go to", "Aller à"), Bar::Page(Page::Places), self.info_open && self.info_page == Page::Places),
@@ -919,7 +872,7 @@ impl Game {
         });
     }
 
-    /// The flight-path marker: where the aircraft is going, not where its nose points.
+    /// where the aircraft is going.
     fn path_marker(&self, ctx: &egui::Context) {
         let Some((vp, cam)) = self.live_view else { return };
         let p = &self.plane;
@@ -944,8 +897,7 @@ impl Game {
         }
     }
 
-    /// Bottom centre, stacked upwards: the approach line, the alerts, and what
-    /// has broken. `lift`: room kept under it (the radio instruments).
+    /// the approach line, alerts and damage, bottom centre.
     pub(crate) fn alerts(&self, ctx: &egui::Context, warn: &[(&str, Color32)], report: &[String], guidance: Option<&(String, u8)>, lift: f32) {
         let ap = self.ap.on || self.real - self.ap_off_t < 4.0;
         if warn.is_empty() && report.is_empty() && guidance.is_none() && !ap {
@@ -969,7 +921,7 @@ impl Game {
                 if !warn.is_empty() {
                     ui.horizontal(|ui| {
                         for (w, col) in warn {
-                            // a lit plate, glowing in its colour
+                            // a lit plate.
                             egui::Frame::new().fill(col.gamma_multiply(0.92)).corner_radius(R_HUD).inner_margin(egui::Margin::symmetric(16, 7)).shadow(egui::Shadow { offset: [0, 0], blur: 22, spread: 2, color: col.gamma_multiply(0.55) }).show(ui, |ui| {
                                 ui.label(RichText::new(w.to_uppercase()).font(menu::semibold(14.0)).color(Color32::WHITE).extra_letter_spacing(1.0));
                             });

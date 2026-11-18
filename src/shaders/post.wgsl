@@ -14,8 +14,7 @@
   // Soft clamp so a single hot pixel cannot flood the screen.
   return vec4f(c / (1.0 + luma(c) * 0.002), 1.0);
 }
-// The first halving of the finished, display-encoded frame for the HUD's
-// frosted glass, back to linear light (egui expects its textures linear).
+// the frosted glass's first halving, back to linear light.
 @fragment fn fs_frost_in(in: FsIn) -> @location(0) vec4f {
   let tx = 1.0 / vec2f(textureDimensions(t_src));
   var c = textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb * 4.0;

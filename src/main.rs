@@ -84,7 +84,7 @@ enum Nav {
     Panel,
 }
 
-/// The fewest points of height the interface is laid out for (see `egui_input`).
+/// the fewest points of height the ui is laid out for.
 pub const UI_MIN_H: f32 = 860.0;
 /// how long a damage or failure flash stays at full strength, then how long it fades (s).
 const FLASH_HOLD: f64 = 1.2;
@@ -973,7 +973,7 @@ struct Game {
     paused: bool,
     show_help: bool,
     show_hud: bool,
-    /// the HUD in the cockpit view (see `hud_on`)
+    /// the hud in the cockpit view.
     hud_cockpit: bool,
     /// arcade mode (settings.rs): the fun features on
     arcade: bool,
@@ -1084,7 +1084,7 @@ struct Game {
     smoke_acc: f32,
     /// things that just broke, to flash on the HUD: text, when
     flash: Vec<(String, f64)>,
-    /// the airport notice: what it said, and since when (it shows for a few seconds after each change)
+    /// the airport notice and when it last changed.
     airport_note: (String, f64),
     /// a weapon's fireball for the renderer's light: position, power, when
     weapon_flash: Option<(DVec3, f32, f64)>,
@@ -1113,7 +1113,7 @@ struct Game {
     /// the settings as last saved, the language picked in the game (None: the
     /// system's), and when they were last compared with the live ones
     prefs: settings::Settings,
-    /// the start of the last flight (saved with the settings)
+    /// where the last flight started.
     last_start: Option<settings::LastStart>,
     prefs_lang: Option<i18n::Lang>,
     prefs_t: f64,
@@ -1426,22 +1426,19 @@ impl Game {
                 g.menu.start = if appr { menu::Start::Approach } else { menu::Start::Runway };
             }
         }
-        // Otherwise the globe opens on the last flight's start, ready to take off.
+        // otherwise open the globe on the last start.
         if g.menu.pick.is_none() && !args.pos_set && args.menu_view.is_none() && args.aircraft.is_none() {
             g.restore_last_start();
         }
         Ok(g)
     }
 
-    /// Whether the HUD is drawn now: in the cockpit it stays hidden (the
-    /// cockpit has its instruments) unless turned on there with H; outside,
-    /// the HUD switch. Warnings show whenever the HUD switch is on.
+    /// the hud shows when on, but in the cockpit only when turned on there.
     fn hud_on(&self) -> bool {
         self.show_hud && (self.cam_mode != 1 || self.hud_cockpit)
     }
 
-    /// Puts the last flight's start back on the globe: the spot, the airport
-    /// and how to start there, and the aircraft. Nothing when there was none.
+    /// puts the last flight's start and aircraft back on the globe.
     fn restore_last_start(&mut self) {
         let Some(l) = self.last_start.clone() else { return };
         if let Some(spec) = aircraft::by_key(&l.aircraft) {
@@ -1467,7 +1464,7 @@ impl Game {
         self.menu.look_at(l.lat, l.lon, 30_000.0);
     }
 
-    /// What "Fly again" on the main menu would start: (where, what), for its label.
+    /// the place and aircraft for the fly again button.
     pub(crate) fn last_start_label(&self) -> Option<(String, &'static str)> {
         let l = self.last_start.as_ref()?;
         let spec = aircraft::by_key(&l.aircraft)?;
@@ -3477,9 +3474,7 @@ impl Game {
         [r.cdi as f32, r.gs.unwrap_or(0.0) as f32, obs, flags]
     }
 
-    /// The navigation instruments over the game: a course deviation
-    /// indicator for NAV 1 (with the glide slope on an ILS) and an ADF dial.
-    /// The radio instruments, bottom centre; false when there is nothing tuned to show.
+    /// the radio instruments at the bottom centre, false when none are tuned.
     fn nav_overlay(&self, ctx: &egui::Context, hdg: f64) -> bool {
         use egui::{Align2, Color32, Stroke};
         let pos = self.plane.pos;
@@ -3787,7 +3782,7 @@ impl Game {
             KeyCode::KeyM => self.wx.clouds = (self.wx.clouds - 0.1).max(0.0),
             KeyCode::F3 => self.wx.open = !self.wx.open,
             KeyCode::KeyP => self.paused = !self.paused,
-            // H turns the HUD of the view you are in on or off: the cockpit keeps its own.
+            // h toggles the hud of the current view.
             KeyCode::KeyH if self.cam_mode == 1 => self.hud_cockpit = !self.hud_cockpit,
             KeyCode::KeyH => self.show_hud = !self.show_hud,
             KeyCode::Backquote => self.minimap.visible = !self.minimap.visible,
@@ -3947,11 +3942,7 @@ impl Game {
     /// Input for the UI, minus Tab: that opens and closes the menu here, not
     /// egui's keyboard focus (which would then keep keys from the aircraft).
     fn egui_input(&mut self) -> egui::RawInput {
-        // The interface is laid out for a window at least UI_MIN_H points
-        // tall. A small window with a large desktop scale (a laptop at 150%
-        // or 200%) would leave less than that: shrink the interface to fit
-        // rather than let the panels overlap. It is never made larger than
-        // the desktop asks for.
+        // shrink the ui to fit short windows instead of letting panels overlap.
         let native = self.window.scale_factor() as f32;
         let h = self.window.inner_size().height as f32;
         let ppp = (h / UI_MIN_H).clamp(0.75, native.max(0.75));
@@ -4044,7 +4035,7 @@ impl Game {
             return;
         }
         self.set_aircraft(aircraft::nth(self.menu.aircraft));
-        // Remembered for next time (the globe opens on it; the main menu offers it again).
+        // remember the start for next time.
         let db = airports::Db::get();
         self.last_start = Some(settings::LastStart {
             lat,
@@ -5891,7 +5882,7 @@ impl Game {
             // (where the other players are on screen: city names give way to theirs)
             let mp_at: Vec<egui::Pos2> = self.mp_world.iter().filter_map(|sp| project(sp.lat_deg(), sp.lon_deg())).collect();
             if alt > 25_000.0 {
-                // (a city right by the start marker gives way to its label)
+                // cities next to the start marker give way to its label.
                 let pick_at = self.menu.pick.and_then(|(la, lo)| project(la, lo));
                 for (name, lat, lon, tier) in menu::CITIES {
                     if *tier > 1 && alt > 7.0e6 {
@@ -5925,7 +5916,7 @@ impl Game {
                             label(p + egui::vec2(if chosen { 18.0 } else { 6.0 }, 16.0), &a.name.chars().take(40).collect::<String>(), 13.0, col);
                         }
                         painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(5.0, 5.0)), 1.0, col);
-                        // (the chosen one is named by the start marker instead)
+                        // the chosen airport is named by the start marker.
                         if !chosen {
                             label(p + egui::vec2(6.0, 0.0), &a.ident, if a.kind == 2 { 13.0 } else { 12.0 }, col);
                         }
@@ -6064,10 +6055,9 @@ impl Game {
             // Below it: where to start. Search, places and airports fold away;
             // the chosen spot and take-off stay in view.
             let top = r.bottom() + 12.0;
-            // (the pinned start point and take-off below the list, as tall as last frame)
+            // room for the pinned start point and take off, as last frame.
             let foot_h = ctx.data(|d| d.get_temp::<f32>(egui::Id::unique("globe_pinned_h"))).unwrap_or(150.0);
-            // (the list gives up its height first: were the panel taller than the
-            // room left, egui would push it up over the aircraft card)
+            // the list gives up height first so the panel never overlaps the aircraft card.
             let body_h = (screen.bottom() - M - top - 40.0 - 28.0 - foot_h).max(48.0);
             egui::Area::new(egui::Id::unique("menu")).anchor(Align2::LEFT_TOP, [M, top]).show(ctx, |ui| {
                 ui.set_max_height(screen.bottom() - M - top);
@@ -6133,8 +6123,7 @@ impl Game {
                         });
                         padui::follow_focus(ui);
                     });
-                    // Pinned under the list, so it is never scrolled away or cut: the
-                    // start point, a line on the whole flight, and take-off.
+                    // pinned under the list: the start point, a summary and take off.
                     let pin_top = ui.cursor().top();
                     let db = airports::Db::get();
                     ui.add_space(12.0);
@@ -6172,7 +6161,7 @@ impl Game {
                                     }
                                 }
                                 None => {
-                                    // Offer the nearest airfield, for a start on the ground.
+                                    // offer the nearest airfield.
                                     let near = db.near(lat, lon, 60_000.0).into_iter().find(|(i, _)| db.apts[*i as usize].any_paved());
                                     if let Some((i, d)) = near {
                                         let a = &db.apts[i as usize];
@@ -6192,10 +6181,10 @@ impl Game {
                     }
                     ui.add_space(14.0);
                     ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top() - 7.0, egui::Stroke::new(1.0, menu::LINE));
-                    // The whole flight in one line, right where it starts.
+                    // the whole flight in one line.
                     if self.menu.pick.is_some() {
                         let ground = self.menu.airport.is_some() && self.menu.start != menu::Start::Overhead;
-                        // (the aircraft is named on its card just above)
+                        // the aircraft is named on its card.
                         let how = if ground {
                             let first = if self.menu.start == menu::Start::Runway { t!("Runway", "Piste") } else { t!("Final", "Finale") };
                             match &self.menu.runway {
@@ -6492,12 +6481,12 @@ impl Game {
             if menu::big_button(ui, t!("Respawn in the air", "Réapparaître en vol"), Hint::of("R", ""), false, false).clicked() {
                 *act = Some(PauseAct::Respawn);
             }
-            // Leaving: back to the globe for a new start (its Menu button goes on to the main menu).
+            // back to the globe for a new start.
             if menu::big_button(ui, t!("End flight", "Terminer le vol"), Hint::Text(t!("pick a new start", "choisir un nouveau départ")), false, false).clicked() {
                 *act = Some(PauseAct::Globe);
             }
             ui.add_space(14.0);
-            // Quit, quieter: a plain line rather than a big button.
+            // quit as a plain line.
             let q = ui.add(egui::Button::new(RichText::new(t!("Quit to desktop", "Quitter vers le bureau")).font(menu::label()).color(DIM)).frame(false));
             if q.clicked() {
                 *act = Some(PauseAct::Quit);
@@ -6559,17 +6548,17 @@ impl Game {
         if !self.info_page.is_info() {
             self.info_page = Page::Flight;
         }
-        // (under the heading strip when the HUD shows)
+        // under the heading strip when the hud shows.
         let max_h = ctx.content_rect().height() - if self.hud_on() { flightui::HEADING_H + 34.0 + 40.0 } else { 120.0 };
         let warn = Color32::from_rgb(255, 196, 80);
         let bad = menu::BAD;
-        // (left of the altitude tape and its buttons, which stay in reach)
+        // left of the altitude tape.
         let (x, y) = if self.hud_on() { (-flightui::RIGHT_EDGE - 10.0, flightui::HEADING_H + 34.0) } else { (-14.0, 12.0) };
         menu::set_switch_tint(ctx, Some(flightui::SKY));
         egui::Area::new(egui::Id::unique("info_panel")).anchor(Align2::RIGHT_TOP, [x, y]).show(ctx, |ui| {
             flightui::frosted(ui, flightui::glass().inner_margin(16.0), |ui| {
                 ui.set_width(flightui::PANEL_W);
-                // The header: the pages as tabs, and a way to close it.
+                // the pages as tabs and a close button.
                 ui.horizontal(|ui| {
                     let mut page = self.info_page;
                     let chosen = menu::segments(ui, |ui| {
@@ -6670,7 +6659,7 @@ impl Game {
                             let rpm = p.prop_rate * 60.0 / std::f64::consts::TAU;
                             let jet = p.spec.is_jet();
                             let trk = { let (e, n, _) = geo::enu(p.pos); p.vel.dot(e).atan2(p.vel.dot(n)).to_degrees().rem_euclid(360.0) };
-                            // The airport here (its notice fades; the details stay on this page).
+                            // the airport here.
                             if let Some(lines) = self.airport_hud() {
                                 pane_section(ui, t!("Airport", "Aéroport"));
                                 ui.add(egui::Label::new(RichText::new(&lines[0].0).font(menu::item_title()).color(Color32::WHITE)).wrap());
@@ -6917,12 +6906,12 @@ impl Game {
         let out = self.egui_ctx.clone().run_ui(raw, |root| {
             let ctx = &root.ctx().clone();
             self.pad_pass(ctx);
-            // the blurred frame behind the HUD's frosted glass (render.rs)
+            // the blurred frame behind the frosted glass.
             flightui::set_frost(ctx, self.r.frost_id);
             use egui::{Align2, Color32, FontId, RichText};
             let pad = padui::active();
             let white = Color32::from_rgba_unmultiplied(255, 255, 255, 235);
-            // What to press next, as key caps (or the gamepad's buttons).
+            // keys to press next, as key caps.
             let keys_line = |ui: &mut egui::Ui, keys: &[(&str, &str)]| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -6943,11 +6932,11 @@ impl Game {
             if self.info_open {
                 self.info_panel(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local, speed, alt, agl, hdg);
             }
-            // The HUD at the edges of the view (flightui.rs).
+            // the hud.
             let mut nav_lift = 0.0;
             if self.hud_on() {
                 self.hud(ctx, &flightui::HudIn { hdg, ias: speed, alt, agl, vs, local }, &mut bar);
-                // Only for the aircraft that have them: a rocket's flight figures, or the weapons.
+                // rocket figures or weapons, for the aircraft that have them.
                 self.systems_card(ctx, vs, base_up);
                 self.notices(ctx, airport_hud.as_deref());
                 if self.radios.show && self.nav_overlay(ctx, hdg) {
@@ -6955,8 +6944,7 @@ impl Game {
                 }
             }
             self.hotspot_overlay(ctx);
-            // Real traffic: a ring on each aircraft within range, and a tag beside
-            // the nearest ones, as long as the tags do not land on one another.
+            // a ring on each aircraft in range, tags on the nearest that do not overlap.
             if let (true, Some((vp, cam))) = (self.hud_on() && self.live.enabled(), self.live_view) {
                 let screen = ctx.content_rect();
                 let painter = ctx.layer_painter(egui::LayerId::background());
@@ -6982,7 +6970,7 @@ impl Game {
                 seen.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let mut taken: Vec<egui::Rect> = Vec::new();
                 for (d, at, p) in seen {
-                    // fainter with distance
+                    // fainter with distance.
                     let a = (1.0 - d / 40_000.0).clamp(0.45, 1.0) as f32;
                     painter.circle_stroke(at, 5.0, egui::Stroke::new(1.5, flightui::SKY.gamma_multiply(a)));
                     let line2 = format!("{}  ·  {:.0} ft  ·  {:.1} km", if p.ty.is_empty() { "?" } else { p.ty.as_str() }, p.alt_ft, d / 1000.0);
@@ -7118,7 +7106,7 @@ impl Game {
                 }
             }
             let report = if self.crashed { Vec::new() } else { p.dmg.report() };
-            // Warnings, damage and the approach line, bottom centre (flightui.rs).
+            // warnings, damage and the approach line.
             if self.show_hud {
                 let guide = if self.hud_on() { airport_hud.as_ref().and_then(|l| l.get(2)) } else { None };
                 self.alerts(ctx, &warn, &report, guide, nav_lift);
@@ -7549,8 +7537,7 @@ fn load_fonts(ctx: &egui::Context) {
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
     ];
-    // The interface's own faces first (bundled, see menu.rs), then the
-    // system's sans and mono behind them for glyphs they don't have.
+    // our bundled faces first, then the system's for missing glyphs.
     let own: [(&str, &'static [u8]); 5] = [("barlow", menu::FONT_REGULAR), ("barlow-medium", menu::FONT_MEDIUM), ("barlow-semibold", menu::FONT_SEMIBOLD), ("barlow-condensed", menu::FONT_DISPLAY), ("plex-mono", menu::FONT_MONO)];
     for (name, data) in own {
         fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(data)));
@@ -7776,7 +7763,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
-    // Linux: the machine in GameMode's performance state while we fly (if installed).
+    // gamemode while we fly, if installed.
     let _gamemode = gamemode::GameMode::request();
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);

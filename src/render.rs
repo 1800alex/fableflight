@@ -28,7 +28,7 @@ const MAX_FALL: usize = 4096;
 /// trees and undergrowth close enough to the camera for their leaf cards
 pub const MAX_NEAR: usize = 20000;
 const BLOOM_MIPS: u32 = 6;
-/// Halvings of the finished frame for the HUD's frosted glass (see `frost`).
+/// halvings of the frame for the frosted glass.
 const FROST_MIPS: u32 = 4;
 pub const MAX_PARTICLES: u32 = 1 << 16;
 /// Smoke volume around the effects anchor: cells along east, north, up; cell
@@ -855,7 +855,7 @@ struct Targets {
     bg_up: Vec<wgpu::BindGroup>,
     bg_final: [wgpu::BindGroup; 3],
     bg_blit: wgpu::BindGroup,
-    /// the frosted glass's halvings, its smoothed result, and their bind groups
+    /// the frosted glass's halvings and result.
     frost: Vec<wgpu::TextureView>,
     frost_out: wgpu::TextureView,
     bg_frost_in: wgpu::BindGroup,
@@ -1017,7 +1017,7 @@ pub struct Renderer {
     parts_until: f32,
     now: f32,
     p_down: wgpu::RenderPipeline,
-    /// the frosted glass: the frame shrunk (decoded to linear), and the last shrink smoothed back up a step
+    /// the frosted glass passes.
     p_frost_in: wgpu::RenderPipeline,
     p_frost_out: wgpu::RenderPipeline,
     p_up: wgpu::RenderPipeline,
@@ -1045,8 +1045,7 @@ pub struct Renderer {
     taa_hist_ok: bool,
     pub meshes: Vec<MeshGpu>,
     pub egui: egui_wgpu::Renderer,
-    /// The finished frame, blurred, as an egui texture: the HUD draws it
-    /// behind its panels for frosted glass. Re-registered when the targets change.
+    /// the frame blurred, as an egui texture for the frosted glass.
     pub frost_id: Option<egui::TextureId>,
     frost_dirty: bool,
     /// the font of the start screen's title, and the screen size and UI
@@ -2824,7 +2823,7 @@ impl Renderer {
 
         let _ = self.device.poll(wgpu::PollType::Poll);
         self.fluid.poll();
-        // (the frosted glass's texture, handed to egui again when the targets were rebuilt)
+        // hand the frosted texture to egui again after a resize.
         if self.frost_dirty {
             match self.frost_id {
                 Some(id) => self.egui.update_egui_texture_from_wgpu_texture(&self.device, &self.targets.frost_out, wgpu::FilterMode::Linear, id),
@@ -3545,8 +3544,7 @@ impl Renderer {
         let out = direct.unwrap_or(&t.ldr);
         full(&mut enc, out, true, if taa { &self.p_final_taa } else { &self.p_final }, &t.bg_final[src]);
 
-        // The frosted glass: the finished frame shrunk and blurred, for the HUD
-        // to draw behind its panels (egui then draws over the frame itself).
+        // the frosted glass: the frame shrunk and blurred.
         if f.egui.is_some() {
             full(&mut enc, &t.frost[0], true, &self.p_frost_in, &t.bg_frost_in);
             for i in 1..FROST_MIPS as usize {

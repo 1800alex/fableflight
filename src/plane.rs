@@ -1206,11 +1206,8 @@ impl Plane {
             0.0
         }
     }
-    /// The 1 g stall speed (m/s indicated) at today's mass with the flaps at
-    /// `flaps` (0..1, slats out with them as the lever would put them): the
-    /// speed at which the wing's largest lift coefficient just carries the
-    /// weight. For the speed bands of the HUD; the flight model itself stalls
-    /// by angle of attack.
+    /// the 1 g stall speed (m/s indicated) at this mass with flaps at `flaps`.
+    /// for the hud's speed bands, the model itself stalls by angle of attack.
     pub fn stall_ias_at(&self, flaps: f64) -> f64 {
         let s = self.spec;
         let notch = (0..s.flaps.len() as u8).find(|&k| s.flap_frac(k) >= flaps - 0.01).unwrap_or(0);

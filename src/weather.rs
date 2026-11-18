@@ -1119,7 +1119,7 @@ fn real_time_switch(ui: &mut egui::Ui, on: &mut bool) {
     switch_row(ui, t!("Real time", "Heure réelle"), t!("the sun where you are, now", "le soleil là où vous êtes, maintenant"), on);
 }
 
-/// A switch on its own row: what it is (and a few words under it) at the left, the switch at the right.
+/// a switch on its own row with its name at the left.
 fn switch_row(ui: &mut egui::Ui, name: &str, hint: &str, on: &mut bool) {
     let w = ui.available_width();
     ui.allocate_ui_with_layout(egui::vec2(w, 36.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1182,7 +1182,7 @@ fn section(ui: &mut egui::Ui, title: &str, rows: impl FnOnce(&mut egui::Ui)) {
     egui::Grid::new(("wx", title)).num_columns(2).min_col_width(104.0).spacing([10.0, 6.0]).show(ui, rows);
 }
 
-/// A row's name in a section of sliders (the caption style, as everywhere in the panel).
+/// a row's name.
 fn row_label(ui: &mut egui::Ui, s: &str) {
     ui.label(RichText::new(s).font(crate::menu::caption()).color(crate::flightui::SOFT));
 }

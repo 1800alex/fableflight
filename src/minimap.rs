@@ -47,8 +47,7 @@ fn rotate(v: Vec2, angle: f64) -> Vec2 {
     Vec2::new(c * v.x - s * v.y, s * v.x + c * v.y)
 }
 
-/// The map's outline: a rounded square (the HUD's corner radius), as the
-/// half-planes of its convex polygon (outward normal, offset) for clipping.
+/// the map's rounded square as half planes, for clipping.
 struct Outline {
     rect: egui::Rect,
     edges: Vec<(Vec2, f32)>,
@@ -79,7 +78,7 @@ impl Outline {
     }
 }
 
-/// Whether `r` lies wholly inside the map, `margin` in from its edge.
+/// whether `r` is inside the map, `margin` in from its edge.
 fn in_disc(r: egui::Rect, outline: &Outline, margin: f32) -> bool {
     let r = r.expand(margin);
     [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()].iter().all(|p| outline.inside(*p))
@@ -93,7 +92,7 @@ fn reserved(rect: egui::Rect, angle: f64) -> Vec<egui::Rect> {
         egui::Rect::from_center_size(center, Vec2::splat(38.0)),
         egui::Rect::from_center_size(north, Vec2::splat(28.0)),
         egui::Rect::from_center_size(Pos2::new(center.x, rect.bottom() - 22.0), Vec2::new(84.0, 32.0)),
-        // the resize grip in the top right corner
+        // the resize grip.
         egui::Rect::from_center_size(rect.right_top() + Vec2::new(-12.0, 12.0), Vec2::splat(24.0)),
     ]
 }
@@ -107,7 +106,7 @@ fn lerp_vertex(a: &egui::epaint::Vertex, b: &egui::epaint::Vertex, t: f32) -> eg
     }
 }
 
-/// Cuts a mesh down to the map's outline, interpolating uv and colour.
+/// cuts a mesh to the map's outline.
 fn clip_mesh(mesh: &egui::Mesh, outline: &Outline) -> egui::Mesh {
     let mut out = egui::Mesh::with_texture(mesh.texture_id);
     for tri in mesh.indices.chunks_exact(3) {
@@ -158,7 +157,7 @@ fn clip_shape(tessellator: &mut egui::epaint::Tessellator, shape: egui::Shape, o
     if !mesh.is_empty() { out.push(egui::Shape::mesh(mesh)); }
 }
 
-/// Replaces the shapes painted on `layer` since `start` with copies cut to the map's outline.
+/// cuts the shapes painted since `start` to the map's outline.
 fn clip_to_disc(ctx: &egui::Context, layer: egui::LayerId, start: egui::layers::ShapeIdx, outline: &Outline) {
     let font_size = ctx.fonts(|f| f.font_image_size());
     let mut tessellator = egui::epaint::Tessellator::new(ctx.pixels_per_point(), ctx.tessellation_options(|o| *o), font_size, Vec::new());
@@ -464,14 +463,14 @@ impl Minimap {
                         else if if self.plan { self.map_pending.is_some() } else { self.pending.is_some() } { crate::t!("Loading map…", "Chargement…") }
                         else { crate::t!("Imagery unavailable", "Images indisponibles") }, egui::FontId::proportional(12.0), Color32::WHITE);
                 }
-                // The aircraft: a white arrowhead with a dark edge.
+                // the aircraft.
                 let arrow = [Vec2::new(0.0, -12.0), Vec2::new(8.5, 9.0), Vec2::new(0.0, 4.5), Vec2::new(-8.5, 9.0)];
                 let points: Vec<_> = arrow.into_iter().map(|v| rect.center() + rotate(v, self.heading + angle)).collect();
                 painter.add(egui::Shape::closed_line(points.clone(), Stroke::new(3.0, Color32::from_black_alpha(150))));
                 for tri in [[0, 1, 2], [0, 2, 3]] {
                     painter.add(egui::Shape::convex_polygon(tri.iter().map(|&k| points[k]).collect(), Color32::WHITE, Stroke::NONE));
                 }
-                // The scale: a short bar and its length, on a dark chip at the foot.
+                // the scale bar on a chip.
                 let meters = 2.0 * std::f64::consts::PI * geo::R * lat.cos() / (n * 256.0) * 60.0;
                 let chip = egui::Rect::from_center_size(Pos2::new(center.x, rect.bottom() - 22.0), Vec2::new(78.0, 26.0));
                 painter.rect_filled(chip, crate::flightui::R_IN, Color32::from_black_alpha(150));
@@ -479,10 +478,10 @@ impl Minimap {
                 let a = Pos2::new(center.x - 30.0, chip.bottom() - 6.0);
                 painter.line_segment([a, a + Vec2::new(60.0, 0.0)], Stroke::new(1.5, Color32::WHITE));
                 clip_to_disc(ctx, painter.layer_id(), first_shape, &outline);
-                // The edge: a dark line outside, the HUD's bright hairline inside.
+                // a dark line outside, a bright hairline inside.
                 painter.rect_stroke(rect, crate::flightui::R_HUD, Stroke::new(1.0, Color32::from_black_alpha(90)), egui::StrokeKind::Outside);
                 painter.rect_stroke(rect, crate::flightui::R_HUD, Stroke::new(1.0, Color32::from_white_alpha(72)), egui::StrokeKind::Inside);
-                // North, on a dark chip riding a ring inside the edge.
+                // north on a chip.
                 let north = center + rotate(Vec2::new(0.0, -(radius - 18.0)), angle);
                 painter.circle_filled(north, 11.0, Color32::from_black_alpha(160));
                 painter.text(north, egui::Align2::CENTER_CENTER, "N", crate::menu::semibold(13.0), Color32::WHITE);
@@ -497,7 +496,7 @@ impl Minimap {
                     let size = (self.resize_start + (d.x - d.y) * 0.5).clamp(240.0f32.min(limit), limit);
                     self.size = Vec2::splat(size);
                 }
-                // (three short diagonal lines in the corner, brighter under the pointer)
+                // the resize grip, lit under the pointer.
                 let hot = resize.hovered() || resize.dragged();
                 let col = if hot { crate::flightui::SKY } else { Color32::from_white_alpha(150) };
                 for k in [0.0, 4.5, 9.0] {

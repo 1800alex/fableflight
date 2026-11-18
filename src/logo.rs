@@ -6,9 +6,9 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 
 pub const TEXT: &str = "FABLE FLIGHT";
 
-/// The title's face: the interface's condensed display bold.
+/// the title's face.
 pub fn find_font() -> Option<Vec<u8>> {
-    // the interface's display face, bundled (menu.rs)
+    // the bundled display face.
     Some(crate::menu::FONT_DISPLAY.to_vec())
 }
 
