@@ -15,7 +15,7 @@
 //! Google key (gmaps.rs).
 use crate::menu::{self, ACCENT, DIM, TEXT};
 use crate::padui::{self, Hint};
-use crate::{bind, gmaps, i18n, padmap, t, tiles3d, Game};
+use crate::{bind, geo, gmaps, i18n, mp, mp_proto, padmap, t, tiles3d, Game};
 use egui::{pos2, vec2, Align, Align2, Color32, Layout, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui};
 
 /// The widest the content column gets, however wide the window.
@@ -30,10 +30,11 @@ pub enum Section {
     Camera,
     Controls,
     Map,
+    Multiplayer,
 }
 
 impl Section {
-    pub const ALL: [Section; 6] = [Section::General, Section::Graphics, Section::Sound, Section::Camera, Section::Controls, Section::Map];
+    pub const ALL: [Section; 7] = [Section::General, Section::Graphics, Section::Sound, Section::Camera, Section::Controls, Section::Map, Section::Multiplayer];
 
     /// The name the command line goes by (`--settings graphics`, `--pause-menu settings:graphics`).
     pub fn name(self) -> &'static str {
@@ -44,6 +45,7 @@ impl Section {
             Section::Camera => "camera",
             Section::Controls => "controls",
             Section::Map => "map",
+            Section::Multiplayer => "multiplayer",
         }
     }
 
@@ -55,6 +57,7 @@ impl Section {
             Section::Camera => t!("Camera and view", "Caméra et vue"),
             Section::Controls => t!("Controls", "Commandes"),
             Section::Map => t!("Map and data", "Carte et données"),
+            Section::Multiplayer => t!("Multiplayer", "Multijoueur"),
         }
     }
 
@@ -66,6 +69,7 @@ impl Section {
             Section::Camera => t!("Where the camera starts and how wide the cockpit view is.", "Le point de vue de départ et l'ouverture de la vue cockpit."),
             Section::Controls => t!("Mouse, joysticks, pedals, gamepads and keys.", "Souris, joysticks, palonniers, manettes et touches."),
             Section::Map => t!("Map imagery, Google's 3D cities and real-world data.", "Imagerie, villes 3D de Google et données réelles."),
+            Section::Multiplayer => t!("Fly with the other players, and see on the globe where they are.", "Volez avec les autres joueurs, et voyez sur le globe où ils sont."),
         }
     }
 
@@ -77,6 +81,7 @@ impl Section {
             "camera" | "view" | "cam" => Section::Camera,
             "controls" | "bindings" | "input" | "keys" => Section::Controls,
             "map" | "data" | "imagery" | "google" => Section::Map,
+            "multiplayer" | "mp" | "online" | "network" => Section::Multiplayer,
             _ => return None,
         })
     }
@@ -89,7 +94,7 @@ impl Section {
     }
 
     /// A small line icon for the sidebar, `s` points across, centred on `c`.
-    fn icon(self, p: &Painter, c: Pos2, s: f32, col: Color32) {
+    pub(crate) fn icon(self, p: &Painter, c: Pos2, s: f32, col: Color32) {
         let st = Stroke::new(1.6, col);
         let u = s / 2.0;
         match self {
@@ -147,6 +152,18 @@ impl Section {
                     c + vec2(a.cos() * u * 0.4, a.sin() * u * 0.95)
                 }).collect();
                 p.line(pts, st);
+            }
+            // two people, one a step behind the other
+            Section::Multiplayer => {
+                for (dx, k) in [(u * 0.42, 0.82), (-u * 0.22, 1.0)] {
+                    let h = c + vec2(dx, -u * 0.38 * k);
+                    p.circle_stroke(h, u * 0.3 * k, st);
+                    let pts: Vec<Pos2> = (0..=10).map(|i| {
+                        let a = std::f32::consts::PI * (1.0 + i as f32 / 10.0);
+                        pos2(c.x + dx + a.cos() * u * 0.62 * k, c.y + u * 0.88 + a.sin() * u * 0.7 * k)
+                    }).collect();
+                    p.line(pts, st);
+                }
             }
         }
     }
@@ -290,6 +307,7 @@ impl Game {
                             Section::Camera => self.set_camera(ui, in_flight),
                             Section::Controls => self.set_controls(ui),
                             Section::Map => self.set_map(ui),
+                            Section::Multiplayer => self.set_multiplayer(ui, in_flight),
                         }
                         ui.add_space(40.0);
                     });
@@ -538,6 +556,227 @@ impl Game {
                     self.live.set_enabled(on);
                 }
             });
+        });
+    }
+
+    // ---- multiplayer (mp.rs)
+
+    /// Opens the settings screen at `sec`; its Back button (and Esc) return to `back`.
+    pub(crate) fn open_settings(&mut self, sec: Section, back: crate::menu::Screen) {
+        self.settings_sec = sec;
+        self.menu.set_back = back;
+        self.menu.screen = crate::menu::Screen::Settings;
+        self.pad_home = true;
+    }
+
+    /// Where multiplayer stands in a few words, and its colour (the
+    /// settings, the main menu's Multiplayer bar and the globe use it).
+    pub(crate) fn mp_line(&self) -> (Color32, String) {
+        if !self.mp_on {
+            return (DIM, t!("Not connected", "Non connecté").to_string());
+        }
+        let server = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
+        match self.mp.as_ref().map(|m| m.status()) {
+            None => (ACCENT, t!("Looking for the fastest server…", "Recherche du serveur le plus rapide…").to_string()),
+            Some(mp::Status::Connecting) => (ACCENT, t!("Connecting to {}…", "Connexion à {}…", server)),
+            Some(mp::Status::Error(e)) => (menu::BAD, t!("No connection: {}", "Pas de connexion : {}", e.chars().take(60).collect::<String>())),
+            Some(mp::Status::Connected) => (menu::OK, t!("Connected to {}", "Connecté à {}", server)),
+        }
+    }
+
+    /// The same in a word or two, for the main menu's Multiplayer bar.
+    pub(crate) fn mp_short(&self) -> (Color32, String) {
+        let (col, _) = self.mp_line();
+        let text = if let Some(n) = self.mp_flying() {
+            n
+        } else {
+            match (self.mp_on, self.mp.as_ref().map(|m| m.status())) {
+                (false, _) => t!("Off", "Désactivé").to_string(),
+                (true, Some(mp::Status::Connected)) => t!("Connected", "Connecté").to_string(),
+                (true, Some(mp::Status::Error(_))) => t!("No connection", "Pas de connexion").to_string(),
+                (true, _) => t!("Connecting…", "Connexion…").to_string(),
+            }
+        };
+        (col, text)
+    }
+
+    /// How many fly, as the menus show it ("12 pilots flying"), once the relay has said.
+    pub(crate) fn mp_flying(&self) -> Option<String> {
+        let connected = self.mp.as_ref().is_some_and(|m| m.status() == mp::Status::Connected);
+        (connected && self.mp_world_known).then(|| i18n::plural(self.mp_world_total as u64, "pilot flying", "pilots flying", "pilote en vol", "pilotes en vol"))
+    }
+
+    fn set_multiplayer(&mut self, ui: &mut Ui, in_flight: bool) {
+        card(ui, t!("Connection", "Connexion"), |ui| {
+            // Where it stands, and the one button that changes it.
+            let (col, line) = self.mp_line();
+            let sub = if !self.mp_on {
+                t!("Connect to see the other players, on the globe and in the air, and be seen by them.", "Connectez-vous pour voir les autres joueurs, sur le globe et en vol, et être vu d'eux.").to_string()
+            } else if in_flight {
+                i18n::plural(self.mp_players.len() as u64, "other pilot nearby", "other pilots nearby", "autre pilote à proximité", "autres pilotes à proximité")
+            } else if let Some(n) = self.mp_flying() {
+                t!("{} on the network: they are on the globe.", "{} sur le réseau : ils sont sur le globe.", n)
+            } else if self.mp.as_ref().is_some_and(|m| m.status() == mp::Status::Connected) {
+                t!("This server does not send the world map (an older relay): you will see the others once in the air.", "Ce serveur n'envoie pas la carte du monde (un ancien relais) : vous verrez les autres une fois en vol.").to_string()
+            } else {
+                String::new()
+            };
+            ui.horizontal(|ui| {
+                let bw = 190.0;
+                ui.allocate_ui_with_layout(vec2((ui.available_width() - bw - 16.0).max(120.0), 46.0), Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.5, col);
+                        ui.add(egui::Label::new(RichText::new(line).font(menu::label()).color(TEXT)).truncate());
+                    });
+                    if !sub.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(sub).font(menu::caption()).color(DIM)).wrap());
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.allocate_ui(vec2(bw, 46.0), |ui| {
+                        let (text, primary) = if self.mp_on { (t!("Disconnect", "Se déconnecter"), false) } else { (t!("Connect", "Se connecter"), true) };
+                        if menu::wide_button(ui, text, Hint::None, primary, true).clicked() {
+                            self.mp_on = !self.mp_on;
+                        }
+                    });
+                });
+            });
+            ui.add_space(10.0);
+            row(ui, t!("Your name", "Votre nom"), t!("shown to the others; left empty, the server gives one", "montré aux autres ; laissé vide, le serveur en donne un"), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.mp_name).desired_width(240.0).char_limit(mp_proto::NAME_MAX).hint_text(t!("Your name", "Votre nom")));
+            });
+            row(ui, t!("Server", "Serveur"), t!("the servers form one network: everyone sees everyone", "les serveurs forment un seul réseau : tout le monde voit tout le monde"), |ui| self.mp_server_picker(ui));
+        });
+        if !in_flight && self.mp_on && !self.mp_world.is_empty() {
+            card(ui, t!("Flying now", "En vol"), |ui| self.mp_pilots(ui));
+        }
+        if in_flight && !self.mp_players.is_empty() {
+            card(ui, t!("Nearby", "À proximité"), |ui| {
+                let me = self.plane.pos;
+                for p in self.mp_players.iter().take(12) {
+                    let ac = mp_proto::AIRCRAFT.get(p.aircraft as usize).copied().unwrap_or("?");
+                    let alt = geo::pos_to_lla(p.pos).2 * 3.28084;
+                    row(ui, &p.name, ac, |ui| {
+                        ui.label(RichText::new(format!("{:.1} km  ·  {:.0} ft  ·  {:.0} kt", (p.pos - me).length() / 1000.0, alt, p.vel.length() * 1.94384)).font(menu::data()).color(TEXT));
+                    });
+                }
+            });
+        }
+        note(ui, t!("Only while you are connected: in flight your aircraft (where it is, how it flies) and your name go to the server, which passes them on to the players within 150 km. On the start screen nothing of your aircraft is sent; it shows where the flying players are, to within about a kilometre.", "Seulement quand vous êtes connecté : en vol, votre avion (sa position, son vol) et votre nom vont au serveur, qui les transmet aux joueurs à moins de 150 km. Sur l'écran de départ, rien de votre avion n'est envoyé ; il montre où sont les joueurs en vol, à un kilomètre près environ."));
+    }
+
+    /// The pilots flying on the network (start screen): name, aircraft,
+    /// where and how high; Show turns the globe to them.
+    fn mp_pilots(&mut self, ui: &mut Ui) {
+        let mut look: Option<(f64, f64)> = None;
+        let shown = 16;
+        for s in self.mp_world.iter().take(shown) {
+            let ac = mp_proto::AIRCRAFT.get(s.aircraft as usize).copied().unwrap_or("?");
+            let (lat, lon) = (s.lat_deg(), s.lon_deg());
+            let place = match crate::menu::Menu::near_city(lat, lon) {
+                Some((c, d)) if d < 120_000.0 => t!("near {}", "près de {}", crate::tr(c)),
+                // (to a tenth of a degree: the world map is no finer than that)
+                _ => format!("{:.1}°{}  {:.1}°{}", lat.abs(), if lat >= 0.0 { "N" } else { "S" }, lon.abs(), if lon >= 0.0 { "E" } else { "W" }),
+            };
+            let how = if s.flags & mp_proto::F_GROUND != 0 { t!("on the ground", "au sol").to_string() } else { format!("{:.0} ft  ·  {} kt", s.alt_m() * 3.28084, s.speed) };
+            ui.horizontal(|ui| {
+                let w = ui.available_width();
+                ui.allocate_ui_with_layout(vec2((w - 96.0).max(100.0), 40.0), Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.add(egui::Label::new(RichText::new(format!("{}  ·  {ac}", s.name)).font(menu::label()).color(TEXT)).truncate());
+                    ui.add(egui::Label::new(RichText::new(format!("{place}  ·  {how}")).font(menu::caption()).color(DIM)).truncate());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(t!("Show", "Voir")).on_hover_text(t!("Turn the globe to them", "Tourner le globe vers eux")).clicked() {
+                        look = Some((lat, lon));
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        }
+        let more = (self.mp_world_total as usize).saturating_sub(self.mp_world.len().min(shown));
+        if more > 0 {
+            note(ui, &i18n::plural(more as u64, "more", "more", "autre", "autres"));
+        }
+        if let Some((lat, lon)) = look {
+            self.menu.look_at(lat, lon, 400_000.0);
+            self.menu.screen = crate::menu::Screen::Fly;
+            self.pad_home = true;
+        }
+    }
+
+    /// The server: the network's servers with their pilots and ping,
+    /// "automatic" (the fastest), or an address typed in.
+    fn mp_server_picker(&mut self, ui: &mut Ui) {
+        let dir = self.mp_directory();
+        let (servers, err, stale) = (dir.servers(), dir.error(), dir.stale());
+        let best = dir.best();
+        let auto = self.mp_auto();
+        let current = mp::with_port(&self.mp_server);
+        let listed = servers.iter().any(|s| s.address == current);
+        let label = |s: &mp::ServerEntry| {
+            let state = match (s.up, s.ping_ms) {
+                (false, _) => t!("offline", "hors ligne").to_string(),
+                (true, Some(ms)) => format!("{ms} ms"),
+                (true, None) => t!("no answer", "pas de réponse").to_string(),
+            };
+            format!("{}  ·  {}  ·  {}", s.name, i18n::plural(s.flying as u64, "pilot", "pilots", "pilote", "pilotes"), state)
+        };
+        let selected = if auto {
+            match &best {
+                Some(b) => t!("Automatic ({})", "Automatique ({})", b.name),
+                None => t!("Automatic: the fastest", "Automatique : le plus rapide").to_string(),
+            }
+        } else if let Some(s) = servers.iter().find(|s| s.address == current) {
+            label(s)
+        } else {
+            t!("Other: {}", "Autre : {}", self.mp_server.trim())
+        };
+        let mut pick: Option<String> = None;
+        egui::ComboBox::from_id_salt("mp_server").selected_text(selected).width(ui.available_width().min(340.0)).show_ui(ui, |ui| {
+            if ui.selectable_label(auto, t!("Automatic: the fastest", "Automatique : le plus rapide")).clicked() {
+                pick = Some("auto".into());
+            }
+            for s in &servers {
+                ui.add_enabled_ui(s.up, |ui| {
+                    if ui.selectable_label(!auto && s.address == current, label(s)).clicked() {
+                        pick = Some(s.address.clone());
+                    }
+                });
+            }
+            if ui.selectable_label(!auto && !listed, t!("Other address…", "Autre adresse…")).clicked() {
+                pick = Some(String::new());
+            }
+        });
+        match pick.as_deref() {
+            Some("") => {
+                self.mp_custom = true;
+                if auto || listed {
+                    self.mp_server.clear();
+                }
+            }
+            Some(a) => {
+                self.mp_custom = false;
+                self.mp_server = a.to_string();
+            }
+            None => {}
+        }
+        if self.mp_custom || (!auto && !listed) {
+            ui.add(egui::TextEdit::singleline(&mut self.mp_server).desired_width(ui.available_width().min(340.0)).char_limit(100).hint_text("host[:port]"));
+        }
+        ui.horizontal(|ui| {
+            let text = match (&err, servers.is_empty()) {
+                (Some(_), false) if stale => t!("Last known list (the list server is not answering)", "Dernière liste connue (le serveur de liste ne répond pas)").to_string(),
+                (Some(e), _) => t!("Server list unavailable: {}", "Liste des serveurs indisponible : {}", e.chars().take(50).collect::<String>()),
+                (None, true) => t!("Reading the server list…", "Lecture de la liste des serveurs…").to_string(),
+                (None, false) => i18n::plural(servers.iter().filter(|s| s.up).count() as u64, "server online", "servers online", "serveur en ligne", "serveurs en ligne"),
+            };
+            ui.label(RichText::new(text).font(menu::caption()).color(DIM));
+            if ui.small_button(t!("Refresh", "Actualiser")).clicked() {
+                self.mp_directory().refresh();
+            }
         });
     }
 
@@ -821,7 +1060,9 @@ mod tests {
         }
         assert_eq!(Section::parse("bindings"), Some(Section::Controls));
         assert_eq!(Section::parse("Graphics"), Some(Section::Graphics));
-        assert_eq!(Section::Map.cycle(true), Section::General);
+        assert_eq!(Section::Map.cycle(true), Section::Multiplayer);
+        assert_eq!(Section::Multiplayer.cycle(true), Section::General);
+        assert_eq!(Section::parse("mp"), Some(Section::Multiplayer));
         assert_eq!(Section::parse("nope"), None);
         // `--pause-menu controls` is the key list, not the settings section.
         assert_eq!(crate::menu::Page::parse("controls"), Some(crate::menu::Page::Controls));
