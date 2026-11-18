@@ -6,8 +6,10 @@
 
 // tear: up to two breaks through the body frame (plane normal, offset); dmg:
 // the mode of each (see damage.rs), scrapes 0..1, raggedness of the edge (m);
-// dmg2: oil film on the windshield, crack centre z and y, crack size.
-struct Obj { model: mat4x4f, tint: vec4f, glow: vec4f, params: array<vec4f, 6>, tear: array<vec4f, 2>, dmg: vec4f, dmg2: vec4f };
+// dmg2: oil film on the windshield, crack centre z and y, crack size;
+// crumple: impact center (xyz) and support radius (w). On non-glass pieces,
+// dmg2 carries inward impact direction (xyz) and permanent crush depth (w).
+struct Obj { model: mat4x4f, tint: vec4f, glow: vec4f, params: array<vec4f, 5>, tear: array<vec4f, 2>, dmg: vec4f, dmg2: vec4f, crumple: vec4f };
 @group(1) @binding(0) var<uniform> O: Obj;
 @group(2) @binding(0) var<uniform> CS: Cascade;
 // The glass pass only: the lit scene before the glass went on, and its depth.
@@ -81,16 +83,49 @@ struct VOut {
 struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f32 };
 struct SOut { @builtin(position) clip: vec4f, @location(0) L: vec3f, @location(1) @interpolate(flat) mat: vec4f };
 
+// Plastic dent: a compact smooth bowl, aligned to the impact direction and
+// limited to the struck side. Depth is bounded separately from the dent radius.
+fn apply_crumple(p: vec3f, n: vec3f, mat: vec4f) -> vec3f {
+  if (u32(mat.x + 0.5) == M_GLASS) { return p; }
+  let c_center = O.crumple.xyz;
+  let c_radius = O.crumple.w;
+  let depth = O.dmg2.w;
+  if (c_radius <= 0.001 || depth <= 0.001) { return p; }
+  let d_vec = p - c_center;
+  let dist = length(d_vec);
+  if (dist < c_radius) {
+    let t = 1.0 - dist / c_radius;
+    let smooth_t = t * t * (3.0 - 2.0 * t);
+    let inward = normalize(O.dmg2.xyz);
+    let facing = smoothstep(-0.1, 0.65, dot(normalize(n), -inward));
+    let wrinkle = nz(p * 5.5).x - 0.5;
+    return p + inward * (depth * smooth_t * facing * (1.0 + 0.12 * wrinkle));
+  }
+  return p;
+}
+
+// Aeroelastic wing bending: glow.w outside [-1, 1] carries an encoded tip
+// deflection divided by the squared half-span. The parabolic shape keeps the
+// root fixed and reaches the requested displacement at the tip. Glass uses
+// glow.w for rain, so its ordinary [0, 1] values pass through untouched.
+fn apply_wing_flex(p: vec3f, mat: vec4f) -> vec3f {
+  if (abs(O.glow.w) <= 1.0 || u32(mat.x + 0.5) == M_GLASS) { return p; }
+  let bend = select(O.glow.w + 2.0, O.glow.w - 2.0, O.glow.w > 1.0);
+  return vec3f(p.x, p.y + bend * p.x * p.x, p.z);
+}
+
 @vertex fn vs(@location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) col: vec4f, @location(3) uv: vec2f, @location(4) mat: vec4f) -> VOut {
   // (A rocket's plume is as wide as the engines burning make it, and spreads in thin air.)
-  var at = pos;
+  var at = apply_wing_flex(pos, mat);
   if (kind() == 5u && u32(mat.x + 0.5) == M_PLUME) { at = vec3f(pos.xy * rocket_spread(pos), pos.z); }
+  else { at = apply_crumple(at, nrm, mat); }
   let P = (O.model * vec4f(at, 1.0)).xyz;
   let N = (O.model * vec4f(nrm, 0.0)).xyz;
   return VOut(G.view_proj * vec4f(P, 1.0), P, N, col, uv, mat, mat.z, pos, nrm);
 }
 @vertex fn vs_shadow(@location(0) pos: vec3f, @location(4) mat: vec4f) -> SOut {
-  return SOut(CS.vp * vec4f((O.model * vec4f(pos, 1.0)).xyz, 1.0), pos, mat);
+  let at = apply_crumple(apply_wing_flex(pos, mat), vec3f(0.0, 1.0, 0.0), mat);
+  return SOut(CS.vp * vec4f((O.model * vec4f(at, 1.0)).xyz, 1.0), pos, mat);
 }
 @fragment fn fs_shadow(in: SOut) {
   // Sunlight comes in through the windows, the gear wells stay open, and
@@ -1350,7 +1385,7 @@ fn gauge(id: u32, uv: vec2f, px: f32) -> vec4f {
       hub = false;
     }
     case 17u: { // magnetic compass: a card seen edge-on through a window
-      let hdg = O.params[5].x % 1000.0;
+      let hdg = vec4f(0.0).x % 1000.0;
       let x = uv.x * 32.0 + hdg;
       let k = round(x / 5.0);
       let major = abs(k - round(k / 2.0) * 2.0) < 0.5;
@@ -2020,7 +2055,7 @@ fn surface(in: VOut) -> Shaded {
       rough = 0.08;
       let ch = u32(in.mat.w + 0.5);
       let P4 = O.params[4];
-      let P5 = O.params[5];
+      let P5 = vec4f(0.0);
       var on = 0.0;
       var k = 0.0;
       switch ch {

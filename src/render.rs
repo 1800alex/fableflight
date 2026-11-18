@@ -516,11 +516,13 @@ struct ObjU {
     model: [[f32; 4]; 4],
     tint: [f32; 4],
     glow: [f32; 4],
-    params: [[f32; 4]; 6],
+    params: [[f32; 4]; 5],
     tear: [[f32; 4]; 2],
     dmg: [f32; 4],
     dmg2: [f32; 4],
+    crumple: [f32; 4],
 }
+const _: () = assert!(std::mem::size_of::<ObjU>() <= UB_ALIGN as usize);
 
 /// An airfield's pavement and lights on the GPU.
 pub struct FieldGpu {
@@ -729,10 +731,14 @@ pub struct DrawObj {
     pub dmg: [f32; 4],
     /// oil film on the windshield, crack centre z and y, crack size
     pub dmg2: [f32; 4],
+    /// soft body crumple / plastic deformation: local impact position and support radius
+    pub crumple: [f32; 4],
+    /// soft body dent direction (xyz) and permanent depth (w), body frame
+    pub crumple_dir: [f32; 4],
 }
 
 impl DrawObj {
-    pub const DEFAULT: DrawObj = DrawObj { mesh: 0, model: Mat4::IDENTITY, tint: [0.0; 4], glow: [0.0; 4], params: [[0.0; 4]; 6], cast: 0, glass: false, cut: false, tear: [[0.0; 4]; 2], dmg: [0.0; 4], dmg2: [0.0; 4] };
+    pub const DEFAULT: DrawObj = DrawObj { mesh: 0, model: Mat4::IDENTITY, tint: [0.0; 4], glow: [0.0; 4], params: [[0.0; 4]; 6], cast: 0, glass: false, cut: false, tear: [[0.0; 4]; 2], dmg: [0.0; 4], dmg2: [0.0; 4], crumple: [0.0; 4], crumple_dir: [0.0; 4] };
 }
 
 pub struct Frame<'a> {
@@ -2769,7 +2775,7 @@ impl Renderer {
         let loose_slot = n_builds as u32 * 256;
         let mut blob = vec![0u8; n_objs * UB_ALIGN as usize];
         for (i, o) in f.objs.iter().take(n_objs).enumerate() {
-            let u = ObjU { model: o.model.to_cols_array_2d(), tint: o.tint, glow: o.glow, params: o.params, tear: o.tear, dmg: o.dmg, dmg2: o.dmg2 };
+            let u = ObjU { model: o.model.to_cols_array_2d(), tint: o.tint, glow: o.glow, params: [o.params[0], o.params[1], o.params[2], o.params[3], o.params[4]], tear: o.tear, dmg: o.dmg, dmg2: if o.glass { o.dmg2 } else { o.crumple_dir }, crumple: o.crumple };
             blob[i * 256..i * 256 + std::mem::size_of::<ObjU>()].copy_from_slice(bytemuck::bytes_of(&u));
         }
         q.write_buffer(&self.obj_ub, 0, &blob);
