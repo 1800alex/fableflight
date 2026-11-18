@@ -2145,9 +2145,26 @@ impl Game {
     /// | d-pad | quick views: ahead, panel, left, right |
     /// | View | cockpit / chase camera |
     /// | Menu | pause menu |
+    /// | Y + View | flight panel |
     ///
-    /// In the menus A starts the flight and B closes the pause menu; after a
-    /// crash A starts again.
+    /// Y with another button reaches what the layout above leaves out:
+    ///
+    /// | input | does |
+    /// |---|---|
+    /// | Y + A (hold) | afterburner / boost |
+    /// | Y + X (hold) | thrust reversers |
+    /// | Y + LB | speedbrake |
+    /// | Y + RB | autopilot on / off (a rocket: the ship lands itself) |
+    /// | Y + left stick click | start / stop the engine |
+    /// | Y + right stick click | hide / show the HUD |
+    /// | Y + Menu | canopy open / shut |
+    /// | Y + d-pad left / right | master arm, lock a target (a rocket: which engines burn, drop the booster) |
+    /// | Y alone, let go | fire at a locked target |
+    ///
+    /// In the menus the d-pad (and the left stick, off the globe) moves, A
+    /// presses, B steps back and the right stick scrolls; the flight panel
+    /// takes the d-pad, A, B, the bumpers and the right stick while it is
+    /// open. A skips the loading screen, and after a crash starts again.
     fn gamepad(&mut self, dt: f64, c: &mut Controls) {
         use gilrs::{Axis, Button, EventType};
         let Some(g) = self.gilrs.as_mut() else { return };
@@ -2237,6 +2254,11 @@ impl Game {
         };
         let modifier = pad.is_pressed(Button::North);
         let flying = self.mode == Mode::Fly && !self.pause_open;
+        // The globe itself is only on the start screen's Fly page; the main
+        // menu, aircraft and settings pages cover it.
+        let globe = nav == Nav::Globe && self.menu.screen == menu::Screen::Fly;
+        // Y + A and Y + X: the afterburner (or boost) and the thrust reversers, held.
+        let chord = |b: Button| nav == Nav::Off && modifier && pad.is_pressed(b);
         self.pad = Controls {
             pitch: -dz(pad.value(Axis::LeftStickY)),
             roll: dz(pad.value(Axis::LeftStickX)),
@@ -2246,20 +2268,22 @@ impl Game {
             brake: pad.is_pressed(Button::West),
             brake_left: 0.0,
             brake_right: 0.0,
-            boost: false,
-            reverse: false,
+            boost: chord(Button::South) && (self.arcade || self.spec.real_boost()),
+            reverse: chord(Button::West),
             throttle_set: None,
             starter: false,
         };
         let (look_x, look_y) = (dz(pad.value(Axis::RightStickX)), dz(pad.value(Axis::RightStickY)));
+        let ry = look_y;
         let trim = if modifier && nav != Nav::Panel { ax_pad(pad.is_pressed(Button::DPadDown), pad.is_pressed(Button::DPadUp)) } else { 0.0 };
 
-        // Moving about the menus: the d-pad (and in the pause menu the left
-        // stick too), repeating while held.
+        // Moving about the menus: the d-pad (and the left stick too, except
+        // where it turns the globe or flies), repeating while held.
         let dirs = [(Button::DPadUp, egui::Key::ArrowUp), (Button::DPadDown, egui::Key::ArrowDown), (Button::DPadLeft, egui::Key::ArrowLeft), (Button::DPadRight, egui::Key::ArrowRight)];
         let mut held = dirs.iter().find(|(b, _)| pad.is_pressed(*b)).map(|d| d.1);
         let (lx, ly) = (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
-        if held.is_none() && nav == Nav::Pause && lx.abs().max(ly.abs()) > 0.6 {
+        let stick_nav = nav == Nav::Pause || (nav == Nav::Globe && !globe);
+        if held.is_none() && stick_nav && lx.abs().max(ly.abs()) > 0.6 {
             held = Some(if ly.abs() > lx.abs() { if ly > 0.0 { egui::Key::ArrowUp } else { egui::Key::ArrowDown } } else if lx > 0.0 { egui::Key::ArrowRight } else { egui::Key::ArrowLeft });
         }
         let tap = pressed.iter().find_map(|b| dirs.iter().find(|d| d.0 == *b).map(|d| d.1));
@@ -2288,7 +2312,10 @@ impl Game {
         for k in nav_keys {
             self.pad_key(k);
         }
-        if nav == Nav::Globe {
+        // The right stick scrolls the menus and the flight panel: squared,
+        // for slow reading near the centre, fast at full tilt.
+        padui::set_scroll(if nav == Nav::Off { 0.0 } else { (ry * ry.abs() * 1600.0 * dt) as f32 });
+        if globe {
             // Left stick turns the globe (squared, for a fine touch), the triggers zoom.
             let h = self.window.inner_size().height.max(1) as f64;
             let sq = |v: f64| v * v.abs();
@@ -2307,8 +2334,11 @@ impl Game {
         c.yaw = (c.yaw + self.pad.yaw).clamp(-1.0, 1.0);
         c.throttle = (c.throttle + self.pad.throttle).clamp(-1.0, 1.0);
         c.brake |= self.pad.brake;
+        c.boost |= self.pad.boost;
+        c.reverse |= self.pad.reverse;
 
-        if flying {
+        // (With the flight panel open the right stick scrolls it instead.)
+        if flying && nav != Nav::Panel {
             // Right stick: look around, as fast as a quick head turn at full deflection.
             // Pushed right the view swings right, in the cockpit and outside.
             let rate = 2.2 * self.look_sens * dt;
@@ -3030,14 +3060,20 @@ impl Game {
             }
             (Nav::Pause, _) => {}
             // The flight panel, open beside the flying: the same, and B (or Y + View) closes it.
-            (Nav::Panel, Button::South) => self.pad_key(egui::Key::Enter),
-            (Nav::Panel, Button::East) => self.info_open = false,
+            // The Y chords (parking brake, speedbrake, autopilot…) still work the aircraft.
+            (Nav::Panel, Button::South) if !modifier => self.pad_key(egui::Key::Enter),
+            (Nav::Panel, Button::East) if !modifier => self.info_open = false,
             (Nav::Panel, Button::Select) if modifier => self.info_open = false,
-            (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) => {
+            (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) if !modifier => {
                 self.info_page = menu::Page::cycle(&menu::Page::INFO, self.info_page, b == Button::RightTrigger);
                 self.pad_home = true;
             }
             (Nav::Panel, Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight) => {}
+            // A skips the loading screen (the scenery goes on loading), as Enter does.
+            (_, Button::South) if self.loading.as_ref().is_some_and(|l| l.done.is_none()) => self.key(KeyCode::Enter),
+            // Y and the d-pad on a rocket: which engines burn, and dropping the booster.
+            (Nav::Off, Button::DPadLeft) if modifier && self.spec.rocket().is_some() => self.key(KeyCode::Digit1),
+            (Nav::Off, Button::DPadRight) if modifier && self.spec.rocket().is_some() => self.key(KeyCode::Backspace),
             // Y and the d-pad: master arm and target lock.
             (Nav::Off, Button::DPadLeft) if modifier => {
                 if !self.missiles_ok() {
@@ -3056,6 +3092,13 @@ impl Game {
                 }
                 self.status_until = self.real + 3.0;
             }
+            // The other Y chords, each the key that does the same.
+            (_, Button::Start) if modifier => self.key(KeyCode::Digit6),
+            (_, Button::LeftTrigger) if modifier => self.key(KeyCode::Slash),
+            // the autopilot; a rocket's ship lands itself instead
+            (_, Button::RightTrigger) if modifier => self.key(if self.spec.rocket().is_some() { KeyCode::Digit2 } else { KeyCode::F5 }),
+            (_, Button::LeftThumb) if modifier => self.key(KeyCode::F4),
+            (_, Button::RightThumb) if modifier => self.key(KeyCode::KeyH),
             (_, Button::Start) => self.set_pause_menu(true),
             (_, Button::South) if self.crashed => self.respawn_here(),
             (_, Button::Select) if modifier => {
@@ -3428,6 +3471,7 @@ impl Game {
     /// box would otherwise keep left and right from the slider. (A widget
     /// only shows as a text box the pass after it takes the focus.)
     fn pad_pass(&mut self, ctx: &egui::Context) {
+        padui::begin_pass();
         if let Some(d) = self.pad_move.take() {
             ctx.memory_mut(|m| m.move_focus(d));
         }
