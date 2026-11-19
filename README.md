@@ -1,7 +1,7 @@
 
 <div align="center">
 
-# FableFlight
+# Fable Flight
 
 ### An Open-World Flight Simulator Built in Pure Rust
 
