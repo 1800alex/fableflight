@@ -47,8 +47,6 @@ pub struct Weather {
     pub moon_age: f64,
     /// how far the wind has carried the clouds, planet frame
     pub cloud_off: DVec3,
-    /// the F3 panel is showing
-    pub open: bool,
     /// sine of the sun's elevation where the aircraft is (drives the thermals)
     pub sun: f64,
     /// how far the boundary-layer wind has carried the thermals, planet frame
@@ -320,7 +318,7 @@ fn sites(q: DVec3, grid: f64, range: f64, mut f: impl FnMut(DVec3, f64, u32)) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, deck_fade: 0.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, open: false, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false, showers_only: false, qnh: 1013.25 }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, deck_fade: 0.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false, showers_only: false, qnh: 1013.25 }
     }
 
     /// The rain deck's mean base and top, metres above sea level: the heavier
@@ -912,50 +910,110 @@ impl Weather {
         Air { sigma_w, sigma_h, len_w, len_h, draft: self.thermal(pos, agl, t) * sunlit * if water { 0.2 } else { 1.0 } + draft, gust: st.gust }
     }
 
-    /// The floating weather & time window (F3). `utc` and `doy` belong to the
-    /// game clock; `lon` (degrees) sets local time.
-    pub fn panel(&mut self, ctx: &egui::Context, utc: &mut f64, doy: &mut f64, lon: f64) {
-        let mut open = self.open;
-        egui::Window::new(t!("Weather & time  (F3)", "Météo et heure  (F3)"))
-            .id(egui::Id::unique("weather_window"))
-            .open(&mut open)
-            .collapsible(true)
-            .resizable(false)
-            .default_pos([14.0, 250.0])
-            .show(ctx, |ui| {
-                ui.spacing_mut().slider_width = 200.0;
-                self.controls(ui, utc, doy, lon, false)
+    /// the flight card's weather: real weather and time, the presets, then the day, wind and sky in tiles.
+    pub fn card(&mut self, ui: &mut egui::Ui, utc: &mut f64, doy: &mut f64, lon: f64) {
+        use crate::flightui::{cells, key, note, tag, GAP};
+        let local = (*utc + lon / 15.0).rem_euclid(24.0);
+        cells(ui, 2, 64.0, |ui, i| {
+            let (name, on) = if i == 0 { (t!("Real weather", "Météo réelle"), &mut self.live) } else { (t!("Real time", "Heure réelle"), &mut self.real_time) };
+            ui.horizontal(|ui| {
+                tag(ui, name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| crate::menu::switch(ui, on));
             });
-        self.open = open;
-    }
-
-    /// The sliders and presets, for the F3 window (one column) and the
-    /// in-flight menu (two).
-    pub fn controls(&mut self, ui: &mut egui::Ui, utc: &mut f64, doy: &mut f64, lon: f64, two_columns: bool) {
-        self.live_switch(ui);
+            let line = if i == 1 {
+                if self.real_time { t!("the sun where you are, {}", "le soleil là où vous êtes, {}", crate::menu::hhmm(local)) } else { t!("set by hand below", "réglée à la main ci-dessous").into() }
+            } else if !self.live {
+                t!("set by hand below", "réglée à la main ci-dessous").into()
+            } else if !self.live_station.is_empty() {
+                t!("from {}", "selon {}", self.live_station)
+            } else if self.live_raw.is_empty() {
+                t!("waiting for a report", "en attente d'un bulletin").into()
+            } else {
+                self.live_raw.clone()
+            };
+            note(ui, &line);
+        });
+        // the presets as keys across the card.
         let free = !self.live;
-        if two_columns {
-            ui.columns(2, |c| {
-                c[0].spacing_mut().slider_width = 115.0;
-                c[1].spacing_mut().slider_width = 115.0;
-                self.day_controls(&mut c[0], utc, doy, lon);
-                c[0].add_space(8.0);
-                c[0].add_enabled_ui(free, |ui| self.wind_controls(ui));
-                c[1].add_enabled_ui(free, |ui| {
-                    self.sky_controls(ui);
-                    ui.add_space(8.0);
-                    self.presets(ui);
+        ui.add_enabled_ui(free, |ui| {
+            let now = self.summary();
+            let n = PRESETS.len() as f32;
+            let w = (ui.available_width() - GAP * (n - 1.0)) / n;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                for &(name, c, b, d, s, a, h, w2, g) in PRESETS {
+                    if key(ui, tr(name), free && now == tr(name), w, 32.0).clicked() {
+                        (self.clouds, self.cloud_base, self.cloud_depth, self.storms, self.alto, self.haze, self.wind, self.gusts) = (c, b, d, s, a, h, w2, g);
+                    }
+                }
+            });
+        });
+        ui.add_space(GAP - ui.spacing().item_spacing.y);
+        let clock_free = !self.real_time;
+        cells(ui, 2, 268.0, |ui, i| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            if i == 0 {
+                tag(ui, t!("Day", "Jour"));
+                ui.add_enabled_ui(clock_free, |ui| {
+                    let mut l = local;
+                    if row(ui, t!("Local time", "Heure locale"), crate::menu::hhmm(l), Slider::new(&mut l, 0.0..=23.99)).changed() {
+                        *utc = (l - lon / 15.0).rem_euclid(24.0);
+                    }
+                    let d = date_label(*doy);
+                    row(ui, "Date", d, Slider::new(doy, 0.0..=364.0).step_by(1.0));
+                    let rate = self.time_rate;
+                    row(ui, t!("Clock", "Horloge"), if rate == 0.0 { t!("stopped", "arrêtée").into() } else { format!("{rate:.0}×") }, Slider::new(&mut self.time_rate, 0.0..=3600.0).logarithmic(true).smallest_positive(1.0));
                 });
-            });
-        } else {
-            self.day_controls(ui, utc, doy, lon);
-            ui.add_enabled_ui(free, |ui| {
-                self.sky_controls(ui);
-                self.wind_controls(ui);
+                let moon = tr(moon_phase(self.moon_age)).to_string();
+                row(ui, t!("Moon", "Lune"), moon, Slider::new(&mut self.moon_age, 0.0..=29.5));
+                ui.add_space(10.0);
+                tag(ui, t!("Wind", "Vent"));
+                ui.add_enabled_ui(free, |ui| {
+                    let mut kt = self.wind * 1.94384;
+                    if row(ui, t!("Speed", "Vitesse"), format!("{kt:.0} kt"), Slider::new(&mut kt, 0.0..=50.0)).changed() {
+                        self.wind = kt.round() / 1.94384;
+                    }
+                    let from = self.wind_from;
+                    row(ui, t!("From", "Direction"), format!("{from:03.0}° {}", tr(compass(from))), Slider::new(&mut self.wind_from, 0.0..=359.0).step_by(1.0));
+                    let g = self.gusts;
+                    row(ui, t!("Gusts", "Rafales"), format!("{:.0}%", g * 100.0), Slider::new(&mut self.gusts, 0.0..=1.0));
+                });
+            } else {
+                tag(ui, t!("Sky", "Ciel"));
+                ui.add_enabled_ui(free, |ui| {
+                    let pc = |v: f32| format!("{:.0}%", v * 100.0);
+                    let v = self.clouds;
+                    row(ui, t!("Cloud cover", "Couverture"), pc(v), Slider::new(&mut self.clouds, 0.0..=1.0));
+                    let v = self.cloud_base;
+                    row(ui, t!("Cloud base", "Base"), format!("{v:.0} m"), Slider::new(&mut self.cloud_base, 300.0..=4000.0).step_by(50.0));
+                    let v = self.cloud_depth;
+                    row(ui, t!("Cloud depth", "Épaisseur"), format!("{v:.0} m"), Slider::new(&mut self.cloud_depth, 500.0..=8000.0).step_by(50.0));
+                    let v = self.storms;
+                    row(ui, t!("Storm cells", "Orages"), pc(v), Slider::new(&mut self.storms, 0.0..=1.0));
+                    let v = self.alto;
+                    row(ui, t!("Mid cloud", "Nuages moyens"), pc(v), Slider::new(&mut self.alto, 0.0..=1.0));
+                    // rain left to the storm cells unless it is set here.
+                    let mut r = self.rain_set.unwrap_or(self.rain);
+                    let shown = if self.rain_set.is_none() { t!("auto", "auto").to_string() } else { pc(r) };
+                    if row(ui, t!("Rain", "Pluie"), shown, Slider::new(&mut r, 0.0..=1.0)).changed() {
+                        self.rain_set = Some(r);
+                    }
+                    let v = self.haze;
+                    row(ui, t!("Haze", "Brume"), format!("{v:.1}×"), Slider::new(&mut self.haze, 0.2..=40.0).logarithmic(true));
+                });
                 ui.add_space(6.0);
-                self.presets(ui);
-            });
-        }
+                ui.horizontal(|ui| {
+                    note(ui, &t!("visibility about {:.0} km", "visibilité environ {:.0} km", self.visibility_km()));
+                    if self.rain_set.is_some() && free {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if key(ui, t!("Rain auto", "Pluie auto"), false, 84.0, 22.0).clicked() {
+                                self.rain_set = None;
+                            }
+                        });
+                    }
+                });
+            }
+        });
     }
 
     /// The real-weather switch, and where the report comes from.
@@ -1013,31 +1071,6 @@ impl Weather {
             }
         }
         t!("{:.0}% cloud · {:.0} kt", "{:.0}% de nuages · {:.0} kt", self.clouds * 100.0, self.wind * 1.94384)
-    }
-
-    fn day_controls(&mut self, ui: &mut egui::Ui, utc: &mut f64, doy: &mut f64, lon: f64) {
-        real_time_switch(ui, &mut self.real_time);
-        let free = !self.real_time;
-        section(ui, t!("Day", "Jour"), |ui| {
-            row_label(ui, t!("Local time", "Heure locale"));
-            let mut local = (*utc + lon / 15.0).rem_euclid(24.0);
-            let hhmm = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:02}:{:02}", v as u32 % 24, (v.fract() * 60.0) as u32);
-            if ui.add_enabled_ui(free, |ui| add(ui, Slider::new(&mut local, 0.0..=23.99).custom_formatter(hhmm))).inner.changed() {
-                *utc = (local - lon / 15.0).rem_euclid(24.0);
-            }
-            ui.end_row();
-            row_label(ui, "Date");
-            let date = |v: f64, _: std::ops::RangeInclusive<usize>| date_label(v);
-            ui.add_enabled_ui(free, |ui| add(ui, Slider::new(doy, 0.0..=364.0).step_by(1.0).custom_formatter(date)));
-            ui.end_row();
-            row_label(ui, t!("Clock speed", "Vitesse de l'horloge"));
-            let rate = &mut self.time_rate;
-            ui.add_enabled_ui(free, |ui| add(ui, Slider::new(rate, 0.0..=3600.0).logarithmic(true).smallest_positive(1.0).custom_formatter(|v, _| if v == 0.0 { t!("stopped", "arrêtée").into() } else { format!("{v:.0}×") })));
-            ui.end_row();
-            row_label(ui, t!("Moon", "Lune"));
-            add(ui, Slider::new(&mut self.moon_age, 0.0..=29.5).custom_formatter(|v, _| tr(moon_phase(v)).into()));
-            ui.end_row();
-        });
     }
 
     fn sky_controls(&mut self, ui: &mut egui::Ui) {
@@ -1180,6 +1213,25 @@ pub fn date_label(doy: f64) -> String {
 fn section(ui: &mut egui::Ui, title: &str, rows: impl FnOnce(&mut egui::Ui)) {
     crate::flightui::pane_section(ui, title);
     egui::Grid::new(("wx", title)).num_columns(2).min_col_width(104.0).spacing([10.0, 6.0]).show(ui, rows);
+}
+
+/// a slider row in a tile: the name, the track and the value, each in its own column.
+fn row(ui: &mut egui::Ui, name: &str, value: String, slider: Slider) -> egui::Response {
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(egui::vec2(w, 26.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.allocate_ui_with_layout(egui::vec2(86.0, 26.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(86.0);
+            row_label(ui, name);
+        });
+        let vw = 92.0;
+        ui.spacing_mut().slider_width = (ui.available_width() - vw - 8.0).max(40.0);
+        let r = add(ui, slider.show_value(false));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(RichText::new(value).font(crate::menu::medium(13.5)).color(egui::Color32::WHITE)).truncate());
+        });
+        r
+    })
+    .inner
 }
 
 /// a row's name.

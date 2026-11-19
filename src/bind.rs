@@ -132,7 +132,6 @@ pub const ACTIONS: &[Action] = &[
     act("starter", KeyCode::KeyO, "Starter", "Démarreur"),
     act("mixture_rich", KeyCode::PageUp, "Mixture richer", "Mélange plus riche"),
     act("mixture_lean", KeyCode::PageDown, "Mixture leaner", "Mélange plus pauvre"),
-    act("nav_display", KeyCode::KeyJ, "Navigation instruments", "Instruments de navigation"),
     act("obs_left", KeyCode::BracketLeft, "OBS course left", "OBS : course à gauche"),
     act("obs_right", KeyCode::BracketRight, "OBS course right", "OBS : course à droite"),
     act("baro_qnh", KeyCode::KeyX, "Altimeter to the QNH", "Caler l'altimètre au QNH"),

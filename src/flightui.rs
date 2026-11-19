@@ -5,9 +5,6 @@ use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke};
 
 // the flight panel's pieces.
 
-/// the panel's width.
-pub const PANEL_W: f32 = 344.0;
-
 /// a section's tag and a hairline.
 pub fn pane_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(14.0);
@@ -15,41 +12,6 @@ pub fn pane_section(ui: &mut egui::Ui, title: &str) {
     let r = ui.available_rect_before_wrap();
     ui.painter().hline(r.x_range(), r.top() + 3.0, Stroke::new(1.0, menu::LINE));
     ui.add_space(8.0);
-}
-
-/// a word at the left, its value at the right.
-pub fn kv(ui: &mut egui::Ui, key: &str, value: &str, col: Color32) {
-    let w = ui.available_width();
-    ui.allocate_ui_with_layout(vec2(w, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.set_min_width(w);
-        ui.label(RichText::new(key).font(menu::caption()).color(SOFT));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add(egui::Label::new(RichText::new(value).font(num_s()).color(col)).truncate());
-        });
-    });
-}
-
-/// the key numbers as tiles, two to a row.
-pub fn tiles(ui: &mut egui::Ui, items: &[(&str, String, &str, Color32)]) {
-    let gap = 8.0;
-    let w = (ui.available_width() - gap) * 0.5;
-    for pair in items.chunks(2) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for (k, v, unit, col) in pair {
-                let (r, _) = ui.allocate_exact_size(vec2(w, 58.0), Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(r, R_IN, Color32::from_white_alpha(7));
-                paint_tag(p, r.left_top() + vec2(10.0, 15.0), Align2::LEFT_CENTER, k);
-                let g = p.layout_no_wrap(v.clone(), num_l(), *col);
-                let base = r.left_bottom() + vec2(10.0, -19.0);
-                let vw = g.size().x;
-                p.galley(pos2(base.x, base.y - g.size().y * 0.5), g, *col);
-                p.text(pos2(base.x + vw + 5.0, base.y + 3.0), Align2::LEFT_CENTER, *unit, num_s(), SOFT);
-            }
-        });
-        ui.add_space(gap - ui.spacing().item_spacing.y);
-    }
 }
 
 /// a small button, yellow when chosen.
@@ -70,44 +32,184 @@ pub fn chip(ui: &mut egui::Ui, text: &str, mono: bool, on: bool) -> egui::Respon
     resp
 }
 
-/// a list entry; the right part is laid out first so the name never runs under it.
-pub fn list_row(ui: &mut egui::Ui, code: &str, name: &str, detail: &str, right: impl FnOnce(&mut egui::Ui)) {
+/// a button `w` by `h`, filled yellow when on.
+pub fn key(ui: &mut egui::Ui, text: &str, on: bool, w: f32, h: f32) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, text));
+    let lit = menu::ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
+    let p = ui.painter();
+    if on {
+        p.rect_filled(r, R_IN, menu::mix(LIT, menu::ACCENT_HI, lit));
+    } else {
+        p.rect_filled(r, R_IN, white(0.07 + 0.1 * lit));
+        p.rect_stroke(r, R_IN, Stroke::new(1.0, white(0.2 + 0.2 * lit)), egui::StrokeKind::Inside);
+    }
+    p.text(r.center(), Align2::CENTER_CENTER, text, menu::semibold(14.0), if on { menu::ON_ACCENT } else { Color32::WHITE });
+    resp
+}
+
+// the flight card: one frosted card in the middle, its pages laid out in tiles.
+
+/// the card's width.
+pub const CARD_W: f32 = 660.0;
+/// the gap between tiles.
+pub const GAP: f32 = 8.0;
+
+/// a row of `n` equal tiles `h` tall, `add` fills tile `i`.
+pub fn cells(ui: &mut egui::Ui, n: usize, h: f32, mut add: impl FnMut(&mut egui::Ui, usize)) {
     let w = ui.available_width();
-    ui.allocate_ui_with_layout(vec2(w, 42.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.set_min_width(w);
-        ui.spacing_mut().item_spacing.x = 4.0;
-        right(ui);
-        ui.add_space(8.0);
-        let room = ui.available_width();
-        ui.allocate_ui_with_layout(vec2(room, 42.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_width(room);
-            ui.spacing_mut().item_spacing.y = 1.0;
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(RichText::new(code).font(num_m()).color(Color32::WHITE));
-                ui.add(egui::Label::new(RichText::new(name).font(menu::caption()).color(TEXT)).truncate());
-            });
-            if !detail.is_empty() {
-                ui.add(egui::Label::new(RichText::new(detail).font(num_s()).color(SOFT)).truncate());
+    let (row, resp) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+    let cw = (w - GAP * (n as f32 - 1.0)) / n as f32;
+    for i in 0..n {
+        let r = Rect::from_min_size(pos2(row.left() + i as f32 * (cw + GAP), row.top()), vec2(cw, h));
+        tile_bg(ui.painter(), r);
+        let inner = r.shrink2(vec2(12.0, 10.0));
+        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)).id_salt(resp.id.with(i)));
+        c.set_clip_rect(r.intersect(ui.clip_rect()));
+        c.spacing_mut().item_spacing = vec2(6.0, 4.0);
+        add(&mut c, i);
+    }
+    ui.add_space(GAP - ui.spacing().item_spacing.y);
+}
+
+/// one tile across the card, as tall as what it holds.
+pub fn wide_tile<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let slot = ui.painter().add(egui::Shape::Noop);
+    let r = egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+        add(ui)
+    });
+    let rect = r.response.rect;
+    ui.painter().set(slot, egui::Shape::Vec(vec![
+        egui::Shape::rect_filled(rect, R_IN, white(0.045)),
+        egui::Shape::rect_stroke(rect, R_IN, Stroke::new(1.0, white(0.07)), egui::StrokeKind::Inside),
+    ]));
+    ui.add_space(GAP - ui.spacing().item_spacing.y);
+    r.inner
+}
+
+fn tile_bg(p: &egui::Painter, r: Rect) {
+    p.rect_filled(r, R_IN, white(0.045));
+    p.rect_stroke(r, R_IN, Stroke::new(1.0, white(0.07)), egui::StrokeKind::Inside);
+}
+
+/// a tile's name in spaced capitals.
+pub fn tag(ui: &mut egui::Ui, s: &str) {
+    ui.label(tag_text(s));
+}
+
+/// a big figure and its unit.
+pub fn big(ui: &mut egui::Ui, value: &str, unit: &str, col: Color32) {
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(w, 30.0), egui::Layout::left_to_right(egui::Align::Max), |ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(RichText::new(value).font(num_l()).color(col));
+        if !unit.is_empty() {
+            ui.add_space(-1.0);
+            ui.label(RichText::new(unit).font(num_s()).color(SOFT));
+        }
+    });
+}
+
+/// a short line in grey, cut at the tile's edge.
+pub fn note(ui: &mut egui::Ui, s: &str) {
+    ui.add(egui::Label::new(RichText::new(s).font(menu::caption()).color(SOFT)).truncate());
+}
+
+/// a thin bar `frac` full.
+pub fn meter(ui: &mut egui::Ui, frac: f32, col: Color32) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
+    ui.painter().rect_filled(r, 2, white(0.1));
+    ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * frac.clamp(0.0, 1.0), r.height())), 2, col);
+}
+
+/// a pick from a list: a code, a name and a figure, lit when it is the one in use.
+pub fn pick_row(ui: &mut egui::Ui, code: &str, name: &str, right: &str, on: bool) -> egui::Response {
+    let w = ui.available_width();
+    let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, name));
+    let lit = menu::ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
+    let p = ui.painter();
+    if on {
+        p.rect_filled(r, R_IN, LIT.gamma_multiply(0.16));
+    } else if lit > 0.0 {
+        p.rect_filled(r, R_IN, white(0.07 * lit));
+    }
+    let col = if on { LIT } else { Color32::WHITE };
+    let cg = p.layout_no_wrap(code.to_string(), num_s(), col);
+    let rg = p.layout_no_wrap(right.to_string(), menu::caption(), SOFT);
+    let left = r.left() + 10.0;
+    let name_x = left + cg.size().x.max(58.0) + 8.0;
+    let room = (r.right() - 10.0 - rg.size().x - 8.0 - name_x).max(0.0);
+    p.galley(pos2(left, r.center().y - cg.size().y * 0.5), cg, col);
+    p.galley(pos2(r.right() - 10.0 - rg.size().x, r.center().y - rg.size().y * 0.5), rg, SOFT);
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), menu::caption(), TEXT);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+    let ng = p.layout_job(job);
+    p.galley(pos2(name_x, r.center().y - ng.size().y * 0.5), ng, TEXT);
+    resp
+}
+
+/// the card's header: the page's icon and name, the pages as icons, and a close button.
+/// gives back the page asked for, and whether close was pressed.
+pub fn card_header(ui: &mut egui::Ui, page: Page) -> (Option<Page>, bool, egui::Response) {
+    let mut to = None;
+    let mut close = false;
+    let mut close_resp = None;
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(26.0, 30.0), Sense::hover());
+        menu::icon(ui.painter(), page_icon(page), r.center(), 22.0, LIT);
+        ui.add_space(2.0);
+        ui.label(RichText::new(page.label()).font(menu::page_title()).color(Color32::WHITE));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let x = icon_key(ui, None, "×", false, t!("Close (Tab)", "Fermer (Tab)"));
+            if x.clicked() {
+                close = true;
+            }
+            close_resp = Some(x);
+            ui.add_space(10.0);
+            for p in Page::INFO.into_iter().rev() {
+                if icon_key(ui, Some(page_icon(p)), "", p == page, p.label()).clicked() && p != page {
+                    to = Some(p);
+                }
             }
         });
     });
-    let r = ui.available_rect_before_wrap();
-    ui.painter().hline(r.x_range(), r.top() + 2.0, Stroke::new(1.0, Color32::from_white_alpha(10)));
-    ui.add_space(4.0);
+    (to, close, close_resp.expect("close button"))
 }
 
-/// a button `w` wide.
-pub fn pane_button(ui: &mut egui::Ui, text: &str, w: f32) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(vec2(w, 34.0), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
+/// a square icon button, yellow when on.
+fn icon_key(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, on: bool, hint: &str) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, hint));
     let lit = menu::ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
     let p = ui.painter();
-    p.rect_filled(r, R_IN, white(0.08 + 0.1 * lit));
-    p.rect_stroke(r, R_IN, Stroke::new(1.0, white(0.28 + 0.2 * lit)), egui::StrokeKind::Inside);
-    p.text(r.center(), Align2::CENTER_CENTER, text, menu::medium(14.5), Color32::WHITE);
-    resp
+    if on {
+        p.rect_filled(r, R_IN, LIT);
+    } else {
+        p.rect_filled(r, R_IN, white(0.04 + 0.1 * lit));
+    }
+    let col = if on { menu::ON_ACCENT } else { menu::mix(SOFT, Color32::WHITE, lit) };
+    match icon {
+        Some(i) => menu::icon(p, i, r.center(), 18.0, col),
+        None => {
+            p.text(r.center(), Align2::CENTER_CENTER, text, menu::medium(18.0), col);
+        }
+    }
+    resp.on_hover_text(hint)
+}
+
+/// the icon each page goes by.
+pub fn page_icon(p: Page) -> Icon {
+    match p {
+        Page::Places => Icon::GoTo,
+        Page::Radio => Icon::Radio,
+        Page::Autopilot => Icon::Autopilot,
+        Page::Weather => Icon::Weather,
+        _ => Icon::Flight,
+    }
 }
 
 /// what the hud's buttons asked for.
@@ -302,12 +404,8 @@ pub(crate) const R_HUD: u8 = 14;
 pub(crate) const R_IN: u8 = 7;
 /// inset inside a panel.
 const PAD: f32 = 12.0;
-/// room the flight panel leaves for the altitude tape.
-pub const RIGHT_EDGE: f32 = ALT_W + 14.0;
-/// the radio instruments' height.
-pub const NAV_H: f32 = 156.0;
 
-const AMBER: Color32 = Color32::from_rgb(255, 196, 80);
+pub const AMBER: Color32 = Color32::from_rgb(255, 196, 80);
 /// the hud's accent: the game's yellow.
 pub const LIT: Color32 = menu::ACCENT;
 /// soft white for secondary text.
@@ -332,11 +430,11 @@ fn num_minor() -> egui::FontId {
 fn num_s() -> egui::FontId {
     menu::medium(13.5)
 }
-fn tag() -> egui::FontId {
+fn tag_font() -> egui::FontId {
     menu::medium(11.5)
 }
 fn tag_text(s: &str) -> RichText {
-    RichText::new(s.to_uppercase()).font(tag()).color(white(0.62)).extra_letter_spacing(1.1)
+    RichText::new(s.to_uppercase()).font(tag_font()).color(white(0.62)).extra_letter_spacing(1.1)
 }
 /// spaced capitals at a point.
 pub(crate) fn paint_tag(p: &egui::Painter, at: egui::Pos2, align: Align2, s: &str) {
@@ -344,7 +442,7 @@ pub(crate) fn paint_tag(p: &egui::Painter, at: egui::Pos2, align: Align2, s: &st
 }
 fn paint_tag_col(p: &egui::Painter, at: egui::Pos2, align: Align2, s: &str, col: Color32) {
     let mut job = egui::text::LayoutJob::default();
-    job.append(&s.to_uppercase(), 0.0, egui::TextFormat { font_id: tag(), color: col, extra_letter_spacing: 1.1, ..Default::default() });
+    job.append(&s.to_uppercase(), 0.0, egui::TextFormat { font_id: tag_font(), color: col, extra_letter_spacing: 1.1, ..Default::default() });
     let g = p.layout_job(job);
     let size = g.size() - vec2(1.1, 0.0);
     p.galley(align.anchor_size(at, size).min, g, col);
@@ -577,9 +675,7 @@ impl Game {
         // the tapes' centre line, a little above the middle.
         let cy = screen.center().y - 36.0;
         self.heading_strip(ctx, h.hdg as f32);
-        if !self.info_open {
-            self.conditions_card(ctx, h);
-        }
+        self.conditions_card(ctx, h);
         self.speed_tape(ctx, h, cy);
         self.altitude_tape(ctx, h, cy);
         self.path_marker(ctx);
@@ -862,12 +958,12 @@ impl Game {
     }
 
     /// the approach line, alerts and damage, bottom centre.
-    pub(crate) fn alerts(&self, ctx: &egui::Context, warn: &[(&str, Color32)], report: &[String], guidance: Option<&(String, u8)>, lift: f32) {
+    pub(crate) fn alerts(&self, ctx: &egui::Context, warn: &[(&str, Color32)], report: &[String], guidance: Option<&(String, u8)>) {
         let ap = self.ap.on || self.real - self.ap_off_t < 4.0;
         if warn.is_empty() && report.is_empty() && guidance.is_none() && !ap {
             return;
         }
-        egui::Area::new(egui::Id::unique("hud_alerts")).anchor(Align2::CENTER_BOTTOM, [0.0, -16.0 - lift]).interactable(false).show(ctx, |ui| {
+        egui::Area::new(egui::Id::unique("hud_alerts")).anchor(Align2::CENTER_BOTTOM, [0.0, -16.0]).interactable(false).show(ctx, |ui| {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
                 if let Some((text, col)) = guidance {

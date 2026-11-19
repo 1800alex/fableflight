@@ -604,7 +604,6 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("I", "magnetos on / off (jets: fuel controls)"),
         ("O", "starter (hold; jets: engage)"),
         ("Page Up / Down", "mixture richer / leaner"),
-        ("J", "navigation instruments (VOR, ILS, ADF)"),
         ("[ / ]", "OBS course left / right"),
         ("X", "altimeter to the QNH"),
         (".", "parking brake"),
