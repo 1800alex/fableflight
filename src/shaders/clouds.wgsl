@@ -90,7 +90,13 @@ fn alto_march(oc: vec3f, rd: vec3f, t0: f32, t1: f32, a: f32, jit: f32, cs: f32,
   var L = vec3f(0.0);
   let n = 6;
   let dt = (t1 - t0) / f32(n);
-  let far = smoothstep(30000.0, 110000.0, 0.5 * (t0 + t1));
+  // By the ground a pixel stretches along the ray takes up (distance over
+  // the grazing angle), not distance alone: seen from below the layer it is
+  // 30-110 km off at ~1/6-1/20, but looked down on from high up (a rocket)
+  // the cloudlets stay many pixels wide and went to a featureless sheet.
+  let tm = 0.5 * (t0 + t1);
+  let mu = abs(dot(rd, normalize(oc + rd * tm)));
+  let far = smoothstep(180000.0, 2200000.0, tm / max(mu, 0.01));
   let sun = G.sun_dir.xyz;
   for (var i = 0; i < n; i++) {
     let ts = t0 + dt * (f32(i) + jit);
@@ -491,7 +497,12 @@ fn depth_match(a: f32, b: f32) -> f32 {
   if (G.alto.x > 0.0) {
     ar = alto_range(oc, rd);
     ar.y = min(min(ar.y, ar.x + 60000.0), tscene);
-    if (ar.x >= 0.0 && ar.x < min(tscene, 250000.0) && ar.y > ar.x) { aamt = alto_amount(oc + rd * (0.5 * (ar.x + ar.y))); }
+    // Drawn out to 250 km from below; from above it (a rocket, high up) out
+    // past the layer's own horizon too, or it ended in a hard-edged disc
+    // round the camera with the bare ground beyond.
+    let ahr = rg + G.alto.y + ALTO_TOP;
+    let alto_far = 250000.0 + sqrt(max((rg + alt) * (rg + alt) - ahr * ahr, 0.0));
+    if (ar.x >= 0.0 && ar.x < min(tscene, alto_far) && ar.y > ar.x) { aamt = alto_amount(oc + rd * (0.5 * (ar.x + ar.y))); }
   }
   var alto_on = aamt > 0.0;
   let atm_ = 0.5 * (ar.x + ar.y);
