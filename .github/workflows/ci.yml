@@ -10,20 +10,70 @@ env:
 
 jobs:
   build-and-test:
-    name: Build and test (${{ matrix.os }})
+    name: Build, test and run (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Linux libraries (audio, gamepads)
+      - name: Linux libraries (audio, gamepads, a virtual screen and a software GPU)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config \
+            xvfb mesa-vulkan-drivers libvulkan1 libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Build
         run: cargo build --release --locked
+
       - name: Test
-        run: cargo test --release --locked
+        run: "cargo test --release --locked -- --skip aircraft::"
+
+      # Every built-in aircraft: a detailed outside at the Spec's scale, a
+      # cockpit with a panel and a view out, reachable clickable controls
+      # (src/aircraft/standards.rs and the hotspot tests in src/aircraft/mod.rs).
+      - name: Aircraft standards
+        if: success() || failure()
+        run: "cargo test --release --locked --bin fablegame aircraft:: -- --nocapture"
+
+      # lavapipe compiles shaders on the CPU, slowly; keep its cache between runs.
+      - name: Mesa shader cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mesa_shader_cache
+          key: mesa-shaders-${{ hashFiles('src/shaders/**') }}
+          restore-keys: mesa-shaders-
+
+      # Launch the game for real: the start menu and a flight scene, each a
+      # scripted screenshot that must come out as a proper picture.
+      # Linux runners have no GPU and lavapipe compiles the flight scene's
+      # shaders far too slowly (minutes per frame), so Linux checks the menu;
+      # Windows and macOS fly the scene too.
+      - name: Run the game (Linux, lavapipe on a virtual screen; menu only)
+        if: runner.os == 'Linux'
+        env:
+          SMOKE_RUNS: menu
+        run: xvfb-run -a -s "-screen 0 1280x720x24" python .github/scripts/smoke.py target/release/fablegame smoke-shots
+      - name: Run the game (Windows, WARP)
+        if: runner.os == 'Windows'
+        run: python .github/scripts/smoke.py target/release/fablegame.exe smoke-shots
+      - name: Run the game (macOS, Metal)
+        if: runner.os == 'macOS'
+        run: python .github/scripts/smoke.py target/release/fablegame smoke-shots
+
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.os }}
+          path: smoke-shots/
+          if-no-files-found: ignore
