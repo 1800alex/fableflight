@@ -34,6 +34,8 @@ pub struct Settings {
     pub live_weather: bool,
     /// the clock follows the real time and date
     pub real_time: bool,
+    /// snow lying on the ground (snow.rs)
+    pub snow: crate::snow::Mode,
     /// multiplayer (mp.rs): on, the relay ("host" or "host:port"), our name
     pub multiplayer: bool,
     pub mp_server: String,
@@ -74,7 +76,7 @@ impl LastStart {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, hud_cockpit: false, minimap: true, landing_guidance: true, arcade: false, minimap_plan: false, minimap_heading_up: false, minimap_zoom: 12, minimap_size: 280.0, minimap_height: 280.0, taa: true, live_traffic: true, live_weather: true, real_time: true, last: None, multiplayer: false, mp_server: "auto".into(), mp_name: String::new() }
+        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, hud_cockpit: false, minimap: true, landing_guidance: true, arcade: false, minimap_plan: false, minimap_heading_up: false, minimap_zoom: 12, minimap_size: 280.0, minimap_height: 280.0, taa: true, live_traffic: true, live_weather: true, real_time: true, snow: crate::snow::Mode::Auto, last: None, multiplayer: false, mp_server: "auto".into(), mp_name: String::new() }
     }
 }
 
@@ -116,6 +118,7 @@ impl Settings {
             live_traffic: b("live_traffic", d.live_traffic),
             live_weather: b("live_weather", d.live_weather),
             real_time: b("real_time", d.real_time),
+            snow: j["terrain_snow"].as_str().and_then(crate::snow::Mode::parse).unwrap_or(d.snow),
             multiplayer: b("multiplayer", d.multiplayer),
             mp_server: j["mp_server"].as_str().map(|s| s.trim().chars().take(100).collect()).unwrap_or(d.mp_server),
             mp_name: j["mp_name"].as_str().map(crate::mp_proto::clean_name).unwrap_or(d.mp_name),
@@ -145,6 +148,7 @@ impl Settings {
             "live_traffic": self.live_traffic,
             "live_weather": self.live_weather,
             "real_time": self.real_time,
+            "terrain_snow": self.snow.code(),
             "multiplayer": self.multiplayer,
             "mp_server": self.mp_server,
             "mp_name": self.mp_name,
@@ -172,7 +176,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let s = Settings { lang: Some(Lang::Fr), sound_on: false, volume: 0.4, cam_mode: 1, cockpit_fov: 50.0, look_sens: 1.5, show_hud: false, hud_cockpit: true, minimap: false, landing_guidance: false, arcade: true, minimap_plan: true, minimap_heading_up: true, minimap_zoom: 15, minimap_size: 420.0, minimap_height: 300.0, taa: false, live_traffic: false, live_weather: false, real_time: false, last: Some(LastStart { lat: 37.6, lon: -122.4, name: "KSFO".into(), airport: Some("KSFO".into()), start: "approach".into(), runway: Some("28L".into()), aircraft: "c172".into() }), multiplayer: true, mp_server: "example.org:7000".into(), mp_name: "Dany".into() };
+        let s = Settings { lang: Some(Lang::Fr), sound_on: false, volume: 0.4, cam_mode: 1, cockpit_fov: 50.0, look_sens: 1.5, show_hud: false, hud_cockpit: true, minimap: false, landing_guidance: false, arcade: true, minimap_plan: true, minimap_heading_up: true, minimap_zoom: 15, minimap_size: 420.0, minimap_height: 300.0, taa: false, live_traffic: false, live_weather: false, real_time: false, snow: crate::snow::Mode::Always, last: Some(LastStart { lat: 37.6, lon: -122.4, name: "KSFO".into(), airport: Some("KSFO".into()), start: "approach".into(), runway: Some("28L".into()), aircraft: "c172".into() }), multiplayer: true, mp_server: "example.org:7000".into(), mp_name: "Dany".into() };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         assert_eq!(Settings::from_json(&serde_json::json!({"last_start": {"lat": 300.0, "lon": 0.0}})).last, None);
         let legacy = Settings::from_json(&serde_json::json!({"minimap_size": 420}));
@@ -181,6 +185,8 @@ mod tests {
         let j = serde_json::json!({ "volume": 7.0, "language": "xx" });
         let t = Settings::from_json(&j);
         assert_eq!((t.volume, t.lang, t.taa), (1.0, None, true));
+        assert_eq!(t.snow, crate::snow::Mode::Auto);
+        assert_eq!(Settings::from_json(&serde_json::json!({"terrain_snow": "OFF"})).snow, crate::snow::Mode::Off);
         assert_eq!((t.minimap, t.minimap_heading_up, t.minimap_zoom), (true, false, 12));
         assert_eq!(Settings::from_json(&serde_json::json!({"minimap_size": 9999})).minimap_size, 640.0);
         assert_eq!(Settings::from_json(&serde_json::json!({"minimap_size": -5})).minimap_size, 240.0);

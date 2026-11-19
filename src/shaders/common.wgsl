@@ -109,6 +109,22 @@ struct Globals {
   // 32 park brake), toe brakes 0..1, angle of attack / stall angle; battery
   // volts and amps, cabin altitude ft, airspeed trend (kt in 6 s).
   cockpit: array<vec4f, 12>,
+  // Snow lying on the ground (snow.rs `globals`): snow line under the camera
+  // (m), its change northwards (m per m), +1 / -1 for the north / south pole,
+  // 1 when there is any snow.
+  snow: vec4f,
+  // Today's real snow cover (snowmap.rs, t_snow): the map's centre relative to
+  // the camera + half its side; its east axis + how much it counts (0 = not
+  // at all); its north axis.
+  snow_c: vec4f,
+  snow_e: vec4f,
+  snow_n: vec4f,
+  // Dynamic snow tracks (snowtrack.rs, t_snowtrack): SW corner of the active
+  // window relative to the camera + side length in m (0 = none); its east axis
+  // + toroidal u offset (m); its north axis + toroidal v offset (m).
+  snow_tr_c: vec4f,
+  snow_tr_e: vec4f,
+  snow_tr_n: vec4f,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -145,6 +161,13 @@ struct Globals {
 // The start screen globe's cloud map (globeclouds.rs): cloud cover from an
 // infrared composite, equirectangular, 180°W at u = 0, 90°N at v = 0.
 @group(0) @binding(20) var t_gclouds: texture_2d<f32>;
+// Today's real snow cover around the camera (snowmap.rs): R share of the
+// cell under snow, G how much of it the analysis knows (land, northern
+// hemisphere).
+@group(0) @binding(21) var t_snow: texture_2d<f32>;
+// Dynamic snow tracks and crash trails around the aircraft (snowtrack.rs):
+// R cleared/compressed snow trough, G displaced snow berm along the rims.
+@group(0) @binding(22) var t_snowtrack: texture_2d<f32>;
 
 // GPU particles (explosions, smoke, dust, spray) and their simulation constants.
 struct Particle {
@@ -1938,6 +1961,130 @@ fn spot_light(P: vec3f, N: vec3f) -> vec3f {
   }
   return vec3f(1.0, 0.92, 0.80) * c;
 }
+// ------------------------------------------------------------- lying snow
+// Snow on the ground, trees and roofs (snow.rs; keep the constants and
+// `snow_cover` the same as there). G.snow: snow line under the camera (m),
+// its change northwards (m per m), +1 / -1 for the north / south pole, 1 when
+// there is any snow.
+const SNOW_BAND = 400.0;       // bare to fully white over this height (m)
+const SNOW_ASPECT = 500.0;     // the line drops this much on a slope facing the pole (per unit of its normal's poleward part)
+const SNOW_HOLD_COS = 0.866;   // holds fully up to 30 degrees
+const SNOW_SLIDE_COS = 0.5;    // none left from 60 degrees
+const SNOW_ALBEDO = vec3f(0.80, 0.82, 0.86);
+fn snow_on() -> bool { return G.snow.w > 0.0; }
+// An integer hash of a lattice point, 0..1 (sin-based hashes lose their
+// precision this far from the origin).
+fn snow_hash(i: vec2f) -> f32 {
+  let q = bitcast<vec2u>(vec2i(i));
+  var h = (q.x * 0x27d4eb2du) ^ ((q.y + 0x9e3779b9u) * 0x85ebca6bu);
+  h ^= h >> 15u;
+  h *= 0x2c1b3c6du;
+  h ^= h >> 12u;
+  return f32(h >> 8u) / 16777216.0;
+}
+// Smooth value noise 0..1 with no tiling (the snow's drifts and bare patches).
+fn snow_vnoise(p: vec2f) -> f32 {
+  let i = floor(p);
+  let f = p - i;
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = snow_hash(i);
+  let b = snow_hash(i + vec2f(1.0, 0.0));
+  let c = snow_hash(i + vec2f(0.0, 1.0));
+  let d = snow_hash(i + vec2f(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// The same, faded to its mean once a cell is under a few pixels.
+fn snow_noise(wc: vec2f, scale: f32, fw: f32) -> f32 {
+  return mix(snow_vnoise(wc / scale), 0.5, smoothstep(0.15, 0.5, fw / scale));
+}
+fn snow_cover(alt: f32, cos_slope: f32, poleward: f32, line: f32) -> f32 {
+  let z = alt - line + SNOW_ASPECT * poleward;
+  return smoothstep(-0.5 * SNOW_BAND, 0.5 * SNOW_BAND, z) * smoothstep(SNOW_SLIDE_COS, SNOW_HOLD_COS, cos_slope);
+}
+// How much snow lies at P (camera-relative) on ground whose normal is N;
+// `lift` (m) moves the point up or down through the band (noise).
+fn snow_at(P: vec3f, N: vec3f, upn: vec3f, lift: f32) -> f32 {
+  if (!snow_on()) { return 0.0; }
+  let alt = length(P - G.planet.xyz) - G.planet.w;
+  return snow_cover(alt + lift, dot(N, upn), dot(N, G.north.xyz) * G.snow.z, snow_line_at(P));
+}
+// The snow line at P (camera-relative). Where today's analysis is known, it
+// decides at its 4 km scale: under snow the line comes down SNOW_DOWN below
+// the worked-out one (a cell is snowy when most of it is, so its lowest
+// ground may still be bare; the slope and the patches still shape it); where
+// there is none it rises SNOW_BARE above it, so only the peaks well above it
+// stay white. Its cells blend into each other, and into the worked-out line at the
+// map's edges and where it knows nothing (open water, the south).
+const SNOW_DOWN = 1500.0;
+const SNOW_BARE = 800.0;
+fn snow_line_at(P: vec3f) -> f32 {
+  let line = G.snow.x + dot(P, G.north.xyz) * G.snow.y;
+  if (G.snow_e.w <= 0.0 || G.snow_c.w <= 0.0) { return line; }
+  let q = P - G.snow_c.xyz;
+  let uv = vec2f(dot(q, G.snow_e.xyz), -dot(q, G.snow_n.xyz)) / (2.0 * G.snow_c.w) + 0.5;
+  let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  if (edge <= 0.0) { return line; }
+  let m = textureSampleLevel(t_snow, s_clamp, uv, 0.0);
+  // (R is the share of the known part: undo the blend with unknown texels.)
+  let share = m.r / max(m.g, 1e-3) * step(1e-3, m.g);
+  let w = G.snow_e.w * smoothstep(0.0, 1.0, m.g) * smoothstep(0.0, 0.05, edge);
+  return mix(line, mix(line + SNOW_BARE, line - SNOW_DOWN, clamp(share, 0.0, 1.0)), w);
+}
+// Snow resting on top of something above the ground (a crown, a roof): as
+// much as lies on flat ground there, where the surface faces up between
+// `lo` and `hi` (cosines with the vertical).
+fn snow_top(P: vec3f, N: vec3f, lo: f32, hi: f32) -> f32 {
+  if (!snow_on()) { return 0.0; }
+  let upn = normalize(P - G.planet.xyz);
+  return snow_at(P, upn, upn, 0.0) * smoothstep(lo, hi, dot(N, upn));
+}
+// Dynamic snow tracks and crash trails (snowtrack.rs; keep constants the same).
+// Returns (clear, berm, dh/dx, dh/dy) in the track map's East/North frame.
+const SNOW_TR_N = 2048.0;
+const SNOW_TR_CELL = 0.25;
+fn snow_track_at(P: vec3f, dist: f32, fw: f32) -> vec4f {
+  let size = G.snow_tr_c.w;
+  if (size <= 0.0 || dist > 1400.0) { return vec4f(0.0); }
+  let q = P - G.snow_tr_c.xyz;
+  let lx = dot(q, G.snow_tr_e.xyz);
+  let ly = dot(q, G.snow_tr_n.xyz);
+  let margin = min(min(lx, size - lx), min(ly, size - ly));
+  if (margin <= 0.0) { return vec4f(0.0); }
+  let edge = smoothstep(0.0, 16.0, margin) * (1.0 - smoothstep(1000.0, 1400.0, dist));
+  let uv = (vec2f(lx, ly) + vec2f(G.snow_tr_e.w, G.snow_tr_n.w)) / size;
+  var c = textureSampleLevel(t_snowtrack, s_repeat, uv, 0.0).rg;
+  if (fw > 0.45) {
+    let d = min(fw * 0.22, 0.75) / size;
+    let avg = 0.25 * (
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(d, d), 0.0).rg +
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(-d, d), 0.0).rg +
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(d, -d), 0.0).rg +
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(-d, -d), 0.0).rg
+    );
+    // Keep narrow tracks legible from altitude instead of diluting them away.
+    c = mix(c, max(c * 0.65, min(avg * 1.25, vec2f(1.0))), smoothstep(0.45, 1.8, fw));
+  }
+  c *= edge;
+  if (c.x < 0.002 && c.y < 0.002) { return vec4f(0.0); }
+  var gx = 0.0;
+  var gy = 0.0;
+  if (dist < 480.0) {
+    let step = 1.0 / SNOW_TR_N;
+    let xp = textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(step, 0.0), 0.0).rg;
+    let xm = textureSampleLevel(t_snowtrack, s_repeat, uv - vec2f(step, 0.0), 0.0).rg;
+    let yp = textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(0.0, step), 0.0).rg;
+    let ym = textureSampleLevel(t_snowtrack, s_repeat, uv - vec2f(0.0, step), 0.0).rg;
+    let hp = xp.y * 0.45 - xp.x * 0.70;
+    let hm = xm.y * 0.45 - xm.x * 0.70;
+    let vp = yp.y * 0.45 - yp.x * 0.70;
+    let vm = ym.y * 0.45 - ym.x * 0.70;
+    let inv = 0.5 / SNOW_TR_CELL * edge;
+    gx = (hp - hm) * inv;
+    gy = (vp - vm) * inv;
+  }
+  return vec4f(c.x, c.y, gx, gy);
+}
+
 fn shade(P: vec3f, N: vec3f, albedo: vec3f) -> vec3f {
   let l = light_at(P);
   let ndl = max(dot(N, G.sun_dir.xyz), 0.0);

@@ -65,6 +65,9 @@ mod trees;
 mod ocean;
 mod shore;
 mod skyglow;
+mod snow;
+mod snowmap;
+mod snowtrack;
 mod world;
 mod yasim;
 
@@ -292,6 +295,8 @@ struct Args {
     minimap_plan: Option<bool>,
     minimap_heading_up: Option<bool>,
     offline: bool,
+    /// --snow auto|off|always: snow on the ground for this run (snow.rs)
+    snow: Option<snow::Mode>,
     shots: Vec<(f64, PathBuf, Option<(f64, f64, f64)>)>,
     /// record frames + audio to a directory: (dir, start, seconds), fixed 30 fps steps
     record: Option<(PathBuf, f64, f64)>,
@@ -415,6 +420,7 @@ fn parse_args() -> Args {
         minimap_plan: None,
         minimap_heading_up: None,
         offline: false,
+        snow: None,
         shots: Vec::new(),
         record: None,
         crash_at: None,
@@ -782,6 +788,7 @@ fn parse_args() -> Args {
                 a.mp_mirror = true;
                 used = 1;
             }
+            "--snow" => a.snow = v.get(i + 1).and_then(|s| snow::Mode::parse(s)),
             "--offline" => {
                 a.offline = true;
                 used = 1;
@@ -804,7 +811,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -1032,6 +1039,8 @@ struct Game {
     /// sound on (U), and its volume (0..1)
     sound_on: bool,
     volume: f32,
+    /// snow lying on the ground (snow.rs, the Graphics settings)
+    snow: snow::Mode,
     /// the flight panel (Tab), beside the running game, and the page it shows
     info_open: bool,
     /// the flight menu, a ring of icons on tab.
@@ -1113,6 +1122,10 @@ struct Game {
     /// how much city is around (0..1), for the orange skyglow at night
     city_glow: f32,
     skyglow: skyglow::SkyGlow,
+    /// today's real snow cover around the camera (snowmap.rs)
+    snowmap: snowmap::SnowMap,
+    /// dynamic snow tracks and crash trails carved into lying snow (snowtrack.rs)
+    snowtrack: snowtrack::SnowTrack,
     /// an airport start being prepared: (airport, the airfield if it could be put together, runway, on approach, keep the local time)
     airport_rx: Option<std::sync::mpsc::Receiver<(u32, Option<Arc<airports::Geo>>, Option<String>, bool, bool)>>,
     /// an airport start asked for on the command line
@@ -1360,11 +1373,11 @@ impl Game {
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
-            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, radial: Default::default(), info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, radial_at: args.flight_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
+            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, snow: args.snow.unwrap_or(prefs.snow), info_open: false, radial: Default::default(), info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, radial_at: args.flight_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -1720,6 +1733,20 @@ impl Game {
         let decl = (-23.44f64).to_radians() * (std::f64::consts::TAU * (self.doy + 10.0) / 365.25).cos();
         let lon = (-15.0 * (self.utc - 12.0)).to_radians();
         DVec3::new(decl.cos() * lon.cos(), decl.cos() * lon.sin(), decl.sin())
+    }
+
+    /// Whether snow lies on flat ground at `p` (for snow spray vs dirt dust).
+    fn snowy_at(&self, p: DVec3) -> bool {
+        match self.snow {
+            snow::Mode::Off => false,
+            snow::Mode::Always => true,
+            snow::Mode::Auto => {
+                let (la, _, alt) = geo::pos_to_lla(p);
+                let Some(base) = snow::snow_line(self.snow, la.to_degrees(), self.doy, self.wx.freezing) else { return false };
+                let line = self.snowmap.snow_line_at(p, base, self.doy);
+                snow::cover(alt, 1.0, 0.0, line) > 0.35
+            }
+        }
     }
 
     /// Direction to the moon: the sun's ecliptic longitude advanced by the
@@ -4717,7 +4744,7 @@ impl Game {
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone(), multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, snow: self.snow, last: self.last_start.clone(), multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
@@ -4972,10 +4999,20 @@ impl Game {
                         }
                     }
                 }
+                if !self.plane.snow_marks.is_empty() {
+                    if self.snow != snow::Mode::Off {
+                        for m in self.plane.snow_marks.drain(..) {
+                            self.snowtrack.stamp(m);
+                        }
+                    } else {
+                        self.plane.snow_marks.clear();
+                    }
+                }
                 if !self.plane.dirt.is_empty() {
                     self.anchor_fx(self.plane.pos);
                     let up = self.plane.pos.normalize().as_vec3();
                     let field = self.world.airfield_near(self.plane.pos, 3_000.0);
+                    let snowy = self.snowy_at(self.plane.pos);
                     for (p, v, amt) in self.plane.dirt.drain(..) {
                         // Paved runways throw up nothing; dirt, grass and fields do.
                         if field.is_some_and(|f| f.geo.on_runway(f.geo.local(p), 2.0).is_some_and(|ri| f.geo.runways[ri].paved)) {
@@ -4989,7 +5026,8 @@ impl Game {
                             k -= 1.0;
                             let big = amt > 1.5;
                             let vel = v.as_vec3() * r.range(0.6, 1.2) + r.dir() * (1.0 + speed * 0.15) + up * r.range(0.5, 2.5);
-                            femit.push((p, render::Particle { vel: vel.into(), life: r.range(1.5, 4.0) * if big { 1.5 } else { 1.0 }, size0: r.range(0.3, 0.7), size1: r.range(2.0, 4.0) * if big { 1.6 } else { 1.0 }, kind: crash::DUST, drag: 1.4, buoy: 0.15, seed: r.f(), alpha: r.range(0.45, 0.75), ..Default::default() }));
+                            let kind = if snowy && (!big || r.f() < 0.7) { crash::MIST } else { crash::DUST };
+                            femit.push((p, render::Particle { vel: vel.into(), life: r.range(1.5, 4.0) * if big { 1.5 } else { 1.0 }, size0: r.range(0.3, 0.7), size1: r.range(2.0, 4.0) * if big { 1.6 } else { 1.0 }, kind, drag: 1.4, buoy: 0.15, seed: r.f(), alpha: r.range(0.45, 0.75), ..Default::default() }));
                         }
                     }
                 }
@@ -5052,6 +5090,20 @@ impl Game {
                         let steep = (-imp.vel.dot(site.normalize()) / imp.vel.length().max(1.0)).clamp(0.0, 1.0) as f32;
                         let r = (3.0 + 5.0 * power) * (1.0 + (size.sqrt() - 1.0) * steep);
                         self.world.add_crater(site, r);
+                        if self.snow != snow::Mode::Off {
+                            let upw = site.normalize();
+                            let tang = imp.vel - upw * imp.vel.dot(upw);
+                            let along = tang.normalize_or_zero();
+                            let skid_len = (r as f64 * (1.8 - 1.1 * steep as f64)).max(0.0);
+                            self.snowtrack.stamp(snowtrack::Mark {
+                                a: site - along * (r as f64 * 0.5),
+                                b: site + along * skid_len,
+                                radius: r * 1.35,
+                                clear: 1.0,
+                                berm: 1.0,
+                                rough: 1.0,
+                            });
+                        }
                         self.destr.eject(site, r, imp.vel, &mut femit);
                         gone = r as f64;
                         for (t, i) in self.world.buildings_near(site, r as f64 + 4.0 * reach as f64, if heavy { 900.0 } else { 400.0 }) {
@@ -5088,6 +5140,15 @@ impl Game {
                 self.destr.booms.push(0.5);
             }
             self.sheds.update(dt as f32, &self.world);
+            if !self.sheds.snow_marks.is_empty() {
+                if self.snow != snow::Mode::Off {
+                    for m in self.sheds.snow_marks.drain(..) {
+                        self.snowtrack.stamp(m);
+                    }
+                } else {
+                    self.sheds.snow_marks.clear();
+                }
+            }
         }
         let booms: Vec<f32> = self.destr.booms.drain(..).collect();
         if !booms.is_empty() {
@@ -5115,6 +5176,7 @@ impl Game {
             }
         }
         let mut fire = 0.0f32;
+        let crash_snowy = self.crash.as_ref().is_some_and(|cr| !cr.water && self.snowy_at(cr.site));
         if let Some(cr) = self.crash.as_mut() {
             if dt > 0.0 {
                 // Smoke leaving the top of the fire simulation carries on as particles.
@@ -5129,7 +5191,16 @@ impl Game {
                     }
                     _ => None,
                 };
-                cr.update(dt, &self.world, &mut emit);
+                cr.update(dt, &self.world, crash_snowy, &mut emit);
+            }
+            if !cr.snow_marks.is_empty() {
+                if self.snow != snow::Mode::Off {
+                    for m in cr.snow_marks.drain(..) {
+                        self.snowtrack.stamp(m);
+                    }
+                } else {
+                    cr.snow_marks.clear();
+                }
             }
         }
         // What the wreckage ploughed through on its way comes down.
@@ -5474,6 +5545,11 @@ impl Game {
         self.city_glow += (city - self.city_glow) * (dt_real as f32 * 0.5).min(1.0);
         // City light in the air: the lights come on as the sun sets.
         let glow_px = if in_menu { None } else { self.skyglow.update(cam) };
+        // Today's real snow cover, when the snow follows the real world.
+        let snow_px = self.snowmap.update(&self.src, cam, !in_menu && self.snow == snow::Mode::Auto);
+        let snow_map = if in_menu || self.snow != snow::Mode::Auto { [[0.0; 4]; 3] } else { self.snowmap.globals(cam, self.doy) };
+        let snow_tr_uploads = if in_menu || self.snow == snow::Mode::Off { Vec::new() } else { self.snowtrack.take_uploads() };
+        let snow_tr = if in_menu || self.snow == snow::Mode::Off { [[0.0; 4]; 3] } else { self.snowtrack.globals(cam) };
         let glow = {
             let (la, lo, _) = geo::pos_to_lla(cam);
             let gh = self.world.ground(la, lo).map(|g| g.h).unwrap_or(0.0);
@@ -5594,6 +5670,13 @@ impl Game {
             spot: [[0.0; 4]; 3],
             nav: self.nav_globals(),
             cockpit: self.cockpit_globals(agl),
+            snow: if in_menu { [0.0; 4] } else { snow::globals(self.snow, clat.to_degrees(), self.doy, self.wx.freezing) },
+            snow_c: snow_map[0],
+            snow_e: snow_map[1],
+            snow_n: snow_map[2],
+            snow_tr_c: snow_tr[0],
+            snow_tr_e: snow_tr[1],
+            snow_tr_n: snow_tr[2],
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -5938,7 +6021,7 @@ impl Game {
             self.lightning.segments(cam, dt, &mut bolts);
         }
         let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
-        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px });
+        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px, snow: snow_px, snow_tracks: snow_tr_uploads });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
@@ -6470,6 +6553,9 @@ impl Game {
         let mut live = if self.live.enabled() && !self.live.planes.is_empty() { format!("  ·  {}", t!("Traffic: adsb.lol (ODbL)", "Trafic : adsb.lol (ODbL)")) } else { String::new() };
         if self.wx.live && (!self.wx.live_cells.is_empty() || self.wx.deck_goal.is_some()) {
             live += t!("  ·  Weather radar: RainViewer", "  ·  Radar météo : RainViewer");
+        }
+        if self.mode != Mode::Menu && self.snow == snow::Mode::Auto && self.snowmap.shown().is_some() {
+            live += t!("  ·  Snow cover: IMS, U.S. National Ice Center (NSIDC)", "  ·  Enneigement : IMS, U.S. National Ice Center (NSIDC)");
         }
         if self.mode == Mode::Menu && self.gclouds.shown {
             live += t!("  ·  Clouds: Live Cloud Maps (Matt Eason), contains modified EUMETSAT data", "  ·  Nuages : Live Cloud Maps (Matt Eason), contient des données EUMETSAT modifiées");
