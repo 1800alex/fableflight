@@ -16,7 +16,7 @@ pub struct Settings {
     pub cockpit_fov: f32,
     pub look_sens: f64,
     pub show_hud: bool,
-    /// the HUD in the cockpit view too (off: hidden there, the cockpit's own instruments in view)
+    /// the hud in the cockpit view too.
     pub hud_cockpit: bool,
     pub taa: bool,
     pub minimap: bool,
@@ -40,25 +40,24 @@ pub struct Settings {
     pub multiplayer: bool,
     pub mp_server: String,
     pub mp_name: String,
-    /// where and how the last flight started (the globe opens on it, and
-    /// the main menu offers to fly it again)
+    /// where the last flight started.
     pub last: Option<LastStart>,
 }
 
-/// The start of the last flight.
+/// the start of the last flight.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LastStart {
     pub lat: f64,
     pub lon: f64,
-    /// what the start point was called on the globe
+    /// the start point's name.
     pub name: String,
-    /// the airport's ident, when it was one
+    /// the airport's ident, if any.
     pub airport: Option<String>,
-    /// "runway", "approach" or "overhead"
+    /// "runway", "approach" or "overhead".
     pub start: String,
-    /// the runway end asked for (None: the one into the wind)
+    /// the runway end, none for into the wind.
     pub runway: Option<String>,
-    /// the aircraft's key (`aircraft::Spec::keys[0]`)
+    /// the aircraft's key.
     pub aircraft: String,
 }
 
