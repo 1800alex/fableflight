@@ -83,9 +83,6 @@ jobs:
           New-ItemProperty -Force $key -Name DumpCount -PropertyType DWord -Value 4 | Out-Null
       - name: Run the game (Windows, WARP)
         if: runner.os == 'Windows'
-        env:
-          # wgpu's own steps too, so the log shows what it was building when it died.
-          RUST_LOG: warn,fablegame=debug,wgpu_core=trace,wgpu_hal=debug,naga=info
         run: python .github/scripts/smoke.py target/release/fablegame.exe smoke-shots
       # Print the crashing thread's stack (and every thread's) from the dump,
       # with our PDB and Microsoft's public symbols for the driver and DXC.
@@ -111,8 +108,10 @@ jobs:
           $exe = "$env:GITHUB_WORKSPACE\target\release\fablegame.exe"
           $gameArgs = '--offline --mute --no-mcp --headless --graphics low --width 640 --height 360 --lang en --no-menu --aircraft c172 --lat 37.6 --lon -122.37 --alt 600 --time 12 --clouds 0.3 --shot smoke-shots\debug-scene.png@6'
           $on = "sxd -c2 `"$stack`""
-          $cmd = ".symopt+0x40; sxd av; sxd dz; sxd sov; sxd c000001d; $on av; $on dz; $on sov; $on c000001d; $on c0000409; g"
+          # (heap corruption, 0xC0000374, is reported through a breakpoint: bpe)
+          $cmd = ".symopt+0x40; $on av; $on dz; $on sov; $on c000001d; $on c0000409; $on c0000374; sxe -c `"$stack`" bpe; g"
           $env:RUST_LOG = 'warn,fablegame=info'
+          $env:FABLE_NO_PAD = '1'
           & $cdb.FullName -G -y $sym -lines -c $cmd $exe $gameArgs.Split(' ') 2>&1 | Tee-Object smoke-shots\debug-scene.txt | Select-Object -Last 400
 
       - name: Run the game (macOS, Metal)
