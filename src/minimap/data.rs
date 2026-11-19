@@ -14,7 +14,9 @@ pub struct Place {
 impl Place {
     /// Resolve at draw time so changing the game language also updates cached tiles.
     pub fn label(&self, lang: crate::i18n::Lang) -> &str {
-        let translated = match lang { crate::i18n::Lang::Fr => &self.fr, crate::i18n::Lang::En => &self.en };
+        // Minimap place labels come from the vector tiles, which carry English
+        // and French names only; Korean falls back to the English label.
+        let translated = match lang { crate::i18n::Lang::Fr => &self.fr, _ => &self.en };
         if translated.is_empty() { &self.name } else { translated }
     }
 

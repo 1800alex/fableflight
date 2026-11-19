@@ -7806,6 +7806,21 @@ fn load_fonts(ctx: &egui::Context) {
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
     ];
+    // A Korean (Hangul) face, for the Korean interface. The bundled Barlow and
+    // the Latin system fonts carry no Hangul, so without this Korean text would
+    // render as empty boxes. Only .ttf/.otf are read (see the filter in `find`),
+    // so the Windows Malgun Gothic and any Noto Sans KR .otf are picked up; the
+    // .ttc entries are there for fontconfig's answer on Linux.
+    let korean: &[&str] = &[
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto/NotoSansKR-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansKR-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/Library/Fonts/AppleGothic.ttf",
+        "C:/Windows/Fonts/malgun.ttf",
+    ];
     // our bundled faces first, then the system's for missing glyphs.
     let own: [(&str, &'static [u8]); 5] = [("barlow", menu::FONT_REGULAR), ("barlow-medium", menu::FONT_MEDIUM), ("barlow-semibold", menu::FONT_SEMIBOLD), ("barlow-condensed", menu::FONT_DISPLAY), ("plex-mono", menu::FONT_MONO)];
     for (name, data) in own {
@@ -7821,13 +7836,15 @@ fn load_fonts(ctx: &egui::Context) {
     for (family, name) in &families {
         fonts.families.entry(family.clone()).or_default().push((*name).into());
     }
-    for (name, kind, fb) in [("mono", "monospace", mono), ("sans", "sans", sans)] {
+    for (name, kind, fb) in [("mono", "monospace", mono), ("sans", "sans", sans), ("korean", "sans:lang=ko", korean)] {
         if let Some(data) = find(kind, fb) {
             fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(data)));
         }
     }
     for (family, _) in families {
-        let fallback = if family == egui::FontFamily::Monospace { ["mono", "sans"] } else { ["sans", "mono"] };
+        // Korean is the last fallback everywhere so Latin keeps the bundled face
+        // and only the Hangul glyphs come from the Korean font.
+        let fallback = if family == egui::FontFamily::Monospace { ["mono", "sans", "korean"] } else { ["sans", "mono", "korean"] };
         for f in fallback {
             if fonts.font_data.contains_key(f) {
                 fonts.families.entry(family.clone()).or_default().push(f.into());
