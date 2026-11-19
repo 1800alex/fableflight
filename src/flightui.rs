@@ -167,7 +167,7 @@ impl Game {
         }
         if !notes.is_empty() {
             // under the heading strip.
-            let y = HEADING_H + 34.0;
+            let y = HEADING_TOP + HEADING_H + 34.0;
             egui::Area::new(egui::Id::unique("notices")).anchor(Align2::CENTER_TOP, [0.0, y]).interactable(false).show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.vertical_centered(|ui| {
@@ -175,7 +175,7 @@ impl Game {
                         // a scope so each notice takes its own room.
                         ui.scope(|ui| {
                             ui.multiply_opacity(*a);
-                            frosted(ui, glass().inner_margin(egui::Margin::symmetric(18, 10)), |ui| {
+                            panel(ui, glass().inner_margin(egui::Margin::symmetric(18, 10)), |ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                                 for (text, font, col) in lines {
@@ -198,7 +198,7 @@ impl Game {
         if !self.ap.on && !flash {
             return;
         }
-        frosted(ui, glass().inner_margin(egui::Margin::symmetric(16, 8)), |ui| {
+        panel(ui, glass().inner_margin(egui::Margin::symmetric(16, 8)), |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
@@ -235,7 +235,7 @@ impl Game {
             ui.end_row();
         };
         let r = egui::Area::new(egui::Id::unique("systems")).anchor(Align2::LEFT_TOP, [14.0, 12.0]).interactable(false).show(ctx, |ui| {
-            frosted(ui, glass(), |ui| {
+            panel(ui, glass(), |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 if let Some((name, _, _)) = p.engines() {
                     ui.label(tag_text(&format!("{}  {}", p.stage_name().unwrap_or(""), name)));
@@ -289,17 +289,18 @@ impl Game {
     }
 }
 
-// the hud sits at the edges, in frosted glass, and leaves the middle to the world.
+// the hud sits at the edges in the menus' dark panels and leaves the middle to the world.
 
-/// the heading strip's height.
+/// the heading strip's height, and its gap from the top edge (layout below it uses both).
 pub const HEADING_H: f32 = 46.0;
+pub const HEADING_TOP: f32 = 10.0;
 /// the tapes' sizes.
 const TAPE_H: f32 = 352.0;
 const SPEED_W: f32 = 124.0;
 const ALT_W: f32 = 118.0;
-/// corner radii.
-pub(crate) const R_HUD: u8 = 14;
-pub(crate) const R_IN: u8 = 7;
+/// corner radii: square, like the menus.
+pub(crate) const R_HUD: u8 = 0;
+pub(crate) const R_IN: u8 = 0;
 /// inset inside a panel.
 const PAD: f32 = 12.0;
 /// room the flight panel leaves for the altitude tape.
@@ -362,14 +363,9 @@ pub struct HudIn {
     pub local: f64,
 }
 
-// frosted glass.
+// the panels.
 
-/// the blurred frame's texture for this frame.
-pub fn set_frost(ctx: &egui::Context, id: Option<egui::TextureId>) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("flightui frost"), id));
-}
-
-/// a rounded rectangle's outline.
+/// a rectangle's outline with corner radii `cr` (the minimap clips to it).
 pub(crate) fn rounded(r: Rect, cr: egui::CornerRadius) -> Vec<egui::Pos2> {
     let mut pts = Vec::new();
     let corners = [
@@ -391,49 +387,35 @@ pub(crate) fn rounded(r: Rect, cr: egui::CornerRadius) -> Vec<egui::Pos2> {
     pts
 }
 
-/// the world behind blurred, a light veil and a bright edge.
-fn frost_shapes(ctx: &egui::Context, r: Rect, cr: egui::CornerRadius) -> Vec<egui::Shape> {
-    let mut out = Vec::new();
-    let screen = ctx.content_rect();
-    let pts = rounded(r, cr);
-    if let Some(id) = ctx.data(|d| d.get_temp::<Option<egui::TextureId>>(egui::Id::unique("flightui frost"))).flatten() {
-        let mut mesh = egui::Mesh::with_texture(id);
-        let uv = |p: egui::Pos2| pos2((p.x - screen.left()) / screen.width(), (p.y - screen.top()) / screen.height());
-        let c = r.center();
-        mesh.vertices.push(egui::epaint::Vertex { pos: c, uv: uv(c), color: Color32::WHITE });
-        for p in &pts {
-            mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv: uv(*p), color: Color32::WHITE });
-        }
-        let n = pts.len() as u32;
-        for k in 0..n {
-            mesh.add_triangle(0, 1 + k, 1 + (k + 1) % n);
-        }
-        out.push(egui::Shape::mesh(mesh));
-    }
-    // the veil, then the edge.
-    out.push(egui::Shape::convex_polygon(pts.clone(), Color32::from_rgba_premultiplied(10, 14, 22, 82), Stroke::NONE));
-    out.push(egui::Shape::closed_line(pts, Stroke::new(1.0, white(0.28))));
-    out
+/// the panels' fill and edge, the start screen's tiles.
+const PANEL_FILL: Color32 = Color32::from_rgba_premultiplied(12, 16, 22, 226);
+const PANEL_EDGE: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
+
+/// a dark panel in `r` with a hairline edge.
+fn panel_shapes(r: Rect) -> Vec<egui::Shape> {
+    vec![
+        egui::Shape::rect_filled(r, 0, PANEL_FILL),
+        egui::Shape::rect_stroke(r, 0, Stroke::new(1.0, PANEL_EDGE), egui::StrokeKind::Inside),
+    ]
 }
 
-/// paints frosted glass in `r`.
-fn frost_rect(p: &egui::Painter, r: Rect, cr: egui::CornerRadius) {
-    for s in frost_shapes(p.ctx(), r, cr) {
+/// paints a panel in `r`.
+fn panel_rect(p: &egui::Painter, r: Rect) {
+    for s in panel_shapes(r) {
         p.add(s);
     }
 }
 
 /// a frame for the hud's panels.
 pub fn glass() -> egui::Frame {
-    egui::Frame::new().corner_radius(R_HUD).inner_margin(PAD)
+    egui::Frame::new().inner_margin(PAD)
 }
 
-/// shows `frame` with frosted glass behind it.
-pub fn frosted<R>(ui: &mut egui::Ui, frame: egui::Frame, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+/// shows `frame` on a panel.
+pub fn panel<R>(ui: &mut egui::Ui, frame: egui::Frame, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
     let slot = ui.painter().add(egui::Shape::Noop);
-    let cr = frame.corner_radius;
     let resp = frame.show(ui, add);
-    ui.painter().set(slot, egui::Shape::Vec(frost_shapes(ui.ctx(), resp.response.rect, cr)));
+    ui.painter().set(slot, egui::Shape::Vec(panel_shapes(resp.response.rect)));
     resp
 }
 
@@ -582,7 +564,9 @@ impl Game {
         }
         self.speed_tape(ctx, h, cy);
         self.altitude_tape(ctx, h, cy);
-        self.path_marker(ctx);
+        if self.path_marker {
+            self.flight_path_marker(ctx);
+        }
         self.minimap.top = cy + TAPE_H * 0.5 + 12.0;
         self.minimap.bottom = 14.0;
     }
@@ -590,39 +574,65 @@ impl Game {
     fn heading_strip(&self, ctx: &egui::Context, hdg: f32) {
         let screen = ctx.content_rect();
         let w = 540.0;
-        let at = pos2(screen.center().x - w * 0.5, screen.top());
+        let at = pos2(screen.center().x - w * 0.5, screen.top() + HEADING_TOP);
         egui::Area::new(egui::Id::unique("hud_heading")).fixed_pos(at).interactable(false).order(egui::Order::Background).show(ctx, |ui| {
             let (r, _) = ui.allocate_exact_size(vec2(w, HEADING_H + 26.0), Sense::hover());
             let strip = Rect::from_min_size(r.min, vec2(w, HEADING_H));
             let p = ui.painter();
-            // only the lower corners are round.
-            frost_rect(p, strip, egui::CornerRadius { nw: 0, ne: 0, sw: R_HUD, se: R_HUD });
-            let clip = p.with_clip_rect(strip.shrink(2.0));
-            const PPD: f32 = 8.4;
-            let lo = ((hdg - 40.0) / 10.0).floor() as i32 * 10;
-            let y = strip.center().y + 1.0;
-            for d in (lo..=lo + 80).step_by(10) {
-                let x = strip.center().x + (d as f32 - hdg) * PPD;
-                let dd = d.rem_euclid(360);
-                let edge = ((x - strip.left()).min(strip.right() - x) / 70.0).clamp(0.0, 1.0);
-                let near = 1.0 - ((x - strip.center().x).abs() / 42.0).min(1.0);
-                // the one under the index grows.
-                let font = egui::FontId::new(17.0 + 5.0 * near, egui::FontFamily::Name(if near > 0.5 { menu::SEMIBOLD } else { menu::MEDIUM }.into()));
-                let label = match dd { 0 => "N".to_string(), 90 => "E".to_string(), 180 => "S".to_string(), 270 => t!("W", "O").to_string(), _ => format!("{dd:03}") };
-                clip.text(pos2(x, y), Align2::CENTER_CENTER, label, font, white((0.7 + 0.3 * near) * edge));
-            }
-            // the index.
-            p.rect_filled(Rect::from_center_size(pos2(strip.center().x, strip.bottom() - 4.0), vec2(34.0, 2.5)), 1, Color32::WHITE);
-            // track, heading and the aircraft under it.
-            let ty = strip.bottom() + 12.0;
+            panel_rect(p, strip);
+            let clip = p.with_clip_rect(strip.shrink(1.0));
             let pl = &self.plane;
             let (e, n, _) = crate::geo::enu(pl.pos);
-            let trk = pl.vel.dot(e).atan2(pl.vel.dot(n)).to_degrees().rem_euclid(360.0);
-            if pl.vel.length() > 3.0 {
-                paint_tag(p, pos2(strip.left() + 16.0, ty), Align2::LEFT_CENTER, &t!("Track {:03.0}°", "Route {:03.0}°", trk));
+            let trk = pl.vel.dot(e).atan2(pl.vel.dot(n)).to_degrees().rem_euclid(360.0) as f32;
+            let moving = pl.vel.length() > 3.0;
+            // a scale of ticks along the foot, figures every 10°, the cardinal points in yellow.
+            const PPD: f32 = 6.0;
+            let cx = strip.center().x;
+            let base = strip.bottom() - 1.0;
+            let lo = ((hdg - 50.0) / 5.0).floor() as i32 * 5;
+            for d in (lo..=lo + 100).step_by(5) {
+                let x = cx + (d as f32 - hdg) * PPD;
+                let edge = ((x - strip.left()).min(strip.right() - x) / 60.0).clamp(0.0, 1.0);
+                if edge <= 0.0 {
+                    continue;
+                }
+                let dd = d.rem_euclid(360);
+                let big = dd % 10 == 0;
+                clip.line_segment([pos2(x, base), pos2(x, base - if big { 9.0 } else { 5.0 })], Stroke::new(1.2, white(if big { 0.8 } else { 0.45 } * edge)));
+                // nothing under the readout.
+                if !big || (x - cx).abs() < 40.0 {
+                    continue;
+                }
+                let (label, col) = match dd {
+                    0 => ("N".to_string(), LIT),
+                    90 => ("E".to_string(), LIT),
+                    180 => ("S".to_string(), LIT),
+                    270 => (t!("W", "O").to_string(), LIT),
+                    _ => (format!("{:02}", dd / 10), Color32::WHITE),
+                };
+                clip.text(pos2(x, base - 20.0), Align2::CENTER_CENTER, label, num_s(), col.gamma_multiply(0.85 * edge));
             }
-            paint_tag(p, pos2(strip.center().x, ty), Align2::CENTER_CENTER, t!("Heading", "Cap"));
-            paint_tag(p, pos2(strip.right() - 16.0, ty), Align2::RIGHT_CENTER, self.spec.name);
+            // the track: a hollow yellow caret on the scale.
+            if moving {
+                let mut dt = (trk - hdg + 540.0).rem_euclid(360.0) - 180.0;
+                dt = dt.clamp(-40.0, 40.0);
+                let x = cx + dt * PPD;
+                let tri = vec![pos2(x, base - 10.0), pos2(x - 5.0, base - 1.0), pos2(x + 5.0, base - 1.0)];
+                clip.add(egui::Shape::closed_line(tri, Stroke::new(1.5, LIT)));
+            }
+            // the readout, boxed in the middle, and the index under it.
+            let rb = Rect::from_center_size(pos2(cx, strip.top() + 17.0), vec2(66.0, 26.0));
+            p.rect_filled(rb, 0, BOX);
+            p.rect_stroke(rb, 0, Stroke::new(1.0, LIT), egui::StrokeKind::Inside);
+            p.text(rb.center(), Align2::CENTER_CENTER, format!("{:03.0}°", hdg.rem_euclid(360.0).round() % 360.0), menu::semibold(17.0), Color32::WHITE);
+            p.line_segment([pos2(cx, rb.bottom()), pos2(cx, base)], Stroke::new(1.5, LIT));
+            // track, heading and the aircraft under it.
+            let ty = strip.bottom() + 12.0;
+            if moving {
+                paint_tag(p, pos2(strip.left() + 2.0, ty), Align2::LEFT_CENTER, &t!("Track {:03.0}°", "Route {:03.0}°", trk));
+            }
+            paint_tag(p, pos2(cx, ty), Align2::CENTER_CENTER, t!("Heading", "Cap"));
+            paint_tag(p, pos2(strip.right() - 2.0, ty), Align2::RIGHT_CENTER, self.spec.name);
         });
     }
 
@@ -657,7 +667,7 @@ impl Game {
         egui::Area::new(egui::Id::unique("hud_conditions")).anchor(Align2::RIGHT_TOP, [-14.0, 12.0]).interactable(false).order(egui::Order::Background).show(ctx, |ui| {
             let (r, _) = ui.allocate_exact_size(vec2(w, 126.0), Sense::hover());
             let p = ui.painter();
-            frost_rect(p, r, R_HUD.into());
+            panel_rect(p, r);
             // the head.
             let hy = r.top() + 19.0;
             glyph(p, Glyph::Menu, pos2(r.left() + 22.0, hy), 14.0, white(0.75));
@@ -713,7 +723,7 @@ impl Game {
             let pt = ui.painter();
             // ground speed over it.
             paint_tag(pt, pos2(panel.left() + 14.0, panel.top() - 12.0), Align2::LEFT_CENTER, &format!("G/S  {:.0}", kt(p.vel.length())));
-            frost_rect(pt, panel, egui::CornerRadius { nw: 0, sw: 0, ne: R_HUD, se: R_HUD });
+            panel_rect(pt, panel);
             // figures fade towards the ends.
             let tape = Rect::from_min_max(pos2(panel.left(), panel.top() + 8.0), pos2(panel.right() - 46.0, panel.bottom() - 8.0));
             let clip = pt.with_clip_rect(tape);
@@ -805,7 +815,7 @@ impl Game {
                 let col = if agl < 300.0 { AMBER } else { white(0.62) };
                 paint_tag_col(&pt, pos2(panel.right() - 14.0, panel.bottom() + 12.0), Align2::RIGHT_CENTER, &format!("{:.0} ft AGL", agl), col);
             }
-            frost_rect(&pt, panel, egui::CornerRadius { nw: R_HUD, sw: R_HUD, ne: 0, se: 0 });
+            panel_rect(&pt, panel);
             let tape = Rect::from_min_max(pos2(panel.left() + 30.0, panel.top() + 8.0), pos2(panel.right(), panel.bottom() - 8.0));
             let c = pos2(tape.center().x, cy);
             let clip = pt.with_clip_rect(tape);
@@ -836,8 +846,9 @@ impl Game {
         });
     }
 
-    /// where the aircraft is going.
-    fn path_marker(&self, ctx: &egui::Context) {
+    /// the flight path marker: a ring where the aircraft is actually going
+    /// (its velocity, not where the nose points). Off unless set in Settings.
+    fn flight_path_marker(&self, ctx: &egui::Context) {
         let Some((vp, cam)) = self.live_view else { return };
         let p = &self.plane;
         if p.vel.length() < 15.0 || p.on_ground {
@@ -854,10 +865,12 @@ impl Game {
             return;
         }
         let painter = ctx.layer_painter(egui::LayerId::background());
-        for (w, col) in [(3.0, Color32::from_black_alpha(90)), (1.5, Color32::from_white_alpha(235))] {
+        // a ring with a short wing each side; a dark edge keeps it legible on bright sky.
+        for (w, col) in [(3.0, Color32::from_black_alpha(90)), (1.5, LIT)] {
             let st = Stroke::new(w, col);
-            painter.line_segment([at + vec2(-9.0, 0.0), at + vec2(9.0, 0.0)], st);
-            painter.line_segment([at + vec2(0.0, -9.0), at + vec2(0.0, 9.0)], st);
+            painter.circle_stroke(at, 6.0, st);
+            painter.line_segment([at + vec2(-14.0, 0.0), at + vec2(-6.0, 0.0)], st);
+            painter.line_segment([at + vec2(6.0, 0.0), at + vec2(14.0, 0.0)], st);
         }
     }
 
@@ -872,7 +885,7 @@ impl Game {
                 ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
                 if let Some((text, col)) = guidance {
                     let col = match col { 1 => Color32::from_rgb(64, 200, 96), 2 => AMBER, 3 => menu::BAD, _ => Color32::WHITE };
-                    frosted(ui, glass().inner_margin(egui::Margin::symmetric(16, 8)), |ui| {
+                    panel(ui, glass().inner_margin(egui::Margin::symmetric(16, 8)), |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         ui.horizontal(|ui| {
                             let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
@@ -886,14 +899,14 @@ impl Game {
                     ui.horizontal(|ui| {
                         for (w, col) in warn {
                             // a lit plate.
-                            egui::Frame::new().fill(col.gamma_multiply(0.92)).corner_radius(R_HUD).inner_margin(egui::Margin::symmetric(16, 7)).shadow(egui::Shadow { offset: [0, 0], blur: 22, spread: 2, color: col.gamma_multiply(0.55) }).show(ui, |ui| {
+                            egui::Frame::new().fill(col.gamma_multiply(0.92)).stroke(Stroke::new(1.0, *col)).inner_margin(egui::Margin::symmetric(16, 7)).show(ui, |ui| {
                                 ui.label(RichText::new(w.to_uppercase()).font(menu::semibold(14.0)).color(Color32::WHITE).extra_letter_spacing(1.0));
                             });
                         }
                     });
                 }
                 if !report.is_empty() {
-                    frosted(ui, glass(), |ui| {
+                    panel(ui, glass(), |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         ui.label(tag_text(t!("Damage", "Dégâts")).color(AMBER));
                         // at most six lines, then how many more.
@@ -928,22 +941,14 @@ const RING_IN: f32 = 70.0;
 const RING_OUT: f32 = 156.0;
 
 /// an annulus sector from `a0` to `a1` (radians) as a triangle strip.
-fn sector(c: egui::Pos2, r0: f32, r1: f32, a0: f32, a1: f32, col: Color32, tex: Option<(egui::TextureId, Rect)>) -> egui::Mesh {
-    let mut m = match tex {
-        Some((id, _)) => egui::Mesh::with_texture(id),
-        None => egui::Mesh::default(),
-    };
+fn sector(c: egui::Pos2, r0: f32, r1: f32, a0: f32, a1: f32, col: Color32) -> egui::Mesh {
+    let mut m = egui::Mesh::default();
     let n = 24;
-    let uv = |p: egui::Pos2| match tex {
-        Some((_, s)) => pos2((p.x - s.left()) / s.width(), (p.y - s.top()) / s.height()),
-        None => egui::epaint::WHITE_UV,
-    };
     for i in 0..=n {
         let a = a0 + (a1 - a0) * i as f32 / n as f32;
         let d = vec2(a.cos(), a.sin());
         for r in [r0, r1] {
-            let p = c + d * r;
-            m.vertices.push(egui::epaint::Vertex { pos: p, uv: uv(p), color: col });
+            m.colored_vertex(c + d * r, col);
         }
     }
     for i in 0..n as u32 {
@@ -972,6 +977,8 @@ impl Game {
         } else {
             self.radial = Radial { open: true, since: self.real, hover: None };
             self.pad_home = true;
+            // the menu takes the mouse: a look drag in progress stops here.
+            self.drag = false;
         }
     }
 
@@ -1020,7 +1027,6 @@ impl Game {
         // item 0 sits at the top, the rest clockwise.
         let mid = |i: usize| -std::f32::consts::FRAC_PI_2 + step * i as f32;
         let gap = 0.035;
-        let frost = ctx.data(|d| d.get_temp::<Option<egui::TextureId>>(egui::Id::unique("flightui frost"))).flatten();
         let mut pick: Option<usize> = None;
         let mut close = false;
         egui::Area::new(egui::Id::unique("flight_menu")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
@@ -1062,14 +1068,13 @@ impl Game {
                     None => close = true,
                 }
             }
-            // the ring: a frosted sector per item, the hovered one lit.
+            // the ring: a dark panel sector per item, the hovered one yellow.
             for (i, (ic, _, _, on)) in items.iter().enumerate() {
                 let (a0, a1) = (mid(i) - step * 0.5 + gap, mid(i) + step * 0.5 - gap);
                 let lit = menu::ease(ctx, ui.scope_id().with(("radial_lit", i)), hover == Some(i));
                 let grow = 6.0 * lit;
-                p.add(sector(c, r0, r1 + grow, a0, a1, Color32::WHITE, frost.map(|id| (id, screen))));
-                p.add(sector(c, r0, r1 + grow, a0, a1, menu::mix(Color32::from_rgba_premultiplied(10, 14, 22, 92), Color32::from_rgba_premultiplied(220, 177, 22, 225), lit), None));
-                p.add(egui::Shape::closed_line(sector_edge(c, r0, r1 + grow, a0, a1), Stroke::new(1.0, white(0.25 + 0.35 * lit))));
+                p.add(sector(c, r0, r1 + grow, a0, a1, menu::mix(PANEL_FILL, LIT, lit)));
+                p.add(egui::Shape::closed_line(sector_edge(c, r0, r1 + grow, a0, a1), Stroke::new(1.0, menu::mix(PANEL_EDGE, LIT, lit))));
                 let at = c + vec2(mid(i).cos(), mid(i).sin()) * ((r0 + r1 + grow) * 0.5);
                 menu::icon(&p, *ic, at, 26.0 + 4.0 * lit, menu::mix(Color32::WHITE, menu::ON_ACCENT, lit));
                 // what is open or on: a small yellow dot by the outer edge.
@@ -1078,9 +1083,8 @@ impl Game {
                 }
             }
             // the hub: the pointed item's name, else what this is.
-            for s in frost_shapes(ctx, Rect::from_center_size(c, vec2(hub * 2.0, hub * 2.0)), (hub as u8).into()) {
-                p.add(s);
-            }
+            p.circle_filled(c, hub, PANEL_FILL);
+            p.circle_stroke(c, hub, Stroke::new(1.0, PANEL_EDGE));
             match hover {
                 Some(i) => {
                     p.text(c, Align2::CENTER_CENTER, items[i].1, menu::semibold(16.0), Color32::WHITE);

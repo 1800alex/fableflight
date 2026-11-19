@@ -14,16 +14,6 @@
   // Soft clamp so a single hot pixel cannot flood the screen.
   return vec4f(c / (1.0 + luma(c) * 0.002), 1.0);
 }
-// the frosted glass's first halving, back to linear light.
-@fragment fn fs_frost_in(in: FsIn) -> @location(0) vec4f {
-  let tx = 1.0 / vec2f(textureDimensions(t_src));
-  var c = textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb * 4.0;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(-1.0, -1.0), 0.0).rgb;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(1.0, -1.0), 0.0).rgb;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(-1.0, 1.0), 0.0).rgb;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(1.0, 1.0), 0.0).rgb;
-  return vec4f(pow(clamp(c / 8.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)), 1.0);
-}
 @fragment fn fs_up(in: FsIn) -> @location(0) vec4f {
   let tx = 1.0 / vec2f(textureDimensions(t_src));
   var c = textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb * 4.0;

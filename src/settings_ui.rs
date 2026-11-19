@@ -350,6 +350,9 @@ impl Game {
             row(ui, t!("HUD in the cockpit", "HUD dans le cockpit"), t!("off: the cockpit's own instruments only; key H in the cockpit", "désactivé : seuls les instruments du cockpit ; touche H dans le cockpit"), |ui| {
                 ui.add_enabled_ui(self.show_hud, |ui| menu::switch(ui, &mut self.hud_cockpit));
             });
+            row(ui, t!("Flight path marker", "Marqueur de trajectoire"), t!("a ring on the HUD where the aircraft is actually going", "un anneau sur le HUD là où l'avion va réellement"), |ui| {
+                ui.add_enabled_ui(self.show_hud, |ui| menu::switch(ui, &mut self.path_marker));
+            });
             row(ui, t!("Minimap", "Mini-carte"), t!("key ` (left of 1) in flight", "touche ² (à gauche de 1) en vol"), |ui| {
                 menu::switch(ui, &mut self.minimap.visible);
             });

@@ -978,6 +978,8 @@ struct Game {
     show_hud: bool,
     /// the hud in the cockpit view.
     hud_cockpit: bool,
+    /// the flight path marker on the hud (off by default)
+    path_marker: bool,
     /// arcade mode (settings.rs): the fun features on
     arcade: bool,
     goto_open: bool,
@@ -1357,7 +1359,7 @@ impl Game {
             minimap: minimap::Minimap::new(&prefs),
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
-            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
+            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, path_marker: prefs.path_marker, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, radial: Default::default(), info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, radial_at: args.flight_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
@@ -3503,7 +3505,7 @@ impl Game {
         let red = Color32::from_rgb(255, 90, 60);
         let mono = |s: f32| menu::medium(s + 1.0);
         egui::Area::new(egui::Id::unique("nav_inst")).anchor(Align2::CENTER_BOTTOM, [0.0, -14.0]).interactable(false).show(ctx, |ui| {
-            flightui::frosted(ui, flightui::glass().inner_margin(10.0), |ui| {
+            flightui::panel(ui, flightui::glass().inner_margin(10.0), |ui| {
                 ui.horizontal(|ui| {
                     if let Some((st, r)) = &nav {
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(220.0, 128.0), egui::Sense::hover());
@@ -4606,7 +4608,7 @@ impl Game {
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone(), multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, path_marker: self.path_marker, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone(), multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
@@ -6563,11 +6565,11 @@ impl Game {
         let warn = Color32::from_rgb(255, 196, 80);
         let bad = menu::BAD;
         // left of the altitude tape, under the heading strip.
-        let (x, y) = if self.hud_on() { (-flightui::RIGHT_EDGE - 10.0, flightui::HEADING_H + 34.0) } else { (-14.0, 12.0) };
+        let (x, y) = if self.hud_on() { (-flightui::RIGHT_EDGE - 10.0, flightui::HEADING_TOP + flightui::HEADING_H + 34.0) } else { (-14.0, 12.0) };
         // what is left below it, less the header, the margins and a gap.
         let max_h = (ctx.content_rect().height() - y - 16.0 - 32.0 - 48.0).max(120.0);
         egui::Area::new(egui::Id::unique("info_panel")).anchor(Align2::RIGHT_TOP, [x, y]).show(ctx, |ui| {
-            flightui::frosted(ui, flightui::glass().inner_margin(16.0), |ui| {
+            flightui::panel(ui, flightui::glass().inner_margin(16.0), |ui| {
                 ui.set_width(flightui::PANEL_W);
                 // the page's icon and name, picked from the flight menu, and a close button.
                 ui.horizontal(|ui| {
@@ -6914,8 +6916,6 @@ impl Game {
         let out = self.egui_ctx.clone().run_ui(raw, |root| {
             let ctx = &root.ctx().clone();
             self.pad_pass(ctx);
-            // the blurred frame behind the frosted glass.
-            flightui::set_frost(ctx, self.r.frost_id);
             use egui::{Align2, Color32, FontId, RichText};
             let pad = padui::active();
             let white = Color32::from_rgba_unmultiplied(255, 255, 255, 235);
@@ -7157,7 +7157,7 @@ impl Game {
             self.wreck_seen = self.real;
             if !self.crashed && self.wreck_t > 2.0 && self.mode == Mode::Fly {
                 egui::Area::new(egui::Id::unique("wreck")).anchor(Align2::CENTER_CENTER, [0.0, 80.0]).show(ctx, |ui| {
-                    flightui::frosted(ui, flightui::glass().inner_margin(egui::Margin::symmetric(24, 16)), |ui| {
+                    flightui::panel(ui, flightui::glass().inner_margin(egui::Margin::symmetric(24, 16)), |ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(RichText::new(t!("AIRCRAFT WRECKED", "AVION DÉTRUIT")).font(menu::bold(34.0)).color(Color32::from_rgb(255, 160, 80)).extra_letter_spacing(1.5));
                             ui.add_space(6.0);
@@ -7175,7 +7175,7 @@ impl Game {
             }
             if self.crashed && self.real - self.crash_real > 3.5 {
                 egui::Area::new(egui::Id::unique("crash")).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ctx, |ui| {
-                    flightui::frosted(ui, flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)), |ui| {
+                    flightui::panel(ui, flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)), |ui| {
                         if pad {
                             let panel = padmap::spec_of("flight_panel");
                             let mut items = vec![("A", tr("respawn")), (panel.as_str(), tr("go somewhere else")), ("Menu", tr("menu"))];
@@ -7315,6 +7315,12 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, _el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let Some(g) = self.game.as_mut() else { return };
         let consumed = g.egui_state.on_window_event(&g.window, &event).consumed;
+        // A look drag ends on any release, even one the UI took (the flight menu
+        // or a panel under the pointer), and when the window loses focus;
+        // otherwise the view keeps turning with the mouse after the button is up.
+        if matches!(event, WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left | MouseButton::Right, .. } | WindowEvent::Focused(false)) {
+            g.drag = false;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 g.keep_settings(true);
