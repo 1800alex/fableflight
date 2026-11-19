@@ -5878,9 +5878,12 @@ impl Game {
                     mesh: self.piece_mesh[i],
                     model: base * pose[i],
                     // (Windows: the phases of the water on them, rain.rs Glass::phases; a
-                    // rocket's other parts: how thin the air is and how hot its tiles.)
-                    tint: [blur, burner, dry, if p.glass { rain_ph[2] } else { thin }],
-                    glow: if p.glass { [0.0, kind, rain_ph[0], rain_ph[1]] } else { [0.0, kind, heat, 0.0] },
+                    // rocket's parts: how thin the air is and how hot its tiles. A rocket
+                    // has no windows: its "glass" is the exhaust plumes, which spread by
+                    // that thinness; given the rain's ever-growing flow phase instead,
+                    // they swelled into a white sheet across the whole view.)
+                    tint: [blur, burner, dry, if p.glass && !rocket { rain_ph[2] } else { thin }],
+                    glow: if p.glass && !rocket { [0.0, kind, rain_ph[0], rain_ph[1]] } else { [0.0, kind, heat, 0.0] },
                     params,
                     cast: 1 << render::PLANE_LAYER,
                     glass: p.glass,
