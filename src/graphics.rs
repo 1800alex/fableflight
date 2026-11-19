@@ -6,6 +6,7 @@
 //!
 //! Google's photorealistic 3D tiles are not part of this: they are switched on
 //! and given their own detail level in the map imagery settings (gmaps.rs).
+use crate::i18n::t;
 use crate::menu::{self, DIM};
 use crate::settings_ui::{note, row};
 use egui::RichText;
@@ -32,6 +33,11 @@ impl Level {
             Level::High => "High",
             Level::Ultra => "Ultra",
         }
+    }
+
+    /// Its name on the settings screen, in the current language.
+    pub fn label(self) -> &'static str {
+        crate::i18n::tr(&format!("graphics.level_{}", self.name().to_ascii_lowercase()))
     }
 
     pub fn parse(s: &str) -> Option<Level> {
@@ -247,29 +253,29 @@ impl Graphics {
     /// The preset row and what the chosen preset does (the settings
     /// screen's Graphics section, settings_ui.rs).
     pub fn preset_ui(&mut self, ui: &mut egui::Ui) {
-        row(ui, "Preset", "sets everything below at once", |ui| {
+        row(ui, t!("graphics.preset"), t!("graphics.preset_hint"), |ui| {
             ui.horizontal(|ui| {
                 let cur = self.matches();
                 let mut pick = cur;
                 menu::segments(ui, |ui| {
                     for l in Level::PRESETS {
-                        menu::seg(ui, &mut pick, Some(l), l.name());
+                        menu::seg(ui, &mut pick, Some(l), l.label());
                     }
                 });
                 if let (Some(l), true) = (pick, pick != cur) {
                     self.apply(l);
                 }
                 if cur.is_none() {
-                    ui.label(RichText::new("Custom").font(menu::label()).color(DIM));
+                    ui.label(RichText::new(t!("graphics.custom")).font(menu::label()).color(DIM));
                 }
             });
         });
         note(ui, match self.matches() {
-            Some(Level::Low) => "Low: 60% resolution, no shadows, quicker clouds, nearer scenery, simpler cities and trees, light traffic, no ambient occlusion.",
-            Some(Level::Medium) => "Medium: 75% resolution, a coarse shadow map, no ambient occlusion and a lighter version of everything else.",
-            Some(Level::High) => "High: the full look at the window's own resolution (what the game has always drawn).",
-            Some(Level::Ultra) => "Ultra: past High. Supersampled at 150%, a 6K shadow map, finer clouds, terrain and scenery further out. Wants a strong GPU.",
-            _ => "Custom: tuned one by one below.",
+            Some(Level::Low) => t!("graphics.low_note"),
+            Some(Level::Medium) => t!("graphics.medium_note"),
+            Some(Level::High) => t!("graphics.high_note"),
+            Some(Level::Ultra) => t!("graphics.ultra_note"),
+            _ => t!("graphics.custom_note"),
         });
     }
 
@@ -278,48 +284,48 @@ impl Graphics {
         let levels = |ui: &mut egui::Ui, v: &mut Level, off: bool| {
             menu::segments(ui, |ui| {
                 if off {
-                    menu::seg(ui, v, Level::Off, "Off");
+                    menu::seg(ui, v, Level::Off, Level::Off.label());
                 }
                 for l in Level::PRESETS {
-                    menu::seg(ui, v, l, l.name());
+                    menu::seg(ui, v, l, l.label());
                 }
             });
         };
         let dim = |ui: &mut egui::Ui, s: String| {
             ui.label(RichText::new(s).font(menu::caption()).color(DIM));
         };
-        row(ui, "Shadows", "", |ui| {
+        row(ui, t!("graphics.shadows"), "", |ui| {
             levels(ui, &mut self.shadows, true);
             if self.shadows != Level::Off {
                 let r = self.shadow_res();
-                dim(ui, format!("{r}×{r} map"));
+                dim(ui, t!("graphics.shadow_map", r = r));
             }
         });
-        row(ui, "Clouds", "", |ui| levels(ui, &mut self.clouds, false));
-        row(ui, "Terrain detail", "", |ui| levels(ui, &mut self.terrain, false));
-        row(ui, "Scenery distance", "", |ui| {
+        row(ui, t!("graphics.clouds"), "", |ui| levels(ui, &mut self.clouds, false));
+        row(ui, t!("graphics.terrain_detail"), "", |ui| levels(ui, &mut self.terrain, false));
+        row(ui, t!("graphics.scenery_distance"), "", |ui| {
             levels(ui, &mut self.scenery, false);
-            dim(ui, format!("buildings and trees out to {:.1} km", 7.5 * self.reach()));
+            dim(ui, t!("graphics.scenery_reach", 7.5 * self.reach()));
         });
-        row(ui, "City detail", "", |ui| {
+        row(ui, t!("graphics.city_detail"), "", |ui| {
             levels(ui, &mut self.city, false);
             let k = self.city_k();
-            dim(ui, format!("full buildings out to {:.1} km (towers further), lit window depth to {:.0} m", 1.3 * k, 550.0 * k));
+            dim(ui, t!("graphics.city_reach", 1.3 * k, 550.0 * k));
         });
-        row(ui, "Tree detail", "", |ui| {
+        row(ui, t!("graphics.tree_detail"), "", |ui| {
             levels(ui, &mut self.trees, false);
-            dim(ui, format!("trees out to {:.1} km, full models to {:.0} m", self.tree_far() / 1000.0, 120.0 * self.tree_imp_k()));
+            dim(ui, t!("graphics.tree_reach", self.tree_far() / 1000.0, 120.0 * self.tree_imp_k()));
         });
-        row(ui, "Traffic", "cars on the roads", |ui| {
+        row(ui, t!("graphics.traffic"), t!("graphics.traffic_hint"), |ui| {
             menu::segments(ui, |ui| {
                 for l in [Level::Off, Level::Low, Level::Medium, Level::High] {
-                    menu::seg(ui, &mut self.cars, l, l.name());
+                    menu::seg(ui, &mut self.cars, l, l.label());
                 }
             });
             let (share, far, _) = self.car_density();
-            dim(ui, if share > 0.0 { format!("{:.0}% of the cars, out to {:.1} km", share * 100.0, far / 1000.0) } else { "no cars on the roads".into() });
+            dim(ui, if share > 0.0 { t!("graphics.traffic_share", share * 100.0, far / 1000.0) } else { t!("graphics.no_cars").into() });
         });
-        row(ui, "Ambient occlusion", "contact shadows (GTAO)", |ui| {
+        row(ui, t!("graphics.ambient_occlusion"), t!("graphics.ambient_occlusion_hint"), |ui| {
             menu::switch(ui, &mut self.ao);
         });
     }
@@ -328,27 +334,27 @@ impl Graphics {
     /// is the window's size in pixels (for the resolution readout), `fps`
     /// the frame rate now.
     pub fn display_ui(&mut self, ui: &mut egui::Ui, window: (u32, u32), fps: f64) {
-        row(ui, "Render resolution", "below 100% upscales, above supersamples", |ui| {
+        row(ui, t!("graphics.render_resolution"), t!("graphics.render_resolution_hint"), |ui| {
             let (w, h) = window;
             let (rw, rh) = ((w as f32 * self.scale).round() as u32, (h as f32 * self.scale).round() as u32);
             ui.add(egui::Slider::new(&mut self.scale, SCALE_MIN..=SCALE_MAX).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-            let what = if self.scale > 1.001 { "supersampled" } else if self.scale < 0.999 { "upscaled" } else { "native" };
+            let what = if self.scale > 1.001 { t!("graphics.supersampled") } else if self.scale < 0.999 { t!("graphics.upscaled") } else { t!("graphics.native") };
             ui.label(RichText::new(format!("{rw}×{rh}, {what}")).font(menu::caption()).color(DIM));
         });
-        row(ui, "Anti-aliasing", "temporal (TAA) · F2 in flight", |ui| {
+        row(ui, t!("graphics.anti_aliasing"), t!("graphics.anti_aliasing_hint"), |ui| {
             menu::switch(ui, &mut self.taa);
         });
-        row(ui, "VSync", if self.vsync { "no tearing" } else { "uncapped, may tear" }, |ui| {
+        row(ui, "VSync", if self.vsync { t!("graphics.vsync_on") } else { t!("graphics.vsync_off") }, |ui| {
             menu::switch(ui, &mut self.vsync);
         });
-        row(ui, "Frame limit", "frames per second", |ui| {
+        row(ui, t!("graphics.frame_limit"), t!("graphics.frame_limit_hint"), |ui| {
             menu::segments(ui, |ui| {
                 for cap in [0u16, 30, 60, 90, 120, 144, 165, 240] {
-                    menu::seg(ui, &mut self.fps_cap, cap, &if cap == 0 { "Unlimited".to_owned() } else { cap.to_string() });
+                    menu::seg(ui, &mut self.fps_cap, cap, &if cap == 0 { t!("graphics.unlimited").to_owned() } else { cap.to_string() });
                 }
             });
         });
-        note(ui, &format!("Now {fps:.0} fps. Changes apply at once; scenery and terrain fill in over a few seconds."));
+        note(ui, &t!("graphics.fps_now", fps = fps));
     }
 }
 

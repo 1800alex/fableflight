@@ -240,26 +240,26 @@ impl Game {
                 if let Some((name, _, _)) = p.engines() {
                     ui.label(tag_text(&format!("{}  {}", p.stage_name().unwrap_or(""), name)));
                     egui::Grid::new("rocket").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
-                        let apo = p.apogee().map_or(t!("escape", "libération").to_string(), |a| format!("{:.0} km", a.max(0.0) / 1000.0));
+                        let apo = p.apogee().map_or(t!("flight.escape").to_string(), |a| format!("{:.0} km", a.max(0.0) / 1000.0));
                         let high = if base_up < 3000.0 { format!("{:.0} m", base_up.max(0.0)) } else { format!("{:.1} km", base_up / 1000.0) };
-                        row(ui, t!("Throttle", "Poussée"), format!("{:.0}%  ·  {:.0} MN", p.throttle * 100.0, p.thrust_now() / 1.0e6), TEXT);
-                        row(ui, t!("Climb, speed", "Montée, vitesse"), format!("{:+.0} m/s  ·  {:.0} m/s", vs, p.vel.length()), TEXT);
-                        row(ui, t!("Height", "Hauteur"), high, TEXT);
-                        row(ui, t!("Apogee", "Apogée"), apo, TEXT);
-                        row(ui, t!("Downrange", "Distance"), format!("{:.0} km", p.downrange() / 1000.0), TEXT);
+                        row(ui, t!("flight.throttle"), format!("{:.0}%  ·  {:.0} MN", p.throttle * 100.0, p.thrust_now() / 1.0e6), TEXT);
+                        row(ui, t!("flight.climb_speed"), format!("{:+.0} m/s  ·  {:.0} m/s", vs, p.vel.length()), TEXT);
+                        row(ui, t!("flight.height"), high, TEXT);
+                        row(ui, t!("flight.apogee"), apo, TEXT);
+                        row(ui, t!("flight.downrange"), format!("{:.0} km", p.downrange() / 1000.0), TEXT);
                         if let Some(t) = p.burnout() {
-                            row(ui, t!("Burnout", "Fin de combustion"), format!("{}:{:02}", t as u32 / 60, t as u32 % 60), TEXT);
+                            row(ui, t!("flight.burnout"), format!("{}:{:02}", t as u32 / 60, t as u32 % 60), TEXT);
                         }
-                        row(ui, t!("Mass, load", "Masse, facteur"), format!("{:.0} t  ·  {:.1} g", p.mass() / 1000.0, p.g_load), TEXT);
+                        row(ui, t!("flight.mass_load"), format!("{:.0} t  ·  {:.1} g", p.mass() / 1000.0, p.g_load), TEXT);
                     });
                 }
                 if self.missiles_ok() {
                     let armed = self.weapons.armed;
                     let power = p.sys.powered();
-                    ui.label(tag_text(t!("Weapons", "Armement")));
+                    ui.label(tag_text(t!("flight.weapons")));
                     egui::Grid::new("weapons").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
                         let arm_col = if !armed { DIM } else if power { menu::OK } else { amber };
-                        row(ui, t!("Master arm", "Armement général"), if armed { "ON".into() } else { "OFF".into() }, arm_col);
+                        row(ui, t!("flight.master_arm"), if armed { "ON".into() } else { "OFF".into() }, arm_col);
                         let (mut left, mut right) = (0u8, 0u8);
                         for (i, st) in self.weapons.stations.iter().enumerate() {
                             if self.weapons.loaded(i) {
@@ -268,19 +268,19 @@ impl Game {
                         }
                         row(ui, "AIM-9", format!("L {left}  ·  R {right}"), TEXT);
                         let (line, col) = if !armed {
-                            (t!("safe", "sécurisé").to_string(), DIM)
+                            (t!("flight.safe").to_string(), DIM)
                         } else if !power {
-                            (t!("no power", "pas d'alimentation").to_string(), amber)
+                            (t!("flight.no_power").to_string(), amber)
                         } else if let Some(v) = &self.weapons.target_view {
                             if self.weapons.lock >= 1.0 {
-                                (t!("lock  {:.1} km", "verrouillé  {:.1} km", v.range / 1000.0), menu::OK)
+                                (t!("flight.lock_km", v.range / 1000.0), menu::OK)
                             } else {
-                                (t!("track  {:.1} km", "poursuite  {:.1} km", v.range / 1000.0), amber)
+                                (t!("flight.track_km", v.range / 1000.0), amber)
                             }
                         } else {
-                            (t!("search", "recherche").to_string(), DIM)
+                            (t!("flight.search").to_string(), DIM)
                         };
-                        row(ui, t!("Seeker", "Autodirecteur"), line, col);
+                        row(ui, t!("flight.seeker"), line, col);
                     });
                 }
             });
@@ -494,10 +494,10 @@ fn grouped(v: f32) -> String {
 /// the time of day in words.
 fn period(h: f64) -> &'static str {
     match h.rem_euclid(24.0) {
-        h if (5.0..11.0).contains(&h) => t!("Morning", "Matin"),
-        h if (11.0..17.0).contains(&h) => t!("Afternoon", "Après-midi"),
-        h if (17.0..21.0).contains(&h) => t!("Evening", "Soirée"),
-        _ => t!("Night", "Nuit"),
+        h if (5.0..11.0).contains(&h) => t!("flight.morning"),
+        h if (11.0..17.0).contains(&h) => t!("flight.afternoon"),
+        h if (17.0..21.0).contains(&h) => t!("flight.evening"),
+        _ => t!("flight.night"),
     }
 }
 
@@ -608,7 +608,7 @@ impl Game {
                 let near = 1.0 - ((x - strip.center().x).abs() / 42.0).min(1.0);
                 // the one under the index grows.
                 let font = egui::FontId::new(17.0 + 5.0 * near, egui::FontFamily::Name(if near > 0.5 { menu::SEMIBOLD } else { menu::MEDIUM }.into()));
-                let label = match dd { 0 => "N".to_string(), 90 => "E".to_string(), 180 => "S".to_string(), 270 => t!("W", "O").to_string(), _ => format!("{dd:03}") };
+                let label = match dd { 0 => "N".to_string(), 90 => "E".to_string(), 180 => "S".to_string(), 270 => t!("flight.w").to_string(), _ => format!("{dd:03}") };
                 clip.text(pos2(x, y), Align2::CENTER_CENTER, label, font, white((0.7 + 0.3 * near) * edge));
             }
             // the index.
@@ -619,9 +619,9 @@ impl Game {
             let (e, n, _) = crate::geo::enu(pl.pos);
             let trk = pl.vel.dot(e).atan2(pl.vel.dot(n)).to_degrees().rem_euclid(360.0);
             if pl.vel.length() > 3.0 {
-                paint_tag(p, pos2(strip.left() + 16.0, ty), Align2::LEFT_CENTER, &t!("Track {:03.0}°", "Route {:03.0}°", trk));
+                paint_tag(p, pos2(strip.left() + 16.0, ty), Align2::LEFT_CENTER, &t!("flight.track", trk));
             }
-            paint_tag(p, pos2(strip.center().x, ty), Align2::CENTER_CENTER, t!("Heading", "Cap"));
+            paint_tag(p, pos2(strip.center().x, ty), Align2::CENTER_CENTER, t!("flight.heading"));
             paint_tag(p, pos2(strip.right() - 16.0, ty), Align2::RIGHT_CENTER, self.spec.name);
         });
     }
@@ -632,26 +632,26 @@ impl Game {
         let night = !(6.0..19.5).contains(&h.local.rem_euclid(24.0));
         let cloudy = wx.clouds > 0.6 || wx.rain > 0.1 || wx.storms > 0.3;
         let sky = if wx.storms > 0.3 {
-            t!("Storms", "Orages")
+            t!("flight.storms")
         } else if wx.rain > 0.1 {
-            t!("Rain", "Pluie")
+            t!("flight.rain")
         } else if wx.clouds < 0.15 {
-            t!("Clear", "Dégagé")
+            t!("flight.clear")
         } else if wx.clouds < 0.45 {
-            t!("Some cloud", "Quelques nuages")
+            t!("flight.some_cloud")
         } else if wx.clouds < 0.8 {
-            t!("Cloudy", "Nuageux")
+            t!("flight.cloudy")
         } else {
-            t!("Overcast", "Couvert")
+            t!("flight.overcast")
         };
         let breeze = match wind_kt {
-            w if w < 3.0 => t!("no wind", "sans vent"),
-            w if w < 11.0 => t!("a light breeze", "brise légère"),
-            w if w < 21.0 => t!("a moderate breeze", "brise modérée"),
-            w if w < 34.0 => t!("a strong wind", "vent fort"),
-            _ => t!("a gale", "tempête"),
+            w if w < 3.0 => t!("flight.no_wind"),
+            w if w < 11.0 => t!("flight.a_light_breeze"),
+            w if w < 21.0 => t!("flight.a_moderate_breeze"),
+            w if w < 34.0 => t!("flight.a_strong_wind"),
+            _ => t!("flight.a_gale"),
         };
-        let sub = t!("{} with {}", "{}, {}", sky, breeze);
+        let sub = t!("flight.with", sky, breeze);
         let oat = 15.0 - 0.0065 * h.alt.clamp(-500.0, 11_000.0);
         let w = 284.0;
         egui::Area::new(egui::Id::unique("hud_conditions")).anchor(Align2::RIGHT_TOP, [-14.0, 12.0]).interactable(false).order(egui::Order::Background).show(ctx, |ui| {
@@ -663,11 +663,11 @@ impl Game {
             glyph(p, Glyph::Menu, pos2(r.left() + 22.0, hy), 14.0, white(0.75));
             let hint = if padui::active() {
                 match crate::padmap::spec_of("flight_panel") {
-                    k if k.is_empty() => t!("Menu: pause", "Menu : pause").to_string(),
-                    k => t!("{}: flight menu", "{} : menu de vol", k),
+                    k if k.is_empty() => t!("flight.menu_pause").to_string(),
+                    k => t!("flight.flight_menu", k),
                 }
             } else {
-                t!("Tab: flight menu", "Tab : menu de vol").to_string()
+                t!("flight.tab_flight_menu").to_string()
             };
             paint_tag(p, pos2(r.left() + 38.0, hy), Align2::LEFT_CENTER, &hint);
             p.hline(r.x_range(), r.top() + 38.0, Stroke::new(1.0, white(0.16)));
@@ -687,7 +687,7 @@ impl Game {
             p.text(pos2(x, fy), Align2::LEFT_CENTER, format!("{:03.0}°", wx.wind_from), num_s(), white(0.85));
             x += 58.0;
             glyph(p, Glyph::Sock, pos2(x, fy), 15.0, white(0.8));
-            p.text(pos2(x + 14.0, fy), Align2::LEFT_CENTER, t!("{:.0} knots", "{:.0} nœuds", wind_kt), num_s(), white(0.85));
+            p.text(pos2(x + 14.0, fy), Align2::LEFT_CENTER, t!("flight.knots", wind_kt), num_s(), white(0.85));
             p.text(pos2(r.right() - 16.0, fy), Align2::RIGHT_CENTER, menu::hhmm(h.local), num_s(), white(0.85));
             glyph(p, Glyph::Clock, pos2(r.right() - 62.0, fy), 16.0, white(0.8));
         });
@@ -776,7 +776,7 @@ impl Game {
             }
             // the throttle.
             let col_r = Rect::from_min_max(pos2(panel.right() - 40.0, panel.top() + 12.0), pos2(panel.right() - 12.0, panel.bottom() - 12.0));
-            paint_tag(pt, pos2(col_r.center().x, col_r.top() + 6.0), Align2::CENTER_CENTER, t!("Thr", "Gaz"));
+            paint_tag(pt, pos2(col_r.center().x, col_r.top() + 6.0), Align2::CENTER_CENTER, t!("flight.thr"));
             let track = Rect::from_min_max(pos2(col_r.center().x - 3.0, col_r.top() + 20.0), pos2(col_r.center().x + 3.0, col_r.bottom() - 26.0));
             pt.rect_filled(track, 3, white(0.14));
             let thr = (p.throttle as f32).clamp(0.0, 1.0);
@@ -895,7 +895,7 @@ impl Game {
                 if !report.is_empty() {
                     frosted(ui, glass(), |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        ui.label(tag_text(t!("Damage", "Dégâts")).color(AMBER));
+                        ui.label(tag_text(t!("flight.damage")).color(AMBER));
                         // at most six lines, then how many more.
                         for l in report.iter().take(6) {
                             ui.label(RichText::new(l.as_str()).font(num_s()).color(Color32::WHITE));
@@ -989,13 +989,13 @@ impl Game {
     fn radial_items(&self) -> [(Icon, &'static str, Bar, bool); 7] {
         let page = |p: Page| self.info_open && self.info_page == p;
         [
-            (Icon::Flight, t!("Flight", "Vol"), Bar::Page(Page::Flight), page(Page::Flight)),
-            (Icon::GoTo, t!("Go to", "Aller à"), Bar::Page(Page::Places), page(Page::Places)),
-            (Icon::Radio, t!("Radio", "Radio"), Bar::Page(Page::Radio), page(Page::Radio)),
-            (Icon::Autopilot, t!("Autopilot", "Pilote auto"), Bar::Page(Page::Autopilot), page(Page::Autopilot)),
-            (Icon::Weather, t!("Weather", "Météo"), Bar::Page(Page::Weather), page(Page::Weather)),
-            (Icon::Map, t!("Map", "Carte"), Bar::Map, self.minimap.visible),
-            (Icon::Camera, if self.cam_mode == 1 { t!("Cockpit", "Cockpit") } else { t!("Chase", "Extérieur") }, Bar::Camera, false),
+            (Icon::Flight, t!("flight.flight"), Bar::Page(Page::Flight), page(Page::Flight)),
+            (Icon::GoTo, t!("flight.go_to"), Bar::Page(Page::Places), page(Page::Places)),
+            (Icon::Radio, t!("flight.radio"), Bar::Page(Page::Radio), page(Page::Radio)),
+            (Icon::Autopilot, t!("flight.autopilot"), Bar::Page(Page::Autopilot), page(Page::Autopilot)),
+            (Icon::Weather, t!("flight.weather"), Bar::Page(Page::Weather), page(Page::Weather)),
+            (Icon::Map, t!("flight.map"), Bar::Map, self.minimap.visible),
+            (Icon::Camera, if self.cam_mode == 1 { t!("flight.cockpit") } else { t!("flight.chase") }, Bar::Camera, false),
         ]
     }
 
@@ -1085,7 +1085,7 @@ impl Game {
                 Some(i) => {
                     p.text(c, Align2::CENTER_CENTER, items[i].1, menu::semibold(16.0), Color32::WHITE);
                 }
-                None => paint_tag(&p, c, Align2::CENTER_CENTER, t!("Flight", "Vol")),
+                None => paint_tag(&p, c, Align2::CENTER_CENTER, t!("flight.flight")),
             }
         });
         if let Some(i) = pick {
