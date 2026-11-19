@@ -87,10 +87,6 @@ pub fn is_fr() -> bool {
     lang() == Lang::Fr
 }
 
-pub fn is_ko() -> bool {
-    lang() == Lang::Ko
-}
-
 /// Which of the two literals a plain `t!` shows. Korean looks the English up in
 /// `ko()` and falls back to the English when it has no translation yet.
 pub fn pick(en: &'static str, fr: &'static str) -> &'static str {
