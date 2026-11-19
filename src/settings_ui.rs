@@ -350,6 +350,9 @@ impl Game {
             row(ui, t!("HUD in the cockpit", "HUD dans le cockpit"), t!("off: the cockpit's own instruments only; key H in the cockpit", "désactivé : seuls les instruments du cockpit ; touche H dans le cockpit"), |ui| {
                 ui.add_enabled_ui(self.show_hud, |ui| menu::switch(ui, &mut self.hud_cockpit));
             });
+            row(ui, t!("Flight path marker", "Marqueur de trajectoire"), t!("a ring on the HUD where the aircraft is actually going", "un anneau sur le HUD là où l'avion va réellement"), |ui| {
+                ui.add_enabled_ui(self.show_hud, |ui| menu::switch(ui, &mut self.path_marker));
+            });
             row(ui, t!("Minimap", "Mini-carte"), t!("key ` (left of 1) in flight", "touche ² (à gauche de 1) en vol"), |ui| {
                 menu::switch(ui, &mut self.minimap.visible);
             });
@@ -397,6 +400,16 @@ impl Game {
         card(ui, t!("Preset", "Préréglage"), |ui| self.gfx.preset_ui(ui));
         card(ui, t!("Quality", "Qualité"), |ui| self.gfx.quality_ui(ui));
         card(ui, t!("Display", "Affichage"), |ui| self.gfx.display_ui(ui, (size.width, size.height), self.fps));
+        card(ui, t!("Scenery", "Paysage"), |ui| {
+            use crate::snow::Mode;
+            row(ui, t!("Snow on the ground", "Neige au sol"), t!("Automatic: from the date, the latitude and the real weather's temperature", "Automatique : selon la date, la latitude et la température de la météo réelle"), |ui| {
+                menu::segments(ui, |ui| {
+                    menu::seg(ui, &mut self.snow, Mode::Auto, t!("Automatic", "Automatique"));
+                    menu::seg(ui, &mut self.snow, Mode::Off, t!("Off", "Désactivée"));
+                    menu::seg(ui, &mut self.snow, Mode::Always, t!("Always", "Toujours"));
+                });
+            });
+        });
         let on = if self.src.google.photoreal() { t!("on", "activées") } else { t!("off", "désactivées") };
         note(ui, &t!("Google's photorealistic 3D cities ({}) have their own switch and detail level under Map and data.", "Les villes 3D photoréalistes de Google ({}) ont leur propre réglage dans Carte et données.", on));
         if self.gfx != before {

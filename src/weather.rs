@@ -78,6 +78,12 @@ pub struct Weather {
     /// sea-level pressure (hPa): the QNH an altimeter is set to (standard
     /// unless the real weather says otherwise)
     pub qnh: f64,
+    /// height of the freezing level (m above sea level) from the real
+    /// weather's surface temperature; None with hand-set weather (snow.rs)
+    pub freezing: Option<f64>,
+    /// snow blown up off the ground the real weather reports (METAR BLSN /
+    /// DRSN), 0..1; the wind lifts it too without a report (snow.rs `blowing`)
+    pub blowing: f32,
 }
 
 /// What kind of convective cell: a shower (towering cumulus or a small
@@ -318,7 +324,7 @@ fn sites(q: DVec3, grid: f64, range: f64, mut f: impl FnMut(DVec3, f64, u32)) {
 impl Weather {
     pub fn new(clouds: f32) -> Self {
         // A light west-south-westerly, as the smoke always drifted before there was a slider for it.
-        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, deck_fade: 0.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false, showers_only: false, qnh: 1013.25 }
+        Self { clouds, cloud_base: 1500.0, cloud_depth: 4500.0, storms: 0.2, alto: 0.25, haze: 1.0, rain: 0.0, rain_set: None, deck: 0.0, deck_at: None, deck_ground: None, deck_place: None, deck_prev: None, deck_fade: 0.0, wind: 4.0, wind_from: 248.0, gusts: 0.15, time_rate: 1.0, moon_age: 11.5, cloud_off: DVec3::ZERO, sun: 0.5, thermal_off: DVec3::ZERO, cells: Vec::new(), placed: Vec::new(), live_cells: Vec::new(), radar_cover: None, deck_goal: None, deck_tau: 6.0, live: false, live_station: String::new(), live_raw: String::new(), real_time: false, showers_only: false, qnh: 1013.25, freezing: None, blowing: 0.0 }
     }
 
     /// The rain deck's mean base and top, metres above sea level: the heavier

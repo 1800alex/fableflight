@@ -352,6 +352,11 @@ fn shade_building(in: VOut) -> GOut {
     let Fe = fspec + (1.0 - fspec) * pow(1.0 - max(dot(N, -V), 0.0), 5.0);
     extra += env_reflect(in.P, reflect(V, N), l.upn, false) * Fe * gloss;
     albedo = ro.albedo * (1.0 - 0.75 * ro.metal);
+    // Snow on the roof (snow.rs), sliding off the steep ones; it hides the
+    // covering's glint and reflections.
+    let ks = snow_top(in.P, normalize(in.N), 0.55, 0.8);
+    albedo = mix(albedo, SNOW_ALBEDO, ks);
+    extra *= 1.0 - ks;
   } else if (kind == 4u) {
     let dk = in.sty.y | (in.sty.z << 8u);
     let rs = road_surface(in.uv.x, in.uv.y, f32(in.sty.x) * 0.25, dk, 1000.0, 0.0, max(fw.x, fw.y));

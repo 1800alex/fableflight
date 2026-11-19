@@ -65,6 +65,9 @@ mod trees;
 mod ocean;
 mod shore;
 mod skyglow;
+mod snow;
+mod snowmap;
+mod snowtrack;
 mod world;
 mod yasim;
 
@@ -292,6 +295,8 @@ struct Args {
     minimap_plan: Option<bool>,
     minimap_heading_up: Option<bool>,
     offline: bool,
+    /// --snow auto|off|always: snow on the ground for this run (snow.rs)
+    snow: Option<snow::Mode>,
     shots: Vec<(f64, PathBuf, Option<(f64, f64, f64)>)>,
     /// record frames + audio to a directory: (dir, start, seconds), fixed 30 fps steps
     record: Option<(PathBuf, f64, f64)>,
@@ -415,6 +420,7 @@ fn parse_args() -> Args {
         minimap_plan: None,
         minimap_heading_up: None,
         offline: false,
+        snow: None,
         shots: Vec::new(),
         record: None,
         crash_at: None,
@@ -782,6 +788,7 @@ fn parse_args() -> Args {
                 a.mp_mirror = true;
                 used = 1;
             }
+            "--snow" => a.snow = v.get(i + 1).and_then(|s| snow::Mode::parse(s)),
             "--offline" => {
                 a.offline = true;
                 used = 1;
@@ -804,7 +811,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -978,6 +985,8 @@ struct Game {
     show_hud: bool,
     /// the hud in the cockpit view.
     hud_cockpit: bool,
+    /// the flight path marker on the hud (off by default)
+    path_marker: bool,
     /// arcade mode (settings.rs): the fun features on
     arcade: bool,
     goto_open: bool,
@@ -1032,6 +1041,8 @@ struct Game {
     /// sound on (U), and its volume (0..1)
     sound_on: bool,
     volume: f32,
+    /// snow lying on the ground (snow.rs, the Graphics settings)
+    snow: snow::Mode,
     /// the flight panel (Tab), beside the running game, and the page it shows
     info_open: bool,
     /// the flight menu, a ring of icons on tab.
@@ -1061,6 +1072,14 @@ struct Game {
     /// rain falling where the camera is, 0..1, and how much of it is hail
     cam_rain: f32,
     cam_hail: f32,
+    /// snowflakes around the camera (snow.rs, precip.wgsl): their field, how
+    /// much of what falls at the camera is snow, the blowing snow there, and
+    /// the fresh snow settling where it snows on the ground
+    snow_field: storm::RainField,
+    cam_snow: f32,
+    cam_blow: f32,
+    fresh: snow::Fresh,
+    fresh_line: f32,
     /// how far the eye has opened up to the gloom under a storm, 0..1
     storm_adapt: f32,
     head_live: bool,
@@ -1113,6 +1132,10 @@ struct Game {
     /// how much city is around (0..1), for the orange skyglow at night
     city_glow: f32,
     skyglow: skyglow::SkyGlow,
+    /// today's real snow cover around the camera (snowmap.rs)
+    snowmap: snowmap::SnowMap,
+    /// dynamic snow tracks and crash trails carved into lying snow (snowtrack.rs)
+    snowtrack: snowtrack::SnowTrack,
     /// an airport start being prepared: (airport, the airfield if it could be put together, runway, on approach, keep the local time)
     airport_rx: Option<std::sync::mpsc::Receiver<(u32, Option<Arc<airports::Geo>>, Option<String>, bool, bool)>>,
     /// an airport start asked for on the command line
@@ -1306,7 +1329,13 @@ impl Game {
         wx.rain = wx.deck_rain(plane.pos) as f32;
         let mut lightning = storm::Lightning::new();
         lightning.forced = args.strikes.clone();
-        let mut glass = rain::Glass::new(wx.rain);
+        // (As wet as the rain's share: snow does not run down the glass.)
+        let start_snow = {
+            let (pla, _, palt) = geo::pos_to_lla(plane.pos);
+            let day = args.day.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) / 86400.0 % 365.25);
+            snow::snow_share(palt, snow::freezing_guess(args.snow.unwrap_or(prefs.snow), pla.to_degrees(), day)) as f32
+        };
+        let mut glass = rain::Glass::new(wx.rain * (1.0 - start_snow));
         if let Some(w) = args.wet {
             glass.wet = w.clamp(0.0, 1.0);
         }
@@ -1356,14 +1385,14 @@ impl Game {
             minimap: minimap::Minimap::new(&prefs),
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
-            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
+            frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, path_marker: prefs.path_marker, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
-            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: args.weather_panel, radial: Default::default(), info_page: if args.weather_panel { menu::Page::Weather } else { menu::Page::Flight }, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, radial_at: args.flight_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
+            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, snow: args.snow.unwrap_or(prefs.snow), info_open: args.weather_panel, radial: Default::default(), info_page: if args.weather_panel { menu::Page::Weather } else { menu::Page::Flight }, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, radial_at: args.flight_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, snow_field: storm::RainField::default(), cam_snow: start_snow, cam_blow: 0.0, fresh: snow::Fresh::default(), fresh_line: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -1585,6 +1614,16 @@ impl Game {
         // (The navigation lights, beacon and strobes run off the bus.)
         let (lit, pw) = if p.sys.powered() { (1000.0, 1.0) } else { (0.0, 0.0) };
         g[0][1] += self.radios.alt_error_ft(self.wx.qnh) as f32;
+        if p.spec.id == 9 && p.sys.powered() {
+            // The G650's attitude and heading come from its inertial reference
+            // units, not the vacuum gyro and DG the gauges model: the aircraft's
+            // own, as soon as the bus is powered (the IRS alignment is not simulated).
+            let (e, n, u) = geo::enu(p.pos);
+            let (f, r, up) = (p.forward(), p.right(), p.up());
+            g[1][0] = f.dot(u).clamp(-1.0, 1.0).asin().to_degrees() as f32;
+            g[1][1] = (-r.dot(u)).atan2(up.dot(u)).to_degrees() as f32;
+            g[0][3] = f.dot(e).atan2(f.dot(n)).to_degrees().rem_euclid(360.0) as f32;
+        }
         if self.spec.is_jet() {
             // The glass cockpit's engine and air data (b747/deck747.wgsl).
             let (_, _, h) = geo::pos_to_lla(p.pos);
@@ -1597,8 +1636,10 @@ impl Game {
             // The Phantom's J79 turbojets: about 250 C idling, 650 C at military power.
             // The Raptor's F119s are taken to run like the Hornet's.
             // Concorde's Olympus 593 turbojets: about 350 C idling, 750 C flat out.
-            // The Blackbird's J58s: about 400 C idling, 795 C at military power and in afterburner.)
-            let (idle_t, rise) = match self.spec.id { 2 | 4 => (400.0, 380.0), 3 => (250.0, 330.0), 6 => (350.0, 400.0), 7 => (80.0, 740.0), _ => (440.0, 200.0) };
+            // The Blackbird's J58s: about 400 C idling, 795 C at military power and in afterburner.
+            // The G650's BR725s show ITT: taken as about 440 C idling and 870 C at take-off
+            // power, an estimate (no published figures found).)
+            let (idle_t, rise) = match self.spec.id { 2 | 4 => (400.0, 380.0), 3 => (250.0, 330.0), 6 => (350.0, 400.0), 7 => (80.0, 740.0), 9 => (440.0, 430.0), _ => (440.0, 200.0) };
             let egt = oat + (idle_t - oat + rise * x.powf(1.4)) * running;
             // Fuel flow per engine (kg/h) and the fuel on board (kg), from the engines' burn.
             let n_eng = match &self.spec.engine { aircraft::Engine::Fan(f) => f.n as f64, _ => 1.0 };
@@ -1613,7 +1654,7 @@ impl Game {
                 [p.n1 as f32, egt as f32, ff as f32, fuel as f32],
                 [mach as f32, gs as f32, (agl * 3.28084) as f32, tat as f32],
                 [p.throttle as f32, local as f32, p.gear as f32, p.flap_deg() as f32],
-                [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if (self.spec.id != 0 && p.gear_down || self.spec.id == 0 && p.landing_lights) && p.sys.powered() { 1.0 } else { 0.0 }],
+                [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if (if matches!(self.spec.id, 0 | 9) { p.landing_lights } else { p.gear_down }) && p.sys.powered() { 1.0 } else { 0.0 }],
             ];
         }
         // Row 5's first slot carries the nav lights (on above 1000) and the compass card.
@@ -1707,6 +1748,20 @@ impl Game {
         let decl = (-23.44f64).to_radians() * (std::f64::consts::TAU * (self.doy + 10.0) / 365.25).cos();
         let lon = (-15.0 * (self.utc - 12.0)).to_radians();
         DVec3::new(decl.cos() * lon.cos(), decl.cos() * lon.sin(), decl.sin())
+    }
+
+    /// Whether snow lies on flat ground at `p` (for snow spray vs dirt dust).
+    fn snowy_at(&self, p: DVec3) -> bool {
+        match self.snow {
+            snow::Mode::Off => false,
+            snow::Mode::Always => true,
+            snow::Mode::Auto => {
+                let (la, _, alt) = geo::pos_to_lla(p);
+                let Some(base) = snow::snow_line(self.snow, la.to_degrees(), self.doy, self.wx.freezing) else { return false };
+                let line = self.snowmap.snow_line_at(p, base, self.doy);
+                snow::cover(alt, 1.0, 0.0, line) > 0.35
+            }
+        }
     }
 
     /// Direction to the moon: the sun's ecliptic longitude advanced by the
@@ -2007,7 +2062,8 @@ impl Game {
         if pw {
             flags |= mp_proto::F_NAV | mp_proto::F_STROBE | mp_proto::F_BEACON;
         }
-        if pw && p.gear_down {
+        // (The G650's landing lights follow their switches alone.)
+        if pw && (if p.spec.id == 9 { p.landing_lights } else { p.gear_down }) {
             flags |= mp_proto::F_LANDING;
         }
         if p.on_ground {
@@ -2331,7 +2387,26 @@ impl Game {
         let on_off = |b: bool| if b { "ON" } else { "OFF" };
         Some(match id {
             "master" => on_off(p.sys.elec.master).into(),
+            "ignition" if self.spec.is_jet() => format!("{}{}", if p.ignition { "RUN" } else { "CUTOFF" }, if p.starter_on || p.cranking { " · START" } else { "" }),
             "ignition" => format!("{}{}", on_off(p.ignition), if p.starter_on || p.cranking { " · START" } else { "" }),
+            "fuel_control_l" | "fuel_control_r" | "battery_l" | "battery_r" => {
+                let fuel = id.starts_with("fuel");
+                let on = p.pair_on(!fuel as usize, id.ends_with("_r") as usize);
+                if fuel {
+                    format!("{}{}", if on { "RUN" } else { "CUTOFF" }, if p.ignition && (p.starter_on || p.cranking) { " · START" } else { "" })
+                } else { on_off(on).into() }
+            }
+            "starter" => if p.starter_on || p.cranking { "START" } else if p.running { "RUNNING" } else { "OFF" }.into(),
+            "speedbrake" if self.spec.chute.is_none() => if p.speedbrake > 0.0 { t!("extended", "sortis") } else { t!("retracted", "rentrés") }.into(),
+            "ap" => on_off(self.ap.on).into(),
+            "ap_hdg" | "ap_hdg_right" => format!("HDG {:03.0}°", self.ap.hdg.rem_euclid(360.0)),
+            "ap_alt" | "ap_alt_up" => format!("ALT {:.0} ft", self.ap.alt * 3.28084),
+            "ap_nav" | "ap_apr" => {
+                let m = if id == "ap_nav" { autopilot::Lat::Nav } else { autopilot::Lat::Apr };
+                if !self.ap.on || self.ap.lat != m { "OFF".into() } else if self.ap.nav_cap { "ON".into() } else { t!("armed", "armé").into() }
+            }
+            "ap_vs" | "ap_vs_up" => format!("VS {:+.0} ft/min{}", self.ap.vs * 196.85, if self.ap.on && self.ap.vert == autopilot::Vert::Vs { "" } else { " (off)" }),
+            "ap_at" | "ap_spd_up" => format!("A/T {} · {:.0} kt", on_off(self.ap.at), self.ap.spd * 1.943_84),
             "parking_brake" => on_off(p.parking_brake).into(),
             "mixture_rich" => format!("{:.0} %", p.mixture * 100.0),
             "throttle_up" => format!("{:.0} %", p.throttle * 100.0),
@@ -3154,6 +3229,22 @@ impl Game {
         }
     }
 
+    /// The autothrottle on or off (holding the airspeed of the moment if none is set).
+    fn ap_at_toggle(&mut self) {
+        self.ap.at = !self.ap.at;
+        if self.ap.at && self.ap.spd <= 0.0 {
+            self.ap.spd = autopilot::State::of(&self.plane).ias;
+        }
+    }
+    /// The vertical speed the autopilot flies in VS, up or down 100 ft/min.
+    fn ap_vs_step(&mut self, up: bool) {
+        self.ap.vs = ((self.ap.vs * 196.85 / 100.0).round() * 100.0 + if up { 100.0 } else { -100.0 }).clamp(-4000.0, 4000.0) / 196.85;
+    }
+    /// The autothrottle's speed, up or down 5 kt.
+    fn ap_spd_step(&mut self, up: bool) {
+        self.ap.spd = ((self.ap.spd * 1.943_84).round() + if up { 5.0 } else { -5.0 }).max(40.0) / 1.943_84;
+    }
+
     /// the autopilot page: its modes as keys, then the four settings it flies to.
     fn autopilot_page(&mut self, ui: &mut egui::Ui) {
         use autopilot::{Lat, Vert};
@@ -3199,6 +3290,9 @@ impl Game {
                 at = key(ui, "AT", self.ap.at, w, 40.0).on_hover_text(t!("Autothrottle", "Automanette")).clicked();
             });
         });
+        if at {
+            self.ap_at_toggle();
+        }
         if toggle {
             self.ap_toggle();
         }
@@ -3207,12 +3301,6 @@ impl Game {
         }
         if let Some(m) = vert {
             self.ap_vert(m);
-        }
-        if at {
-            self.ap.at = !self.ap.at;
-            if self.ap.at && self.ap.spd <= 0.0 {
-                self.ap.spd = s.ias;
-            }
         }
         // the settings: a big figure, then less, sync to the aircraft's own, more.
         let values = [
@@ -3253,14 +3341,14 @@ impl Game {
         }
         let d = sign(steps[2]);
         if d != 0.0 {
-            self.ap.vs = ((self.ap.vs * 196.85 / 100.0).round() * 100.0 + 100.0 * d).clamp(-4000.0, 4000.0) / 196.85;
+            self.ap_vs_step(d > 0.0);
         }
         if steps[2].2 {
             self.ap.vs = (s.vs * 196.85 / 100.0).round() * 100.0 / 196.85;
         }
         let d = sign(steps[3]);
         if d != 0.0 {
-            self.ap.spd = ((self.ap.spd * 1.943_84).round() + 5.0 * d).max(40.0) / 1.943_84;
+            self.ap_spd_step(d > 0.0);
         }
         if steps[3].2 {
             self.ap.spd = s.ias;
@@ -3455,13 +3543,13 @@ impl Game {
         self.radios.baro = baro;
     }
 
-    fn cockpit_globals(&self) -> [[f32; 4]; 8] {
+    fn cockpit_globals(&self, agl: f64) -> [[f32; 4]; 12] {
         let p = &self.plane;
         let (lat, lon, h) = geo::pos_to_lla(p.pos);
         let (east, north, up) = geo::enu(p.pos);
         let gs = (p.vel - up * p.vel.dot(up)).length() * 1.94384;
         let hdg = p.forward().dot(east).atan2(p.forward().dot(north));
-        let mut data = [[0.0; 4]; 8];
+        let mut data = [[0.0; 4]; 12];
         data[0] = [(self.radios.setting(self.wx.qnh) * 0.029529983 * 100.0) as f32,
             ((h * 3.28084 + (1013.25 - self.wx.qnh) * 27.3) / 100.0) as f32,
             gs as f32, (p.spec.fuel_kg / 0.72 / 3.785 / 2.0) as f32];
@@ -3471,7 +3559,35 @@ impl Game {
         data[2] = [self.gauges.cylinder_head_f(), ((p.trim + 0.05) / 0.29) as f32, if p.sys.powered() { 1.0 } else { 0.0 }, p.engine_hours as f32];
         let plot = |pos: DVec3| { let v = pos - p.pos; [v.dot(east) as f32 / 18520.0, v.dot(north) as f32 / 18520.0, 1.0, 0.0] };
         if let Some(st) = &self.radios.nav { data[3] = plot(st.pos()); }
-        for (dst, (st, _)) in data[4..].iter_mut().zip(nav::near(lat.to_degrees(), lon.to_degrees(), 18520.0, nav::Kind::Vor).iter().take(4)) { *dst = plot(st.pos()); }
+        for (dst, (st, _)) in data[4..8].iter_mut().zip(nav::near(lat.to_degrees(), lon.to_degrees(), 18520.0, nav::Kind::Vor).iter().take(4)) { *dst = plot(st.pos()); }
+        // Rows 8-11: what the glass cockpits show of the autopilot and the
+        // systems (common.wgsl `Globals::cockpit`, deck650.wgsl).
+        {
+            use autopilot::{Lat, Vert};
+            let ap = &self.ap;
+            let bit = |b: bool, v: u32| if b { v } else { 0 };
+            let bits = bit(ap.on, 1) | bit(ap.at, 2)
+                | match ap.lat { Lat::Roll => 0, Lat::Hdg => 4, Lat::Nav => 8, Lat::Apr => 16 }
+                | match ap.vert { Vert::Pitch => 0, Vert::Alt => 32, Vert::Vs => 64, Vert::Gs => 128 }
+                | bit(ap.nav_cap, 256) | bit(ap.gs_cap, 512) | bit(ap.alt_cap, 1024) | bit(ap.slow, 2048) | bit(ap.fast, 4096);
+            data[8] = [bits as f32, ap.hdg.rem_euclid(360.0) as f32, (ap.alt * 3.28084) as f32, (ap.spd * 1.943_84) as f32];
+            data[9] = [(ap.vs * 196.85) as f32, p.trim.to_degrees() as f32, p.speedbrake as f32, p.spoilers as f32];
+            let flags = bit(p.running, 1) | bit(p.starter_on, 2) | bit(p.ignition, 4) | bit(p.sys.powered(), 8) | bit(p.on_ground, 16) | bit(p.parking_brake, 32);
+            data[10] = [p.reverser as f32, flags as f32, p.toe_brake[0].max(p.toe_brake[1]) as f32, (p.alpha / p.stall_alpha().max(0.01)) as f32];
+            // The cabin: held near the field's height on the ground and low,
+            // scheduled to about 4,850 ft at 51,000 ft (an estimate, not the
+            // real pressurisation schedule). The speed trend: the along-path
+            // acceleration (the accelerometers' specific force less gravity)
+            // carried 6 s ahead.
+            let alt_ft = h * 3.28084;
+            let agl_ft = agl * 3.28084;
+            let k = ((agl_ft - 500.0) / 3000.0).clamp(0.0, 1.0);
+            let cabin = alt_ft + (alt_ft * 0.095 - alt_ft).min(0.0) * k;
+            let air = p.vel - p.wind;
+            let acc = p.rot * p.sf - up * 9.81;
+            let trend = if air.length() > 1.0 { acc.dot(air.normalize()) * 6.0 * 1.943_84 } else { 0.0 };
+            data[11] = [p.sys.elec.volts as f32, p.sys.elec.amps as f32, cabin as f32, trend as f32];
+        }
         data
     }
 
@@ -3494,6 +3610,11 @@ impl Game {
             "cowl_open" => self.plane.cowl_flaps = (self.plane.cowl_flaps + 0.1).min(1.0),
             "cowl_close" => self.plane.cowl_flaps = (self.plane.cowl_flaps - 0.1).max(0.0),
             "landing_lights" => self.plane.landing_lights = !self.plane.landing_lights,
+            "ap_vs" if !self.crashed => self.ap_vert(autopilot::Vert::Vs),
+            "ap_at" => self.ap_at_toggle(),
+            "ap_vs_up" | "ap_vs_down" => self.ap_vs_step(id == "ap_vs_up"),
+            "ap_spd_up" | "ap_spd_down" => self.ap_spd_step(id == "ap_spd_up"),
+            "fuel_control_l" | "fuel_control_r" | "battery_l" | "battery_r" => self.pair_switch(id),
             "fuel_valve" | "fuel_next" | "fuel_prev" => {
                 self.plane.fuel_selector = self.plane.fuel_selector.turn(id != "fuel_prev");
             }
@@ -3511,6 +3632,33 @@ impl Game {
             }
             _ => {}
         }
+    }
+
+    /// One of a twin jet's L/R fuel control or battery switches clicked: it
+    /// goes to the other position. The shared state (`Plane::ignition`,
+    /// `sys.elec.master`) is on while either switch of the pair is, and is
+    /// switched with the action's key (`ignition`, `master`), so the mouse
+    /// does what the key does.
+    fn pair_switch(&mut self, id: &str) {
+        let fuel = id.starts_with("fuel");
+        let (k, w) = (id.ends_with("_r") as usize, !fuel as usize);
+        let shared = |p: &plane::Plane| if fuel { p.ignition } else { p.sys.elec.master };
+        let on = shared(&self.plane);
+        let want = [!self.plane.pair_on(w, k), self.plane.pair_on(w, 1 - k)];
+        if want[0] != on && !(on && want[1]) {
+            // Off to on, or the last switch of the pair off: the key.
+            if let Some(key) = Self::action_key(if fuel { "ignition" } else { "master" }) {
+                self.key(key);
+            }
+            if shared(&self.plane) == on { return; }
+        }
+        // Which switch is off while its partner holds the state on (both on, or both off: neither).
+        let mut pair = [false; 2];
+        if want[0] != want[1] {
+            pair[k] = !want[0];
+            pair[1 - k] = !want[1];
+        }
+        self.plane.pair_off[w] = pair;
     }
 
     /// NAV 1 as the cockpit's course deviation indicators show it (Globals::nav).
@@ -3742,12 +3890,14 @@ impl Game {
             KeyCode::KeyH => self.show_hud = !self.show_hud,
             KeyCode::Backquote => self.minimap.visible = !self.minimap.visible,
             KeyCode::Insert => {
+                self.plane.pair_off[1] = [false; 2];
                 let m = &mut self.plane.sys.elec.master;
                 *m = !*m;
                 self.status = if *m { t!("Battery master on", "Batterie (master) sur ON") } else { t!("Battery master off", "Batterie (master) sur OFF") }.into();
                 self.status_until = self.real + 3.0;
             }
             KeyCode::KeyI => {
+                self.plane.pair_off[0] = [false; 2];
                 self.plane.ignition = !self.plane.ignition;
                 let on = self.plane.ignition;
                 self.status = if self.spec.is_jet() {
@@ -4553,7 +4703,7 @@ impl Game {
 
     /// The settings worth keeping, as they are now.
     fn live_settings(&self) -> settings::Settings {
-        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, last: self.last_start.clone(), multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
+        settings::Settings { lang: self.prefs_lang, sound_on: self.sound_on, volume: self.volume, cam_mode: self.cam_mode, cockpit_fov: self.cockpit_fov, look_sens: self.look_sens, show_hud: self.show_hud, hud_cockpit: self.hud_cockpit, path_marker: self.path_marker, minimap: self.minimap.visible, landing_guidance: self.minimap.landing_guidance, arcade: self.arcade, minimap_plan: self.minimap.plan, minimap_heading_up: self.minimap.heading_up, minimap_zoom: self.minimap.zoom, minimap_size: self.minimap.size.x, minimap_height: self.minimap.size.y, taa: self.gfx.taa, live_traffic: self.live.enabled(), live_weather: self.wx.live, real_time: self.wx.real_time, snow: self.snow, last: self.last_start.clone(), multiplayer: self.mp_on, mp_server: self.mp_server.clone(), mp_name: self.mp_name.clone() }
     }
 
     /// Saves the settings when they have changed (looked at once a second,
@@ -4720,6 +4870,7 @@ impl Game {
         let scale = if self.paused || in_menu || self.pause_open || self.real < self.hold || loading { 0.0 } else { 1.0 };
         let dt = dt_real * scale;
         self.time += dt;
+        let mut glass_rain = 0.0f32;
         if !in_menu {
             // The clock runs at the panel's rate; past midnight the date turns over.
             let t = self.utc + dt * self.wx.time_rate / 3600.0;
@@ -4745,7 +4896,13 @@ impl Game {
             self.wx.step_deck(dt, self.plane.pos, gh);
             self.wx.rain = self.wx.rain_at(self.plane.pos, agl, self.time) as f32;
             self.wx.advance(dt, self.plane.pos);
-            self.glass.step(dt, self.wx.rain, self.plane.ias() * 1.94384);
+            // (Snow does not wet the glass or streak across it: only the liquid rain share does.)
+            let fz = match (self.snow, self.wx.freezing) {
+                (snow::Mode::Always, _) | (_, None) => snow::freezing_guess(self.snow, la.to_degrees(), self.doy),
+                (_, Some(f)) => f,
+            };
+            glass_rain = self.wx.rain * (1.0 - snow::snow_share(h, fz) as f32);
+            self.glass.step(dt, glass_rain, self.plane.ias() * 1.94384);
         }
 
         // Physics at a fixed step.
@@ -4808,10 +4965,20 @@ impl Game {
                         }
                     }
                 }
+                if !self.plane.snow_marks.is_empty() {
+                    if self.snow != snow::Mode::Off {
+                        for m in self.plane.snow_marks.drain(..) {
+                            self.snowtrack.stamp(m);
+                        }
+                    } else {
+                        self.plane.snow_marks.clear();
+                    }
+                }
                 if !self.plane.dirt.is_empty() {
                     self.anchor_fx(self.plane.pos);
                     let up = self.plane.pos.normalize().as_vec3();
                     let field = self.world.airfield_near(self.plane.pos, 3_000.0);
+                    let snowy = self.snowy_at(self.plane.pos);
                     for (p, v, amt) in self.plane.dirt.drain(..) {
                         // Paved runways throw up nothing; dirt, grass and fields do.
                         if field.is_some_and(|f| f.geo.on_runway(f.geo.local(p), 2.0).is_some_and(|ri| f.geo.runways[ri].paved)) {
@@ -4825,7 +4992,8 @@ impl Game {
                             k -= 1.0;
                             let big = amt > 1.5;
                             let vel = v.as_vec3() * r.range(0.6, 1.2) + r.dir() * (1.0 + speed * 0.15) + up * r.range(0.5, 2.5);
-                            femit.push((p, render::Particle { vel: vel.into(), life: r.range(1.5, 4.0) * if big { 1.5 } else { 1.0 }, size0: r.range(0.3, 0.7), size1: r.range(2.0, 4.0) * if big { 1.6 } else { 1.0 }, kind: crash::DUST, drag: 1.4, buoy: 0.15, seed: r.f(), alpha: r.range(0.45, 0.75), ..Default::default() }));
+                            let kind = if snowy && (!big || r.f() < 0.7) { crash::MIST } else { crash::DUST };
+                            femit.push((p, render::Particle { vel: vel.into(), life: r.range(1.5, 4.0) * if big { 1.5 } else { 1.0 }, size0: r.range(0.3, 0.7), size1: r.range(2.0, 4.0) * if big { 1.6 } else { 1.0 }, kind, drag: 1.4, buoy: 0.15, seed: r.f(), alpha: r.range(0.45, 0.75), ..Default::default() }));
                         }
                     }
                 }
@@ -4855,8 +5023,13 @@ impl Game {
                             let keep = self.spec.mass / (self.spec.mass + mb);
                             if keep > 0.55 {
                                 through = keep as f32;
-                                let (la, lo, _) = geo::pos_to_lla(imp.pos);
-                                imp.ground_h = self.world.ground(la, lo).map(|g| g.h).unwrap_or(base);
+                                // (the blast stays where the aircraft went up, up the
+                                // side of the house; only a low hit is at street level)
+                                let (la, lo, alt) = geo::pos_to_lla(imp.pos);
+                                let g = self.world.ground(la, lo).map(|g| g.h).unwrap_or(base);
+                                if alt - g < 6.0 {
+                                    imp.ground_h = g;
+                                }
                             }
                         }
                     }
@@ -4870,10 +5043,8 @@ impl Game {
                     if let Some((tile, idx)) = imp.building {
                         // The building that was hit comes down, and any shed or small house right beside it.
                         let (la, lo, alt) = geo::pos_to_lla(site);
-                        if through == 0.0 {
-                            if let Some(g) = self.world.ground(la, lo) {
-                                crash.set_lift(alt - g.h);
-                            }
+                        if let Some(g) = self.world.ground(la, lo) {
+                            crash.set_lift(alt - g.h);
                         }
                         let d = &self.plane.dmg;
                         let hit = destruct::Hitter { right: self.plane.right(), up: self.plane.up(), span: d.wing, shape: &self.spec.hole, full: self.spec.span, stab: d.stab, fin: d.fin };
@@ -4888,6 +5059,20 @@ impl Game {
                         let steep = (-imp.vel.dot(site.normalize()) / imp.vel.length().max(1.0)).clamp(0.0, 1.0) as f32;
                         let r = (3.0 + 5.0 * power) * (1.0 + (size.sqrt() - 1.0) * steep);
                         self.world.add_crater(site, r);
+                        if self.snow != snow::Mode::Off {
+                            let upw = site.normalize();
+                            let tang = imp.vel - upw * imp.vel.dot(upw);
+                            let along = tang.normalize_or_zero();
+                            let skid_len = (r as f64 * (1.8 - 1.1 * steep as f64)).max(0.0);
+                            self.snowtrack.stamp(snowtrack::Mark {
+                                a: site - along * (r as f64 * 0.5),
+                                b: site + along * skid_len,
+                                radius: r * 1.35,
+                                clear: 1.0,
+                                berm: 1.0,
+                                rough: 1.0,
+                            });
+                        }
                         self.destr.eject(site, r, imp.vel, &mut femit);
                         gone = r as f64;
                         for (t, i) in self.world.buildings_near(site, r as f64 + 4.0 * reach as f64, if heavy { 900.0 } else { 400.0 }) {
@@ -4904,7 +5089,20 @@ impl Game {
                     self.crashed = true;
                     self.crash_real = self.real;
                     self.orbit = 0.0;
-                    self.cam_ang = None;
+                    // Watch from back along the way it came in: that air is
+                    // clear (it just flew through it), so the camera never
+                    // starts inside the building or behind it.
+                    {
+                        let (e, n, u) = geo::enu(site);
+                        let v = imp.vel - u * imp.vel.dot(u);
+                        let back = if v.length() > 1.0 { -v.normalize() } else { -self.plane.forward() };
+                        let a = back.dot(n).atan2(back.dot(e));
+                        self.cam_ang = Some(a);
+                        let dist = (70.0 + 34.0 * power as f64) * (self.crash.as_ref().map_or(1.0, |c| c.size) as f64).sqrt() + self.cam_dist;
+                        let horiz = e * a.cos() + n * a.sin();
+                        self.cam_pos = site + horiz * dist * 0.6 + u * (12.0 + dist * 0.15);
+                        self.cam_look = site;
+                    }
                     self.cam_clear_t = 0.0;
                     self.cam_rise = 0.0;
                     self.acc = 0.0;
@@ -4924,6 +5122,15 @@ impl Game {
                 self.destr.booms.push(0.5);
             }
             self.sheds.update(dt as f32, &self.world);
+            if !self.sheds.snow_marks.is_empty() {
+                if self.snow != snow::Mode::Off {
+                    for m in self.sheds.snow_marks.drain(..) {
+                        self.snowtrack.stamp(m);
+                    }
+                } else {
+                    self.sheds.snow_marks.clear();
+                }
+            }
         }
         let booms: Vec<f32> = self.destr.booms.drain(..).collect();
         if !booms.is_empty() {
@@ -4951,6 +5158,7 @@ impl Game {
             }
         }
         let mut fire = 0.0f32;
+        let crash_snowy = self.crash.as_ref().is_some_and(|cr| !cr.water && self.snowy_at(cr.site));
         if let Some(cr) = self.crash.as_mut() {
             if dt > 0.0 {
                 // Smoke leaving the top of the fire simulation carries on as particles.
@@ -4965,7 +5173,16 @@ impl Game {
                     }
                     _ => None,
                 };
-                cr.update(dt, &self.world, &mut emit);
+                cr.update(dt, &self.world, crash_snowy, &mut emit);
+            }
+            if !cr.snow_marks.is_empty() {
+                if self.snow != snow::Mode::Off {
+                    for m in cr.snow_marks.drain(..) {
+                        self.snowtrack.stamp(m);
+                    }
+                } else {
+                    cr.snow_marks.clear();
+                }
             }
         }
         // What the wreckage ploughed through on its way comes down.
@@ -5116,7 +5333,10 @@ impl Game {
         } else if self.crashed {
             let cr = self.crash.as_ref().unwrap();
             // After an impact up the side of a building, the wreck ends up in the street below.
-            let street = cr.site - cr.up * cr.lift;
+            // While the fire burns up at the hole (6 s, see `Crash::set_lift`),
+            // watch it there; then follow the wreck down to the street.
+            let down = { let x = ((cr.time - 5.0) / 4.0).clamp(0.0, 1.0); x * x * (3.0 - 2.0 * x) };
+            let street = cr.site - cr.up * (cr.lift * down as f64);
             let mut target = cr.debris.first().filter(|d| !d.sunk).map(|d| d.pos).unwrap_or(street) * 0.5 + street * 0.5 + cr.up * 6.0;
             // (an airliner's fireball is a few hundred metres across: further back)
             let mut dist = (70.0 + 34.0 * cr.power as f64) * (cr.size as f64).sqrt() + self.cam_dist;
@@ -5244,6 +5464,7 @@ impl Game {
         if in_menu {
             self.cam_rain = 0.0;
             self.cam_hail = 0.0;
+            (self.cam_snow, self.cam_blow) = (0.0, 0.0);
         } else {
             self.cam_rain = self.wx.rain_at(cam, agl, self.time) as f32;
             self.cam_hail = if self.cam_rain > 0.0 { storm::local(&self.wx, cam, agl, self.time).hail as f32 } else { 0.0 };
@@ -5254,6 +5475,31 @@ impl Game {
             };
             self.lightning.step(dt, self.time, &self.wx, self.plane.pos, cam, &gnd);
             self.rain_field.step(dt, cam, self.wx.at(cam, agl, self.time));
+            self.snow_field.step_fall(dt, cam, self.wx.at(cam, agl, self.time), storm::FLAKE_FALL);
+            // Snow (snow.rs): what falls is snow above the melting layer under
+            // the freezing level (from the real weather, else the season's);
+            // where it reaches the ground fresh snow settles; the wind lifts
+            // lying snow into a blizzard.
+            let (lat_d, gh) = (clat.to_degrees(), ground.unwrap_or(0.0));
+            let fz = match (self.snow, self.wx.freezing) {
+                (snow::Mode::Always, _) | (_, None) => snow::freezing_guess(self.snow, lat_d, self.doy),
+                (_, Some(f)) => f,
+            };
+            self.cam_snow = snow::snow_share(calt, fz) as f32;
+            let at_ground = self.wx.rain_at(geo::lla_to_pos(clat, clon, gh), 0.0, self.time) * snow::snow_share(gh, fz);
+            if self.snow == snow::Mode::Off {
+                self.fresh = snow::Fresh::default();
+            } else {
+                self.fresh.step(dt, at_ground);
+            }
+            self.fresh_line = snow::Fresh::line(gh) as f32;
+            let white = snow::snow_line(self.snow, lat_d, self.doy, self.wx.freezing).map_or(0.0, |l| {
+                let l = l + (l.min(snow::Fresh::line(gh)) - l) * self.fresh.k;
+                snow::cover(gh, 1.0, 0.0, l)
+            });
+            // (Blown snow fills the lowest hundred metres or so.)
+            let low = 1.0 - snow::smoothstep(60.0, 400.0, agl);
+            self.cam_blow = (snow::blowing(white, at_ground.min(1.0), self.wx.wind, self.wx.blowing as f64) * low) as f32;
         }
         let scrape = if steps > 0 { (scrape_n as f32 / steps as f32 * 0.5).min(1.0) } else { 0.0 };
         self.update_audio(cam, fire, in_menu, &c, dt, scrape);
@@ -5310,6 +5556,11 @@ impl Game {
         self.city_glow += (city - self.city_glow) * (dt_real as f32 * 0.5).min(1.0);
         // City light in the air: the lights come on as the sun sets.
         let glow_px = if in_menu { None } else { self.skyglow.update(cam) };
+        // Today's real snow cover, when the snow follows the real world.
+        let snow_px = self.snowmap.update(&self.src, cam, !in_menu && self.snow == snow::Mode::Auto);
+        let snow_map = if in_menu || self.snow != snow::Mode::Auto { [[0.0; 4]; 3] } else { self.snowmap.globals(cam, self.doy) };
+        let snow_tr_uploads = if in_menu || self.snow == snow::Mode::Off { Vec::new() } else { self.snowtrack.take_uploads() };
+        let snow_tr = if in_menu || self.snow == snow::Mode::Off { [[0.0; 4]; 3] } else { self.snowtrack.globals(cam) };
         let glow = {
             let (la, lo, _) = geo::pos_to_lla(cam);
             let gh = self.world.ground(la, lo).map(|g| g.h).unwrap_or(0.0);
@@ -5416,8 +5667,8 @@ impl Game {
             shore_vp: [[0.0; 4]; 4],
             shore: [0.0; 4],
             foam: [[0.0; 4]; 16],
-            // (yzw: the rain, how wet the windows are, and the airspeed over them in kt; plane.wgsl rain_water)
-            start: [if in_menu { 1.0 } else { 0.0 }, self.wx.rain, self.glass.wet, (self.plane.ias() * 1.94384) as f32],
+            // (yzw: the liquid rain, how wet the windows are, and the airspeed over them in kt; plane.wgsl rain_water)
+            start: [if in_menu { 1.0 } else { 0.0 }, glass_rain, self.glass.wet, (self.plane.ias() * 1.94384) as f32],
             stormfx: [0.0; 4],
             flash: [[0.0; 4]; 2 * storm::MAX_FLASHES],
             rain: [[0.0; 4]; 2],
@@ -5429,7 +5680,17 @@ impl Game {
             glow_n: glow[2],
             spot: [[0.0; 4]; 3],
             nav: self.nav_globals(),
-            cockpit: self.cockpit_globals(),
+            cockpit: self.cockpit_globals(agl),
+            snow: if in_menu { [0.0; 4] } else { snow::globals(self.snow, clat.to_degrees(), self.doy, self.wx.freezing) },
+            snow_c: snow_map[0],
+            snow_e: snow_map[1],
+            snow_n: snow_map[2],
+            flakes: [0.0; 4],
+            flakes_v: [0.0; 4],
+            fresh: [0.0; 4],
+            snow_tr_c: snow_tr[0],
+            snow_tr_e: snow_tr[1],
+            snow_tr_n: snow_tr[2],
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -5450,6 +5711,10 @@ impl Game {
             // (Hail rides along in the intensity's whole part, in sixteenths: precip.wgsl.)
             let rain_w = self.cam_rain.min(0.999) + (self.cam_hail.clamp(0.0, 1.0) * 15.0).round();
             g.rain = [[o.x as f32, o.y as f32, o.z as f32, rain_w], [v.x as f32, v.y as f32, v.z as f32, near_cut as f32]];
+            let (o, v) = (self.snow_field.off, self.snow_field.rel);
+            g.flakes = [o.x as f32, o.y as f32, o.z as f32, self.cam_snow];
+            g.flakes_v = [v.x as f32, v.y as f32, v.z as f32, self.cam_blow];
+            g.fresh = [self.fresh_line, self.fresh.k as f32, 0.0, 0.0];
         }
         if !self.crashed && !in_menu {
             // The aircraft keeps pace with the camera, so its pixels are found
@@ -5577,9 +5842,12 @@ impl Game {
                     mesh: self.piece_mesh[i],
                     model: base * pose[i],
                     // (Windows: the phases of the water on them, rain.rs Glass::phases; a
-                    // rocket's other parts: how thin the air is and how hot its tiles.)
-                    tint: [blur, burner, dry, if p.glass { rain_ph[2] } else { thin }],
-                    glow: if p.glass { [0.0, kind, rain_ph[0], rain_ph[1]] } else { [0.0, kind, heat, 0.0] },
+                    // rocket's parts: how thin the air is and how hot its tiles. A rocket
+                    // has no windows: its "glass" is the exhaust plumes, which spread by
+                    // that thinness; given the rain's ever-growing flow phase instead,
+                    // they swelled into a white sheet across the whole view.)
+                    tint: [blur, burner, dry, if p.glass && !rocket { rain_ph[2] } else { thin }],
+                    glow: if p.glass && !rocket { [0.0, kind, rain_ph[0], rain_ph[1]] } else { [0.0, kind, heat, 0.0] },
                     params,
                     cast: 1 << render::PLANE_LAYER,
                     glass: p.glass,
@@ -5773,8 +6041,8 @@ impl Game {
         if !in_menu {
             self.lightning.segments(cam, dt, &mut bolts);
         }
-        let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
-        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px });
+        let rain_drops = if in_menu || (self.cam_rain < 0.002 && self.cam_blow < 0.01) { 0 } else { render::RAIN_DROPS };
+        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px, snow: snow_px, snow_tracks: snow_tr_uploads });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
@@ -6307,6 +6575,9 @@ impl Game {
         if self.wx.live && (!self.wx.live_cells.is_empty() || self.wx.deck_goal.is_some()) {
             live += t!("  ·  Weather radar: RainViewer", "  ·  Radar météo : RainViewer");
         }
+        if self.mode != Mode::Menu && self.snow == snow::Mode::Auto && self.snowmap.shown().is_some() {
+            live += t!("  ·  Snow cover: IMS, U.S. National Ice Center (NSIDC)", "  ·  Enneigement : IMS, U.S. National Ice Center (NSIDC)");
+        }
         if self.mode == Mode::Menu && self.gclouds.shown {
             live += t!("  ·  Clouds: Live Cloud Maps (Matt Eason), contains modified EUMETSAT data", "  ·  Nuages : Live Cloud Maps (Matt Eason), contient des données EUMETSAT modifiées");
         }
@@ -6507,12 +6778,12 @@ impl Game {
             self.info_page = Page::Flight;
         }
         // in the middle, under the heading strip, clear of the alerts at the foot.
-        let y = if self.hud_on() { flightui::HEADING_H + 34.0 } else { 24.0 };
+        let y = if self.hud_on() { flightui::HEADING_TOP + flightui::HEADING_H + 34.0 } else { 24.0 };
         let max_h = (ctx.content_rect().height() - y - 84.0 - 36.0 - 48.0).max(160.0);
         egui::Area::new(egui::Id::unique("info_panel")).anchor(Align2::CENTER_TOP, [0.0, y]).show(ctx, |ui| {
             // an area only offers last frame's height; a longer page needs the room up front.
             ui.set_max_height(max_h + 120.0);
-            flightui::frosted(ui, flightui::glass().inner_margin(18.0), |ui| {
+            flightui::panel(ui, flightui::glass().inner_margin(18.0), |ui| {
                 ui.set_width(flightui::CARD_W);
                 let (to, close, x) = flightui::card_header(ui, self.info_page);
                 self.pad_home_focus(&x);
@@ -6866,8 +7137,6 @@ impl Game {
         let out = self.egui_ctx.clone().run_ui(raw, |root| {
             let ctx = &root.ctx().clone();
             self.pad_pass(ctx);
-            // the blurred frame behind the frosted glass.
-            flightui::set_frost(ctx, self.r.frost_id);
             use egui::{Align2, Color32, FontId, RichText};
             let pad = padui::active();
             let white = Color32::from_rgba_unmultiplied(255, 255, 255, 235);
@@ -7108,7 +7377,7 @@ impl Game {
             self.wreck_seen = self.real;
             if !self.crashed && self.wreck_t > 2.0 && self.mode == Mode::Fly {
                 egui::Area::new(egui::Id::unique("wreck")).anchor(Align2::CENTER_CENTER, [0.0, 80.0]).show(ctx, |ui| {
-                    flightui::frosted(ui, flightui::glass().inner_margin(egui::Margin::symmetric(24, 16)), |ui| {
+                    flightui::panel(ui, flightui::glass().inner_margin(egui::Margin::symmetric(24, 16)), |ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(RichText::new(t!("AIRCRAFT WRECKED", "AVION DÉTRUIT")).font(menu::bold(34.0)).color(Color32::from_rgb(255, 160, 80)).extra_letter_spacing(1.5));
                             ui.add_space(6.0);
@@ -7126,7 +7395,7 @@ impl Game {
             }
             if self.crashed && self.real - self.crash_real > 3.5 {
                 egui::Area::new(egui::Id::unique("crash")).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ctx, |ui| {
-                    flightui::frosted(ui, flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)), |ui| {
+                    flightui::panel(ui, flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)), |ui| {
                         if pad {
                             let panel = padmap::spec_of("flight_panel");
                             let mut items = vec![("A", tr("respawn")), (panel.as_str(), tr("go somewhere else")), ("Menu", tr("menu"))];
@@ -7263,6 +7532,12 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, _el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let Some(g) = self.game.as_mut() else { return };
         let consumed = g.egui_state.on_window_event(&g.window, &event).consumed;
+        // A look drag ends on any release, even one the UI took (the flight menu
+        // or a panel under the pointer), and when the window loses focus;
+        // otherwise the view keeps turning with the mouse after the button is up.
+        if matches!(event, WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left | MouseButton::Right, .. } | WindowEvent::Focused(false)) {
+            g.drag = false;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 g.keep_settings(true);
@@ -7475,9 +7750,22 @@ impl ApplicationHandler for App {
 
 /// The UI library ships no fonts of its own here, so borrow the system's.
 fn load_fonts(ctx: &egui::Context) {
-    let find = |kind: &str, fallbacks: &[&str]| -> Option<Vec<u8>> {
-        let fc = std::process::Command::new("fc-match").args(["-f", "%{file}", kind]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok());
-        fc.iter().map(|s| s.trim().to_string()).chain(fallbacks.iter().map(|s| s.to_string())).filter(|p| p.ends_with(".ttf") || p.ends_with(".otf")).find_map(|p| std::fs::read(p).ok())
+    // Each candidate is "path" or "path#face", the face picking one font out of a
+    // .ttc collection. fontconfig's index carries the named instance of a variable
+    // font in its upper 16 bits; only the low 16 are the face.
+    let find = |kind: &str, fallbacks: &[&str]| -> Option<(Vec<u8>, u32)> {
+        let fc = std::process::Command::new("fc-match").args(["-f", "%{file}#%{index}", kind]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok());
+        fc.iter().map(|s| s.trim().to_string()).chain(fallbacks.iter().map(|s| s.to_string())).find_map(|c| {
+            let (path, face) = match c.rsplit_once('#') {
+                Some((p, i)) => (p.to_string(), i.parse::<u32>().ok()? & 0xFFFF),
+                None => (c.clone(), 0),
+            };
+            let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            if !matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc") {
+                return None;
+            }
+            std::fs::read(&path).ok().map(|d| (d, face))
+        })
     };
     let mut fonts = egui::FontDefinitions::empty();
     // fontconfig's answer where there is one (Linux), then each system's own fonts.
@@ -7503,6 +7791,22 @@ fn load_fonts(ctx: &egui::Context) {
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
     ];
+    // A Korean (Hangul) face, for the Korean interface. The bundled Barlow and
+    // the Latin system fonts carry no Hangul, so without this Korean text would
+    // render as empty boxes. Noto Sans CJK collections hold JP, KR, SC, TC, HK
+    // in that order, so "#1" picks the Korean face.
+    let korean: &[&str] = &[
+        "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc#1",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc#1",
+        "/usr/share/fonts/opentype/noto-cjk/NotoSansCJK-Regular.ttc#1",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc#1",
+        "/usr/share/fonts/google-noto/NotoSansKR-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansKR-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/Library/Fonts/AppleGothic.ttf",
+        "C:/Windows/Fonts/malgun.ttf",
+    ];
     // our bundled faces first, then the system's for missing glyphs.
     let own: [(&str, &'static [u8]); 5] = [("barlow", menu::FONT_REGULAR), ("barlow-medium", menu::FONT_MEDIUM), ("barlow-semibold", menu::FONT_SEMIBOLD), ("barlow-condensed", menu::FONT_DISPLAY), ("plex-mono", menu::FONT_MONO)];
     for (name, data) in own {
@@ -7518,13 +7822,21 @@ fn load_fonts(ctx: &egui::Context) {
     for (family, name) in &families {
         fonts.families.entry(family.clone()).or_default().push((*name).into());
     }
-    for (name, kind, fb) in [("mono", "monospace", mono), ("sans", "sans", sans)] {
-        if let Some(data) = find(kind, fb) {
-            fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(data)));
+    for (name, kind, fb) in [("mono", "monospace", mono), ("sans", "sans", sans), ("korean", "sans:lang=ko", korean)] {
+        if let Some((data, face)) = find(kind, fb) {
+            let mut fd = egui::FontData::from_blob(Arc::new(data), face);
+            // A variable font starts at its default instance, which for Noto Sans
+            // CJK VF is Thin (wght 100); ask for Regular instead.
+            if fd.variation_axes().iter().any(|a| a.tag.to_be_bytes() == *b"wght") {
+                fd.tweak.coords.push(b"wght", 400.0);
+            }
+            fonts.font_data.insert(name.into(), Arc::new(fd));
         }
     }
     for (family, _) in families {
-        let fallback = if family == egui::FontFamily::Monospace { ["mono", "sans"] } else { ["sans", "mono"] };
+        // Korean is the last fallback everywhere so Latin keeps the bundled face
+        // and only the Hangul glyphs come from the Korean font.
+        let fallback = if family == egui::FontFamily::Monospace { ["mono", "sans", "korean"] } else { ["sans", "mono", "korean"] };
         for f in fallback {
             if fonts.font_data.contains_key(f) {
                 fonts.families.entry(family.clone()).or_default().push(f.into());

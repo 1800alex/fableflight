@@ -90,7 +90,13 @@ fn alto_march(oc: vec3f, rd: vec3f, t0: f32, t1: f32, a: f32, jit: f32, cs: f32,
   var L = vec3f(0.0);
   let n = 6;
   let dt = (t1 - t0) / f32(n);
-  let far = smoothstep(30000.0, 110000.0, 0.5 * (t0 + t1));
+  // By the ground a pixel stretches along the ray takes up (distance over
+  // the grazing angle), not distance alone: seen from below the layer it is
+  // 30-110 km off at ~1/6-1/20, but looked down on from high up (a rocket)
+  // the cloudlets stay many pixels wide and went to a featureless sheet.
+  let tm = 0.5 * (t0 + t1);
+  let mu = abs(dot(rd, normalize(oc + rd * tm)));
+  let far = smoothstep(180000.0, 2200000.0, tm / max(mu, 0.01));
   let sun = G.sun_dir.xyz;
   for (var i = 0; i < n; i++) {
     let ts = t0 + dt * (f32(i) + jit);
@@ -491,7 +497,12 @@ fn depth_match(a: f32, b: f32) -> f32 {
   if (G.alto.x > 0.0) {
     ar = alto_range(oc, rd);
     ar.y = min(min(ar.y, ar.x + 60000.0), tscene);
-    if (ar.x >= 0.0 && ar.x < min(tscene, 250000.0) && ar.y > ar.x) { aamt = alto_amount(oc + rd * (0.5 * (ar.x + ar.y))); }
+    // Drawn out to 250 km from below; from above it (a rocket, high up) out
+    // past the layer's own horizon too, or it ended in a hard-edged disc
+    // round the camera with the bare ground beyond.
+    let ahr = rg + G.alto.y + ALTO_TOP;
+    let alto_far = 250000.0 + sqrt(max((rg + alt) * (rg + alt) - ahr * ahr, 0.0));
+    if (ar.x >= 0.0 && ar.x < min(tscene, alto_far) && ar.y > ar.x) { aamt = alto_amount(oc + rd * (0.5 * (ar.x + ar.y))); }
   }
   var alto_on = aamt > 0.0;
   let atm_ = 0.5 * (ar.x + ar.y);
@@ -1056,6 +1067,8 @@ fn cs_band(h: f32) -> vec3f {
   return select(select(vec3f(0.0, 0.0, 1.0), vec3f(0.0, 1.0, 0.0), f < 2.0), vec3f(1.0, 0.0, 0.0), f < 1.0);
 }
 fn cshadow_ray(px: vec2f, ext: f32) -> vec4f {
+  // Shadows of the clouds as drawn (eroded), not of their whole envelopes.
+  g_mean_erode = true;
   let base = G.cs[9].x;
   let rg = G.planet.w;
   let R = rg + base;
@@ -1078,16 +1091,28 @@ fn cshadow_ray(px: vec2f, ext: f32) -> vec4f {
   // fine noise, which the lookup's smooth filter averages away; it is tied to the
   // texel, which stays put on the ground from map to map, so it does not shimmer.
   let n = i32(clamp(tl / 300.0, 32.0, 56.0));
-  let dt = tl / f32(n);
+  let nf = f32(n);
   let jit = ign(px);
+  // Steps packed towards the base, t = tl u (u + K) / (1 + K): fair-weather puffs
+  // are only 60-150 m thick there, and evenly spaced steps (60-90 m apart in
+  // height) hit or missed them by the jitter alone, so neighbouring texels
+  // alternated dark and light and the shadows showed as a grid of dots. Now ~6x
+  // finer at the base, under 2x coarser at the top (towers, km across), the
+  // same step count; it follows the bands' squeeze towards the base too.
+  const K = 0.2;
+  let ts = tl / (1.0 + K);
   // The column weather changes slowly along the ray: look it up every other step.
   var wx = no_weather();
   for (var i = 0; i < n; i++) {
-    let p = q + sun * (dt * (f32(i) + jit));
+    let u = (f32(i) + jit) / nf;
+    let p = q + sun * (ts * u * (u + K));
     let h = length(p) - rg;
-    if ((i & 1) == 0) { wx = cloud_weather_m(q + sun * (dt * (f32(i) + 1.0)), smask); }
+    if ((i & 1) == 0) {
+      let uw = (f32(i) + 1.0) / nf;
+      wx = cloud_weather_m(q + sun * (ts * uw * (uw + K)), smask);
+    }
     let d = cloud_shape(p, h, wx, false);
-    if (d > 0.0) { b += cs_band(h) * (d * dt); }
+    if (d > 0.0) { b += cs_band(h) * (d * ts * (2.0 * u + K) / nf); }
   }
   // The mid-level layer (which drifts half as fast again): one crossing of its lens.
   if (G.alto.x > 0.0) {
