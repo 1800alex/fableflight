@@ -48,8 +48,8 @@ impl Mode {
 }
 
 // The per-pixel part below runs in the shaders; here it is the reference the
-// tests check (and that they hold common.wgsl to), so the game itself does
-// not call it.
+// tests check (and that they hold common.wgsl to). The game calls it for the
+// ground under the camera (is there snow to blow about?).
 /// Height (m) of the transition from bare ground to full snow cover: the
 /// snow thins out over this band around the snow line.
 pub const BAND: f64 = 400.0;
@@ -156,7 +156,7 @@ pub fn cover(alt: f64, cos_slope: f64, poleward: f64, line: f64) -> f64 {
     smoothstep(-0.5 * BAND, 0.5 * BAND, z) * smoothstep(SLIDE_COS, HOLD_COS, cos_slope)
 }
 
-fn smoothstep(a: f64, b: f64, x: f64) -> f64 {
+pub fn smoothstep(a: f64, b: f64, x: f64) -> f64 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -177,6 +177,72 @@ pub fn globals(mode: Mode, lat: f64, doy: f64, freezing: Option<f64>) -> [f32; 4
         0.0
     };
     [line as f32, grad as f32, if lat < 0.0 { -1.0 } else { 1.0 }, 1.0]
+}
+
+// ---------------------------------------------------------------- falling snow
+
+/// Depth (m) of the melting layer: snow falling through the freezing level
+/// has turned to rain this far below it.
+const MELT: f64 = 450.0;
+
+/// How much of the precipitation at height `alt` (m) falls as snow, 0..1,
+/// for a freezing level `freezing` (m): all of it above the freezing level,
+/// none once the flakes have fallen through the melting layer under it, wet
+/// snow and sleet in between.
+pub fn snow_share(alt: f64, freezing: f64) -> f64 {
+    smoothstep(freezing - MELT, freezing - 50.0, alt)
+}
+
+/// The freezing level (m) when the weather gives no temperature: a little
+/// above the climatological snow line; below the ground in Always mode (the
+/// depth of winter).
+pub fn freezing_guess(mode: Mode, lat: f64, doy: f64) -> f64 {
+    match mode {
+        Mode::Always => ALWAYS_LINE,
+        _ => climate_line(lat, doy) + 150.0,
+    }
+}
+
+/// Blowing snow, 0..1: lying snow (`white`, 0..1) lifted by the wind
+/// (`wind`, m/s at the surface) from about 9 m/s, a blizzard by 16 m/s
+/// (with snow falling, `snowing`, it starts a little sooner); or what the
+/// report says (`reported`, METAR BLSN / DRSN) where there is snow to lift.
+pub fn blowing(white: f64, snowing: f64, wind: f64, reported: f64) -> f64 {
+    let lift = smoothstep(9.0 - 2.0 * snowing, 16.0, wind);
+    (white * lift).max(reported * white).clamp(0.0, 1.0)
+}
+
+/// Fresh snow settling on the ground while it snows there: how much of the
+/// ground around has been whitened, 0..1.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fresh {
+    pub k: f64,
+}
+
+/// Moderate snow (intensity 0.5) whitens the ground in about this long (s);
+/// fresh snow fades back to the season's over this long once it stops.
+const SETTLE: f64 = 900.0;
+const FADE: f64 = 6.0 * 3600.0;
+
+impl Fresh {
+    /// Advance `dt` seconds of game time with snow falling on the ground at
+    /// `rate` (precipitation intensity 0..1 times its snow share there).
+    pub fn step(&mut self, dt: f64, rate: f64) {
+        if dt <= 0.0 {
+            return;
+        }
+        if rate > 0.01 {
+            self.k = (self.k + dt * rate / (0.5 * SETTLE)).min(1.0);
+        } else {
+            self.k *= (-dt / FADE).exp();
+        }
+    }
+
+    /// The snow line it brings: under the ground at `ground` (m), so the
+    /// fresh snow lies on everything around.
+    pub fn line(ground: f64) -> f64 {
+        ground - 0.75 * BAND
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +354,53 @@ mod tests {
         // Ordinary weather leaves the climatology alone.
         let jul = climate_line(CHAMONIX, JUL_15);
         assert_eq!(snow_line(Mode::Auto, CHAMONIX, JUL_15, Some(jul)).unwrap(), jul);
+    }
+
+    #[test]
+    fn rain_turns_to_snow_above_the_melting_layer() {
+        let f = 1200.0;
+        assert_eq!(snow_share(2000.0, f), 1.0);
+        assert_eq!(snow_share(f - MELT - 1.0, f), 0.0);
+        let mid = snow_share(f - 250.0, f);
+        assert!(mid > 0.2 && mid < 0.8, "{mid}");
+        let mut prev = 0.0;
+        for a in (0..2000).step_by(25) {
+            let s = snow_share(a as f64, f);
+            assert!(s >= prev);
+            prev = s;
+        }
+        // Hand-set weather: January in the Alps snows at 1500 m, July rains there.
+        assert_eq!(snow_share(1500.0, freezing_guess(Mode::Auto, 45.9, 14.0)), 1.0);
+        assert_eq!(snow_share(1500.0, freezing_guess(Mode::Auto, 45.9, 195.0)), 0.0);
+        assert_eq!(snow_share(0.0, freezing_guess(Mode::Always, 10.0, 195.0)), 1.0);
+    }
+
+    #[test]
+    fn blizzards_need_snow_and_wind() {
+        assert_eq!(blowing(1.0, 0.0, 5.0, 0.0), 0.0);
+        assert!(blowing(1.0, 1.0, 12.0, 0.0) > blowing(1.0, 0.0, 12.0, 0.0));
+        assert_eq!(blowing(1.0, 1.0, 20.0, 0.0), 1.0);
+        // Nothing to lift on bare ground, whatever the wind or the report.
+        assert_eq!(blowing(0.0, 1.0, 25.0, 1.0), 0.0);
+        assert_eq!(blowing(1.0, 0.0, 3.0, 0.6), 0.6);
+    }
+
+    #[test]
+    fn fresh_snow_settles_and_fades() {
+        let mut f = Fresh::default();
+        for _ in 0..60 {
+            f.step(10.0, 0.5);
+        }
+        assert!((f.k - 600.0 / SETTLE).abs() < 1e-9, "{}", f.k);
+        for _ in 0..60 {
+            f.step(10.0, 0.5);
+        }
+        assert_eq!(f.k, 1.0);
+        f.step(FADE, 0.0);
+        assert!((f.k - (-1f64).exp()).abs() < 1e-9);
+        f.step(-1.0, 1.0);
+        assert!(f.k < 0.4);
+        assert!(cover(500.0, 1.0, 0.0, Fresh::line(500.0)) > 0.95);
     }
 
     #[test]

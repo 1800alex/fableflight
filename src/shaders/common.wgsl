@@ -119,6 +119,14 @@ struct Globals {
   snow_c: vec4f,
   snow_e: vec4f,
   snow_n: vec4f,
+  // Snowflakes around the camera (precip.wgsl): how far they have moved past
+  // the camera (east, north, up, m, wrapped) + how much of what falls here is
+  // snow; their velocity relative to the camera (m/s) + blowing snow 0..1.
+  flakes: vec4f,
+  flakes_v: vec4f,
+  // Fresh snow where it has snowed (snow.rs Fresh): its snow line (m), how
+  // far it has settled 0..1.
+  fresh: vec4f,
   // Dynamic snow tracks (snowtrack.rs, t_snowtrack): SW corner of the active
   // window relative to the camera + side length in m (0 = none); its east axis
   // + toroidal u offset (m); its north axis + toroidal v offset (m).
@@ -2018,6 +2026,11 @@ fn snow_at(P: vec3f, N: vec3f, upn: vec3f, lift: f32) -> f32 {
 const SNOW_DOWN = 1500.0;
 const SNOW_BARE = 800.0;
 fn snow_line_at(P: vec3f) -> f32 {
+  let l = snow_line_real(P);
+  // Snow that has fallen during the flight lies on top of it all.
+  return mix(l, min(l, G.fresh.x), G.fresh.y);
+}
+fn snow_line_real(P: vec3f) -> f32 {
   let line = G.snow.x + dot(P, G.north.xyz) * G.snow.y;
   if (G.snow_e.w <= 0.0 || G.snow_c.w <= 0.0) { return line; }
   let q = P - G.snow_c.xyz;

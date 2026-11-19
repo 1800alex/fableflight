@@ -56,6 +56,8 @@ pub struct Target {
     /// freezing level (m above sea level) from the surface temperature
     /// (None: not reported)
     pub freezing: Option<f64>,
+    /// snow blown up off the ground (METAR BLSN 1, DRSN 0.5), 0..1
+    pub blowing: f32,
     /// what it came from, for the weather panel: "EBBR" or "Open-Meteo",
     /// and the report itself (the raw METAR)
     pub station: String,
@@ -111,6 +113,7 @@ impl LiveWx {
             // Hand-set weather: the standard atmosphere.
             wx.qnh = 1013.25;
             wx.freezing = None;
+            wx.blowing = 0.0;
             return;
         }
         let (got, radar) = {
@@ -181,6 +184,7 @@ impl LiveWx {
         if let Some(q) = t.qnh {
             wx.qnh += (q - wx.qnh) * k;
         }
+        wx.blowing = t.blowing;
         wx.freezing = match (wx.freezing, t.freezing) {
             (Some(a), Some(b)) => Some(a + (b - a) * k),
             (_, b) => b,
@@ -534,7 +538,8 @@ fn from_metar(m: &serde_json::Value) -> Option<Target> {
         wind_from,
         gusts: gust.map(|g| ((g - wind) / 8.0).clamp(0.0, 1.0)).unwrap_or(0.1),
         qnh: m["altim"].as_f64().filter(|q| (850.0..1100.0).contains(q)),
-        freezing: m["temp"].as_f64().filter(|t| (-80.0..60.0).contains(t)).map(|t| crate::snow::freezing_level(t, elev)),
+        freezing: freezing_for(m["temp"].as_f64().filter(|t| (-80.0..60.0).contains(t)).map(|t| crate::snow::freezing_level(t, elev)), elev, p.snow),
+        blowing: p.blowing,
         station,
         raw,
     })
@@ -543,11 +548,29 @@ fn from_metar(m: &serde_json::Value) -> Option<Target> {
 /// What falls, from a METAR's present weather ("-SHRA BR", "+TSRA", "DZ").
 #[derive(Debug, PartialEq)]
 struct Precip {
-    /// the rain deck (the Rain slider), 0..1
+    /// the rain deck (the Rain slider), 0..1: rain, or snow as heavy
     rain: f32,
     /// showers: the storm-cell slider they want (convective cloud), 0 = none
     showers: f32,
     thunder: bool,
+    /// how much of what falls is snow, when the report says (None: nothing
+    /// falls); 1 snow, snow grains or ice pellets, 0 rain or freezing rain
+    snow: Option<f32>,
+    /// snow blown up off the ground: BLSN 1, DRSN (drifting, low) 0.5
+    blowing: f32,
+}
+
+/// The freezing level (m) moved, if need be, so that what the report says is
+/// falling at the station (height `elev`, m) falls as that: snow, rain or a mix.
+fn freezing_for(freezing: Option<f64>, elev: f64, snow: Option<f32>) -> Option<f64> {
+    let Some(s) = snow else { return freezing };
+    // (snow.rs `snow_share`: all snow 50 m under the freezing level, all rain 450 m under it.)
+    let at = elev + 50.0 + (1.0 - s as f64) * 400.0;
+    Some(match freezing {
+        Some(f) if s >= 0.99 => f.min(at),
+        Some(f) if s <= 0.01 => f.max(at),
+        _ => at,
+    })
 }
 
 /// Rain deck amount for each intensity (light, moderate, heavy): drizzle
@@ -558,7 +581,9 @@ const DRIZZLE: [f32; 3] = [0.12, 0.18, 0.25];
 const CONVECTIVE_DECK: f32 = 0.5;
 
 fn precip(wx: &str) -> Precip {
-    let mut p = Precip { rain: 0.0, showers: 0.0, thunder: false };
+    let mut p = Precip { rain: 0.0, showers: 0.0, thunder: false, snow: None, blowing: 0.0 };
+    // (rain amount, snow amount) falling here, to tell the mix.
+    let (mut wet, mut white) = (0.0f32, 0.0f32);
     for tok in wx.split_whitespace() {
         let (level, rest) = match tok.as_bytes().first() {
             Some(b'-') => (0, &tok[1..]),
@@ -572,12 +597,29 @@ fn precip(wx: &str) -> Precip {
         let ts = has("TS");
         let sh = has("SH");
         p.thunder |= ts;
+        // Blowing (BL) or drifting (DR) snow is lifted off the ground, not falling.
+        if has("BL") || has("DR") {
+            if has("SN") && near {
+                p.blowing = p.blowing.max(if has("BL") { 1.0 } else { 0.5 });
+            }
+            continue;
+        }
         let mut r = 0.0f32;
         if has("RA") {
             r = RAIN[level];
         } else if has("DZ") {
             r = DRIZZLE[level];
         }
+        // Snow (SN), snow grains (SG), ice pellets (PL), snow pellets (GS):
+        // as thick as rain of the same strength to the eye.
+        let w = if has("SN") || has("PL") { RAIN[level] } else if has("SG") || has("GS") { DRIZZLE[level] } else { 0.0 };
+        if near {
+            wet = wet.max(if has("FZ") { r.max(w) } else { r });
+            if !has("FZ") {
+                white = white.max(w);
+            }
+        }
+        r = r.max(w);
         if sh && !ts {
             // stronger showers, taller and more cells
             p.showers = p.showers.max(if near { [0.25, 0.35, 0.5][level] } else { 0.2 });
@@ -585,6 +627,9 @@ fn precip(wx: &str) -> Precip {
         if near && r > 0.0 {
             p.rain = p.rain.max(if ts || sh { r * CONVECTIVE_DECK } else { r });
         }
+    }
+    if wet + white > 0.0 {
+        p.snow = Some(white / (wet + white));
     }
     p
 }
@@ -620,7 +665,7 @@ fn haze(vis_km: Option<f64>, foggy: bool) -> f32 {
 /// Open-Meteo's model where there is no METAR near.
 fn open_meteo(src: &Sources, (lat, lon): (f64, f64)) -> Result<Target, String> {
     let url = format!(
-        "https://api.open-meteo.com/v1/forecast?latitude={lat:.3}&longitude={lon:.3}&current=temperature_2m,dew_point_2m,cloud_cover_low,cloud_cover_mid,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,weather_code,rain,showers,pressure_msl&wind_speed_unit=ms"
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.3}&longitude={lon:.3}&current=temperature_2m,dew_point_2m,cloud_cover_low,cloud_cover_mid,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,weather_code,rain,showers,snowfall,pressure_msl&wind_speed_unit=ms"
     );
     let j = get_json(src, &url)?;
     from_open_meteo(&j).ok_or_else(|| "unreadable Open-Meteo answer".to_string())
@@ -640,13 +685,20 @@ fn from_open_meteo(j: &serde_json::Value) -> Option<Target> {
     };
     let storms = match code {
         95..=99 => 0.75,
-        80 => 0.25,
+        80 | 85 => 0.25,
         81 => 0.35,
-        82 => 0.5,
+        82 | 86 => 0.5,
         _ => 0.0,
     };
-    // WMO weather codes: drizzle 51-57, rain 61-67, showers 80-82, storms 95-99.
+    // WMO weather codes: drizzle 51-57, rain 61-67, snow 71-77, showers 80-82,
+    // snow showers 85-86, storms 95-99.
     let by_code = match code {
+        71 => RAIN[0],
+        73 => RAIN[1],
+        75 => RAIN[2],
+        77 => DRIZZLE[1],
+        85 => RAIN[0] * CONVECTIVE_DECK,
+        86 => RAIN[2] * CONVECTIVE_DECK,
         51 | 56 => DRIZZLE[0],
         53 => DRIZZLE[1],
         55 | 57 => DRIZZLE[2],
@@ -662,9 +714,18 @@ fn from_open_meteo(j: &serde_json::Value) -> Option<Target> {
     // heavy from 7.6.
     let mm = f("rain").unwrap_or(0.0) + f("showers").unwrap_or(0.0);
     let by_amount = if mm < 0.1 { 0.0 } else if mm < 2.5 { RAIN[0] } else if mm < 7.6 { RAIN[1] } else { RAIN[2] };
-    let rain = if by_code > 0.0 || (50..=99).contains(&code) { by_code } else { by_amount };
+    // Snowfall (cm/h): about a centimetre an hour is moderate snow.
+    let cm = f("snowfall").unwrap_or(0.0);
+    let by_snow = if cm < 0.05 { 0.0 } else if cm < 0.5 { RAIN[0] } else if cm < 2.0 { RAIN[1] } else { RAIN[2] };
+    let rain = if by_code > 0.0 || (50..=99).contains(&code) { by_code } else { by_amount.max(by_snow) };
+    let snow = match code {
+        71..=77 | 85 | 86 => Some(1.0),
+        51..=67 | 80..=82 | 95..=99 => Some(if cm > 0.05 && mm > 0.1 { 0.5 } else if cm > 0.05 { 1.0 } else { 0.0 }),
+        _ if rain > 0.0 => Some(if mm < 0.1 { 1.0 } else if by_snow > 0.0 { 0.5 } else { 0.0 }),
+        _ => None,
+    };
     let clouds = if low > 0.05 { low } else { mid * 0.6 }.max(0.03);
-    let clouds = if (80..=82).contains(&code) { clouds.max(0.45) } else { clouds };
+    let clouds = if matches!(code, 80..=82 | 85 | 86) { clouds.max(0.45) } else { clouds };
     let wind = f("wind_speed_10m")?;
     Some(Target {
         clouds,
@@ -672,14 +733,15 @@ fn from_open_meteo(j: &serde_json::Value) -> Option<Target> {
         depth_m: depth(clouds, storms),
         alto: mid,
         storms,
-        showers_only: (80..=82).contains(&code),
+        showers_only: matches!(code, 80..=82 | 85 | 86),
         rain,
         haze: haze(f("visibility").map(|v| v / 1000.0), matches!(code, 45 | 48)),
         wind,
         wind_from: f("wind_direction_10m"),
         gusts: f("wind_gusts_10m").map(|g| ((g - wind) / 8.0).clamp(0.0, 1.0)).unwrap_or(0.1),
         qnh: f("pressure_msl").filter(|q| (850.0..1100.0).contains(q)),
-        freezing: f("temperature_2m").filter(|t| (-80.0..60.0).contains(t)).map(|t| crate::snow::freezing_level(t, elev)),
+        freezing: freezing_for(f("temperature_2m").filter(|t| (-80.0..60.0).contains(t)).map(|t| crate::snow::freezing_level(t, elev)), elev, snow),
+        blowing: 0.0,
         station: "Open-Meteo".into(),
         raw: String::new(),
     })
@@ -729,6 +791,28 @@ mod tests {
     }
 
     #[test]
+    fn reports_set_the_freezing_level() {
+        // +2 °C at 500 m would put the freezing level 300 m up, all snow there;
+        // the report says rain: it goes up to where rain reaches the ground.
+        let warm = freezing_for(Some(800.0), 500.0, Some(0.0)).unwrap();
+        assert!((crate::snow::snow_share(500.0, warm)).abs() < 1e-9, "{warm}");
+        // Snow reported at +3 °C (wet bulb): brought down to snow at the station.
+        let s = freezing_for(Some(960.0), 500.0, Some(1.0)).unwrap();
+        assert!((crate::snow::snow_share(500.0, s) - 1.0).abs() < 1e-9, "{s}");
+        // A mix: half and half.
+        let m = freezing_for(Some(3000.0), 500.0, Some(0.5)).unwrap();
+        assert!((crate::snow::snow_share(500.0, m) - 0.5).abs() < 1e-9);
+        // Nothing falling: the temperature alone; snow with no temperature: at the station.
+        assert_eq!(freezing_for(Some(1234.0), 500.0, None), Some(1234.0));
+        assert_eq!(freezing_for(None, 500.0, Some(1.0)), Some(550.0));
+        // Open-Meteo: moderate snow at the grid cell.
+        let j = serde_json::json!({"elevation":37.0,"current":{"temperature_2m":1.0,"dew_point_2m":0.0,"cloud_cover_low":100,"cloud_cover_mid":100,"wind_speed_10m":17.0,"wind_direction_10m":20,"wind_gusts_10m":25.0,"visibility":400.0,"weather_code":73,"rain":0.0,"showers":0.0,"snowfall":1.2,"pressure_msl":1008.0}});
+        let t = from_open_meteo(&j).unwrap();
+        assert_eq!(t.rain, RAIN[1]);
+        assert!(crate::snow::snow_share(37.0, t.freezing.unwrap()) > 0.99);
+    }
+
+    #[test]
     fn present_weather() {
         let p = |s| precip(s);
         assert_eq!(p("").rain, 0.0);
@@ -742,7 +826,19 @@ mod tests {
         assert_eq!(p("-DZ RA").rain, RAIN[1]);
         assert!(p("+DZ").rain < p("-RA").rain);
         assert_eq!(p("-RASN").rain, RAIN[0]);
-        assert_eq!(p("SN").rain, 0.0);
+        assert_eq!(p("-RASN").snow, Some(0.5));
+        assert_eq!((p("SN").rain, p("SN").snow), (RAIN[1], Some(1.0)));
+        assert_eq!((p("+SHSN").rain, p("+SHSN").showers, p("+SHSN").snow), (RAIN[2] * CONVECTIVE_DECK, 0.5, Some(1.0)));
+        assert_eq!(p("-FZRA").snow, Some(0.0));
+        assert_eq!(p("RA").snow, Some(0.0));
+        assert_eq!(p("BR").snow, None);
+        // Blowing snow alone: nothing falls, but it blows.
+        let bl = p("BLSN");
+        assert_eq!((bl.rain, bl.snow, bl.blowing), (0.0, None, 1.0));
+        let bz = p("+SN BLSN");
+        assert_eq!((bz.rain, bz.snow, bz.blowing), (RAIN[2], Some(1.0), 1.0));
+        assert_eq!(p("-SN DRSN").blowing, 0.5);
+        assert_eq!(p("VCBLSN").blowing, 0.0);
         let sh = p("+SHRA");
         assert_eq!((sh.rain, sh.showers, sh.thunder), (RAIN[2] * CONVECTIVE_DECK, 0.5, false));
         let ts = p("TSRA");

@@ -1070,6 +1070,14 @@ struct Game {
     /// rain falling where the camera is, 0..1, and how much of it is hail
     cam_rain: f32,
     cam_hail: f32,
+    /// snowflakes around the camera (snow.rs, precip.wgsl): their field, how
+    /// much of what falls at the camera is snow, the blowing snow there, and
+    /// the fresh snow settling where it snows on the ground
+    snow_field: storm::RainField,
+    cam_snow: f32,
+    cam_blow: f32,
+    fresh: snow::Fresh,
+    fresh_line: f32,
     /// how far the eye has opened up to the gloom under a storm, 0..1
     storm_adapt: f32,
     head_live: bool,
@@ -1319,7 +1327,13 @@ impl Game {
         wx.rain = wx.deck_rain(plane.pos) as f32;
         let mut lightning = storm::Lightning::new();
         lightning.forced = args.strikes.clone();
-        let mut glass = rain::Glass::new(wx.rain);
+        // (As wet as the rain's share: snow does not run down the glass.)
+        let start_snow = {
+            let (pla, _, palt) = geo::pos_to_lla(plane.pos);
+            let day = args.day.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) / 86400.0 % 365.25);
+            snow::snow_share(palt, snow::freezing_guess(args.snow.unwrap_or(prefs.snow), pla.to_degrees(), day)) as f32
+        };
+        let mut glass = rain::Glass::new(wx.rain * (1.0 - start_snow));
         if let Some(w) = args.wet {
             glass.wet = w.clamp(0.0, 1.0);
         }
@@ -1377,7 +1391,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, storm_adapt: 0.0, plane, weapons,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, snow_field: storm::RainField::default(), cam_snow: start_snow, cam_blow: 0.0, fresh: snow::Fresh::default(), fresh_line: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -4911,6 +4925,7 @@ impl Game {
         let scale = if self.paused || in_menu || self.pause_open || self.real < self.hold || loading { 0.0 } else { 1.0 };
         let dt = dt_real * scale;
         self.time += dt;
+        let mut glass_rain = 0.0f32;
         if !in_menu {
             // The clock runs at the panel's rate; past midnight the date turns over.
             let t = self.utc + dt * self.wx.time_rate / 3600.0;
@@ -4936,7 +4951,13 @@ impl Game {
             self.wx.step_deck(dt, self.plane.pos, gh);
             self.wx.rain = self.wx.rain_at(self.plane.pos, agl, self.time) as f32;
             self.wx.advance(dt, self.plane.pos);
-            self.glass.step(dt, self.wx.rain, self.plane.ias() * 1.94384);
+            // (Snow does not wet the glass or streak across it: only the liquid rain share does.)
+            let fz = match (self.snow, self.wx.freezing) {
+                (snow::Mode::Always, _) | (_, None) => snow::freezing_guess(self.snow, la.to_degrees(), self.doy),
+                (_, Some(f)) => f,
+            };
+            glass_rain = self.wx.rain * (1.0 - snow::snow_share(h, fz) as f32);
+            self.glass.step(dt, glass_rain, self.plane.ias() * 1.94384);
         }
 
         // Physics at a fixed step.
@@ -5479,6 +5500,7 @@ impl Game {
         if in_menu {
             self.cam_rain = 0.0;
             self.cam_hail = 0.0;
+            (self.cam_snow, self.cam_blow) = (0.0, 0.0);
         } else {
             self.cam_rain = self.wx.rain_at(cam, agl, self.time) as f32;
             self.cam_hail = if self.cam_rain > 0.0 { storm::local(&self.wx, cam, agl, self.time).hail as f32 } else { 0.0 };
@@ -5489,6 +5511,31 @@ impl Game {
             };
             self.lightning.step(dt, self.time, &self.wx, self.plane.pos, cam, &gnd);
             self.rain_field.step(dt, cam, self.wx.at(cam, agl, self.time));
+            self.snow_field.step_fall(dt, cam, self.wx.at(cam, agl, self.time), storm::FLAKE_FALL);
+            // Snow (snow.rs): what falls is snow above the melting layer under
+            // the freezing level (from the real weather, else the season's);
+            // where it reaches the ground fresh snow settles; the wind lifts
+            // lying snow into a blizzard.
+            let (lat_d, gh) = (clat.to_degrees(), ground.unwrap_or(0.0));
+            let fz = match (self.snow, self.wx.freezing) {
+                (snow::Mode::Always, _) | (_, None) => snow::freezing_guess(self.snow, lat_d, self.doy),
+                (_, Some(f)) => f,
+            };
+            self.cam_snow = snow::snow_share(calt, fz) as f32;
+            let at_ground = self.wx.rain_at(geo::lla_to_pos(clat, clon, gh), 0.0, self.time) * snow::snow_share(gh, fz);
+            if self.snow == snow::Mode::Off {
+                self.fresh = snow::Fresh::default();
+            } else {
+                self.fresh.step(dt, at_ground);
+            }
+            self.fresh_line = snow::Fresh::line(gh) as f32;
+            let white = snow::snow_line(self.snow, lat_d, self.doy, self.wx.freezing).map_or(0.0, |l| {
+                let l = l + (l.min(snow::Fresh::line(gh)) - l) * self.fresh.k;
+                snow::cover(gh, 1.0, 0.0, l)
+            });
+            // (Blown snow fills the lowest hundred metres or so.)
+            let low = 1.0 - snow::smoothstep(60.0, 400.0, agl);
+            self.cam_blow = (snow::blowing(white, at_ground.min(1.0), self.wx.wind, self.wx.blowing as f64) * low) as f32;
         }
         let scrape = if steps > 0 { (scrape_n as f32 / steps as f32 * 0.5).min(1.0) } else { 0.0 };
         self.update_audio(cam, fire, in_menu, &c, dt, scrape);
@@ -5656,8 +5703,8 @@ impl Game {
             shore_vp: [[0.0; 4]; 4],
             shore: [0.0; 4],
             foam: [[0.0; 4]; 16],
-            // (yzw: the rain, how wet the windows are, and the airspeed over them in kt; plane.wgsl rain_water)
-            start: [if in_menu { 1.0 } else { 0.0 }, self.wx.rain, self.glass.wet, (self.plane.ias() * 1.94384) as f32],
+            // (yzw: the liquid rain, how wet the windows are, and the airspeed over them in kt; plane.wgsl rain_water)
+            start: [if in_menu { 1.0 } else { 0.0 }, glass_rain, self.glass.wet, (self.plane.ias() * 1.94384) as f32],
             stormfx: [0.0; 4],
             flash: [[0.0; 4]; 2 * storm::MAX_FLASHES],
             rain: [[0.0; 4]; 2],
@@ -5674,6 +5721,9 @@ impl Game {
             snow_c: snow_map[0],
             snow_e: snow_map[1],
             snow_n: snow_map[2],
+            flakes: [0.0; 4],
+            flakes_v: [0.0; 4],
+            fresh: [0.0; 4],
             snow_tr_c: snow_tr[0],
             snow_tr_e: snow_tr[1],
             snow_tr_n: snow_tr[2],
@@ -5697,6 +5747,10 @@ impl Game {
             // (Hail rides along in the intensity's whole part, in sixteenths: precip.wgsl.)
             let rain_w = self.cam_rain.min(0.999) + (self.cam_hail.clamp(0.0, 1.0) * 15.0).round();
             g.rain = [[o.x as f32, o.y as f32, o.z as f32, rain_w], [v.x as f32, v.y as f32, v.z as f32, near_cut as f32]];
+            let (o, v) = (self.snow_field.off, self.snow_field.rel);
+            g.flakes = [o.x as f32, o.y as f32, o.z as f32, self.cam_snow];
+            g.flakes_v = [v.x as f32, v.y as f32, v.z as f32, self.cam_blow];
+            g.fresh = [self.fresh_line, self.fresh.k as f32, 0.0, 0.0];
         }
         if !self.crashed && !in_menu {
             // The aircraft keeps pace with the camera, so its pixels are found
@@ -6020,7 +6074,7 @@ impl Game {
         if !in_menu {
             self.lightning.segments(cam, dt, &mut bolts);
         }
-        let rain_drops = if in_menu || self.cam_rain < 0.002 { 0 } else { render::RAIN_DROPS };
+        let rain_drops = if in_menu || (self.cam_rain < 0.002 && self.cam_blow < 0.01) { 0 } else { render::RAIN_DROPS };
         self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px, snow: snow_px, snow_tracks: snow_tr_uploads });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
