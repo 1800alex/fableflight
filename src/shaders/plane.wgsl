@@ -49,7 +49,10 @@ fn tex_at(uv: vec2f, layer: f32, dx: vec2f, dy: vec2f) -> vec4f {
   if (layer < -0.5) { return vec4f(1.0); }
   return textureSampleGrad(t_paint, s_aniso, fract(uv), i32(layer + 0.5), dx, dy);
 }
-struct Paint { box: vec4f, view: vec4f };
+// PT.scheme, PT.trim: the Cessna's paint scheme, chosen in the aircraft
+// picker (c172::LIVERIES): the main colour and 1 if it has one (0: bare
+// aluminium, no paint), the pinstripe colour.
+struct Paint { box: vec4f, view: vec4f, scheme: vec4f, trim: vec4f };
 @group(1) @binding(2) var<uniform> PT: Paint;
 
 // Which aircraft is being drawn (aircraft::Spec::id, carried in glow.y): 0 the
@@ -68,8 +71,6 @@ fn burner() -> f32 { return O.tint.y * step(O.glow.x, 0.001); }
 fn dry_power() -> f32 { return O.tint.z * step(O.glow.x, 0.001); }
 
 const WHITE_PAINT = vec3f(0.80, 0.80, 0.78);
-const NAVY = vec3f(0.010, 0.024, 0.075);
-const ACCENT = vec3f(0.34, 0.018, 0.012);
 
 struct VOut {
   @builtin(position) clip: vec4f,
@@ -563,41 +564,54 @@ fn pack(a: u32, b: u32, c: u32, d: u32, e: u32, f: u32) -> u32 {
 fn livery(L: vec3f, aa: f32, pt: u32) -> vec3f {
   if (kind() == 1u) { return livery747(L, aa, pt); }
   if (kind() == 8u) { return livery_dr400(L, aa, pt); }
+  // The Cessna: white, and the scheme picked for it (PT.scheme, PT.trim).
   var c = WHITE_PAINT;
   let ax = abs(L.x);
+  let painted = PT.scheme.w > 0.5;
+  let prim = PT.scheme.rgb;
+  let trim = PT.trim.rgb;
   let fin = ax < 0.15 && L.y > 0.33 && L.z > 2.8;
-  // Cheat line along the fuselage, sweeping up the tail cone.
-  if (!fin && ax < 0.62 && L.y < 0.62 && L.z > -3.16 && L.z < 4.7) {
-    let zz = max(L.z - 1.0, 0.0);
-    let yc = -0.18 + zz * zz * 0.045;
-    let dy = L.y - yc;
-    let taper = smoothstep(-3.16, -2.85, L.z);
-    let hw = 0.065 * taper;
-    let navy = smoothstep(hw + aa, hw - aa, abs(dy));
-    let red = smoothstep(0.009 * taper + aa, 0.009 * taper - aa, abs(dy - 0.095 * taper));
-    c = mix(c, NAVY, navy);
-    c = mix(c, ACCENT, red);
+  // No scheme: no paint at all, the airframe in bare aluminium (made metallic
+  // in the material switch, `bare_c172`), only the registration painted on.
+  if (!painted) { c = vec3f(0.62, 0.63, 0.65); }
+  if (painted) {
+    // Cheat line along the fuselage, sweeping up the tail cone.
+    if (!fin && ax < 0.62 && L.y < 0.62 && L.z > -3.16 && L.z < 4.7) {
+      let zz = max(L.z - 1.0, 0.0);
+      let yc = -0.18 + zz * zz * 0.045;
+      let dy = L.y - yc;
+      let taper = smoothstep(-3.16, -2.85, L.z);
+      let hw = 0.065 * taper;
+      let band = smoothstep(hw + aa, hw - aa, abs(dy));
+      let pin = smoothstep(0.009 * taper + aa, 0.009 * taper - aa, abs(dy - 0.095 * taper));
+      c = mix(c, prim, band);
+      c = mix(c, trim, pin);
+    }
+    if (fin) {
+      let band = smoothstep(aa, -aa, abs(L.y - 1.09) - 0.07);
+      let pin = smoothstep(aa, -aa, abs(L.y - 1.205) - 0.014);
+      c = mix(c, prim, max(band, smoothstep(1.69 - aa, 1.69 + aa, L.y)));
+      c = mix(c, trim, pin);
+    }
+    // Wing and stabiliser tips, spinner.
+    if (ax > 5.26 && L.y > 0.5) { c = prim; }
+    if (ax > 1.53 && L.z > 3.3 && L.y > -0.1 && L.y < 0.3) { c = prim; }
+    if (L.z < -3.178) { c = prim; }
   }
-  if (fin) {
-    let band = smoothstep(aa, -aa, abs(L.y - 1.09) - 0.07);
-    let pin = smoothstep(aa, -aa, abs(L.y - 1.205) - 0.014);
-    c = mix(c, NAVY, max(band, smoothstep(1.69 - aa, 1.69 + aa, L.y)));
-    c = mix(c, ACCENT, pin);
-  }
-  // Wing and stabiliser tips, spinner.
-  if (ax > 5.26 && L.y > 0.5) { c = NAVY; }
-  if (ax > 1.53 && L.z > 3.3 && L.y > -0.1 && L.y < 0.3) { c = NAVY; }
-  if (L.z < -3.178) { c = NAVY; }
   // Registration on both sides of the tail cone, reading nose-to-tail on the
-  // left and tail-to-nose on the right as painted.
+  // left and tail-to-nose on the right as painted: in the scheme's colour, or
+  // black on a bare aeroplane.
   if (ax > 0.1 && L.z > 1.6 && L.z < 3.0 && L.y > 0.0 && L.y < 0.3) {
     let tx = (2.25 - L.z) * sign(L.x) + 0.44;
     let reg = pack(10u, 4u, 1u, 9u, 6u, 12u);
     let ink = text(vec2f(tx, L.y - 0.045) / 0.09, reg, 6u, 0.13, aa / 0.09 + 0.01);
-    c = mix(c, NAVY, ink);
+    c = mix(c, select(vec3f(0.012, 0.012, 0.014), prim, painted), ink);
   }
   return c;
 }
+
+// The Cessna with no paint scheme: its skin is bare aluminium.
+fn bare_c172() -> bool { return kind() == 0u && PT.scheme.w < 0.5; }
 
 // The Robin DR 400: white, a blue cheat line from the spinner to the tail
 // with a red pinstripe under it, the top of the fin blue, red wing tips and
@@ -1909,6 +1923,12 @@ fn surface(in: VOut) -> Shaded {
     case 0u, 1u, 15u: {
       if (id == 1u) { albedo = livery(L, px * 1.2, pt); }
       rough = select(0.13 + 0.08 * ns.g, 0.5 + 0.15 * ns.g, id == 15u);
+      if (id == 1u && bare_c172()) {
+        // Bare aluminium, as `case 2u`; the black registration stays paint.
+        metal = smoothstep(0.08, 0.3, luma(albedo));
+        rough = mix(rough, 0.22 + 0.18 * fine.g, metal);
+        albedo *= mix(1.0, 0.9 + 0.12 * ns.r, metal);
+      }
       if (pt == P_HORNET && paint.a > 0.5) {
         // The Hornet's matte tactical greys, as painted; fluid stains (darker and browner) are a little glossier.
         albedo = paint.rgb * 0.85;
@@ -1930,7 +1950,7 @@ fn surface(in: VOut) -> Shaded {
         // Chipped paint where things get knocked: leading edges, around fasteners.
         let chip = smoothstep(0.80, 0.83, nz(L * 7.0).b + in.wear * 0.07) * sat(in.wear * 1.5);
         albedo = mix(albedo, vec3f(0.55, 0.56, 0.58), chip);
-        metal = chip;
+        metal = max(metal, chip);
         rough = mix(rough, 0.35, chip);
         // Bugs on the leading edges.
         let bugs = smoothstep(0.86, 0.9, nz(L * 9.0).a) * smoothstep(0.75, 0.97, in.wear) * sat(-in.Nl.z * 2.0) * (1.0 - smoothstep(0.002, 0.008, px));

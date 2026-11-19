@@ -21,6 +21,11 @@ const BAD: Color32 = Color32::from_rgb(255, 128, 96);
 impl crate::Game {
     /// An aircraft's picture (shared by types drawn with the same body).
     pub(crate) fn still(&mut self, ctx: &egui::Context, spec: &Spec) -> egui::TextureHandle {
+        // (The Cessna's in the paint scheme picked for it.)
+        if std::ptr::eq(spec, &crate::aircraft::c172::SPEC) {
+            let stills = crate::aircraft::c172::LIVERY_STILLS;
+            return self.picture(ctx, stills[self.menu.c172_livery.min(stills.len() - 1)]);
+        }
         self.picture(ctx, spec.still)
     }
 
@@ -350,7 +355,7 @@ impl crate::Game {
             ui.label(RichText::new(t!("Livery", "Livrée")).font(menu::caption()).color(DIM));
             let mut changed = false;
             ui.horizontal_wrapped(|ui| {
-                for (i, (name, upper, lower)) in crate::aircraft::c172::LIVERIES.iter().enumerate() {
+                for (i, (name, colours)) in crate::aircraft::c172::LIVERIES.iter().enumerate() {
                     let selected = self.menu.c172_livery == i;
                     let button = egui::Button::new(RichText::new(*name).color(if selected { Color32::WHITE } else { TEXT }))
                         .fill(if selected { Color32::from_rgb(48, 59, 78) } else { menu::SURFACE })
@@ -360,9 +365,16 @@ impl crate::Game {
                         self.menu.c172_livery = i;
                         changed = true;
                     }
-                    let swatch = ui.allocate_exact_size(egui::vec2(35.0, 10.0), egui::Sense::hover()).0;
-                    ui.painter().rect_filled(swatch, 2.0, Color32::from_rgb((upper[0] * 255.0) as u8, (upper[1] * 255.0) as u8, (upper[2] * 255.0) as u8));
-                    ui.painter().rect_filled(egui::Rect::from_min_max(swatch.left_bottom(), swatch.right_bottom() + egui::vec2(0.0, 4.0)), 1.0, Color32::from_rgb((lower[0] * 255.0) as u8, (lower[1] * 255.0) as u8, (lower[2] * 255.0) as u8));
+                    // A swatch: the main colour over the trim, or bare aluminium.
+                    let srgb = |c: [f32; 3]| Color32::from(egui::Rgba::from_rgb(c[0], c[1], c[2]));
+                    let (top, under) = match colours {
+                        Some((m, t)) => (srgb(*m), srgb(*t)),
+                        None => (srgb([0.62, 0.63, 0.65]), srgb([0.40, 0.41, 0.43])),
+                    };
+                    let swatch = ui.allocate_exact_size(egui::vec2(35.0, 14.0), egui::Sense::hover()).0;
+                    let split = swatch.top() + 10.0;
+                    ui.painter().rect_filled(egui::Rect::from_min_max(swatch.min, egui::pos2(swatch.right(), split)), 2.0, top);
+                    ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(swatch.left(), split), swatch.max), 1.0, under);
                 }
             });
             if changed { self.apply_c172_livery(); }

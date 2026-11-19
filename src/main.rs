@@ -363,6 +363,8 @@ struct Args {
     approach: bool,
     /// which aircraft to fly (`aircraft::by_key`)
     aircraft: Option<String>,
+    /// the Cessna's paint scheme (index into `c172::LIVERIES`)
+    livery: Option<usize>,
     /// start with the HUD hidden (H), for screenshots
     no_hud: bool,
     /// rain 0..1 (wets the windows), and how wet the glass starts (default: settled in that rain)
@@ -455,6 +457,7 @@ fn parse_args() -> Args {
         runway: None,
         approach: false,
         aircraft: None,
+        livery: None,
         no_hud: false,
         rain: None,
         wet: None,
@@ -522,6 +525,7 @@ fn parse_args() -> Args {
                 a.menu.get_or_insert(false);
             }
             "--runway" => a.runway = v.get(i + 1).cloned(),
+            "--livery" => a.livery = v.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n < aircraft::c172::LIVERIES.len()),
             "--aircraft" => {
                 a.aircraft = v.get(i + 1).cloned();
                 if let Some(k) = &a.aircraft {
@@ -1237,6 +1241,8 @@ impl Game {
         let mut world = world::World::new(sources::Loader::new(src.clone(), 14), args.max_zoom);
         let mut r = r;
         r.set_paint(spec.paint.as_ref());
+        let livery = args.livery.unwrap_or(aircraft::c172::DEFAULT_LIVERY);
+        r.set_livery(aircraft::c172::livery_uniform(livery));
         let Loaded { spec: _, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, plane_box, lamps } = Loaded::build(spec, &mut r);
         let tm = trees::build_meshes();
         r.set_tree_meshes(&tm.meshes);
@@ -1253,6 +1259,7 @@ impl Game {
         menu.fuel = args.fuel.unwrap_or(menu.fuel);
         menu.cold = args.cold;
         menu.aircraft = aircraft::index_of(spec);
+        menu.c172_livery = livery;
         if let Some((la, lo, al)) = args.menu_view {
             menu.look_at(la, lo, al);
             menu.alt = al;
@@ -1548,21 +1555,10 @@ impl Game {
         self.apply_c172_livery();
     }
 
-    /// Apply the selected Cessna stripe palette to the visible model and to
-    /// the matching pieces used when the aircraft breaks apart.
+    /// Send the chosen Cessna paint scheme to the shader (only the Cessna's
+    /// livery reads it).
     pub(crate) fn apply_c172_livery(&mut self) {
-        if !std::ptr::eq(self.spec, &aircraft::c172::SPEC) { return; }
-        aircraft::c172::apply_livery(&mut self.model, self.menu.c172_livery);
-        for (i, piece) in self.model.pieces.iter().enumerate() {
-            if piece.name == "Cutlass accent stripes" {
-                self.r.replace_mesh(self.piece_mesh[i], &piece.mesh.v, &piece.mesh.i);
-            }
-        }
-        for (i, mesh) in self.model.groups.iter().enumerate() {
-            if mesh.v.iter().any(|v| v.mat[3] == 42.0 || v.mat[3] == 43.0) {
-                self.r.replace_mesh(self.group_mesh[i], &mesh.v, &mesh.i);
-            }
-        }
+        self.r.set_livery(aircraft::c172::livery_uniform(self.menu.c172_livery));
     }
 
     /// Menu selection: swap to `spec` without stalling the frame. A model not
