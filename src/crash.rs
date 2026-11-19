@@ -809,7 +809,7 @@ impl Crash {
         };
         for (k, b) in due.into_iter().enumerate() {
             let pos = if b.pos.is_nan() {
-                let pick = [2usize, 3, 0][(self.time * 7.0) as usize % 3 + k * 0 % 3];
+                let pick = [2usize, 3, 0][((self.time * 7.0) as usize + k) % 3];
                 self.debris.get(pick).filter(|d| !d.sunk).map(|d| self.local(d.pos) + up).unwrap_or(up * 2.0)
             } else {
                 b.pos

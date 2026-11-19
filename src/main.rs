@@ -388,7 +388,24 @@ struct Args {
     mcp_port: u16,
 }
 
+const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr|ko] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
+
 fn parse_args() -> Args {
+    let v: Vec<String> = std::env::args().skip(1).collect();
+    if v.iter().any(|s| s == "--help" || s == "-h") {
+        println!("{CLI_USAGE}");
+        std::process::exit(0);
+    }
+    match parse_args_from(&v) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}\nRun with --help for usage.");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_args_from(v: &[String]) -> Result<Args, String> {
     let mut a = Args {
         lat: 37.8085,
         lon: -122.4650,
@@ -472,31 +489,74 @@ fn parse_args() -> Args {
         mcp: true,
         mcp_port: mcp::rpc::DEFAULT_PORT,
     };
-    let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
-    let num = |v: &Vec<String>, i: usize| v.get(i + 1).and_then(|s| s.parse::<f64>().ok());
+    let req = |flag: &str, i: usize| -> Result<&str, String> {
+        v.get(i + 1).map(|s| s.as_str()).ok_or_else(|| format!("{flag} requires a value"))
+    };
+    let req_num = |flag: &str, i: usize| -> Result<f64, String> {
+        let s = req(flag, i)?;
+        let x: f64 = s.parse().map_err(|_| format!("{flag}: invalid number '{s}'"))?;
+        if !x.is_finite() {
+            return Err(format!("{flag}: number must be finite ('{s}')"));
+        }
+        Ok(x)
+    };
+    let req_nums = |flag: &str, i: usize, min: usize, max: usize| -> Result<Vec<f64>, String> {
+        let s = req(flag, i)?;
+        let mut out = Vec::new();
+        for part in s.split(',') {
+            let x: f64 = part.parse().map_err(|_| format!("{flag}: invalid number '{part}' in '{s}'"))?;
+            if !x.is_finite() {
+                return Err(format!("{flag}: non-finite number '{part}' in '{s}'"));
+            }
+            out.push(x);
+        }
+        if out.len() < min || out.len() > max {
+            return Err(format!("{flag}: expected {} value(s), got '{}'", if min == max { min.to_string() } else { format!("{min}..={max}") }, s));
+        }
+        Ok(out)
+    };
     while i < v.len() {
         let mut used = 2;
-        match v[i].as_str() {
-            "--minimap" => a.minimap_plan = v.get(i + 1).and_then(|s| match s.as_str() { "plan" => Some(true), "satellite" => Some(false), _ => None }),
-            "--minimap-up" => a.minimap_heading_up = v.get(i + 1).and_then(|s| match s.as_str() { "north" => Some(false), "heading" => Some(true), _ => None }),
+        let flag = v[i].as_str();
+        match flag {
+            "--minimap" => {
+                let s = req(flag, i)?;
+                a.minimap_plan = Some(match s {
+                    "plan" => true,
+                    "satellite" => false,
+                    _ => return Err(format!("{flag} takes plan or satellite, got '{s}'")),
+                });
+            }
+            "--minimap-up" => {
+                let s = req(flag, i)?;
+                a.minimap_heading_up = Some(match s {
+                    "north" => false,
+                    "heading" => true,
+                    _ => return Err(format!("{flag} takes north or heading, got '{s}'")),
+                });
+            }
             "--lat" => {
-                a.lat = num(&v, i).unwrap_or(a.lat);
+                a.lat = req_num(flag, i)?;
+                if !(-90.0..=90.0).contains(&a.lat) {
+                    return Err(format!("{flag}: latitude must be within -90..=90"));
+                }
                 a.pos_set = true;
                 a.menu.get_or_insert(false);
             }
             "--lon" => {
-                a.lon = num(&v, i).unwrap_or(a.lon);
+                a.lon = req_num(flag, i)?;
+                if !(-180.0..=180.0).contains(&a.lon) {
+                    return Err(format!("{flag}: longitude must be within -180..=180"));
+                }
                 a.pos_set = true;
                 a.menu.get_or_insert(false);
             }
-            "--menu-go" => a.menu_go = num(&v, i),
+            "--menu-go" => a.menu_go = Some(req_num(flag, i)?),
             "--menu-view" => {
                 // lat,lon,altitude of the menu camera, for scripted screenshots
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
-                if p.len() == 3 {
-                    a.menu_view = Some((p[0], p[1], p[2]));
-                }
+                let p = req_nums(flag, i, 3, 3)?;
+                a.menu_view = Some((p[0], p[1], p[2]));
             }
             "--menu" => {
                 a.menu = Some(true);
@@ -504,10 +564,8 @@ fn parse_args() -> Args {
             }
             "--menu-screen" => {
                 // the start menu's screen: main (the default), fly (the globe), aircraft, settings
-                a.menu_screen = v.get(i + 1).and_then(|s| menu::Screen::parse(s));
-                if a.menu_screen.is_none() {
-                    eprintln!("--menu-screen: main, fly, aircraft or settings");
-                }
+                let s = req(flag, i)?;
+                a.menu_screen = Some(menu::Screen::parse(s).ok_or_else(|| format!("{flag}: expected main, fly, aircraft or settings, got '{s}'"))?);
                 a.menu.get_or_insert(true);
             }
             "--no-menu" => {
@@ -519,79 +577,79 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--fov" => {
-                a.fov = v.get(i + 1).and_then(|s| s.parse().ok());
+                a.fov = Some(req_num(flag, i)? as f32);
                 used = 2;
             }
             "--airport" => {
-                a.airport = v.get(i + 1).cloned();
+                a.airport = Some(req(flag, i)?.to_string());
                 a.menu.get_or_insert(false);
             }
-            "--runway" => a.runway = v.get(i + 1).cloned(),
+            "--runway" => a.runway = Some(req(flag, i)?.to_string()),
             "--aircraft" => {
-                a.aircraft = v.get(i + 1).cloned();
-                if let Some(k) = &a.aircraft {
-                    if aircraft::by_key(k).is_none() {
-                        eprintln!("unknown aircraft {k} (try {})", aircraft::list().iter().map(|s| s.keys[0]).collect::<Vec<_>>().join(", "));
-                    }
+                let k = req(flag, i)?;
+                if aircraft::by_key(k).is_none() {
+                    return Err(format!("unknown aircraft '{k}' (try {})", aircraft::list().iter().map(|s| s.keys[0]).collect::<Vec<_>>().join(", ")));
                 }
+                a.aircraft = Some(k.to_string());
             }
             "--approach" => {
                 a.approach = true;
                 used = 1;
             }
-            "--alt" => a.alt = num(&v, i),
-            "--agl" => a.agl = num(&v, i),
-            "--heading" => a.heading = num(&v, i).unwrap_or(a.heading),
+            "--alt" => a.alt = Some(req_num(flag, i)?),
+            "--agl" => a.agl = Some(req_num(flag, i)?),
+            "--heading" => a.heading = req_num(flag, i)?,
             "--place" => {
-                a.place = v.get(i + 1).cloned();
+                a.place = Some(req(flag, i)?.to_string());
                 a.pos_set = true;
                 a.menu.get_or_insert(false);
             }
-            "--max-zoom" => a.max_zoom = num(&v, i).unwrap_or(17.0).clamp(8.0, 19.0) as u8,
-            "--time" => a.hour = num(&v, i).unwrap_or(a.hour),
-            "--clouds" => a.clouds = num(&v, i).unwrap_or(0.5) as f32,
-            "--storms" => a.storms = num(&v, i).map(|x| x as f32),
+            "--max-zoom" => a.max_zoom = req_num(flag, i)?.clamp(8.0, 19.0) as u8,
+            "--time" => a.hour = req_num(flag, i)?,
+            "--clouds" => a.clouds = req_num(flag, i)? as f32,
+            "--storms" => a.storms = Some(req_num(flag, i)? as f32),
             "--storm-at" => {
                 // km,bearing[,radius km[,shower|thunder|severe|supercell]]: a convective cell that far
                 // from the spawn, a mature cumulonimbus unless a kind says otherwise (repeatable)
-                let f: Vec<&str> = v.get(i + 1).map(|s| s.split(',').collect()).unwrap_or_default();
-                let p: Vec<f64> = f.iter().take(3).map_while(|x| x.parse().ok()).collect();
-                let kind = f.iter().skip(p.len()).find_map(|x| weather::CellKind::parse(x));
-                if p.len() >= 2 {
-                    let r = p.get(2).copied().unwrap_or(match kind {
-                        Some(weather::CellKind::Shower) => 1.8,
-                        Some(weather::CellKind::Supercell) => weather::SUPER_R,
-                        _ => 6.0,
-                    });
-                    a.storm_at.push((p[0], p[1], r, kind));
+                let s = req(flag, i)?;
+                let f: Vec<&str> = s.split(',').collect();
+                let p: Vec<f64> = f.iter().take(3).map_while(|x| x.parse::<f64>().ok().filter(|n| n.is_finite())).collect();
+                let rest = &f[p.len()..];
+                let kind = match rest {
+                    [] => None,
+                    [k] => Some(weather::CellKind::parse(k).ok_or_else(|| format!("{flag}: unknown storm kind '{k}' in '{s}'"))?),
+                    _ => return Err(format!("{flag}: expected km,bearing[,radius][,kind], got '{s}'")),
+                };
+                if p.len() < 2 {
+                    return Err(format!("{flag}: expected km,bearing[,radius][,kind], got '{s}'"));
                 }
+                let r = p.get(2).copied().unwrap_or(match kind {
+                    Some(weather::CellKind::Shower) => 1.8,
+                    Some(weather::CellKind::Supercell) => weather::SUPER_R,
+                    _ => 6.0,
+                });
+                a.storm_at.push((p[0], p[1], r, kind));
             }
             "--squall-at" => {
                 // km,bearing[,length km]: a squall line that far from the spawn, lying
                 // across that bearing (the wind aloft blows from there unless --wind says)
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').map_while(|x| x.parse().ok()).collect()).unwrap_or_default();
-                if p.len() >= 2 {
-                    a.squall_at.push((p[0], p[1], p.get(2).copied().unwrap_or(100.0)));
-                }
+                let p = req_nums(flag, i, 2, 3)?;
+                a.squall_at.push((p[0], p[1], p.get(2).copied().unwrap_or(100.0)));
             }
             "--rain-at" => {
                 // km,bearing: centre the rain deck's area (--rain) that far from the spawn
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
-                if p.len() >= 2 {
-                    a.rain_at = Some((p[0], p[1]));
-                }
+                let p = req_nums(flag, i, 2, 2)?;
+                a.rain_at = Some((p[0], p[1]));
             }
-            "--time-rate" => a.time_rate = num(&v, i),
-            "--alto" => a.alto = num(&v, i).map(|x| x as f32),
+            "--time-rate" => a.time_rate = Some(req_num(flag, i)?),
+            "--alto" => a.alto = Some(req_num(flag, i)? as f32),
             "--wind" => {
                 // knots,from-degrees
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
-                if p.len() == 2 {
-                    a.wind = Some((p[0], p[1]));
-                }
+                let p = req_nums(flag, i, 2, 2)?;
+                a.wind = Some((p[0], p[1]));
             }
-            "--haze" => a.haze = num(&v, i).map(|h| h as f32),
-            "--day" => a.day = num(&v, i),
+            "--haze" => a.haze = Some(req_num(flag, i)? as f32),
+            "--day" => a.day = Some(req_num(flag, i)?),
             "--weather" => {
                 // a preset name (clear, fair, hazy, overcast, windy, storm), or on its own: open the weather panel
                 match v.get(i + 1).filter(|s| !s.starts_with("--")) {
@@ -604,103 +662,153 @@ fn parse_args() -> Args {
             }
             "--strike" => {
                 // cg|ic,km,bearing@seconds: a lightning strike that far from the aircraft at that game time
-                let f: Vec<&str> = v.get(i + 1).map(|s| s.split('@').collect()).unwrap_or_default();
-                let p: Vec<&str> = f.first().map(|s| s.split(',').collect()).unwrap_or_default();
-                let n = |k: usize| p.get(k).and_then(|x| x.parse::<f64>().ok());
-                if let (Some(kind), Some(km), Some(at)) = (p.first(), n(1), f.get(1).and_then(|t| t.parse::<f64>().ok())) {
-                    let kind = if kind.eq_ignore_ascii_case("ic") { storm::Kind::Cloud } else { storm::Kind::Ground };
-                    a.strikes.push(storm::Forced { at, kind, km, bearing: n(2).unwrap_or(0.0) });
-                }
+                let s = req(flag, i)?;
+                let (head, at_s) = s.split_once('@').ok_or_else(|| format!("{flag}: expected cg|ic,km[,bearing]@seconds, got '{s}'"))?;
+                let at: f64 = at_s.parse().map_err(|_| format!("{flag}: invalid time '{at_s}' in '{s}'"))?;
+                let p: Vec<&str> = head.split(',').collect();
+                let kind = match p.first().copied().unwrap_or("") {
+                    k if k.eq_ignore_ascii_case("ic") => storm::Kind::Cloud,
+                    k if k.eq_ignore_ascii_case("cg") => storm::Kind::Ground,
+                    k => return Err(format!("{flag}: expected cg or ic, got '{k}' in '{s}'")),
+                };
+                let km: f64 = p.get(1).ok_or_else(|| format!("{flag}: missing distance in '{s}'"))?.parse().map_err(|_| format!("{flag}: invalid distance in '{s}'"))?;
+                let bearing: f64 = match p.get(2) {
+                    Some(b) => b.parse().map_err(|_| format!("{flag}: invalid bearing '{b}' in '{s}'"))?,
+                    None => 0.0,
+                };
+                a.strikes.push(storm::Forced { at, kind, km, bearing });
             }
-            "--imagery" => a.imagery = v.get(i + 1).cloned().unwrap_or(a.imagery.clone()),
-            "--crash-at" => a.crash_at = num(&v, i),
-            "--boost-at" => a.boost_at = num(&v, i),
+            "--imagery" => a.imagery = req(flag, i)?.to_string(),
+            "--crash-at" => a.crash_at = Some(req_num(flag, i)?),
+            "--boost-at" => a.boost_at = Some(req_num(flag, i)?),
             "--ap" => {
-                if let Some((m, t)) = v.get(i + 1).and_then(|s| s.split_once('@')) {
-                    a.ap_script.push((t.parse().unwrap_or(0.0), m.to_ascii_lowercase()));
-                }
+                let s = req(flag, i)?;
+                let (m, t) = s.split_once('@').ok_or_else(|| format!("{flag}: expected mode@seconds, got '{s}'"))?;
+                let t: f64 = t.parse().map_err(|_| format!("{flag}: invalid time '{t}' in '{s}'"))?;
+                a.ap_script.push((t, m.to_ascii_lowercase()));
             }
-            "--stage-at" => a.stage_at = num(&v, i),
-            "--engines" => a.engines = num(&v, i).map(|k| k as usize),
+            "--stage-at" => a.stage_at = Some(req_num(flag, i)?),
+            "--engines" => {
+                let k = req_num(flag, i)?;
+                if k < 0.0 {
+                    return Err(format!("{flag}: expected non-negative integer, got {k}"));
+                }
+                a.engines = Some(k as usize);
+            }
             "--ship" => {
                 a.ship = true;
                 used = 1;
             }
-            "--hold" => a.hold = num(&v, i).unwrap_or(0.0),
-            "--damage" => a.damage = v.get(i + 1).cloned(),
-            "--flight-menu" => a.flight_menu = Some(num(&v, i).unwrap_or(3.0)),
+            "--hold" => a.hold = req_num(flag, i)?,
+            "--damage" => a.damage = Some(req(flag, i)?.to_string()),
+            "--flight-menu" => a.flight_menu = Some(req_num(flag, i)?),
             "--pause-menu" => {
                 // page[@seconds]: open the flight panel (Tab) or the pause menu (Esc) on that page, for scripted screenshots.
                 // `settings:SECTION` (or a section's name alone, e.g. `graphics`) opens the settings screen there.
-                let f: Vec<&str> = v.get(i + 1).map(|s| s.split('@').collect()).unwrap_or_default();
-                let spec = f.first().copied().unwrap_or("");
-                let (pg, sec) = spec.split_once(':').map(|(p, s)| (p, settings_ui::Section::parse(s))).unwrap_or((spec, None));
-                let page = match (menu::Page::parse(pg), settings_ui::Section::parse(pg)) {
-                    (Some(p), _) => Some((p, sec)),
-                    (None, Some(s)) => Some((menu::Page::Settings, Some(s))),
-                    _ => None,
+                let s = req(flag, i)?;
+                let (spec, t) = match s.split_once('@') {
+                    Some((sp, ts)) => (sp, ts.parse::<f64>().map_err(|_| format!("{flag}: invalid time '{ts}' in '{s}'"))?),
+                    None => (s, 0.0),
                 };
-                if let Some((page, sec)) = page {
-                    a.pause_menu = Some((page, sec, f.get(1).and_then(|t| t.parse().ok()).unwrap_or(0.0)));
-                }
+                let (pg, sec) = match spec.split_once(':') {
+                    Some((p, sec_s)) => (p, Some(settings_ui::Section::parse(sec_s).ok_or_else(|| format!("{flag}: unknown settings section '{sec_s}'"))?)),
+                    None => (spec, None),
+                };
+                let page = match (menu::Page::parse(pg), settings_ui::Section::parse(pg)) {
+                    (Some(p), _) => (p, sec),
+                    (None, Some(s)) => (menu::Page::Settings, Some(s)),
+                    _ => return Err(format!("{flag}: unknown page '{pg}' in '{s}'")),
+                };
+                a.pause_menu = Some((page.0, page.1, t));
             }
             "--settings" => {
                 // the start menu's settings screen, open on this section
-                a.settings = Some(v.get(i + 1).and_then(|s| settings_ui::Section::parse(s)).unwrap_or(settings_ui::Section::General));
+                let s = req(flag, i)?;
+                let sec = settings_ui::Section::parse(s).ok_or_else(|| format!("{flag}: unknown section '{s}'"))?;
+                a.settings = Some(sec);
                 a.menu.get_or_insert(true);
             }
             "--hangar" => {
-                let f = v.get(i + 1).cloned().unwrap_or_default();
-                let (page, sel) = f.split_once(':').map(|(p, s)| (p.to_string(), Some(s.to_string()))).unwrap_or((f, None));
-                a.hangar = Some((if page.starts_with('d') { hangar_ui::Tab::Download } else { hangar_ui::Tab::Mine }, sel));
+                let f = req(flag, i)?;
+                let (page, sel) = f.split_once(':').map(|(p, s)| (p, Some(s.to_string()))).unwrap_or((f, None));
+                let tab = if page.starts_with('d') {
+                    hangar_ui::Tab::Download
+                } else if page.starts_with('m') {
+                    hangar_ui::Tab::Mine
+                } else {
+                    return Err(format!("{flag}: expected mine or download[:FOLDER], got '{f}'"));
+                };
+                a.hangar = Some((tab, sel));
                 a.menu.get_or_insert(true);
             }
-            "--width" => a.size.0 = num(&v, i).unwrap_or(1600.0) as u32,
-            "--height" => a.size.1 = num(&v, i).unwrap_or(900.0) as u32,
+            "--width" => {
+                let w = req_num(flag, i)?;
+                if w < 1.0 {
+                    return Err(format!("{flag}: width must be positive"));
+                }
+                a.size.0 = w as u32;
+            }
+            "--height" => {
+                let h = req_num(flag, i)?;
+                if h < 1.0 {
+                    return Err(format!("{flag}: height must be positive"));
+                }
+                a.size.1 = h as u32;
+            }
             "--cam" => {
                 // yaw,pitch,distance of the chase camera, for scripted screenshots
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
-                if p.len() == 3 {
-                    a.cam = Some((p[0], p[1], p[2]));
-                }
+                let p = req_nums(flag, i, 3, 3)?;
+                a.cam = Some((p[0], p[1], p[2]));
             }
             "--cursor" => {
                 // x,y window pixels: the mouse, for scripted screenshots
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
-                if p.len() == 2 {
-                    a.cursor = Some((p[0], p[1]));
-                }
+                let p = req_nums(flag, i, 2, 2)?;
+                a.cursor = Some((p[0], p[1]));
             }
             "--click" | "--wheel" => {
                 // --click seconds[,held seconds[,x,y]]: a left click (at --cursor, or x,y)
                 // --wheel seconds,notches[,x,y]: the mouse wheel turned
-                let p: Vec<f64> = v.get(i + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                let p = req_nums(flag, i, 1, 4)?;
                 let at = (p.len() >= 4).then(|| (p[2], p[3]));
-                if let Some(&t) = p.first() {
-                    if v[i] == "--click" {
-                        a.clicks.push(MouseScript { t, at, ev: 1.0 });
-                        a.clicks.push(MouseScript { t: t + p.get(1).copied().unwrap_or(0.1), at: None, ev: 0.0 });
-                    } else {
-                        a.clicks.push(MouseScript { t, at, ev: 100.0 + p.get(1).copied().unwrap_or(1.0) });
-                    }
-                    a.clicks.sort_by(|x, y| x.t.total_cmp(&y.t));
+                let t = p[0];
+                if flag == "--click" {
+                    a.clicks.push(MouseScript { t, at, ev: 1.0 });
+                    a.clicks.push(MouseScript { t: t + p.get(1).copied().unwrap_or(0.1), at: None, ev: 0.0 });
+                } else {
+                    a.clicks.push(MouseScript { t, at, ev: 100.0 + p.get(1).copied().unwrap_or(1.0) });
                 }
+                a.clicks.sort_by(|x, y| x.t.total_cmp(&y.t));
             }
             "--shot" => {
                 // path@seconds[@yaw,pitch,distance]
-                let f: Vec<&str> = v.get(i + 1).map(|s| s.split('@').collect()).unwrap_or_default();
-                if f.len() >= 2 {
-                    let c: Vec<f64> = f.get(2).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
-                    a.shots.push((f[1].parse().unwrap_or(5.0), PathBuf::from(f[0]), if c.len() == 3 { Some((c[0], c[1], c[2])) } else { None }));
+                let s = req(flag, i)?;
+                let f: Vec<&str> = s.split('@').collect();
+                if f.len() < 2 || f.len() > 3 {
+                    return Err(format!("{flag}: expected path@seconds[@yaw,pitch,distance], got '{s}'"));
                 }
+                let t: f64 = f[1].parse().map_err(|_| format!("{flag}: invalid time '{}' in '{s}'", f[1]))?;
+                let cam = if let Some(cs) = f.get(2) {
+                    let c: Vec<f64> = cs.split(',').map(|x| x.parse::<f64>()).collect::<Result<_, _>>().map_err(|_| format!("{flag}: invalid camera '{cs}' in '{s}'"))?;
+                    if c.len() != 3 {
+                        return Err(format!("{flag}: camera needs yaw,pitch,distance, got '{cs}'"));
+                    }
+                    Some((c[0], c[1], c[2]))
+                } else {
+                    None
+                };
+                a.shots.push((t, PathBuf::from(f[0]), cam));
                 a.menu.get_or_insert(false);
             }
             "--record" => {
                 // dir@start@seconds: every frame steps 1/30 s; PNG frames + audio.wav
-                let f: Vec<&str> = v.get(i + 1).map(|s| s.split('@').collect()).unwrap_or_default();
-                if f.len() == 3 {
-                    a.record = Some((PathBuf::from(f[0]), f[1].parse().unwrap_or(0.0), f[2].parse().unwrap_or(10.0)));
+                let s = req(flag, i)?;
+                let f: Vec<&str> = s.split('@').collect();
+                if f.len() != 3 {
+                    return Err(format!("{flag}: expected dir@start@seconds, got '{s}'"));
                 }
+                let start: f64 = f[1].parse().map_err(|_| format!("{flag}: invalid start '{}' in '{s}'", f[1]))?;
+                let secs: f64 = f[2].parse().map_err(|_| format!("{flag}: invalid duration '{}' in '{s}'", f[2]))?;
+                a.record = Some((PathBuf::from(f[0]), start, secs));
                 a.menu.get_or_insert(false);
             }
             "--no-vsync" => {
@@ -711,11 +819,14 @@ fn parse_args() -> Args {
                 a.taa = false;
                 used = 1;
             }
-            "--rain" => a.rain = num(&v, i).map(|x| x as f32),
-            "--wet" => a.wet = num(&v, i).map(|x| x as f32),
-            "--speed" => a.speed = num(&v, i),
-            "--graphics" => a.graphics = v.get(i + 1).and_then(|s| graphics::Level::parse(s)).filter(|l| *l != graphics::Level::Off),
-            "--render-scale" => a.render_scale = num(&v, i).map(|s| (s as f32).clamp(graphics::SCALE_MIN, graphics::SCALE_MAX)),
+            "--rain" => a.rain = Some(req_num(flag, i)? as f32),
+            "--wet" => a.wet = Some(req_num(flag, i)? as f32),
+            "--speed" => a.speed = Some(req_num(flag, i)?),
+            "--graphics" => {
+                let s = req(flag, i)?;
+                a.graphics = Some(graphics::Level::parse(s).filter(|l| *l != graphics::Level::Off).ok_or_else(|| format!("{flag}: expected low, medium, high or ultra, got '{s}'"))?);
+            }
+            "--render-scale" => a.render_scale = Some((req_num(flag, i)? as f32).clamp(graphics::SCALE_MIN, graphics::SCALE_MAX)),
             "--headless" => {
                 a.headless = true;
                 used = 1;
@@ -736,7 +847,7 @@ fn parse_args() -> Args {
                 a.no_hud = true;
                 used = 1;
             }
-            "--fuel" => a.fuel = num(&v, i).map(|f| f.clamp(0.0, 1.0)),
+            "--fuel" => a.fuel = Some(req_num(flag, i)?.clamp(0.0, 1.0)),
             "--arcade" => {
                 a.arcade = true;
                 used = 1;
@@ -753,12 +864,17 @@ fn parse_args() -> Args {
                 a.mcp = false;
                 used = 1;
             }
-            "--mcp-port" => a.mcp_port = num(&v, i).map(|p| p.clamp(1.0, 65535.0) as u16).unwrap_or(a.mcp_port),
+            "--mcp-port" => {
+                let s = req(flag, i)?;
+                let p: u16 = s.parse().map_err(|_| format!("{flag}: invalid port '{s}'"))?;
+                if p == 0 {
+                    return Err(format!("{flag}: port must be 1..=65535"));
+                }
+                a.mcp_port = p;
+            }
             "--photo-detail" => {
-                a.photo_detail = Some(v.get(i + 1).and_then(|s| gmaps::Detail::parse(s)).unwrap_or_else(|| {
-                    eprintln!("--photo-detail takes low, medium, high or ultra");
-                    std::process::exit(2)
-                }));
+                let s = req(flag, i)?;
+                a.photo_detail = Some(gmaps::Detail::parse(s).ok_or_else(|| format!("{flag} takes low, medium, high or ultra, got '{s}'"))?);
             }
             "--no-pave" => {
                 pave::ON.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -769,31 +885,31 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--lang" => {
-                a.lang = Some(v.get(i + 1).and_then(|s| i18n::Lang::parse(s)).unwrap_or_else(|| {
-                    eprintln!("--lang takes en or fr");
-                    std::process::exit(2)
-                }));
+                let s = req(flag, i)?;
+                a.lang = Some(i18n::Lang::parse(s).ok_or_else(|| format!("{flag} takes en, fr or ko, got '{s}'"))?);
             }
             "--mp" => {
-                if let Some(s) = v.get(i + 1) {
-                    let (server, name) = match s.split_once(',') {
-                        Some((a, b)) => (a.to_string(), Some(b.to_string())),
-                        None => (s.to_string(), None),
-                    };
-                    a.mp = Some((server, name));
-                }
+                let s = req(flag, i)?;
+                let (server, name) = match s.split_once(',') {
+                    Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                    None => (s.to_string(), None),
+                };
+                a.mp = Some((server, name));
             }
-            "--mp-list" => a.mp_list = v.get(i + 1).cloned(),
+            "--mp-list" => a.mp_list = Some(req(flag, i)?.to_string()),
             "--mp-mirror" => {
                 a.mp_mirror = true;
                 used = 1;
             }
-            "--snow" => a.snow = v.get(i + 1).and_then(|s| snow::Mode::parse(s)),
+            "--snow" => {
+                let s = req(flag, i)?;
+                a.snow = Some(snow::Mode::parse(s).ok_or_else(|| format!("{flag} takes auto, off or always, got '{s}'"))?);
+            }
             "--offline" => {
                 a.offline = true;
                 used = 1;
             }
-            "--google-key" => a.google_key = v.get(i + 1).cloned(),
+            "--google-key" => a.google_key = Some(req(flag, i)?.to_string()),
             "--google" => {
                 a.google = Some(true);
                 used = 1;
@@ -810,19 +926,14 @@ fn parse_args() -> Args {
                 a.photoreal = Some(false);
                 used = 1;
             }
-            "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
-                std::process::exit(0);
-            }
             other => {
-                eprintln!("unknown argument {other}");
-                used = 1;
+                return Err(format!("unknown argument '{other}'"));
             }
         }
         i += used;
     }
     a.shots.sort_by(|x, y| x.0.total_cmp(&y.0));
-    a
+    Ok(a)
 }
 
 fn url_encode(s: &str) -> String {
@@ -1218,11 +1329,18 @@ impl Game {
             gfx.scale = INTEGRATED_SCALE;
         }
         let cache = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame");
+        {
+            let prune_dir = cache.clone();
+            let _ = std::thread::Builder::new().name("cache-prune".into()).spawn(move || {
+                fetch::prune_cache(&prune_dir, fetch::CACHE_MAX_BYTES);
+            });
+        }
         let mut r = r;
         r.headless = args.headless;
         // Cached scans load offline too; missing ones keep the procedural layer.
         r.load_ground_photos(fetch::Fetcher::new(cache.clone(), args.offline));
-        let google = Arc::new(gmaps::Google::load(args.google_key.clone()));
+        let google_key = args.google_key.clone().or_else(|| std::env::var("FABLE_GOOGLE_KEY").ok().filter(|s| !s.is_empty()));
+        let google = Arc::new(gmaps::Google::load(google_key));
         if let Some(on) = args.google {
             google.set_enabled(on);
         }
@@ -4800,12 +4918,23 @@ impl Game {
     fn frame(&mut self) {
         self.keep_settings(false);
         self.random_failures();
+        if let Some(err) = self.r.take_gpu_error() {
+            eprintln!("GPU error: {err}");
+            self.status = format!("GPU error: {err}");
+            self.status_until = self.real + 15.0;
+        }
+        if self.r.is_device_lost() {
+            eprintln!("GPU device lost; exiting cleanly.");
+            self.quit = true;
+            return;
+        }
         let now = Instant::now();
-        let mut dt_real = (now - self.last).as_secs_f64().min(0.05);
+        let raw_dt = (now - self.last).as_secs_f64();
+        let mut dt_real = raw_dt.min(0.25);
         if self.fps_log.0 {
             let l = &mut self.fps_log;
             l.2 += 1;
-            l.3 = l.3.max((now - self.last).as_secs_f64());
+            l.3 = l.3.max(raw_dt);
             let el = (now - l.1).as_secs_f64();
             if el >= 1.0 {
                 let n = l.2 as f64;
@@ -4823,7 +4952,7 @@ impl Game {
         self.frame += 1;
         self.pump_mcp();
         if self.record.is_none() {
-            self.fps += (1.0 / dt_real.max(1e-4) - self.fps) * 0.05;
+            self.fps += (1.0 / raw_dt.max(1e-4) - self.fps) * 0.05;
         }
 
         // Results of background lookups.
@@ -4973,9 +5102,10 @@ impl Game {
                 t.extend(self.world.air_targets(self.plane.pos));
                 t
             };
-            self.acc += dt;
             let h = 1.0 / 180.0;
-            while self.acc >= h {
+            const MAX_SUBSTEPS: usize = 45;
+            self.acc = (self.acc + dt).min(h * MAX_SUBSTEPS as f64);
+            while self.acc >= h && steps < MAX_SUBSTEPS {
                 self.acc -= h;
                 let imp = self.plane.step(h, &c, &self.world);
                 let powered = self.plane.sys.powered();
@@ -7622,6 +7752,9 @@ impl ApplicationHandler for App {
                 g.cancel_cockpit_input();
                 g.keys.clear();
                 (g.pad_y, g.pad_y_combo) = (false, false);
+                if g.mode == Mode::Fly && !g.crashed && !g.r.headless && g.record.is_none() && g.shots.is_empty() {
+                    g.set_pause_menu(true);
+                }
             }
             WindowEvent::KeyboardInput { event: k, .. } => {
                 if let PhysicalKey::Code(raw) = k.physical_key {
@@ -8218,4 +8351,34 @@ struct Kill {
 /// The top three rows of a piece's pose, for the shader (render.rs `DrawObj::pose`).
 fn pose_rows(m: &Mat4) -> [[f32; 4]; 3] {
     [m.row(0).to_array(), m.row(1).to_array(), m.row(2).to_array()]
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn cli_rejects_bad_values_and_unknown_flags() {
+        assert!(parse_args_from(&s(&["--lat", "abc"])).is_err());
+        assert!(parse_args_from(&s(&["--lat"])).is_err());
+        assert!(parse_args_from(&s(&["--lat", "95"])).is_err());
+        assert!(parse_args_from(&s(&["--unknown-flag"])).is_err());
+        assert!(parse_args_from(&s(&["--lang", "zz"])).is_err());
+        assert!(parse_args_from(&s(&["--cam", "1,2"])).is_err());
+        assert!(parse_args_from(&s(&["--mcp-port", "0"])).is_err());
+    }
+
+    #[test]
+    fn cli_accepts_valid_flags() {
+        let a = parse_args_from(&s(&["--lat", "37.6", "--lon", "-122.37", "--lang", "ko", "--weather", "--no-mcp"])).unwrap();
+        assert!((a.lat - 37.6).abs() < 1e-9);
+        assert!((a.lon + 122.37).abs() < 1e-9);
+        assert_eq!(a.lang, Some(i18n::Lang::Ko));
+        assert!(a.weather_panel);
+        assert!(!a.mcp);
+    }
 }
