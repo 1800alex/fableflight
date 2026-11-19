@@ -7778,9 +7778,22 @@ impl ApplicationHandler for App {
 
 /// The UI library ships no fonts of its own here, so borrow the system's.
 fn load_fonts(ctx: &egui::Context) {
-    let find = |kind: &str, fallbacks: &[&str]| -> Option<Vec<u8>> {
-        let fc = std::process::Command::new("fc-match").args(["-f", "%{file}", kind]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok());
-        fc.iter().map(|s| s.trim().to_string()).chain(fallbacks.iter().map(|s| s.to_string())).filter(|p| p.ends_with(".ttf") || p.ends_with(".otf")).find_map(|p| std::fs::read(p).ok())
+    // Each candidate is "path" or "path#face", the face picking one font out of a
+    // .ttc collection. fontconfig's index carries the named instance of a variable
+    // font in its upper 16 bits; only the low 16 are the face.
+    let find = |kind: &str, fallbacks: &[&str]| -> Option<(Vec<u8>, u32)> {
+        let fc = std::process::Command::new("fc-match").args(["-f", "%{file}#%{index}", kind]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok());
+        fc.iter().map(|s| s.trim().to_string()).chain(fallbacks.iter().map(|s| s.to_string())).find_map(|c| {
+            let (path, face) = match c.rsplit_once('#') {
+                Some((p, i)) => (p.to_string(), i.parse::<u32>().ok()? & 0xFFFF),
+                None => (c.clone(), 0),
+            };
+            let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            if !matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc") {
+                return None;
+            }
+            std::fs::read(&path).ok().map(|d| (d, face))
+        })
     };
     let mut fonts = egui::FontDefinitions::empty();
     // fontconfig's answer where there is one (Linux), then each system's own fonts.
@@ -7808,12 +7821,13 @@ fn load_fonts(ctx: &egui::Context) {
     ];
     // A Korean (Hangul) face, for the Korean interface. The bundled Barlow and
     // the Latin system fonts carry no Hangul, so without this Korean text would
-    // render as empty boxes. Only .ttf/.otf are read (see the filter in `find`),
-    // so the Windows Malgun Gothic and any Noto Sans KR .otf are picked up; the
-    // .ttc entries are there for fontconfig's answer on Linux.
+    // render as empty boxes. Noto Sans CJK collections hold JP, KR, SC, TC, HK
+    // in that order, so "#1" picks the Korean face.
     let korean: &[&str] = &[
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc#1",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc#1",
+        "/usr/share/fonts/opentype/noto-cjk/NotoSansCJK-Regular.ttc#1",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc#1",
         "/usr/share/fonts/google-noto/NotoSansKR-Regular.otf",
         "/usr/share/fonts/opentype/noto/NotoSansKR-Regular.otf",
         "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
@@ -7837,8 +7851,14 @@ fn load_fonts(ctx: &egui::Context) {
         fonts.families.entry(family.clone()).or_default().push((*name).into());
     }
     for (name, kind, fb) in [("mono", "monospace", mono), ("sans", "sans", sans), ("korean", "sans:lang=ko", korean)] {
-        if let Some(data) = find(kind, fb) {
-            fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(data)));
+        if let Some((data, face)) = find(kind, fb) {
+            let mut fd = egui::FontData::from_blob(Arc::new(data), face);
+            // A variable font starts at its default instance, which for Noto Sans
+            // CJK VF is Thin (wght 100); ask for Regular instead.
+            if fd.variation_axes().iter().any(|a| a.tag.to_be_bytes() == *b"wght") {
+                fd.tweak.coords.push(b"wght", 400.0);
+            }
+            fonts.font_data.insert(name.into(), Arc::new(fd));
         }
     }
     for (family, _) in families {
