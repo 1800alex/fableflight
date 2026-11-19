@@ -874,9 +874,44 @@ fn city_glow(gq: vec2f, dens: f32, dcx: vec2f, dcy: vec2f, upn: vec3f) -> vec3f 
     ks *= select(1.0, 0.8, cls == GC_ROCK);
     var sc = SNOW_ALBEDO * (0.93 + 0.14 * s3);
     if (cls == GC_WOOD) { sc = mix(img, sc, 0.45); }
-    albedo = mix(albedo, sc, ks);
-    // It smooths over the ground's small relief.
+    // Dynamic tracks and crash trails carved into the snow (snowtrack.rs):
+    // scrape snow away to reveal the ground underneath, compact what remains,
+    // pile snow into raised berms along the rims, and bend the normal so the
+    // indented ruts and snow banks catch the light.
+    var tr_ao = 1.0;
+    var tr_grad = vec2f(0.0);
+    let ks_orig = ks;
+    if (ks > 0.005) {
+      let tr = snow_track_at(in.P, dist, fw);
+      if (tr.x > 0.002 || tr.y > 0.002) {
+        let tn1 = snow_noise(wc0 + 71.0, 0.65, fw);
+        let tn2 = snow_noise(wc0 - 37.0, 2.3, fw);
+        let rough = tn1 * 0.65 + tn2 * 0.35;
+        let reveal = smoothstep(0.12, 0.68, tr.x + (rough - 0.5) * 0.22 * tr.x);
+        // Clear snow in the trough; pile displaced snow slightly thicker on berms.
+        ks = clamp(ks_orig * (1.0 - reveal) + tr.y * 0.35 * ks_orig * (0.7 + 0.6 * tn1), 0.0, 1.0);
+        // Compacted snow left in the rut is slightly darker and cooler in tone;
+        // fluffed snow in the raised berms gets subtle clumpy variation.
+        let comp = tr.x * (1.0 - reveal * 0.45);
+        sc *= mix(1.0, 0.72 + 0.14 * tn1, comp);
+        sc = mix(sc, sc * vec3f(0.84, 0.91, 1.04), comp * 0.55);
+        sc *= 1.0 + tr.y * 0.09 * (tn1 - 0.30);
+        // Dampen the exposed ground beneath scraped snow, and mix a touch of
+        // churned topsoil on deep crash/belly gouges.
+        albedo *= 1.0 - 0.35 * reveal * ks_orig;
+        let gouge = smoothstep(0.82, 1.0, tr.x) * ks_orig * 0.48 * (0.5 + 0.5 * tn2);
+        albedo = mix(albedo, vec3f(0.13, 0.10, 0.075) * (0.7 + 0.6 * tn1), gouge);
+        tr_ao = 1.0 - 0.22 * tr.x * ks_orig;
+        tr_grad = tr.zw;
+      }
+    }
+    albedo = mix(albedo, sc, ks) * tr_ao;
+    // It smooths over the ground's small relief, while tracks carve new slopes in it.
     N = normalize(mix(N, Ngeo, ks * 0.75));
+    if (dot(tr_grad, tr_grad) > 1e-8) {
+      let n_fade = (1.0 - smoothstep(180.0, 480.0, dist)) * ks_orig;
+      N = normalize(N - (G.snow_tr_e.xyz * tr_grad.x + G.snow_tr_n.xyz * tr_grad.y) * (1.15 * n_fade));
+    }
   }
   for (var i = 0; i < 8; i++) {
     let s = G.scorch[i];

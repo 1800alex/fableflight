@@ -112,6 +112,12 @@ struct Globals {
   snow_c: vec4f,
   snow_e: vec4f,
   snow_n: vec4f,
+  // Dynamic snow tracks (snowtrack.rs, t_snowtrack): SW corner of the active
+  // window relative to the camera + side length in m (0 = none); its east axis
+  // + toroidal u offset (m); its north axis + toroidal v offset (m).
+  snow_tr_c: vec4f,
+  snow_tr_e: vec4f,
+  snow_tr_n: vec4f,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;
@@ -152,6 +158,9 @@ struct Globals {
 // cell under snow, G how much of it the analysis knows (land, northern
 // hemisphere).
 @group(0) @binding(21) var t_snow: texture_2d<f32>;
+// Dynamic snow tracks and crash trails around the aircraft (snowtrack.rs):
+// R cleared/compressed snow trough, G displaced snow berm along the rims.
+@group(0) @binding(22) var t_snowtrack: texture_2d<f32>;
 
 // GPU particles (explosions, smoke, dust, spray) and their simulation constants.
 struct Particle {
@@ -2009,6 +2018,52 @@ fn snow_top(P: vec3f, N: vec3f, lo: f32, hi: f32) -> f32 {
   if (!snow_on()) { return 0.0; }
   let upn = normalize(P - G.planet.xyz);
   return snow_at(P, upn, upn, 0.0) * smoothstep(lo, hi, dot(N, upn));
+}
+// Dynamic snow tracks and crash trails (snowtrack.rs; keep constants the same).
+// Returns (clear, berm, dh/dx, dh/dy) in the track map's East/North frame.
+const SNOW_TR_N = 2048.0;
+const SNOW_TR_CELL = 0.25;
+fn snow_track_at(P: vec3f, dist: f32, fw: f32) -> vec4f {
+  let size = G.snow_tr_c.w;
+  if (size <= 0.0 || dist > 1400.0) { return vec4f(0.0); }
+  let q = P - G.snow_tr_c.xyz;
+  let lx = dot(q, G.snow_tr_e.xyz);
+  let ly = dot(q, G.snow_tr_n.xyz);
+  let margin = min(min(lx, size - lx), min(ly, size - ly));
+  if (margin <= 0.0) { return vec4f(0.0); }
+  let edge = smoothstep(0.0, 16.0, margin) * (1.0 - smoothstep(1000.0, 1400.0, dist));
+  let uv = (vec2f(lx, ly) + vec2f(G.snow_tr_e.w, G.snow_tr_n.w)) / size;
+  var c = textureSampleLevel(t_snowtrack, s_repeat, uv, 0.0).rg;
+  if (fw > 0.45) {
+    let d = min(fw * 0.22, 0.75) / size;
+    let avg = 0.25 * (
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(d, d), 0.0).rg +
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(-d, d), 0.0).rg +
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(d, -d), 0.0).rg +
+      textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(-d, -d), 0.0).rg
+    );
+    // Keep narrow tracks legible from altitude instead of diluting them away.
+    c = mix(c, max(c * 0.65, min(avg * 1.25, vec2f(1.0))), smoothstep(0.45, 1.8, fw));
+  }
+  c *= edge;
+  if (c.x < 0.002 && c.y < 0.002) { return vec4f(0.0); }
+  var gx = 0.0;
+  var gy = 0.0;
+  if (dist < 480.0) {
+    let step = 1.0 / SNOW_TR_N;
+    let xp = textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(step, 0.0), 0.0).rg;
+    let xm = textureSampleLevel(t_snowtrack, s_repeat, uv - vec2f(step, 0.0), 0.0).rg;
+    let yp = textureSampleLevel(t_snowtrack, s_repeat, uv + vec2f(0.0, step), 0.0).rg;
+    let ym = textureSampleLevel(t_snowtrack, s_repeat, uv - vec2f(0.0, step), 0.0).rg;
+    let hp = xp.y * 0.45 - xp.x * 0.70;
+    let hm = xm.y * 0.45 - xm.x * 0.70;
+    let vp = yp.y * 0.45 - yp.x * 0.70;
+    let vm = ym.y * 0.45 - ym.x * 0.70;
+    let inv = 0.5 / SNOW_TR_CELL * edge;
+    gx = (hp - hm) * inv;
+    gy = (vp - vm) * inv;
+  }
+  return vec4f(c.x, c.y, gx, gy);
 }
 
 fn shade(P: vec3f, N: vec3f, albedo: vec3f) -> vec3f {

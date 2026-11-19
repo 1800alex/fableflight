@@ -47,7 +47,20 @@ struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f3
   var snowy = 0.0;
   if ((rclass == 7u || rclass == 8u) && snow_on()) {
     snowy = snow_at(in.P, N, N, 0.0);
-    albedo = mix(albedo, SNOW_ALBEDO, snowy);
+    let ks_orig = snowy;
+    var sc = SNOW_ALBEDO;
+    if (snowy > 0.005) {
+      let tr = snow_track_at(in.P, dist, fw);
+      if (tr.x > 0.002 || tr.y > 0.002) {
+        let reveal = smoothstep(0.12, 0.68, tr.x);
+        snowy = clamp(ks_orig * (1.0 - reveal) + tr.y * 0.30 * ks_orig, 0.0, 1.0);
+        sc *= mix(1.0, 0.78, tr.x * (1.0 - reveal * 0.45));
+        albedo *= 1.0 - 0.32 * reveal * ks_orig;
+        let n_fade = (1.0 - smoothstep(180.0, 480.0, dist)) * ks_orig;
+        N = normalize(N - (G.snow_tr_e.xyz * tr.z + G.snow_tr_n.xyz * tr.w) * (1.05 * n_fade));
+      }
+    }
+    albedo = mix(albedo, sc, snowy);
   }
   // Wet-look sheen toward the sun at grazing angles.
   let V = normalize(in.P);

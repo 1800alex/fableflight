@@ -204,6 +204,12 @@ pub struct Globals {
     pub snow_c: [f32; 4],
     pub snow_e: [f32; 4],
     pub snow_n: [f32; 4],
+    /// dynamic snow tracks (snowtrack.rs `SnowTrack::globals`): SW corner of
+    /// the active window relative to the camera + side length in m (0 = none);
+    /// its east axis + toroidal u offset (m); its north axis + toroidal v offset (m)
+    pub snow_tr_c: [f32; 4],
+    pub snow_tr_e: [f32; 4],
+    pub snow_tr_n: [f32; 4],
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).
@@ -821,6 +827,8 @@ pub struct Frame<'a> {
     pub glow: Option<Vec<u16>>,
     /// a new snow cover map to upload (snowmap.rs, N x N RG8)
     pub snow: Option<Vec<u8>>,
+    /// dirty sub-rectangles of the dynamic snow track map (snowtrack.rs, RG8)
+    pub snow_tracks: Vec<crate::snowtrack::Upload>,
 }
 
 struct Targets {
@@ -966,6 +974,8 @@ pub struct Renderer {
     gclouds_tex: wgpu::Texture,
     /// today's real snow cover around the camera (snowmap.rs)
     snow_tex: wgpu::Texture,
+    /// dynamic snow tracks and crash trails around the aircraft (snowtrack.rs)
+    snow_track_tex: wgpu::Texture,
     build_ub: wgpu::Buffer,
     obj_ub: wgpu::Buffer,
     bg_obj: wgpu::BindGroup,
@@ -1136,6 +1146,7 @@ struct Bg0Src {
     glow: wgpu::TextureView,
     gclouds: wgpu::TextureView,
     snow: wgpu::TextureView,
+    snow_track: wgpu::TextureView,
 }
 
 impl Bg0Src {
@@ -1169,6 +1180,7 @@ impl Bg0Src {
                 tex_res(19, &self.glow),
                 tex_res(20, &self.gclouds),
                 tex_res(21, &self.snow),
+                tex_res(22, &self.snow_track),
             ],
         })
     }
@@ -1689,6 +1701,7 @@ impl Renderer {
                 tex_entry(19, d2, false),
                 tex_entry(20, d2, false),
                 tex_entry(21, d2, false),
+                tex_entry(22, d2, false),
             ],
         });
         // Coverage of the photorealistic 3D tiles, seen from above (tiles3d.rs).
@@ -1702,6 +1715,8 @@ impl Renderer {
         let gclouds_view = view(&gclouds_tex);
         let snow_tex = make_tex(d, "snow cover", crate::snowmap::N as u32, crate::snowmap::N as u32, 1, 1, wgpu::TextureFormat::Rg8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let snow_view = view(&snow_tex);
+        let snow_track_tex = make_tex(d, "snow tracks", crate::snowtrack::N as u32, crate::snowtrack::N as u32, 1, 1, wgpu::TextureFormat::Rg8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let snow_track_view = view(&snow_track_tex);
         let no_mask = view(&make_tex(d, "no photo mask", 1, 1, 1, 1, PHOTO_MASK_FMT, rt));
         let make_bg0 = |sky: &wgpu::TextureView, trans: &wgpu::TextureView, ms: &wgpu::TextureView, sh: &wgpu::TextureView, vl: &wgpu::TextureView, pm: &wgpu::TextureView, cs: &wgpu::TextureView| {
             d.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1730,6 +1745,7 @@ impl Renderer {
                     tex_res(19, &glow_view),
                     tex_res(20, &gclouds_view),
                     tex_res(21, &snow_view),
+                    tex_res(22, &snow_track_view),
                 ],
             })
         };
@@ -1738,7 +1754,7 @@ impl Renderer {
         let bg0_src = Bg0Src {
             layout: l0.clone(), ub: globals_ub.clone(), trans: lut_trans.clone(), ms: lut_ms.clone(), sky: lut_sky.clone(), noise: noise.clone(), wave: wave.clone(),
             s_clamp: s_clamp.clone(), s_repeat: s_repeat.clone(), s_shadow: s_shadow.clone(), s_aniso: s_aniso.clone(), vol: vol_light.clone(), det_alb: det_alb.clone(), det_nrm: det_nrm.clone(),
-            s_detail: s_detail.clone(), mask: photo_mask.clone(), cs: cs_mix.clone(), ocean: ocean.view.clone(), shore: shore.view.clone(), glow: glow_view.clone(), gclouds: gclouds_view.clone(), snow: snow_view.clone(),
+            s_detail: s_detail.clone(), mask: photo_mask.clone(), cs: cs_mix.clone(), ocean: ocean.view.clone(), shore: shore.view.clone(), glow: glow_view.clone(), gclouds: gclouds_view.clone(), snow: snow_view.clone(), snow_track: snow_track_view.clone(),
         };
         // Variant for passes that render into the LUTs / shadow map / smoke volume / photo mask / cloud shadow themselves.
         let bg0_pre = make_bg0(&black, &lut_trans, &lut_ms, &dummy_depth, &dummy_vol, &no_mask, &no_cs);
@@ -2256,7 +2272,7 @@ impl Renderer {
             casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_rain, p_veil, p_bolt, bolt_buf, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
-            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, gclouds_tex, snow_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
+            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, gclouds_tex, snow_tex, snow_track_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
             p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_composite_edge, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
@@ -2725,6 +2741,14 @@ impl Renderer {
                 px,
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 2), rows_per_image: Some(n) },
                 wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+            );
+        }
+        for u in &f.snow_tracks {
+            q.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.snow_track_tex, mip_level: 0, origin: wgpu::Origin3d { x: u.x, y: u.y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                &u.data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(u.w * 2), rows_per_image: Some(u.h) },
+                wgpu::Extent3d { width: u.w, height: u.h, depth_or_array_layers: 1 },
             );
         }
         if f.cover.len() == COVER_N * COVER_N {

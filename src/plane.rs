@@ -204,6 +204,10 @@ pub struct Plane {
     /// where something is ploughing or rolling through the ground: position,
     /// velocity the dirt is thrown at, how much (wheel ~1, airframe more)
     pub dirt: Vec<(DVec3, DVec3, f32)>,
+    /// tracks and gouges carved into snow on the ground this step (snowtrack.rs)
+    pub snow_marks: Vec<crate::snowtrack::Mark>,
+    /// previous ground-contact position of each gear leg, for continuous tyre tracks
+    wheel_prev: [Option<DVec3>; MAX_GEAR],
     /// resting or sliding on the airframe itself rather than the wheels
     pub on_hull: bool,
     /// contact points (reused each step)
@@ -333,6 +337,8 @@ impl Plane {
             notes: Vec::new(),
             sparks: Vec::new(),
             dirt: Vec::new(),
+            snow_marks: Vec::new(),
+            wheel_prev: [None; MAX_GEAR],
             t: 0.0,
             near_trees: Vec::new(),
             struck: Vec::new(),
@@ -2010,6 +2016,23 @@ impl Plane {
                 if tl > 1.5 && building.is_none() {
                     self.dirt.push((p, tang * 0.45 + upw * (2.0 + tl * 0.12), 2.5));
                 }
+                if building.is_none() && (tl > 0.05 || !self.on_hull) {
+                    let rad = match part {
+                        Part::Belly | Part::Nose | Part::Side | Part::Roof => (0.75 * k).clamp(0.65, 3.8),
+                        Part::Pod(_) => (0.55 * k).clamp(0.45, 2.2),
+                        Part::Wing(..) | Part::Fold(_) => (0.42 * k).clamp(0.35, 1.8),
+                        Part::Tail | Part::Fin | Part::Stab(_) | Part::Prop => (0.38 * k).clamp(0.32, 1.5),
+                    };
+                    let clear = (0.82 + (tl as f32 / 14.0).min(0.18)).min(1.0);
+                    self.snow_marks.push(crate::snowtrack::Mark {
+                        a: p - tang * dt,
+                        b: p,
+                        radius: rad,
+                        clear,
+                        berm: 0.92,
+                        rough: 0.65,
+                    });
+                }
             }
             self.pts = pts;
             let mut touching = [false; MAX_GEAR];
@@ -2071,15 +2094,41 @@ impl Plane {
                     if pv.length() > 3.0 && building.is_none() {
                         self.dirt.push((p, (pv - upw * vn) * 0.3 + upw * 1.5, 1.0));
                     }
+                    if building.is_none() {
+                        // Continuous landing-gear track in snow: wider for heavy multi-wheel
+                        // bogies, deeper when braking, skidding sideways or touching down hard.
+                        let bogie = if spec.mass > 30_000.0 { 1.4 } else { 1.0 };
+                        let skid = ((vs.abs() / 6.0).min(1.0) * 0.5 + brake * 0.5) as f32;
+                        let touch = ((-vn / 3.0).clamp(0.0, 1.0)) as f32;
+                        let rad = (leg.wheel_r as f32 * bogie).max(0.28) * (1.0 + 0.20 * skid);
+                        let clear = (0.80 + 0.14 * skid.max(touch)).min(0.95);
+                        let berm = (0.68 + 0.24 * skid.max(touch)).min(0.95);
+                        match self.wheel_prev[gi] {
+                            Some(p0) => {
+                                if (p - p0).length_squared() >= 0.04 * 0.04 {
+                                    self.snow_marks.push(crate::snowtrack::Mark { a: p0, b: p, radius: rad, clear, berm, rough: 0.12 + 0.35 * skid });
+                                    self.wheel_prev[gi] = Some(p);
+                                }
+                            }
+                            None => {
+                                self.snow_marks.push(crate::snowtrack::Mark { a: p, b: p, radius: rad, clear, berm, rough: 0.15 });
+                                self.wheel_prev[gi] = Some(p);
+                            }
+                        }
+                    } else {
+                        self.wheel_prev[gi] = None;
+                    }
                 }
             }
             for gi in 0..spec.gear.len() {
                 if !touching[gi] {
                     self.compress[gi] *= (1.0 - dt * 12.0).max(0.0);
+                    self.wheel_prev[gi] = None;
                 }
             }
         } else {
             self.compress = [0.0; MAX_GEAR];
+            self.wheel_prev = [None; MAX_GEAR];
         }
         // Wheels spin down in the air; brakes stop the mains at once.
         for (gi, leg) in spec.gear.iter().enumerate() {

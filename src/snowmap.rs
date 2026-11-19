@@ -220,6 +220,26 @@ impl SnowMap {
         self.map.as_ref().map(|m| (m.grid.year, m.grid.ddd))
     }
 
+    /// The snow line at a point (matching common.wgsl `snow_line_at`), for
+    /// CPU-side effects such as snow spray vs dirt dust particles.
+    pub fn snow_line_at(&self, p: DVec3, line: f64, doy: f64) -> f64 {
+        let Some(grid) = &self.grid else { return line };
+        let d = (doy - (grid.ddd as f64 - 1.0)).rem_euclid(365.0);
+        let days = d.min(365.0 - d);
+        let w = ((2.0 * NEAR_DAYS - days) / NEAR_DAYS).clamp(0.0, 1.0);
+        if w <= 0.0 {
+            return line;
+        }
+        let (la, lo, _) = geo::pos_to_lla(p);
+        let Some((col, row)) = cell_of(la.to_degrees(), lo.to_degrees()) else { return line };
+        let target = match grid.class(col, row) {
+            2 => line + 800.0,
+            3 => line - 1500.0,
+            _ => return line,
+        };
+        line + (target - line) * w
+    }
+
     /// Globals `snow_c`, `snow_e`, `snow_n`: the map's centre relative to the
     /// camera + half its side; its east axis + how much it counts (0..1, by how
     /// near the game's day `doy` (0 = January 1st) is to the analysis' day);

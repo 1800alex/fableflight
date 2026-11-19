@@ -81,6 +81,8 @@ pub struct Debris {
     wet: bool,
     /// time to its next escaping-air burst once it is going under
     glug: f32,
+    /// previous ground-contact position for continuous snow crash trails
+    track_prev: Option<DVec3>,
 }
 
 /// White water left on the surface (see `Crash::foam`).
@@ -166,6 +168,8 @@ pub struct Crash {
     foam: Vec<Foam>,
     /// how steeply it went in (0 flat .. 1 straight down)
     steep: f32,
+    /// snow trails carved by sliding and tumbling wreckage this frame
+    pub snow_marks: Vec<crate::snowtrack::Mark>,
 }
 
 pub const GAS: f32 = 0.0;
@@ -340,6 +344,7 @@ impl Crash {
                 lean: 0.0,
                 wet: false,
                 glug: 0.0,
+                track_prev: None,
             };
             if let Some((lo, hi, share)) = shares[i] {
                 // A heavy piece: a box as big as what it kept, that goes on
@@ -442,6 +447,7 @@ impl Crash {
                 lean: 0.0,
                 wet: false,
                 glug: 0.0,
+                track_prev: None,
             });
         }
         let mut c = Self {
@@ -474,6 +480,7 @@ impl Crash {
             splashes: Vec::new(),
             foam: Vec::new(),
             steep: (-vn / imp.vel.length().max(1.0)).clamp(0.0, 1.0) as f32,
+            snow_marks: Vec::new(),
         };
         // Fuel ignites only when the impact ruptures a tank or carries enough
         // energy to make ignition plausible; ditching never makes a fireball.
@@ -777,7 +784,7 @@ impl Crash {
     }
 
     /// Advance the wreck. `dt` is game time.
-    pub fn update(&mut self, dt: f64, world: &World, out: &mut Vec<Particle>) {
+    pub fn update(&mut self, dt: f64, world: &World, snowy: bool, out: &mut Vec<Particle>) {
         self.time += dt;
         self.last_blast.0 += dt;
         self.fluid.clear();
@@ -950,8 +957,38 @@ impl Crash {
                         k -= 1.0;
                         let r = &mut self.rng;
                         let vel = tang * r.range(0.3, 0.8) + r.dir() * (2.0 + c.slide * 0.15) + up * r.range(2.0, 6.0);
-                        out.push(Particle { pos: at.into(), vel: vel.into(), life: r.range(3.0, 7.0), size0: r.range(1.0, 2.0), size1: r.range(5.0, 11.0), kind: DUST, drag: 1.2, buoy: 0.2, seed: r.f(), alpha: r.range(0.45, 0.7), ..Default::default() });
+                        let kind = if snowy && r.f() < 0.65 { MIST } else { DUST };
+                        out.push(Particle { pos: at.into(), vel: vel.into(), life: r.range(3.0, 7.0), size0: r.range(1.0, 2.0), size1: r.range(5.0, 11.0), kind, drag: 1.2, buoy: 0.2, seed: r.f(), alpha: r.range(0.45, 0.7), ..Default::default() });
                     }
+                }
+                if let Some(at) = c.ground_at {
+                    // Carve a crash trail matching this piece's width across the ground.
+                    let tang = d.vel - upw * d.vel.dot(upw);
+                    let side = if tang.length_squared() > 0.04 {
+                        tang.cross(upw).normalize_or_zero()
+                    } else {
+                        let (_, e, _) = geo::enu(at);
+                        e
+                    };
+                    let rx = d.rot * DVec3::X;
+                    let ry = d.rot * DVec3::Y;
+                    let rz = d.rot * DVec3::Z;
+                    let hw = (side.dot(rx).abs() * d.half.x as f64 + side.dot(ry).abs() * d.half.y as f64 + side.dot(rz).abs() * d.half.z as f64) as f32;
+                    let radius = (hw * 1.05).clamp(0.65, 5.5);
+                    match d.track_prev {
+                        Some(p0) => {
+                            if (at - p0).length_squared() >= 0.10 * 0.10 {
+                                self.snow_marks.push(crate::snowtrack::Mark { a: p0, b: at, radius, clear: 0.97, berm: 0.95, rough: 0.85 });
+                                d.track_prev = Some(at);
+                            }
+                        }
+                        None => {
+                            self.snow_marks.push(crate::snowtrack::Mark { a: at, b: at, radius: radius * 1.1, clear: 0.97, berm: 0.95, rough: 0.85 });
+                            d.track_prev = Some(at);
+                        }
+                    }
+                } else {
+                    d.track_prev = None;
                 }
                 // Burning fuel left behind along its path.
                 if c.slide > 1.0 && d.burn > 5.0 && d.group != Some(airframe::G_PROP) && d.mass > 3000.0 {
@@ -976,17 +1013,20 @@ impl Crash {
                 }
                 let (lat, lon, h) = geo::pos_to_lla(d.pos);
                 let mut gh = None;
+                let mut on_building = false;
                 if let Some(g) = world.ground(lat, lon) {
                     gh = Some((g.h, g.water));
                 }
                 if let Some(b) = world.building(lat, lon) {
                     if h < b.top + 1.0 && (!b.bridge || h > b.base) {
                         gh = Some((b.top, false));
+                        on_building = true;
                     }
                 }
                 if let Some((g, water)) = gh {
                     if h >= g + d.radius {
                         d.wet = false;
+                        d.track_prev = None;
                     } else if water {
                         // In the water: it floats while it can, dragged to a stop.
                         let r = d.radius.max(0.1);
@@ -1026,6 +1066,24 @@ impl Crash {
                         if d.vel.length() < 0.8 && vn.abs() < 1.0 {
                             d.resting = true;
                             d.vel = DVec3::ZERO;
+                        }
+                        if !on_building {
+                            let at = d.pos - upw * d.radius;
+                            let radius = (d.radius as f32 * 1.15).clamp(0.28, 1.3);
+                            match d.track_prev {
+                                Some(p0) => {
+                                    if (at - p0).length_squared() >= 0.12 * 0.12 {
+                                        self.snow_marks.push(crate::snowtrack::Mark { a: p0, b: at, radius, clear: 0.88, berm: 0.82, rough: 0.75 });
+                                        d.track_prev = Some(at);
+                                    }
+                                }
+                                None => {
+                                    self.snow_marks.push(crate::snowtrack::Mark { a: at, b: at, radius, clear: 0.88, berm: 0.82, rough: 0.75 });
+                                    d.track_prev = Some(at);
+                                }
+                            }
+                        } else {
+                            d.track_prev = None;
                         }
                         // Burning fuel left behind where the big pieces slide.
                         if big && d.group != Some(airframe::G_PROP) && d.burn > 5.0 {
@@ -1272,6 +1330,8 @@ struct Contact {
     /// sliding speed where it touches the ground (0: in the air), and where
     slide: f32,
     at: DVec3,
+    /// centroid of corners penetrating open terrain (not water or buildings)
+    ground_at: Option<DVec3>,
     water: bool,
     /// a building it went into below its roof, and where
     build: Option<(BHit, DVec3)>,
@@ -1315,6 +1375,8 @@ fn rigid_step(d: &mut Debris, dt: f64, world: &World, ignore: &[(geo::TileId, us
         let iw = |v: DVec3| rot * (d.inv_i * (rot.inverse() * v));
         let mut deepest = 0.0f64;
         let mut touching = false;
+        let mut ground_sum = DVec3::ZERO;
+        let mut ground_n = 0u32;
         for &pb in &pts {
             let r = rot * pb;
             let p = d.pos + r;
@@ -1350,6 +1412,10 @@ fn rigid_step(d: &mut Debris, dt: f64, world: &World, ignore: &[(geo::TileId, us
                 return c;
             }
             touching = true;
+            if floor == g.h {
+                ground_sum += p;
+                ground_n += 1;
+            }
             deepest = deepest.max(pen);
             // The ground pushes back at this corner: no bounce to speak of,
             // and friction along it.
@@ -1378,6 +1444,9 @@ fn rigid_step(d: &mut Debris, dt: f64, world: &World, ignore: &[(geo::TileId, us
                 c.slide = sl as f32;
                 c.at = p;
             }
+        }
+        if ground_n > 0 {
+            c.ground_at = Some(ground_sum / ground_n as f64);
         }
         if touching {
             d.pos += upw * deepest.min(1.5) * 0.6;

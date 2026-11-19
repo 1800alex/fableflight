@@ -52,17 +52,13 @@ impl Mode {
 // not call it.
 /// Height (m) of the transition from bare ground to full snow cover: the
 /// snow thins out over this band around the snow line.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const BAND: f64 = 400.0;
 /// How far (m) the snow line drops on a steep slope facing the pole, and
 /// rises on one facing the equator, per unit of the normal's poleward part.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const ASPECT: f64 = 500.0;
 /// Cosines of the slopes between which the snow slides off: it holds fully
 /// up to 30°, none is left on cliffs from 60°.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const HOLD_COS: f64 = 0.866;
-#[cfg_attr(not(test), allow(dead_code))]
 pub const SLIDE_COS: f64 = 0.5;
 /// The snow line in Always mode: below any ground.
 const ALWAYS_LINE: f64 = -1000.0;
@@ -155,13 +151,11 @@ pub fn snow_line(mode: Mode, lat: f64, doy: f64, freezing: Option<f64>) -> Optio
 /// line `line` (m), on a slope whose normal makes `cos_slope` with the
 /// vertical and has `poleward` (-1..1) as its part towards the nearer pole.
 /// Same as common.wgsl `snow_cover`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn cover(alt: f64, cos_slope: f64, poleward: f64, line: f64) -> f64 {
     let z = alt - line + ASPECT * poleward;
     smoothstep(-0.5 * BAND, 0.5 * BAND, z) * smoothstep(SLIDE_COS, HOLD_COS, cos_slope)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn smoothstep(a: f64, b: f64, x: f64) -> f64 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
