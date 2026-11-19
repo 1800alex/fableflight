@@ -93,16 +93,27 @@ jobs:
         if: failure() && runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dumps = Get-ChildItem "$env:GITHUB_WORKSPACE\smoke-shots\dumps" -Filter *.dmp -ErrorAction SilentlyContinue
-          if (-not $dumps) { Write-Host "no crash dump was written"; exit 0 }
           $cdb = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe', 'C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $cdb) { $cdb = Get-ChildItem 'C:\Program Files*\Windows Kits' -Recurse -Filter cdb.exe -ErrorAction SilentlyContinue | Where-Object FullName -like '*x64*' | Select-Object -First 1 }
-          if (-not $cdb) { Write-Host "cdb.exe not found; the dumps are in the uploaded artifact"; exit 0 }
+          if (-not $cdb) { Write-Host "cdb.exe not found"; exit 0 }
+          Write-Host "cdb: $($cdb.FullName)"
           $sym = "$env:GITHUB_WORKSPACE\target\release;srv*$env:RUNNER_TEMP\symbols*https://msdl.microsoft.com/download/symbols"
+          $stack = '.echo ===== crashing thread; .ecxr; kn 80; .echo ===== all threads; ~*kn 40; .echo ===== modules; lmo; q'
+          $dumps = Get-ChildItem "$env:GITHUB_WORKSPACE\smoke-shots\dumps" -Filter *.dmp -ErrorAction SilentlyContinue
           foreach ($d in $dumps) {
-            Write-Host "===== $($d.Name)"
-            & $cdb.FullName -z $d.FullName -y $sym -lines -c ".symopt+0x40; .ecxr; .echo ===== crashing thread; kn 80; .echo ===== all threads; ~*kn 40; .echo ===== modules; lm; q"
+            Write-Host "===== dump $($d.Name)"
+            & $cdb.FullName -z $d.FullName -y $sym -lines -c ".symopt+0x40; $stack"
           }
+          if ($dumps) { exit 0 }
+          # No dump from WER: fly the scene again under the debugger and stop
+          # on the crash itself (second chance, so handled exceptions pass).
+          Write-Host "no crash dump was written; running the scene under cdb"
+          $exe = "$env:GITHUB_WORKSPACE\target\release\fablegame.exe"
+          $gameArgs = '--offline --mute --no-mcp --headless --graphics low --width 640 --height 360 --lang en --no-menu --aircraft c172 --lat 37.6 --lon -122.37 --alt 600 --time 12 --clouds 0.3 --shot smoke-shots\debug-scene.png@6'
+          $on = "sxd -c2 `"$stack`""
+          $cmd = ".symopt+0x40; sxd av; sxd dz; sxd sov; sxd c000001d; $on av; $on dz; $on sov; $on c000001d; $on c0000409; g"
+          $env:RUST_LOG = 'warn,fablegame=info'
+          & $cdb.FullName -G -y $sym -lines -c $cmd $exe $gameArgs.Split(' ') 2>&1 | Tee-Object smoke-shots\debug-scene.txt | Select-Object -Last 400
 
       - name: Run the game (macOS, Metal)
         if: runner.os == 'macOS'
