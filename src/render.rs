@@ -987,7 +987,7 @@ pub struct Renderer {
     obj_ub: wgpu::Buffer,
     bg_obj: wgpu::BindGroup,
     l_obj: wgpu::BindGroupLayout,
-    /// the aircraft shader source and its layout, kept to specialise it per kind off the main thread
+    /// the aircraft shader source, kept to specialise it per kind off the main thread.
     obj_src: std::sync::Arc<String>,
     pl_obj: wgpu::PipelineLayout,
     obj_fast: Option<ObjFast>,
@@ -2584,7 +2584,7 @@ impl Renderer {
         }
     }
     fn mesh_gpu(&self, verts: &[PartVertex], idx: &[u32], bind: Option<std::sync::Arc<wgpu::BindGroup>>) -> MeshGpu {
-        // (an empty piece, a hinge other pieces hang from, still gets a buffer: nothing is drawn from it)
+        // an empty piece, a hinge others hang from, still gets a buffer.
         let pad = [PartVertex::zeroed()];
         let verts = if verts.is_empty() { &pad[..] } else { verts };
         let (idx, n_main) = split_instruments(verts, idx);

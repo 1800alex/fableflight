@@ -980,14 +980,11 @@ impl Game {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
                 if let Some((text, col)) = guidance {
-                    let col = match col { 1 => Color32::from_rgb(64, 200, 96), 2 => AMBER, 3 => menu::BAD, _ => Color32::WHITE };
+                    // no dot, only a caution or warning tints the line.
+                    let col = match col { 2 => AMBER, 3 => menu::BAD, _ => Color32::WHITE };
                     panel(ui, glass().inner_margin(egui::Margin::symmetric(16, 8)), |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                            ui.painter().circle_filled(r.center(), 4.0, col);
-                            ui.label(RichText::new(text).font(num_s()).color(Color32::WHITE));
-                        });
+                        ui.label(RichText::new(text).font(num_s()).color(col));
                     });
                 }
                 self.ap_strip(ui);

@@ -899,7 +899,7 @@ struct Game {
     group_mesh: Vec<usize>,
     /// does the piece have openings cut in it
     piece_cut: Vec<bool>,
-    /// is the piece inside the cabin
+    /// is the piece inside the cabin.
     piece_inner: Vec<bool>,
     /// each breakable group's centre and size, for the wreckage
     group_pivots: Vec<(Vec3, f32)>,
