@@ -68,6 +68,24 @@ jobs:
         env:
           SMOKE_RUNS: menu
         run: xvfb-run -a -s "-screen 0 1280x720x24" python .github/scripts/smoke.py target/release/fablegame smoke-shots
+      # The runner's built-in WARP corrupts its own heap while JIT-compiling
+      # one of the flight scene's pixel shaders (cdb: HEAP "modified past
+      # requested size" freeing d3d10warp!PixelShaderJIT, inside
+      # ExecuteCommandLists), so the game died at random a moment later.
+      # Use Microsoft's current WARP from NuGet: D3D12 loads d3d10warp.dll
+      # from the executable's folder first. Pinned and checked by hash.
+      - name: Newer WARP (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = '1.0.22'
+          $sha = 'AFC058F4D1066EDC4231A38F3AB3592B1930F7287D4AC700E6A056E0874BB0BE'
+          $pkg = "$env:RUNNER_TEMP\warp.zip"
+          Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/$ver/microsoft.direct3d.warp.$ver.nupkg" -OutFile $pkg
+          if ((Get-FileHash $pkg -Algorithm SHA256).Hash -ne $sha) { throw "WARP package hash mismatch" }
+          Expand-Archive $pkg "$env:RUNNER_TEMP\warp" -Force
+          Copy-Item "$env:RUNNER_TEMP\warp\build\native\bin\x64\d3d10warp.dll" target\release\
+          Write-Host "WARP $ver next to fablegame.exe"
       # A native crash (access violation, say) leaves no Rust backtrace, so
       # have Windows Error Reporting write a minidump of the game when it dies.
       - name: Crash dumps on (Windows)

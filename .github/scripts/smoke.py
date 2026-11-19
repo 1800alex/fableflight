@@ -114,10 +114,8 @@ def main():
     exe = os.path.abspath(sys.argv[1])
     out = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else "smoke-shots")
     os.makedirs(out, exist_ok=True)
-    # FABLE_NO_PAD: no gamepads in scripted runs (main.rs, open_gamepads).
-    # On the Windows runner, opening Windows.Gaming.Input left the heap
-    # corrupted (0xC0000374 under cdb; otherwise a random crash a few seconds
-    # later: access violation, divide by zero, stack overflow).
+    # FABLE_NO_PAD: no gamepads in scripted runs (main.rs, open_gamepads),
+    # so a pad plugged into a developer's machine can't steer the shot.
     env = dict(os.environ, RUST_BACKTRACE="1", FABLE_NO_PAD="1", RUST_LOG=os.environ.get("RUST_LOG", "warn,fablegame=info"))
     # SMOKE_RUNS=menu picks runs by name (Linux CI: lavapipe needs many
     # minutes per frame for the flight scene's shaders, so it checks the menu)
