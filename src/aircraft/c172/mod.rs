@@ -9,6 +9,33 @@ use crate::airframe::*;
 use glam::{DVec3, Mat4, Quat, Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
+/// Period-inspired stripe palettes offered by the aircraft picker. The base
+/// airframe paint stays white; these colors are applied to the two accent bands.
+pub const LIVERIES: &[(&str, [f32; 3], [f32; 3])] = &[
+    ("Navy & red", [0.025, 0.075, 0.20], [0.62, 0.035, 0.025]),
+    ("Royal blue", [0.025, 0.12, 0.48], [0.80, 0.80, 0.78]),
+    ("Forest green", [0.035, 0.22, 0.12], [0.86, 0.68, 0.12]),
+    ("Burgundy", [0.30, 0.025, 0.075], [0.88, 0.72, 0.48]),
+];
+
+/// Repaint the distinctive stripe mesh and its wreckage copy. Matching the
+/// original vertex colors keeps the livery data local to the Cessna model.
+pub fn apply_livery(model: &mut Model, choice: usize) {
+    let (_, upper, lower) = LIVERIES[choice.min(LIVERIES.len() - 1)];
+    fn recolor(mesh: &mut Mesh, upper: [f32; 3], lower: [f32; 3]) {
+        for v in &mut mesh.v {
+            let color = if v.mat[3] == 42.0 { Some(upper) }
+                else if v.mat[3] == 43.0 { Some(lower) }
+                else { None };
+            if let Some(rgb) = color { v.col[..3].copy_from_slice(&rgb); }
+        }
+    }
+    for piece in &mut model.pieces {
+        if piece.name == "Cutlass accent stripes" { recolor(&mut piece.mesh, upper, lower); }
+    }
+    for group in &mut model.groups { recolor(group, upper, lower); }
+}
+
 pub fn build() -> Model {
     let mut b = Builder::default();
     fuselage(&mut b);
@@ -16,6 +43,7 @@ pub fn build() -> Model {
     tail(&mut b);
     engine(&mut b);
     gear(&mut b);
+    cutlass_livery(&mut b);
     cabin::build(&mut b);
     bake_ao(&mut b.pieces, &AoBake { vox: 0.025, reach: 2.6, rays: 28, open: &|q, pat| window(q) < 0.0 || (well_cut_by(pat) && well(q) < 0.0) });
     Model::finish(b.pieces)
@@ -23,6 +51,38 @@ pub fn build() -> Model {
 
 const KT: f64 = 1.0 / 1.94384;
 const V_NONE: f64 = 1e9;
+
+/// A fictional, period-inspired navy and red Cutlass scheme. The 1981 Cessna
+/// 172RG information manual is the variant reference; side photographs show
+/// period white-and-blue Cutlasses, but do not establish one factory paint
+/// recipe. This stripe is therefore a visual design choice, not a claim of an
+/// exact production livery.
+/// References: https://blueskyaviation.cz/wp-content/uploads/2023/12/Cessna_172RG_C172RG_Cutlass_1981_POH.pdf
+/// and https://www.planesales.com.au/details/Listing/Single-Engine-Propeller/7574/1981-Cessna-172RG-Cutlass-Aircraft
+fn cutlass_livery(b: &mut Builder) {
+    let mut stripes = Mesh::default();
+    let bands = [
+        (mt(mat::PAINT, 0.025, 0.075, 0.20).x(42.0), -0.225f32, -0.145f32),
+        (mt(mat::PAINT, 0.62, 0.035, 0.025).x(43.0), -0.136, -0.112),
+    ];
+    for &(paint, y0, y1) in &bands {
+        let mut right = Mesh::default();
+        // v runs upward in body Y on the right side, opposite the fuse angle;
+        // flip the grid normals so the paint catches exterior light correctly.
+        right.patch(&paint, 112, 4, true, |u, v| {
+            let z = -2.90 + u * 7.28;
+            let y = y0 + (y1 - y0) * v;
+            let th = fuse_th(z, y);
+            let (mut p, n) = (fuse_pt(z, th), fuse_n(z, th));
+            p += n * 0.0012;
+            (p, [z, y], 0.0)
+        });
+        let left = right.mirror_x();
+        stripes.append(&left);
+        stripes.append(&right);
+    }
+    b.fixed("Cutlass accent stripes", G_FUSE, stripes);
+}
 
 const fn leg(at: DVec3, r: f32, travel: f64, steer: f64, fold_vn: f64, fold_kick: DVec3, name: &'static str) -> Leg {
     Leg { at, wheel_r: r as f64, travel, k: 70_000.0, c: 7_000.0, nf_max: 120_000.0, steer, brakes: at.x != 0.0, side_k: 5000.0, side_mu: 0.9, roll_k: 80.0, roll_mu: 0.025, brake_k: 2500.0, brake_mu: 0.55, fold_vn, fold_kick, name }

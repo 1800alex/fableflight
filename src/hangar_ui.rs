@@ -345,6 +345,29 @@ impl crate::Game {
         });
         ui.add_space(8.0);
         ui.add(egui::Label::new(RichText::new(tr(spec.blurb)).size(16.0).color(TEXT)).wrap());
+        if std::ptr::eq(spec, &crate::aircraft::c172::SPEC) {
+            ui.add_space(14.0);
+            ui.label(RichText::new(t!("Livery", "Livrée")).font(menu::caption()).color(DIM));
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                for (i, (name, upper, lower)) in crate::aircraft::c172::LIVERIES.iter().enumerate() {
+                    let selected = self.menu.c172_livery == i;
+                    let button = egui::Button::new(RichText::new(*name).color(if selected { Color32::WHITE } else { TEXT }))
+                        .fill(if selected { Color32::from_rgb(48, 59, 78) } else { menu::SURFACE })
+                        .stroke(Stroke::new(if selected { 1.5 } else { 1.0 }, if selected { ACCENT } else { menu::LINE }))
+                        .corner_radius(menu::R_WIDGET);
+                    if ui.add(button).clicked() && !selected {
+                        self.menu.c172_livery = i;
+                        changed = true;
+                    }
+                    let swatch = ui.allocate_exact_size(egui::vec2(35.0, 10.0), egui::Sense::hover()).0;
+                    ui.painter().rect_filled(swatch, 2.0, Color32::from_rgb((upper[0] * 255.0) as u8, (upper[1] * 255.0) as u8, (upper[2] * 255.0) as u8));
+                    ui.painter().rect_filled(egui::Rect::from_min_max(swatch.left_bottom(), swatch.right_bottom() + egui::vec2(0.0, 4.0)), 1.0, Color32::from_rgb((lower[0] * 255.0) as u8, (lower[1] * 255.0) as u8, (lower[2] * 255.0) as u8));
+                }
+            });
+            if changed { self.apply_c172_livery(); }
+            ui.add_space(12.0);
+        }
         ui.add_space(18.0);
         // The numbers, in a row of tiles.
         let cells = numbers(spec);
