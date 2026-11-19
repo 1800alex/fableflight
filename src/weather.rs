@@ -966,7 +966,7 @@ impl Weather {
 
     /// The real-weather switch, and where the report comes from.
     fn live_switch(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.live, t!("Real weather (METAR, else Open-Meteo; radar)", "Météo réelle (METAR, sinon Open-Meteo ; radar)"));
+        switch_row(ui, t!("Real weather", "Météo réelle"), t!("METAR, else Open-Meteo; radar", "METAR, sinon Open-Meteo ; radar"), &mut self.live);
         if self.live {
             let text = if self.live_station.is_empty() {
                 if self.live_raw.is_empty() { t!("Waiting for a report…", "En attente d'un bulletin…").to_string() } else { self.live_raw.clone() }
@@ -975,7 +975,7 @@ impl Weather {
             } else {
                 self.live_raw.clone()
             };
-            ui.label(RichText::new(text).font(crate::menu::data()).weak());
+            ui.add(egui::Label::new(RichText::new(text).font(egui::FontId::monospace(12.5)).color(crate::menu::DIM)).wrap());
         }
     }
 
@@ -997,10 +997,10 @@ impl Weather {
         real_time_switch(ui, real_time);
         let free = !*real_time;
         egui::Grid::new("start_time").num_columns(2).min_col_width(92.0).spacing([10.0, 5.0]).show(ui, |ui| {
-            ui.label(t!("Local time", "Heure locale"));
+            row_label(ui, t!("Local time", "Heure locale"));
             ui.add_enabled_ui(free, |ui| add(ui, Slider::new(hour, 0.0..=23.99).custom_formatter(|v, _| crate::menu::hhmm(v))));
             ui.end_row();
-            ui.label("Date");
+            row_label(ui, "Date");
             ui.add_enabled_ui(free, |ui| add(ui, Slider::new(doy, 0.0..=364.0).step_by(1.0).custom_formatter(|v, _| date_label(v))));
             ui.end_row();
         });
@@ -1024,46 +1024,46 @@ impl Weather {
     fn day_controls(&mut self, ui: &mut egui::Ui, utc: &mut f64, doy: &mut f64, lon: f64) {
         real_time_switch(ui, &mut self.real_time);
         let free = !self.real_time;
-        section(ui, tr("DAY"), |ui| {
-            ui.label(t!("Local time", "Heure locale"));
+        section(ui, t!("Day", "Jour"), |ui| {
+            row_label(ui, t!("Local time", "Heure locale"));
             let mut local = (*utc + lon / 15.0).rem_euclid(24.0);
             let hhmm = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:02}:{:02}", v as u32 % 24, (v.fract() * 60.0) as u32);
             if ui.add_enabled_ui(free, |ui| add(ui, Slider::new(&mut local, 0.0..=23.99).custom_formatter(hhmm))).inner.changed() {
                 *utc = (local - lon / 15.0).rem_euclid(24.0);
             }
             ui.end_row();
-            ui.label("Date");
+            row_label(ui, "Date");
             let date = |v: f64, _: std::ops::RangeInclusive<usize>| date_label(v);
             ui.add_enabled_ui(free, |ui| add(ui, Slider::new(doy, 0.0..=364.0).step_by(1.0).custom_formatter(date)));
             ui.end_row();
-            ui.label(t!("Clock speed", "Vitesse de l'horloge"));
+            row_label(ui, t!("Clock speed", "Vitesse de l'horloge"));
             let rate = &mut self.time_rate;
             ui.add_enabled_ui(free, |ui| add(ui, Slider::new(rate, 0.0..=3600.0).logarithmic(true).smallest_positive(1.0).custom_formatter(|v, _| if v == 0.0 { t!("stopped", "arrêtée").into() } else { format!("{v:.0}×") })));
             ui.end_row();
-            ui.label(t!("Moon", "Lune"));
+            row_label(ui, t!("Moon", "Lune"));
             add(ui, Slider::new(&mut self.moon_age, 0.0..=29.5).custom_formatter(|v, _| tr(moon_phase(v)).into()));
             ui.end_row();
         });
     }
 
     fn sky_controls(&mut self, ui: &mut egui::Ui) {
-        section(ui, tr("SKY"), |ui| {
-            ui.label(t!("Cloud cover", "Couverture nuageuse"));
+        section(ui, t!("Sky", "Ciel"), |ui| {
+            row_label(ui, t!("Cloud cover", "Couverture nuageuse"));
             add(ui, Slider::new(&mut self.clouds, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             ui.end_row();
-            ui.label(t!("Cloud base", "Base des nuages"));
+            row_label(ui, t!("Cloud base", "Base des nuages"));
             add(ui, Slider::new(&mut self.cloud_base, 300.0..=4000.0).step_by(50.0).suffix(" m"));
             ui.end_row();
-            ui.label(t!("Cloud depth", "Épaisseur des nuages"));
+            row_label(ui, t!("Cloud depth", "Épaisseur des nuages"));
             add(ui, Slider::new(&mut self.cloud_depth, 500.0..=8000.0).step_by(50.0).suffix(" m"));
             ui.end_row();
-            ui.label(t!("Storm cells", "Cellules orageuses"));
+            row_label(ui, t!("Storm cells", "Cellules orageuses"));
             add(ui, Slider::new(&mut self.storms, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             ui.end_row();
-            ui.label(t!("Mid-level cloud", "Nuages moyens"));
+            row_label(ui, t!("Mid-level cloud", "Nuages moyens"));
             add(ui, Slider::new(&mut self.alto, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             ui.end_row();
-            ui.label(t!("Rain", "Pluie"));
+            row_label(ui, t!("Rain", "Pluie"));
             ui.horizontal(|ui| {
                 let mut r = self.rain_set.unwrap_or(self.rain);
                 if add(ui, Slider::new(&mut r, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0))).changed() {
@@ -1072,43 +1072,44 @@ impl Weather {
                 // Set, a rain deck (nimbostratus) that heavy closes in overhead;
                 // unset, the rain is wherever the storm cells drop it.
                 let mut auto = self.rain_set.is_none();
-                if ui.checkbox(&mut auto, "auto").changed() {
+                if crate::menu::toggle(ui, &mut auto, "auto").changed() {
                     self.rain_set = if auto { None } else { Some(self.rain) };
                 }
             });
             ui.end_row();
-            ui.label(t!("Haze", "Brume"));
+            row_label(ui, t!("Haze", "Brume"));
             add(ui, Slider::new(&mut self.haze, 0.2..=40.0).logarithmic(true).custom_formatter(|v, _| format!("{v:.1}×")));
             ui.end_row();
-            ui.label("");
-            ui.label(RichText::new(t!("visibility ~{:.0} km", "visibilité ~{:.0} km", self.visibility_km())).font(crate::menu::caption()).weak());
+            ui.label(RichText::new(t!("Visibility", "Visibilité")).font(crate::menu::caption()).color(crate::menu::DIM));
+            ui.label(RichText::new(format!("~{:.0} km", self.visibility_km())).font(egui::FontId::monospace(12.5)).color(crate::menu::TEXT));
             ui.end_row();
         });
     }
 
     fn wind_controls(&mut self, ui: &mut egui::Ui) {
-        section(ui, tr("WIND"), |ui| {
-            ui.label(t!("Speed", "Vitesse"));
+        section(ui, t!("Wind", "Vent"), |ui| {
+            row_label(ui, t!("Speed", "Vitesse"));
             let mut kt = self.wind * 1.94384;
             if add(ui, Slider::new(&mut kt, 0.0..=50.0).fixed_decimals(0).suffix(" kt")).changed() {
                 self.wind = kt / 1.94384;
             }
             ui.end_row();
-            ui.label(t!("From", "Direction"));
+            row_label(ui, t!("From", "Direction"));
             add(ui, Slider::new(&mut self.wind_from, 0.0..=359.0).step_by(1.0).custom_formatter(|v, _| format!("{:03.0}° {}", v, tr(compass(v)))));
             ui.end_row();
-            ui.label(t!("Gusts", "Rafales"));
+            row_label(ui, t!("Gusts", "Rafales"));
             add(ui, Slider::new(&mut self.gusts, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             ui.end_row();
         });
     }
 
     fn presets(&mut self, ui: &mut egui::Ui) {
-        crate::menu::heading(ui, tr("PRESETS"));
+        crate::flightui::pane_section(ui, t!("Presets", "Préréglages"));
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            let now = self.summary();
             for &(name, c, b, d, s, a, h, w, g) in PRESETS {
-                if ui.button(tr(name)).clicked() {
+                if crate::flightui::chip(ui, tr(name), false, !self.live && now == tr(name)).clicked() {
                     (self.clouds, self.cloud_base, self.cloud_depth, self.storms, self.alto, self.haze, self.wind, self.gusts) = (c, b, d, s, a, h, w, g);
                 }
             }
@@ -1121,7 +1122,23 @@ use egui::{RichText, Slider};
 
 /// The "real time" switch above the clock's sliders.
 fn real_time_switch(ui: &mut egui::Ui, on: &mut bool) {
-    ui.checkbox(on, t!("Real time (the sun where you are, now)", "Heure réelle (le soleil là où vous êtes, maintenant)"));
+    switch_row(ui, t!("Real time", "Heure réelle"), t!("the sun where you are, now", "le soleil là où vous êtes, maintenant"), on);
+}
+
+/// a switch on its own row with its name at the left.
+fn switch_row(ui: &mut egui::Ui, name: &str, hint: &str, on: &mut bool) {
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(egui::vec2(w, 36.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_width(w);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.label(RichText::new(name).font(crate::menu::label()).color(crate::menu::TEXT));
+            ui.label(RichText::new(hint).font(crate::menu::caption()).color(crate::flightui::SOFT));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::menu::switch(ui, on);
+        });
+    });
 }
 
 /// The real time now: hours UTC and the day of the year (0 = 1 January,
@@ -1167,8 +1184,13 @@ pub fn date_label(doy: f64) -> String {
 
 /// A headed two-column grid of labelled sliders.
 fn section(ui: &mut egui::Ui, title: &str, rows: impl FnOnce(&mut egui::Ui)) {
-    crate::menu::heading(ui, title);
-    egui::Grid::new(("wx", title)).num_columns(2).min_col_width(92.0).spacing([10.0, 5.0]).show(ui, rows);
+    crate::flightui::pane_section(ui, title);
+    egui::Grid::new(("wx", title)).num_columns(2).min_col_width(104.0).spacing([10.0, 6.0]).show(ui, rows);
+}
+
+/// a row's name.
+fn row_label(ui: &mut egui::Ui, s: &str) {
+    ui.label(RichText::new(s).font(crate::menu::caption()).color(crate::flightui::SOFT));
 }
 
 /// A focused slider would also take the arrow keys that fly the aircraft, so it lets go.

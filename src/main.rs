@@ -41,7 +41,6 @@ mod graphics;
 mod tiles3d;
 mod impostor;
 mod materials;
-mod logo;
 mod flightui;
 mod mainmenu;
 mod menu;
@@ -68,6 +67,7 @@ mod shore;
 mod skyglow;
 mod snow;
 mod snowmap;
+mod snowtrack;
 mod world;
 mod yasim;
 
@@ -86,13 +86,9 @@ enum Nav {
     Panel,
 }
 
-/// The height of the instruments drawn over the flying (`flight_hud`), bottom centre.
-/// The fewest points of height the interface is laid out for (see `egui_input`).
+/// the fewest points of height the ui is laid out for.
 pub const UI_MIN_H: f32 = 860.0;
-pub const HUD_H: f32 = 226.0;
-/// and its width
-pub const HUD_W: f32 = 410.0;
-/// how long a damage/failure flash stays at full strength, then how long it takes to fade (s)
+/// how long a damage or failure flash stays at full strength, then how long it fades (s).
 const FLASH_HOLD: f64 = 1.2;
 const FLASH_FADE: f64 = 0.8;
 
@@ -355,6 +351,8 @@ struct Args {
     /// open the in-flight menu on this page after this many seconds, for scripted screenshots
     /// (page, settings section when the page is Settings, seconds)
     pause_menu: Option<(menu::Page, Option<settings_ui::Section>, f64)>,
+    /// open the flight menu after this many seconds, for scripted screenshots.
+    flight_menu: Option<f64>,
     /// `--settings SECTION`: the start screen opens with the settings screen on that section (scripted screenshots)
     settings: Option<settings_ui::Section>,
     /// `--hangar mine|download[:FOLDER]`: the start screen opens with the hangar on that page (scripted screenshots)
@@ -453,6 +451,7 @@ fn parse_args() -> Args {
         menu_go: None,
         damage: None,
         pause_menu: None,
+        flight_menu: None,
         settings: None,
         hangar: None,
         menu_screen: None,
@@ -629,6 +628,7 @@ fn parse_args() -> Args {
             }
             "--hold" => a.hold = num(&v, i).unwrap_or(0.0),
             "--damage" => a.damage = v.get(i + 1).cloned(),
+            "--flight-menu" => a.flight_menu = Some(num(&v, i).unwrap_or(3.0)),
             "--pause-menu" => {
                 // page[@seconds]: open the flight panel (Tab) or the pause menu (Esc) on that page, for scripted screenshots.
                 // `settings:SECTION` (or a section's name alone, e.g. `graphics`) opens the settings screen there.
@@ -811,7 +811,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -983,7 +983,7 @@ struct Game {
     paused: bool,
     show_help: bool,
     show_hud: bool,
-    /// the HUD in the cockpit view (see `hud_on`)
+    /// the hud in the cockpit view.
     hud_cockpit: bool,
     /// arcade mode (settings.rs): the fun features on
     arcade: bool,
@@ -1043,11 +1043,15 @@ struct Game {
     snow: snow::Mode,
     /// the flight panel (Tab), beside the running game, and the page it shows
     info_open: bool,
+    /// the flight menu, a ring of icons on tab.
+    radial: flightui::Radial,
     info_page: menu::Page,
     /// the pause menu (Esc): open, the page it shows, and a scripted opening
     pause_open: bool,
     pause_page: menu::Page,
     pause_at: Option<(menu::Page, Option<settings_ui::Section>, f64)>,
+    /// when to open the flight menu, for scripted screenshots.
+    radial_at: Option<f64>,
     /// the section the settings screen shows (settings_ui.rs)
     settings_sec: settings_ui::Section,
     /// mouse-look speed (1 = default)
@@ -1104,10 +1108,8 @@ struct Game {
     smoke_acc: f32,
     /// things that just broke, to flash on the HUD: text, when
     flash: Vec<(String, f64)>,
-    /// the airport notice: what it said, and since when (it shows for a few seconds after each change)
+    /// the airport notice and when it last changed.
     airport_note: (String, f64),
-    /// when the pointer last asked for the flight toolbar (it slides away a moment after)
-    toolbar_t: f64,
     /// a weapon's fireball for the renderer's light: position, power, when
     weapon_flash: Option<(DVec3, f32, f64)>,
     /// aircraft shot down and still falling: they burn on the way down and
@@ -1130,6 +1132,8 @@ struct Game {
     skyglow: skyglow::SkyGlow,
     /// today's real snow cover around the camera (snowmap.rs)
     snowmap: snowmap::SnowMap,
+    /// dynamic snow tracks and crash trails carved into lying snow (snowtrack.rs)
+    snowtrack: snowtrack::SnowTrack,
     /// an airport start being prepared: (airport, the airfield if it could be put together, runway, on approach, keep the local time)
     airport_rx: Option<std::sync::mpsc::Receiver<(u32, Option<Arc<airports::Geo>>, Option<String>, bool, bool)>>,
     /// an airport start asked for on the command line
@@ -1137,7 +1141,7 @@ struct Game {
     /// the settings as last saved, the language picked in the game (None: the
     /// system's), and when they were last compared with the live ones
     prefs: settings::Settings,
-    /// the start of the last flight (saved with the settings)
+    /// where the last flight started.
     last_start: Option<settings::LastStart>,
     prefs_lang: Option<i18n::Lang>,
     prefs_t: f64,
@@ -1383,11 +1387,11 @@ impl Game {
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
-            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, snow: args.snow.unwrap_or(prefs.snow), info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
+            record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, snow: args.snow.unwrap_or(prefs.snow), info_open: false, radial: Default::default(), info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, radial_at: args.flight_menu, settings_sec: args.settings.unwrap_or(settings_ui::Section::General), look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
-            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), toolbar_t: -100.0, weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, snow_field: storm::RainField::default(), cam_snow: start_snow, cam_blow: 0.0, fresh: snow::Fresh::default(), fresh_line: 0.0, storm_adapt: 0.0, plane, weapons,
+            sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, snow_field: storm::RainField::default(), cam_snow: start_snow, cam_blow: 0.0, fresh: snow::Fresh::default(), fresh_line: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -1456,22 +1460,19 @@ impl Game {
                 g.menu.start = if appr { menu::Start::Approach } else { menu::Start::Runway };
             }
         }
-        // Otherwise the globe opens on the last flight's start, ready to take off.
+        // otherwise open the globe on the last start.
         if g.menu.pick.is_none() && !args.pos_set && args.menu_view.is_none() && args.aircraft.is_none() {
             g.restore_last_start();
         }
         Ok(g)
     }
 
-    /// Whether the HUD is drawn now: in the cockpit it stays hidden (the
-    /// cockpit has its instruments) unless turned on there with H; outside,
-    /// the HUD switch. Warnings show whenever the HUD switch is on.
+    /// the hud shows when on, but in the cockpit only when turned on there.
     fn hud_on(&self) -> bool {
         self.show_hud && (self.cam_mode != 1 || self.hud_cockpit)
     }
 
-    /// Puts the last flight's start back on the globe: the spot, the airport
-    /// and how to start there, and the aircraft. Nothing when there was none.
+    /// puts the last flight's start and aircraft back on the globe.
     fn restore_last_start(&mut self) {
         let Some(l) = self.last_start.clone() else { return };
         if let Some(spec) = aircraft::by_key(&l.aircraft) {
@@ -1497,7 +1498,7 @@ impl Game {
         self.menu.look_at(l.lat, l.lon, 30_000.0);
     }
 
-    /// What "Fly again" on the main menu would start: (where, what), for its label.
+    /// the place and aircraft for the fly again button.
     pub(crate) fn last_start_label(&self) -> Option<(String, &'static str)> {
         let l = self.last_start.as_ref()?;
         let spec = aircraft::by_key(&l.aircraft)?;
@@ -1612,6 +1613,16 @@ impl Game {
         // (The navigation lights, beacon and strobes run off the bus.)
         let (lit, pw) = if p.sys.powered() { (1000.0, 1.0) } else { (0.0, 0.0) };
         g[0][1] += self.radios.alt_error_ft(self.wx.qnh) as f32;
+        if p.spec.id == 9 && p.sys.powered() {
+            // The G650's attitude and heading come from its inertial reference
+            // units, not the vacuum gyro and DG the gauges model: the aircraft's
+            // own, as soon as the bus is powered (the IRS alignment is not simulated).
+            let (e, n, u) = geo::enu(p.pos);
+            let (f, r, up) = (p.forward(), p.right(), p.up());
+            g[1][0] = f.dot(u).clamp(-1.0, 1.0).asin().to_degrees() as f32;
+            g[1][1] = (-r.dot(u)).atan2(up.dot(u)).to_degrees() as f32;
+            g[0][3] = f.dot(e).atan2(f.dot(n)).to_degrees().rem_euclid(360.0) as f32;
+        }
         if self.spec.is_jet() {
             // The glass cockpit's engine and air data (b747/deck747.wgsl).
             let (_, _, h) = geo::pos_to_lla(p.pos);
@@ -1624,8 +1635,10 @@ impl Game {
             // The Phantom's J79 turbojets: about 250 C idling, 650 C at military power.
             // The Raptor's F119s are taken to run like the Hornet's.
             // Concorde's Olympus 593 turbojets: about 350 C idling, 750 C flat out.
-            // The Blackbird's J58s: about 400 C idling, 795 C at military power and in afterburner.)
-            let (idle_t, rise) = match self.spec.id { 2 | 4 => (400.0, 380.0), 3 => (250.0, 330.0), 6 => (350.0, 400.0), 7 => (80.0, 740.0), _ => (440.0, 200.0) };
+            // The Blackbird's J58s: about 400 C idling, 795 C at military power and in afterburner.
+            // The G650's BR725s show ITT: taken as about 440 C idling and 870 C at take-off
+            // power, an estimate (no published figures found).)
+            let (idle_t, rise) = match self.spec.id { 2 | 4 => (400.0, 380.0), 3 => (250.0, 330.0), 6 => (350.0, 400.0), 7 => (80.0, 740.0), 9 => (440.0, 430.0), _ => (440.0, 200.0) };
             let egt = oat + (idle_t - oat + rise * x.powf(1.4)) * running;
             // Fuel flow per engine (kg/h) and the fuel on board (kg), from the engines' burn.
             let n_eng = match &self.spec.engine { aircraft::Engine::Fan(f) => f.n as f64, _ => 1.0 };
@@ -1640,7 +1653,7 @@ impl Game {
                 [p.n1 as f32, egt as f32, ff as f32, fuel as f32],
                 [mach as f32, gs as f32, (agl * 3.28084) as f32, tat as f32],
                 [p.throttle as f32, local as f32, p.gear as f32, p.flap_deg() as f32],
-                [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if (self.spec.id != 0 && p.gear_down || self.spec.id == 0 && p.landing_lights) && p.sys.powered() { 1.0 } else { 0.0 }],
+                [lit + card.rem_euclid(360.0), strobe * pw, beacon as f32 * pw, if (if matches!(self.spec.id, 0 | 9) { p.landing_lights } else { p.gear_down }) && p.sys.powered() { 1.0 } else { 0.0 }],
             ];
         }
         // Row 5's first slot carries the nav lights (on above 1000) and the compass card.
@@ -1734,6 +1747,20 @@ impl Game {
         let decl = (-23.44f64).to_radians() * (std::f64::consts::TAU * (self.doy + 10.0) / 365.25).cos();
         let lon = (-15.0 * (self.utc - 12.0)).to_radians();
         DVec3::new(decl.cos() * lon.cos(), decl.cos() * lon.sin(), decl.sin())
+    }
+
+    /// Whether snow lies on flat ground at `p` (for snow spray vs dirt dust).
+    fn snowy_at(&self, p: DVec3) -> bool {
+        match self.snow {
+            snow::Mode::Off => false,
+            snow::Mode::Always => true,
+            snow::Mode::Auto => {
+                let (la, _, alt) = geo::pos_to_lla(p);
+                let Some(base) = snow::snow_line(self.snow, la.to_degrees(), self.doy, self.wx.freezing) else { return false };
+                let line = self.snowmap.snow_line_at(p, base, self.doy);
+                snow::cover(alt, 1.0, 0.0, line) > 0.35
+            }
+        }
     }
 
     /// Direction to the moon: the sun's ecliptic longitude advanced by the
@@ -2034,7 +2061,8 @@ impl Game {
         if pw {
             flags |= mp_proto::F_NAV | mp_proto::F_STROBE | mp_proto::F_BEACON;
         }
-        if pw && p.gear_down {
+        // (The G650's landing lights follow their switches alone.)
+        if pw && (if p.spec.id == 9 { p.landing_lights } else { p.gear_down }) {
             flags |= mp_proto::F_LANDING;
         }
         if p.on_ground {
@@ -2358,7 +2386,26 @@ impl Game {
         let on_off = |b: bool| if b { "ON" } else { "OFF" };
         Some(match id {
             "master" => on_off(p.sys.elec.master).into(),
+            "ignition" if self.spec.is_jet() => format!("{}{}", if p.ignition { "RUN" } else { "CUTOFF" }, if p.starter_on || p.cranking { " · START" } else { "" }),
             "ignition" => format!("{}{}", on_off(p.ignition), if p.starter_on || p.cranking { " · START" } else { "" }),
+            "fuel_control_l" | "fuel_control_r" | "battery_l" | "battery_r" => {
+                let fuel = id.starts_with("fuel");
+                let on = p.pair_on(!fuel as usize, id.ends_with("_r") as usize);
+                if fuel {
+                    format!("{}{}", if on { "RUN" } else { "CUTOFF" }, if p.ignition && (p.starter_on || p.cranking) { " · START" } else { "" })
+                } else { on_off(on).into() }
+            }
+            "starter" => if p.starter_on || p.cranking { "START" } else if p.running { "RUNNING" } else { "OFF" }.into(),
+            "speedbrake" if self.spec.chute.is_none() => if p.speedbrake > 0.0 { t!("extended", "sortis") } else { t!("retracted", "rentrés") }.into(),
+            "ap" => on_off(self.ap.on).into(),
+            "ap_hdg" | "ap_hdg_right" => format!("HDG {:03.0}°", self.ap.hdg.rem_euclid(360.0)),
+            "ap_alt" | "ap_alt_up" => format!("ALT {:.0} ft", self.ap.alt * 3.28084),
+            "ap_nav" | "ap_apr" => {
+                let m = if id == "ap_nav" { autopilot::Lat::Nav } else { autopilot::Lat::Apr };
+                if !self.ap.on || self.ap.lat != m { "OFF".into() } else if self.ap.nav_cap { "ON".into() } else { t!("armed", "armé").into() }
+            }
+            "ap_vs" | "ap_vs_up" => format!("VS {:+.0} ft/min{}", self.ap.vs * 196.85, if self.ap.on && self.ap.vert == autopilot::Vert::Vs { "" } else { " (off)" }),
+            "ap_at" | "ap_spd_up" => format!("A/T {} · {:.0} kt", on_off(self.ap.at), self.ap.spd * 1.943_84),
             "parking_brake" => on_off(p.parking_brake).into(),
             "mixture_rich" => format!("{:.0} %", p.mixture * 100.0),
             "throttle_up" => format!("{:.0} %", p.throttle * 100.0),
@@ -2713,7 +2760,7 @@ impl Game {
             Nav::Globe
         } else if self.pause_open {
             Nav::Pause
-        } else if self.info_open {
+        } else if self.info_open || self.radial.open {
             Nav::Panel
         } else {
             Nav::Off
@@ -2930,9 +2977,7 @@ impl Game {
                 None
             }
             Does::Key(KeyCode::Tab) => {
-                // The flight panel, with its first choice picked out for the pad.
-                self.info_open = !self.info_open;
-                self.pad_home = self.info_open;
+                self.flight_menu_key();
                 None
             }
             Does::Key(k) => {
@@ -3183,6 +3228,22 @@ impl Game {
         }
     }
 
+    /// The autothrottle on or off (holding the airspeed of the moment if none is set).
+    fn ap_at_toggle(&mut self) {
+        self.ap.at = !self.ap.at;
+        if self.ap.at && self.ap.spd <= 0.0 {
+            self.ap.spd = autopilot::State::of(&self.plane).ias;
+        }
+    }
+    /// The vertical speed the autopilot flies in VS, up or down 100 ft/min.
+    fn ap_vs_step(&mut self, up: bool) {
+        self.ap.vs = ((self.ap.vs * 196.85 / 100.0).round() * 100.0 + if up { 100.0 } else { -100.0 }).clamp(-4000.0, 4000.0) / 196.85;
+    }
+    /// The autothrottle's speed, up or down 5 kt.
+    fn ap_spd_step(&mut self, up: bool) {
+        self.ap.spd = ((self.ap.spd * 1.943_84).round() + if up { 5.0 } else { -5.0 }).max(40.0) / 1.943_84;
+    }
+
     /// The flight panel's Autopilot page: the mode buttons and the settings.
     fn autopilot_page(&mut self, ui: &mut egui::Ui) {
         use autopilot::{Lat, Vert};
@@ -3207,6 +3268,7 @@ impl Game {
         let mut lat = None;
         let mut vert = None;
         let mut toggle = false;
+        let mut at = false;
         ui.horizontal(|ui| {
             toggle = btn(ui, "AP", self.ap.on);
             for (m, n) in [(Lat::Hdg, "HDG"), (Lat::Nav, "NAV"), (Lat::Apr, "APR")] {
@@ -3222,12 +3284,12 @@ impl Game {
                 }
             }
             if btn(ui, "AT", self.ap.at) {
-                self.ap.at = !self.ap.at;
-                if self.ap.at && self.ap.spd <= 0.0 {
-                    self.ap.spd = s.ias;
-                }
+                at = true;
             }
         });
+        if at {
+            self.ap_at_toggle();
+        }
         if toggle {
             self.ap_toggle();
         }
@@ -3267,7 +3329,7 @@ impl Game {
         let (mut m, mut p, mut y) = (false, false, false);
         row(ui, "VS", format!("{:+.0} fpm", self.ap.vs * 196.85), &mut m, &mut p, &mut y);
         if m || p {
-            self.ap.vs = ((self.ap.vs * 196.85 / 100.0).round() * 100.0 + if p { 100.0 } else { -100.0 }).clamp(-4000.0, 4000.0) / 196.85;
+            self.ap_vs_step(p);
         }
         if y {
             self.ap.vs = (s.vs * 196.85 / 100.0).round() * 100.0 / 196.85;
@@ -3275,7 +3337,7 @@ impl Game {
         let (mut m, mut p, mut y) = (false, false, false);
         row(ui, "SPD", format!("{:.0} kt", self.ap.spd * 1.943_84), &mut m, &mut p, &mut y);
         if m || p {
-            self.ap.spd = ((self.ap.spd * 1.943_84).round() + if p { 5.0 } else { -5.0 }).max(40.0) / 1.943_84;
+            self.ap_spd_step(p);
         }
         if y {
             self.ap.spd = s.ias;
@@ -3289,18 +3351,28 @@ impl Game {
 
     fn radio_page(&mut self, ui: &mut egui::Ui) {
         use egui::RichText;
-        use menu::{ACCENT, DIM, TEXT};
+        use flightui::{chip, kv, list_row, pane_section};
+        use menu::{ACCENT, TEXT};
         use nav::Kind;
         let pos = self.plane.pos;
         let (la, lo, h) = geo::pos_to_lla(pos);
         let (lat, lon) = (la.to_degrees(), lo.to_degrees());
-        let dim = |s: String| RichText::new(s).font(menu::caption()).color(DIM);
-        ui.checkbox(&mut self.radios.show, t!("Show the navigation instruments (J)", "Afficher les instruments de navigation (J)"));
+        let note = |ui: &mut egui::Ui, s: &str| {
+            ui.add(egui::Label::new(RichText::new(s).font(menu::caption()).color(flightui::SOFT)).wrap());
+        };
+        ui.add_space(8.0);
+        let w = ui.available_width();
+        ui.allocate_ui_with_layout(egui::vec2(w, 26.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(w);
+            ui.label(RichText::new(t!("Instruments on screen (J)", "Instruments à l'écran (J)")).font(menu::caption()).color(flightui::SOFT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                menu::switch(ui, &mut self.radios.show);
+            });
+        });
 
-        menu::heading(ui, "NAV 1  (VOR / ILS)");
+        pane_section(ui, "NAV 1  ·  VOR / ILS");
         if let Some(st) = self.radios.nav.clone() {
             let r = nav::nav_reading(&st, self.radios.obs, pos);
-            ui.label(RichText::new(format!("{}  {}", st.freq_text(), st.label())).font(menu::data()).color(ACCENT));
             let state = if !r.live {
                 t!("no signal", "pas de signal").to_string()
             } else {
@@ -3310,34 +3382,38 @@ impl Game {
                     None => "LOC".to_string(),
                 };
                 if r.gs.is_some() {
-                    s += " · G/S";
+                    s += "  G/S";
                 }
                 if let Some(d) = r.dme {
-                    s += &format!(" · DME {d:.1} NM");
+                    s += &format!("  DME {d:.1} NM");
                 }
                 s
             };
-            ui.label(dim(state));
-            ui.horizontal(|ui| {
-                if st.kind == Kind::Ils {
-                    ui.label(RichText::new(t!("Course {:03.0}°", "Axe {:03.0}°", st.course)).monospace().color(TEXT));
-                } else {
-                    ui.label(RichText::new(format!("OBS {:03.0}°", self.radios.obs)).monospace().color(TEXT));
+            let mut off = false;
+            list_row(ui, &st.freq_text(), &st.label(), &state, |ui| {
+                off = chip(ui, t!("Off", "Éteindre"), false, false).clicked();
+            });
+            if off {
+                self.radios.nav = None;
+            }
+            if st.kind == Kind::Ils {
+                kv(ui, t!("Course", "Axe"), &format!("{:03.0}°", st.course), ACCENT);
+            } else {
+                kv(ui, "OBS", &format!("{:03.0}°", self.radios.obs), ACCENT);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for (txt, d) in [("−10", -10.0), ("−1", -1.0), ("+1", 1.0), ("+10", 10.0)] {
-                        if ui.small_button(txt).clicked() {
+                        if chip(ui, txt, true, false).clicked() {
                             self.radios.obs = (self.radios.obs.round() + d).rem_euclid(360.0);
                         }
                     }
-                    if ui.small_button(t!("Direct to", "Direct")).clicked() {
+                    if chip(ui, t!("Direct to", "Direct"), false, false).clicked() {
                         self.radios.obs = nav::bearing(pos, st.pos()).round();
                     }
-                }
-                if ui.small_button(t!("Off", "Éteindre")).clicked() {
-                    self.radios.nav = None;
-                }
-            });
+                });
+            }
         } else {
-            ui.label(dim(t!("Not tuned: pick a station below.", "Non réglée : choisissez une station ci-dessous.").into()));
+            note(ui, t!("Not tuned: pick a station below.", "Non réglée : choisissez une station ci-dessous."));
         }
         let mut list = nav::near(lat, lon, 200_000.0, Kind::Vor);
         list.truncate(8);
@@ -3346,83 +3422,80 @@ impl Game {
         list.extend(ils);
         list.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut tune = None;
-        egui::Grid::new("radio_nav").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
-            for (st, d) in list.iter().take(10) {
-                let on = self.radios.nav.as_ref() == Some(st);
-                if ui.add(egui::Button::selectable(on, RichText::new(st.freq_text()).font(menu::data()))).clicked() {
+        ui.add_space(6.0);
+        for (st, d) in list.iter().take(10) {
+            let on = self.radios.nav.as_ref() == Some(st);
+            list_row(ui, &st.freq_text(), &st.label(), &format!("{:.0} km", d / 1000.0), |ui| {
+                if chip(ui, if on { t!("Tuned", "Réglée") } else { t!("Tune", "Régler") }, false, on).clicked() && !on {
                     tune = Some(st.clone());
                 }
-                ui.label(RichText::new(st.label().chars().take(30).collect::<String>()).font(menu::caption()).color(TEXT));
-                ui.label(dim(format!("{:.0} km", d / 1000.0)));
-                ui.end_row();
-            }
-        });
+            });
+        }
         if let Some(st) = tune {
             self.radios.tune_nav(st, pos);
         }
 
-        menu::heading(ui, "ADF  (NDB)");
+        pane_section(ui, "ADF  ·  NDB");
         match self.radios.adf.clone() {
             Some(st) => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}  {}", st.freq_text(), st.label())).font(menu::data()).color(ACCENT));
-                    if ui.small_button(t!("Off", "Éteindre")).clicked() {
-                        self.radios.adf = None;
-                    }
+                let mut off = false;
+                list_row(ui, &st.freq_text(), &st.label(), "", |ui| {
+                    off = chip(ui, t!("Off", "Éteindre"), false, false).clicked();
                 });
+                if off {
+                    self.radios.adf = None;
+                }
             }
-            None => {
-                ui.label(dim(t!("Not tuned.", "Non réglé.").into()));
-            }
+            None => note(ui, t!("Not tuned.", "Non réglé.")),
         }
         let mut tune = None;
-        egui::Grid::new("radio_adf").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
-            for (st, d) in nav::near(lat, lon, 150_000.0, Kind::Ndb).iter().take(6) {
-                let on = self.radios.adf.as_ref() == Some(st);
-                if ui.add(egui::Button::selectable(on, RichText::new(st.freq_text()).font(menu::data()))).clicked() {
+        for (st, d) in nav::near(lat, lon, 150_000.0, Kind::Ndb).iter().take(6) {
+            let on = self.radios.adf.as_ref() == Some(st);
+            list_row(ui, &st.freq_text(), &st.label(), &format!("{:.0} km", d / 1000.0), |ui| {
+                if chip(ui, if on { t!("Tuned", "Réglé") } else { t!("Tune", "Régler") }, false, on).clicked() && !on {
                     tune = Some(st.clone());
                 }
-                ui.label(RichText::new(st.label().chars().take(30).collect::<String>()).font(menu::caption()).color(TEXT));
-                ui.label(dim(format!("{:.0} km", d / 1000.0)));
-                ui.end_row();
-            }
-        });
+            });
+        }
         if let Some(st) = tune {
             self.radios.tune_adf(st);
         }
 
-        menu::heading(ui, t!("ALTIMETER", "ALTIMÈTRE"));
+        pane_section(ui, t!("Altimeter", "Altimètre"));
         let qnh = self.wx.qnh;
         let src = if self.wx.live && !self.wx.live_station.is_empty() { self.wx.live_station.clone() } else { t!("standard", "standard").into() };
-        ui.label(dim(t!("QNH {:.0} hPa ({})", "QNH {:.0} hPa ({})", qnh, src)));
+        kv(ui, "QNH", &format!("{qnh:.0} hPa  ({src})"), TEXT);
         let set = self.radios.setting(qnh);
+        kv(ui, t!("Setting", "Calage"), &format!("{set:.0} hPa{}", if self.radios.baro.is_none() { t!("  on QNH", "  sur QNH") } else { "" }), TEXT);
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            let auto = if self.radios.baro.is_none() { t!(" (on the QNH)", " (sur le QNH)") } else { "" };
-            ui.label(RichText::new(t!("Setting {:.0} hPa{}", "Calage {:.0} hPa{}", set, auto)).monospace().color(TEXT));
-            if ui.small_button("−1").clicked() {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if chip(ui, "−1", true, false).clicked() {
                 self.radios.baro = Some(set.round() - 1.0);
             }
-            if ui.small_button("+1").clicked() {
+            if chip(ui, "+1", true, false).clicked() {
                 self.radios.baro = Some(set.round() + 1.0);
             }
-            if ui.small_button("QNH (X)").clicked() {
+            if chip(ui, "QNH", true, self.radios.baro.is_none()).on_hover_text("X").clicked() {
                 self.radios.baro = None;
             }
-            if ui.small_button("STD 1013").clicked() {
+            if chip(ui, "STD 1013", true, self.radios.baro == Some(1013.25)).clicked() {
                 self.radios.baro = Some(1013.25);
             }
         });
         let true_ft = h * 3.28084;
-        ui.label(dim(t!("The altimeter reads {:.0} ft (true altitude {:.0} ft).", "L'altimètre indique {:.0} ft (altitude vraie {:.0} ft).", true_ft + self.radios.alt_error_ft(qnh), true_ft)));
+        ui.add_space(4.0);
+        kv(ui, t!("Altimeter reads", "L'altimètre indique"), &format!("{:.0} ft", true_ft + self.radios.alt_error_ft(qnh)), TEXT);
+        kv(ui, t!("True altitude", "Altitude vraie"), &format!("{true_ft:.0} ft"), TEXT);
     }
 
-    fn cockpit_globals(&self) -> [[f32; 4]; 8] {
+    fn cockpit_globals(&self, agl: f64) -> [[f32; 4]; 12] {
         let p = &self.plane;
         let (lat, lon, h) = geo::pos_to_lla(p.pos);
         let (east, north, up) = geo::enu(p.pos);
         let gs = (p.vel - up * p.vel.dot(up)).length() * 1.94384;
         let hdg = p.forward().dot(east).atan2(p.forward().dot(north));
-        let mut data = [[0.0; 4]; 8];
+        let mut data = [[0.0; 4]; 12];
         data[0] = [(self.radios.setting(self.wx.qnh) * 0.029529983 * 100.0) as f32,
             ((h * 3.28084 + (1013.25 - self.wx.qnh) * 27.3) / 100.0) as f32,
             gs as f32, (p.spec.fuel_kg / 0.72 / 3.785 / 2.0) as f32];
@@ -3432,7 +3505,35 @@ impl Game {
         data[2] = [self.gauges.cylinder_head_f(), ((p.trim + 0.05) / 0.29) as f32, if p.sys.powered() { 1.0 } else { 0.0 }, p.engine_hours as f32];
         let plot = |pos: DVec3| { let v = pos - p.pos; [v.dot(east) as f32 / 18520.0, v.dot(north) as f32 / 18520.0, 1.0, 0.0] };
         if let Some(st) = &self.radios.nav { data[3] = plot(st.pos()); }
-        for (dst, (st, _)) in data[4..].iter_mut().zip(nav::near(lat.to_degrees(), lon.to_degrees(), 18520.0, nav::Kind::Vor).iter().take(4)) { *dst = plot(st.pos()); }
+        for (dst, (st, _)) in data[4..8].iter_mut().zip(nav::near(lat.to_degrees(), lon.to_degrees(), 18520.0, nav::Kind::Vor).iter().take(4)) { *dst = plot(st.pos()); }
+        // Rows 8-11: what the glass cockpits show of the autopilot and the
+        // systems (common.wgsl `Globals::cockpit`, deck650.wgsl).
+        {
+            use autopilot::{Lat, Vert};
+            let ap = &self.ap;
+            let bit = |b: bool, v: u32| if b { v } else { 0 };
+            let bits = bit(ap.on, 1) | bit(ap.at, 2)
+                | match ap.lat { Lat::Roll => 0, Lat::Hdg => 4, Lat::Nav => 8, Lat::Apr => 16 }
+                | match ap.vert { Vert::Pitch => 0, Vert::Alt => 32, Vert::Vs => 64, Vert::Gs => 128 }
+                | bit(ap.nav_cap, 256) | bit(ap.gs_cap, 512) | bit(ap.alt_cap, 1024) | bit(ap.slow, 2048) | bit(ap.fast, 4096);
+            data[8] = [bits as f32, ap.hdg.rem_euclid(360.0) as f32, (ap.alt * 3.28084) as f32, (ap.spd * 1.943_84) as f32];
+            data[9] = [(ap.vs * 196.85) as f32, p.trim.to_degrees() as f32, p.speedbrake as f32, p.spoilers as f32];
+            let flags = bit(p.running, 1) | bit(p.starter_on, 2) | bit(p.ignition, 4) | bit(p.sys.powered(), 8) | bit(p.on_ground, 16) | bit(p.parking_brake, 32);
+            data[10] = [p.reverser as f32, flags as f32, p.toe_brake[0].max(p.toe_brake[1]) as f32, (p.alpha / p.stall_alpha().max(0.01)) as f32];
+            // The cabin: held near the field's height on the ground and low,
+            // scheduled to about 4,850 ft at 51,000 ft (an estimate, not the
+            // real pressurisation schedule). The speed trend: the along-path
+            // acceleration (the accelerometers' specific force less gravity)
+            // carried 6 s ahead.
+            let alt_ft = h * 3.28084;
+            let agl_ft = agl * 3.28084;
+            let k = ((agl_ft - 500.0) / 3000.0).clamp(0.0, 1.0);
+            let cabin = alt_ft + (alt_ft * 0.095 - alt_ft).min(0.0) * k;
+            let air = p.vel - p.wind;
+            let acc = p.rot * p.sf - up * 9.81;
+            let trend = if air.length() > 1.0 { acc.dot(air.normalize()) * 6.0 * 1.943_84 } else { 0.0 };
+            data[11] = [p.sys.elec.volts as f32, p.sys.elec.amps as f32, cabin as f32, trend as f32];
+        }
         data
     }
 
@@ -3455,6 +3556,11 @@ impl Game {
             "cowl_open" => self.plane.cowl_flaps = (self.plane.cowl_flaps + 0.1).min(1.0),
             "cowl_close" => self.plane.cowl_flaps = (self.plane.cowl_flaps - 0.1).max(0.0),
             "landing_lights" => self.plane.landing_lights = !self.plane.landing_lights,
+            "ap_vs" if !self.crashed => self.ap_vert(autopilot::Vert::Vs),
+            "ap_at" => self.ap_at_toggle(),
+            "ap_vs_up" | "ap_vs_down" => self.ap_vs_step(id == "ap_vs_up"),
+            "ap_spd_up" | "ap_spd_down" => self.ap_spd_step(id == "ap_spd_up"),
+            "fuel_control_l" | "fuel_control_r" | "battery_l" | "battery_r" => self.pair_switch(id),
             "fuel_valve" | "fuel_next" | "fuel_prev" => {
                 self.plane.fuel_selector = self.plane.fuel_selector.turn(id != "fuel_prev");
             }
@@ -3472,6 +3578,33 @@ impl Game {
             }
             _ => {}
         }
+    }
+
+    /// One of a twin jet's L/R fuel control or battery switches clicked: it
+    /// goes to the other position. The shared state (`Plane::ignition`,
+    /// `sys.elec.master`) is on while either switch of the pair is, and is
+    /// switched with the action's key (`ignition`, `master`), so the mouse
+    /// does what the key does.
+    fn pair_switch(&mut self, id: &str) {
+        let fuel = id.starts_with("fuel");
+        let (k, w) = (id.ends_with("_r") as usize, !fuel as usize);
+        let shared = |p: &plane::Plane| if fuel { p.ignition } else { p.sys.elec.master };
+        let on = shared(&self.plane);
+        let want = [!self.plane.pair_on(w, k), self.plane.pair_on(w, 1 - k)];
+        if want[0] != on && !(on && want[1]) {
+            // Off to on, or the last switch of the pair off: the key.
+            if let Some(key) = Self::action_key(if fuel { "ignition" } else { "master" }) {
+                self.key(key);
+            }
+            if shared(&self.plane) == on { return; }
+        }
+        // Which switch is off while its partner holds the state on (both on, or both off: neither).
+        let mut pair = [false; 2];
+        if want[0] != want[1] {
+            pair[k] = !want[0];
+            pair[1 - k] = !want[1];
+        }
+        self.plane.pair_off[w] = pair;
     }
 
     /// NAV 1 as the cockpit's course deviation indicators show it (Globals::nav).
@@ -3496,10 +3629,9 @@ impl Game {
         [r.cdi as f32, r.gs.unwrap_or(0.0) as f32, obs, flags]
     }
 
-    /// The navigation instruments over the game: a course deviation
-    /// indicator for NAV 1 (with the glide slope on an ILS) and an ADF dial.
-    fn nav_overlay(&self, ctx: &egui::Context, hdg: f64) {
-        use egui::{Align2, Color32, FontId, Stroke};
+    /// the radio instruments at the bottom centre, false when none are tuned.
+    fn nav_overlay(&self, ctx: &egui::Context, hdg: f64) -> bool {
+        use egui::{Align2, Color32, Stroke};
         let pos = self.plane.pos;
         // (Without power the receivers are dead: OFF flags.)
         let pw = self.plane.sys.powered();
@@ -3512,18 +3644,16 @@ impl Game {
         });
         let adf = self.radios.adf.as_ref().map(|s| (s, nav::adf_bearing(s, pos, hdg).filter(|_| pw)));
         if nav.is_none() && adf.is_none() {
-            return;
+            return false;
         }
         let white = Color32::from_rgba_unmultiplied(255, 255, 255, 235);
         let dim = Color32::from_rgba_unmultiplied(255, 255, 255, 140);
         let green = Color32::from_rgb(110, 235, 140);
         let amber = Color32::from_rgb(255, 196, 64);
         let red = Color32::from_rgb(255, 90, 60);
-        let mono = |s: f32| FontId::monospace(s);
-        // Beside the instruments, to their right (they take the bottom centre).
-        let x = ctx.content_rect().width() * 0.5 + HUD_W * 0.5 + 12.0;
-        egui::Area::new(egui::Id::unique("nav_inst")).anchor(Align2::LEFT_BOTTOM, [x, -14.0]).interactable(false).show(ctx, |ui| {
-            flightui::glass().inner_margin(10.0).show(ui, |ui| {
+        let mono = |s: f32| menu::medium(s + 1.0);
+        egui::Area::new(egui::Id::unique("nav_inst")).anchor(Align2::CENTER_BOTTOM, [0.0, -14.0]).interactable(false).show(ctx, |ui| {
+            flightui::frosted(ui, flightui::glass().inner_margin(10.0), |ui| {
                 ui.horizontal(|ui| {
                     if let Some((st, r)) = &nav {
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(220.0, 128.0), egui::Sense::hover());
@@ -3603,6 +3733,7 @@ impl Game {
                 });
             });
         });
+        true
     }
 
     /// A gamepad button pressed, for whatever it works at the moment.
@@ -3644,6 +3775,7 @@ impl Game {
             // The flight panel, open beside the flying: the same, and B closes it.
             // (Its other buttons, and Y with any, still fly: pad_fly_buttons.)
             (Nav::Panel, Button::South) if !modifier => self.pad_key(egui::Key::Enter),
+            (Nav::Panel, Button::East) if !modifier && self.radial.open => self.radial.open = false,
             (Nav::Panel, Button::East) if !modifier => self.info_open = false,
             (Nav::Panel, Button::LeftTrigger | Button::RightTrigger) if !modifier => {
                 self.info_page = menu::Page::cycle(&menu::Page::INFO, self.info_page, b == Button::RightTrigger);
@@ -3741,7 +3873,8 @@ impl Game {
             return;
         }
         match code {
-            KeyCode::Tab => self.info_open = !self.info_open,
+            KeyCode::Tab => self.flight_menu_key(),
+            KeyCode::Escape if self.radial.open => self.radial.open = false,
             // Esc closes a pop-up window first; otherwise it pauses.
             KeyCode::Escape if self.show_help => self.show_help = false,
             KeyCode::Escape if self.wx.open => self.wx.open = false,
@@ -3806,18 +3939,20 @@ impl Game {
             KeyCode::KeyM => self.wx.clouds = (self.wx.clouds - 0.1).max(0.0),
             KeyCode::F3 => self.wx.open = !self.wx.open,
             KeyCode::KeyP => self.paused = !self.paused,
-            // H turns the HUD of the view you are in on or off: the cockpit keeps its own.
+            // h toggles the hud of the current view.
             KeyCode::KeyH if self.cam_mode == 1 => self.hud_cockpit = !self.hud_cockpit,
             KeyCode::KeyH => self.show_hud = !self.show_hud,
             KeyCode::Backquote => self.minimap.visible = !self.minimap.visible,
             KeyCode::KeyJ => self.radios.show = !self.radios.show,
             KeyCode::Insert => {
+                self.plane.pair_off[1] = [false; 2];
                 let m = &mut self.plane.sys.elec.master;
                 *m = !*m;
                 self.status = if *m { t!("Battery master on", "Batterie (master) sur ON") } else { t!("Battery master off", "Batterie (master) sur OFF") }.into();
                 self.status_until = self.real + 3.0;
             }
             KeyCode::KeyI => {
+                self.plane.pair_off[0] = [false; 2];
                 self.plane.ignition = !self.plane.ignition;
                 let on = self.plane.ignition;
                 self.status = if self.spec.is_jet() {
@@ -3916,6 +4051,7 @@ impl Game {
         }
         self.cancel_cockpit_input();
         self.pause_open = open;
+        self.radial.open = false;
         self.pause_page = menu::Page::Game;
         self.pad_home = open;
         self.drag = false;
@@ -3966,11 +4102,7 @@ impl Game {
     /// Input for the UI, minus Tab: that opens and closes the menu here, not
     /// egui's keyboard focus (which would then keep keys from the aircraft).
     fn egui_input(&mut self) -> egui::RawInput {
-        // The interface is laid out for a window at least UI_MIN_H points
-        // tall. A small window with a large desktop scale (a laptop at 150%
-        // or 200%) would leave less than that: shrink the interface to fit
-        // rather than let the panels overlap. It is never made larger than
-        // the desktop asks for.
+        // shrink the ui to fit short windows instead of letting panels overlap.
         let native = self.window.scale_factor() as f32;
         let h = self.window.inner_size().height as f32;
         let ppp = (h / UI_MIN_H).clamp(0.75, native.max(0.75));
@@ -4063,7 +4195,7 @@ impl Game {
             return;
         }
         self.set_aircraft(aircraft::nth(self.menu.aircraft));
-        // Remembered for next time (the globe opens on it; the main menu offers it again).
+        // remember the start for next time.
         let db = airports::Db::get();
         self.last_start = Some(settings::LastStart {
             lat,
@@ -4768,6 +4900,10 @@ impl Game {
         }
         let in_menu = self.mode == Mode::Menu;
 
+        if self.radial_at.is_some_and(|t| self.real >= t && self.mode == Mode::Fly) {
+            self.flight_menu_key();
+            self.radial_at = None;
+        }
         if let Some((page, sec, t)) = self.pause_at {
             if self.real >= t && self.mode == Mode::Fly {
                 if page.is_info() {
@@ -4884,10 +5020,20 @@ impl Game {
                         }
                     }
                 }
+                if !self.plane.snow_marks.is_empty() {
+                    if self.snow != snow::Mode::Off {
+                        for m in self.plane.snow_marks.drain(..) {
+                            self.snowtrack.stamp(m);
+                        }
+                    } else {
+                        self.plane.snow_marks.clear();
+                    }
+                }
                 if !self.plane.dirt.is_empty() {
                     self.anchor_fx(self.plane.pos);
                     let up = self.plane.pos.normalize().as_vec3();
                     let field = self.world.airfield_near(self.plane.pos, 3_000.0);
+                    let snowy = self.snowy_at(self.plane.pos);
                     for (p, v, amt) in self.plane.dirt.drain(..) {
                         // Paved runways throw up nothing; dirt, grass and fields do.
                         if field.is_some_and(|f| f.geo.on_runway(f.geo.local(p), 2.0).is_some_and(|ri| f.geo.runways[ri].paved)) {
@@ -4901,7 +5047,8 @@ impl Game {
                             k -= 1.0;
                             let big = amt > 1.5;
                             let vel = v.as_vec3() * r.range(0.6, 1.2) + r.dir() * (1.0 + speed * 0.15) + up * r.range(0.5, 2.5);
-                            femit.push((p, render::Particle { vel: vel.into(), life: r.range(1.5, 4.0) * if big { 1.5 } else { 1.0 }, size0: r.range(0.3, 0.7), size1: r.range(2.0, 4.0) * if big { 1.6 } else { 1.0 }, kind: crash::DUST, drag: 1.4, buoy: 0.15, seed: r.f(), alpha: r.range(0.45, 0.75), ..Default::default() }));
+                            let kind = if snowy && (!big || r.f() < 0.7) { crash::MIST } else { crash::DUST };
+                            femit.push((p, render::Particle { vel: vel.into(), life: r.range(1.5, 4.0) * if big { 1.5 } else { 1.0 }, size0: r.range(0.3, 0.7), size1: r.range(2.0, 4.0) * if big { 1.6 } else { 1.0 }, kind, drag: 1.4, buoy: 0.15, seed: r.f(), alpha: r.range(0.45, 0.75), ..Default::default() }));
                         }
                     }
                 }
@@ -4964,6 +5111,20 @@ impl Game {
                         let steep = (-imp.vel.dot(site.normalize()) / imp.vel.length().max(1.0)).clamp(0.0, 1.0) as f32;
                         let r = (3.0 + 5.0 * power) * (1.0 + (size.sqrt() - 1.0) * steep);
                         self.world.add_crater(site, r);
+                        if self.snow != snow::Mode::Off {
+                            let upw = site.normalize();
+                            let tang = imp.vel - upw * imp.vel.dot(upw);
+                            let along = tang.normalize_or_zero();
+                            let skid_len = (r as f64 * (1.8 - 1.1 * steep as f64)).max(0.0);
+                            self.snowtrack.stamp(snowtrack::Mark {
+                                a: site - along * (r as f64 * 0.5),
+                                b: site + along * skid_len,
+                                radius: r * 1.35,
+                                clear: 1.0,
+                                berm: 1.0,
+                                rough: 1.0,
+                            });
+                        }
                         self.destr.eject(site, r, imp.vel, &mut femit);
                         gone = r as f64;
                         for (t, i) in self.world.buildings_near(site, r as f64 + 4.0 * reach as f64, if heavy { 900.0 } else { 400.0 }) {
@@ -5000,6 +5161,15 @@ impl Game {
                 self.destr.booms.push(0.5);
             }
             self.sheds.update(dt as f32, &self.world);
+            if !self.sheds.snow_marks.is_empty() {
+                if self.snow != snow::Mode::Off {
+                    for m in self.sheds.snow_marks.drain(..) {
+                        self.snowtrack.stamp(m);
+                    }
+                } else {
+                    self.sheds.snow_marks.clear();
+                }
+            }
         }
         let booms: Vec<f32> = self.destr.booms.drain(..).collect();
         if !booms.is_empty() {
@@ -5027,6 +5197,7 @@ impl Game {
             }
         }
         let mut fire = 0.0f32;
+        let crash_snowy = self.crash.as_ref().is_some_and(|cr| !cr.water && self.snowy_at(cr.site));
         if let Some(cr) = self.crash.as_mut() {
             if dt > 0.0 {
                 // Smoke leaving the top of the fire simulation carries on as particles.
@@ -5041,7 +5212,16 @@ impl Game {
                     }
                     _ => None,
                 };
-                cr.update(dt, &self.world, &mut emit);
+                cr.update(dt, &self.world, crash_snowy, &mut emit);
+            }
+            if !cr.snow_marks.is_empty() {
+                if self.snow != snow::Mode::Off {
+                    for m in cr.snow_marks.drain(..) {
+                        self.snowtrack.stamp(m);
+                    }
+                } else {
+                    cr.snow_marks.clear();
+                }
             }
         }
         // What the wreckage ploughed through on its way comes down.
@@ -5415,6 +5595,8 @@ impl Game {
         // Today's real snow cover, when the snow follows the real world.
         let snow_px = self.snowmap.update(&self.src, cam, !in_menu && self.snow == snow::Mode::Auto);
         let snow_map = if in_menu || self.snow != snow::Mode::Auto { [[0.0; 4]; 3] } else { self.snowmap.globals(cam, self.doy) };
+        let snow_tr_uploads = if in_menu || self.snow == snow::Mode::Off { Vec::new() } else { self.snowtrack.take_uploads() };
+        let snow_tr = if in_menu || self.snow == snow::Mode::Off { [[0.0; 4]; 3] } else { self.snowtrack.globals(cam) };
         let glow = {
             let (la, lo, _) = geo::pos_to_lla(cam);
             let gh = self.world.ground(la, lo).map(|g| g.h).unwrap_or(0.0);
@@ -5534,7 +5716,7 @@ impl Game {
             glow_n: glow[2],
             spot: [[0.0; 4]; 3],
             nav: self.nav_globals(),
-            cockpit: self.cockpit_globals(),
+            cockpit: self.cockpit_globals(agl),
             snow: if in_menu { [0.0; 4] } else { snow::globals(self.snow, clat.to_degrees(), self.doy, self.wx.freezing) },
             snow_c: snow_map[0],
             snow_e: snow_map[1],
@@ -5542,6 +5724,9 @@ impl Game {
             flakes: [0.0; 4],
             flakes_v: [0.0; 4],
             fresh: [0.0; 4],
+            snow_tr_c: snow_tr[0],
+            snow_tr_e: snow_tr[1],
+            snow_tr_n: snow_tr[2],
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -5890,7 +6075,7 @@ impl Game {
             self.lightning.segments(cam, dt, &mut bolts);
         }
         let rain_drops = if in_menu || (self.cam_rain < 0.002 && self.cam_blow < 0.01) { 0 } else { render::RAIN_DROPS };
-        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, logo: (in_menu && self.menu.screen == menu::Screen::Main).then(|| self.egui_ctx.pixels_per_point()), cover, glow: glow_px, snow: snow_px });
+        self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px, snow: snow_px, snow_tracks: snow_tr_uploads });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
@@ -5957,7 +6142,7 @@ impl Game {
             // (where the other players are on screen: city names give way to theirs)
             let mp_at: Vec<egui::Pos2> = self.mp_world.iter().filter_map(|sp| project(sp.lat_deg(), sp.lon_deg())).collect();
             if alt > 25_000.0 {
-                // (a city right by the start marker gives way to its label)
+                // cities next to the start marker give way to its label.
                 let pick_at = self.menu.pick.and_then(|(la, lo)| project(la, lo));
                 for (name, lat, lon, tier) in menu::CITIES {
                     if *tier > 1 && alt > 7.0e6 {
@@ -5991,7 +6176,7 @@ impl Game {
                             label(p + egui::vec2(if chosen { 18.0 } else { 6.0 }, 16.0), &a.name.chars().take(40).collect::<String>(), 13.0, col);
                         }
                         painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(5.0, 5.0)), 1.0, col);
-                        // (the chosen one is named by the start marker instead)
+                        // the chosen airport is named by the start marker.
                         if !chosen {
                             label(p + egui::vec2(6.0, 0.0), &a.ident, if a.kind == 2 { 13.0 } else { 12.0 }, col);
                         }
@@ -6130,10 +6315,9 @@ impl Game {
             // Below it: where to start. Search, places and airports fold away;
             // the chosen spot and take-off stay in view.
             let top = r.bottom() + 12.0;
-            // (the pinned start point and take-off below the list, as tall as last frame)
+            // room for the pinned start point and take off, as last frame.
             let foot_h = ctx.data(|d| d.get_temp::<f32>(egui::Id::unique("globe_pinned_h"))).unwrap_or(150.0);
-            // (the list gives up its height first: were the panel taller than the
-            // room left, egui would push it up over the aircraft card)
+            // the list gives up height first so the panel never overlaps the aircraft card.
             let body_h = (screen.bottom() - M - top - 40.0 - 28.0 - foot_h).max(48.0);
             egui::Area::new(egui::Id::unique("menu")).anchor(Align2::LEFT_TOP, [M, top]).show(ctx, |ui| {
                 ui.set_max_height(screen.bottom() - M - top);
@@ -6199,8 +6383,7 @@ impl Game {
                         });
                         padui::follow_focus(ui);
                     });
-                    // Pinned under the list, so it is never scrolled away or cut: the
-                    // start point, a line on the whole flight, and take-off.
+                    // pinned under the list: the start point, a summary and take off.
                     let pin_top = ui.cursor().top();
                     let db = airports::Db::get();
                     ui.add_space(12.0);
@@ -6238,7 +6421,7 @@ impl Game {
                                     }
                                 }
                                 None => {
-                                    // Offer the nearest airfield, for a start on the ground.
+                                    // offer the nearest airfield.
                                     let near = db.near(lat, lon, 60_000.0).into_iter().find(|(i, _)| db.apts[*i as usize].any_paved());
                                     if let Some((i, d)) = near {
                                         let a = &db.apts[i as usize];
@@ -6258,10 +6441,10 @@ impl Game {
                     }
                     ui.add_space(14.0);
                     ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top() - 7.0, egui::Stroke::new(1.0, menu::LINE));
-                    // The whole flight in one line, right where it starts.
+                    // the whole flight in one line.
                     if self.menu.pick.is_some() {
                         let ground = self.menu.airport.is_some() && self.menu.start != menu::Start::Overhead;
-                        // (the aircraft is named on its card just above)
+                        // the aircraft is named on its card.
                         let how = if ground {
                             let first = if self.menu.start == menu::Start::Runway { t!("Runway", "Piste") } else { t!("Final", "Finale") };
                             match &self.menu.runway {
@@ -6561,12 +6744,12 @@ impl Game {
             if menu::big_button(ui, t!("Respawn in the air", "Réapparaître en vol"), Hint::of("R", ""), false, false).clicked() {
                 *act = Some(PauseAct::Respawn);
             }
-            // Leaving: back to the globe for a new start (its Menu button goes on to the main menu).
+            // back to the globe for a new start.
             if menu::big_button(ui, t!("End flight", "Terminer le vol"), Hint::Text(t!("pick a new start", "choisir un nouveau départ")), false, false).clicked() {
                 *act = Some(PauseAct::Globe);
             }
             ui.add_space(14.0);
-            // Quit, quieter: a plain line rather than a big button.
+            // quit as a plain line.
             let q = ui.add(egui::Button::new(RichText::new(t!("Quit to desktop", "Quitter vers le bureau")).font(menu::label()).color(DIM)).frame(false));
             if q.clicked() {
                 *act = Some(PauseAct::Quit);
@@ -6575,7 +6758,7 @@ impl Game {
             if pad {
                 padui::prompts(ui, &[("Dpad", tr("move")), ("A", tr("press")), ("B", tr("back"))], 20.0, 12.0, DIM);
             } else {
-                let t = t!("While you fly, move the pointer to the top of the screen (or press Tab) for the toolbar: places, airports, radio and weather.", "En vol, amenez le pointeur en haut de l'écran (ou appuyez sur Tab) pour la barre d'outils : lieux, aéroports, radio et météo.");
+                let t = t!("While you fly, Tab opens the flight menu: places, radio, autopilot, weather, the map and the camera.", "En vol, Tab ouvre le menu de vol : lieux, radio, pilote auto, météo, carte et caméra.");
                 ui.add(egui::Label::new(RichText::new(t).font(menu::caption()).color(DIM)).wrap());
             }
         });
@@ -6623,96 +6806,99 @@ impl Game {
     #[allow(clippy::too_many_arguments)]
     fn info_panel(&mut self, ctx: &egui::Context, act: &mut Option<PauseAct>, lat: f64, lon: f64, local: f64, speed: f64, alt: f64, agl: f64, hdg: f64) {
         use egui::{Align2, Color32, RichText};
-        use menu::{Page, ACCENT, DIM, TEXT};
+        use flightui::{chip, kv, list_row, pane_section, tiles};
+        use menu::{Page, TEXT};
         if !self.info_page.is_info() {
             self.info_page = Page::Flight;
         }
-        const W: f32 = 340.0;
-        let max_h = ctx.content_rect().height() - 110.0;
-        let frame = flightui::glass().inner_margin(16.0);
-        egui::Area::new(egui::Id::unique("info_panel")).anchor(Align2::RIGHT_TOP, [-14.0, 14.0]).show(ctx, |ui| {
-            frame.show(ui, |ui| {
-                ui.set_width(W);
-                // The page's name and a way to close it; the pages themselves are on the toolbar.
+        let warn = Color32::from_rgb(255, 196, 80);
+        let bad = menu::BAD;
+        // left of the altitude tape, under the heading strip.
+        let (x, y) = if self.hud_on() { (-flightui::RIGHT_EDGE - 10.0, flightui::HEADING_H + 34.0) } else { (-14.0, 12.0) };
+        // what is left below it, less the header, the margins and a gap.
+        let max_h = (ctx.content_rect().height() - y - 16.0 - 32.0 - 48.0).max(120.0);
+        egui::Area::new(egui::Id::unique("info_panel")).anchor(Align2::RIGHT_TOP, [x, y]).show(ctx, |ui| {
+            flightui::frosted(ui, flightui::glass().inner_margin(16.0), |ui| {
+                ui.set_width(flightui::PANEL_W);
+                // the page's icon and name, picked from the flight menu, and a close button.
                 ui.horizontal(|ui| {
+                    let ic = match self.info_page {
+                        Page::Places => menu::Icon::GoTo,
+                        Page::Radio => menu::Icon::Radio,
+                        Page::Autopilot => menu::Icon::Autopilot,
+                        Page::Weather => menu::Icon::Weather,
+                        _ => menu::Icon::Flight,
+                    };
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                    menu::icon(ui.painter(), ic, r.center(), 22.0, Color32::WHITE);
+                    ui.add_space(4.0);
                     ui.label(RichText::new(self.info_page.label()).font(menu::page_title()).color(Color32::WHITE));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close = ui.add(egui::Button::new(RichText::new("×").font(menu::data())).min_size(egui::vec2(30.0, 30.0))).on_hover_text(t!("Close (Tab)", "Fermer (Tab)"));
-                        if close.clicked() {
+                        let x = chip(ui, "×", true, false).on_hover_text(t!("Close (Tab)", "Fermer (Tab)"));
+                        self.pad_home_focus(&x);
+                        if x.clicked() {
                             self.info_open = false;
-                        }
-                        self.pad_home_focus(&close);
-                        if padui::active() {
-                            padui::glyphs(ui, "LB RB", 17.0);
                         }
                     });
                 });
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, |ui| {
-                    let row = |ui: &mut egui::Ui, k: &str, v: String, col: Color32| {
-                        ui.label(RichText::new(k).font(menu::caption()).color(DIM));
-                        ui.add(egui::Label::new(RichText::new(v).font(menu::data()).color(col)).wrap());
-                        ui.end_row();
-                    };
+                egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.set_width(flightui::PANEL_W);
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     match self.info_page {
                         Page::Places => {
+                            ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                let pad = padui::active();
-                                if ui.button(if pad { t!("Respawn here", "Réapparaître ici") } else { t!("Respawn here  R", "Réapparaître ici  R") }).clicked() {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let w = (ui.available_width() - 8.0) * 0.5;
+                                if flightui::pane_button(ui, t!("Respawn here", "Réapparaître ici"), w).on_hover_text("R").clicked() {
                                     *act = Some(PauseAct::Respawn);
                                 }
-                                if ui.button(if pad { t!("Search a place…", "Chercher un lieu…") } else { t!("Search a place…  G", "Chercher un lieu…  G") }).clicked() {
+                                if flightui::pane_button(ui, t!("Search a place", "Chercher un lieu"), w).on_hover_text("G").clicked() {
                                     *act = Some(PauseAct::GoTo);
                                 }
                             });
-                            ui.add_space(4.0);
                             let db = airports::Db::get();
                             let (la, lo, _) = geo::pos_to_lla(self.plane.pos);
-                            menu::heading(ui, t!("NEAREST AIRPORTS", "AÉROPORTS LES PLUS PROCHES"));
+                            pane_section(ui, t!("Nearest airports", "Aéroports les plus proches"));
                             let near: Vec<(u32, f64)> = db.near(la.to_degrees(), lo.to_degrees(), 120_000.0).into_iter().filter(|(i, _)| { let a = &db.apts[*i as usize]; a.any_paved() || a.kind > 0 }).take(6).collect();
                             if near.is_empty() {
-                                ui.label(RichText::new(t!("No airfield within 120 km.", "Aucun aérodrome à moins de 120 km.")).font(menu::caption()).color(DIM));
+                                ui.label(RichText::new(t!("No airfield within 120 km.", "Aucun aérodrome à moins de 120 km.")).font(menu::caption()).color(flightui::SOFT));
                             }
                             let here = geo::enu(self.plane.pos);
                             for (i, d) in near {
                                 let a = &db.apts[i as usize];
                                 let to = geo::lla_to_pos(a.lat.to_radians(), a.lon.to_radians(), 0.0) - self.plane.pos;
                                 let brg = to.dot(here.0).atan2(to.dot(here.1)).to_degrees().rem_euclid(360.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&a.ident).font(menu::data()).color(TEXT));
-                                    ui.label(RichText::new(format!("{:.0} km {:03.0}°", d / 1000.0, brg)).font(menu::caption()).color(DIM));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing.x = 3.0;
-                                        if ui.small_button(t!("approach", "approche")).clicked() {
-                                            *act = Some(PauseAct::Airport(i, true));
-                                        }
-                                        if ui.small_button(t!("runway", "piste")).clicked() {
-                                            *act = Some(PauseAct::Airport(i, false));
-                                        }
-                                    });
+                                let detail = format!("{:.0} km  {:03.0}°  ·  {:.0} m", d / 1000.0, brg, a.longest());
+                                list_row(ui, &a.ident, &a.name, &detail, |ui| {
+                                    if chip(ui, t!("Final", "Finale"), false, false).on_hover_text(t!("Start on a final approach", "Partir en approche finale")).clicked() {
+                                        *act = Some(PauseAct::Airport(i, true));
+                                    }
+                                    if chip(ui, t!("Runway", "Piste"), false, false).on_hover_text(t!("Line up on the runway", "S'aligner sur la piste")).clicked() {
+                                        *act = Some(PauseAct::Airport(i, false));
+                                    }
                                 });
-                                ui.label(RichText::new(t!("{} · {:.0} m runway", "{} · piste de {:.0} m", a.name.chars().take(38).collect::<String>(), a.longest())).font(menu::caption()).color(DIM));
                             }
-                            ui.add_space(8.0);
-                            menu::heading(ui, t!("AIRPORTS AROUND THE WORLD", "AÉROPORTS DU MONDE"));
-                            let t = if padui::active() { t!("Lines up on the runway (\"approach\" above for a final approach).", "Aligne sur la piste (« approche » ci-dessus pour une approche finale).") } else { t!("Click to line up on the runway; shift-click for a final approach.", "Clic pour s'aligner sur la piste ; Maj+clic pour une approche finale.") };
-                            ui.label(RichText::new(t).font(menu::caption()).color(DIM));
+                            pane_section(ui, t!("Airports around the world", "Aéroports du monde"));
+                            let tip = if padui::active() { t!("Lines up on the runway.", "Aligne sur la piste.") } else { t!("Lines up on the runway; shift-click for a final approach.", "Aligne sur la piste ; Maj+clic pour une approche finale.") };
+                            ui.label(RichText::new(tip).font(menu::caption()).color(flightui::SOFT));
+                            ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                                 for (code, name) in menu::AIRPORTS {
                                     if let Some(i) = db.find(code) {
-                                        if ui.button(RichText::new(*code).font(menu::caption())).on_hover_text(tr(name)).clicked() {
+                                        if chip(ui, code, true, false).on_hover_text(tr(name)).clicked() {
                                             *act = Some(PauseAct::Airport(i, ui.input(|inp| inp.modifiers.shift)));
                                         }
                                     }
                                 }
                             });
-                            ui.add_space(8.0);
-                            menu::heading(ui, t!("FLY TO", "ALLER À"));
+                            pane_section(ui, t!("Fly to", "Aller à"));
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                                 for (name, la, lo) in menu::QUICK {
-                                    if ui.button(RichText::new(tr(name)).font(menu::caption())).clicked() {
+                                    if chip(ui, tr(name), false, false).clicked() {
                                         *act = Some(PauseAct::FlyTo(*la, *lo, name));
                                     }
                                 }
@@ -6721,7 +6907,7 @@ impl Game {
                         Page::Radio => self.radio_page(ui),
                         Page::Autopilot => self.autopilot_page(ui),
                         Page::Weather => {
-                            ui.spacing_mut().slider_width = 140.0;
+                            ui.spacing_mut().slider_width = 150.0;
                             self.wx.controls(ui, &mut self.utc, &mut self.doy, lon, false);
                         }
                         _ => {
@@ -6733,174 +6919,155 @@ impl Game {
                             let rpm = p.prop_rate * 60.0 / std::f64::consts::TAU;
                             let jet = p.spec.is_jet();
                             let trk = { let (e, n, _) = geo::enu(p.pos); p.vel.dot(e).atan2(p.vel.dot(n)).to_degrees().rem_euclid(360.0) };
-                            // The airport here (its notice fades; the details stay on this page).
+                            // the airport here.
                             if let Some(lines) = self.airport_hud() {
-                                menu::heading(ui, t!("Airport", "Aéroport"));
+                                pane_section(ui, t!("Airport", "Aéroport"));
                                 ui.add(egui::Label::new(RichText::new(&lines[0].0).font(menu::item_title()).color(Color32::WHITE)).wrap());
                                 for (l, _) in lines.iter().skip(1) {
                                     ui.add(egui::Label::new(RichText::new(l).font(menu::caption()).color(TEXT)).wrap());
                                 }
-                                ui.add_space(6.0);
                             }
                             let p = &self.plane;
-                            menu::heading(ui, t!("FLIGHT", "VOL"));
-                            egui::Grid::new("info_fl").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
-                                row(ui, t!("Airspeed", "Vitesse air"), format!("{:.0} kt IAS  ·  {:.0} TAS", speed * 1.94384, p.airspeed().length() * 1.94384), TEXT);
-                                row(ui, t!("Ground speed", "Vitesse sol"), t!("{:.0} kt  ·  track {trk:03.0}°", "{:.0} kt  ·  route {trk:03.0}°", p.vel.length() * 1.94384), TEXT);
-                                row(ui, "Altitude", format!("{:.0} ft", alt * 3.28084), TEXT);
-                                let set = self.radios.setting(self.wx.qnh);
-                                row(ui, t!("Altimeter", "Altimètre"), format!("{:.0} ft  ·  {:.0} hPa", alt * 3.28084 + self.radios.alt_error_ft(self.wx.qnh), set), TEXT);
-                                row(ui, t!("Above ground", "Hauteur sol"), format!("{:.0} ft", agl.max(0.0) * 3.28084), TEXT);
-                                row(ui, t!("Vertical speed", "Vitesse verticale"), t!("{:+.0} fpm", "{:+.0} ft/min", vs * 196.85), TEXT);
-                                row(ui, t!("Heading", "Cap"), format!("{hdg:03.0}°"), TEXT);
-                                row(ui, t!("Angle of attack", "Incidence"), format!("{:.1}°", p.alpha.to_degrees()), if p.stalled { Color32::from_rgb(255, 90, 60) } else { TEXT });
-                                row(ui, t!("Load", "Facteur de charge"), format!("{:.1} g", p.g_load), if p.g_load.abs() > 3.8 { Color32::from_rgb(255, 180, 50) } else { TEXT });
-                            });
-                            ui.add_space(6.0);
-                            menu::heading(ui, t!("AIRCRAFT", "AVION"));
-                            egui::Grid::new("info_ac").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
-                                row(ui, t!("Aircraft", "Avion"), p.spec.name.into(), TEXT);
-                                if let Some((name, lit, n)) = p.engines() {
-                                    row(ui, t!("Stage", "Étage"), p.stage_name().unwrap_or("").into(), TEXT);
-                                    row(ui, t!("Engines", "Moteurs"), t!("{}  ·  {} of {} lit", "{}  ·  {} sur {} allumés", name, lit, n), TEXT);
-                                    row(ui, t!("Thrust", "Poussée"), format!("{:.0}%  ·  {:.1} MN", p.throttle * 100.0, p.thrust_now() / 1.0e6), TEXT);
-                                } else if jet {
-                                    row(ui, t!("Thrust", "Poussée"), format!("{:.0}%  ·  N1 {:.0}%{}", p.throttle * 100.0, p.n1 * 100.0, if p.reverser > 0.0 { "  · REV" } else { "" }), TEXT);
-                                } else {
-                                    row(ui, t!("Throttle", "Gaz"), format!("{:.0}%  ·  {:.0} rpm", p.throttle * 100.0, rpm), if rpm > 2710.0 { Color32::from_rgb(255, 180, 50) } else { TEXT });
-                                }
-                                match &p.spec.lever {
-                                    Some(l) => row(ui, l.name[i18n::is_fr() as usize], l.notch(p.flap_set).into(), TEXT),
-                                    None => row(ui, t!("Flaps", "Volets"), format!("{:.0}°", p.flap_notch_deg()), TEXT),
-                                }
-                                if p.spec.chute.is_some() {
-                                    row(ui, t!("Drag chute", "Parachute-frein"), if p.spoilers > 0.0 { t!("out", "sorti") } else if p.chute_spent { t!("gone", "largué") } else { t!("packed", "plié") }.into(), TEXT);
-                                }
-                                if p.spec.spoiler_cd > 0.0 {
-                                    row(ui, t!("Speedbrake", "Aérofreins"), if p.spoilers > 0.6 { t!("ground spoilers", "spoilers sol").into() } else if p.speedbrake > 0.0 { t!("flight detent", "cran vol").into() } else { t!("down", "rentrés").to_string() }, TEXT);
-                                }
-                                row(ui, t!("Gear", "Train"), if p.gear >= 1.0 { t!("down", "sorti") } else if p.gear <= 0.0 { t!("up", "rentré") } else { t!("moving", "en mouvement") }.into(), TEXT);
-                                let low = Color32::from_rgb(255, 180, 50);
-                                row(ui, t!("Fuel", "Carburant"), format!("{:.0} kg  ·  {:.0}%", p.fuel, p.fuel_frac() * 100.0), if p.fuel_frac() < 0.1 { low } else { TEXT });
-                                let flow = match p.endurance() {
-                                    Some(e) => format!("{:.0} kg/h  ·  {}h{:02}", p.fuel_flow * 3600.0, (e / 3600.0) as u32, (e / 60.0) as u32 % 60),
-                                    None => "—".into(),
-                                };
-                                row(ui, t!("Fuel flow", "Débit"), flow, TEXT);
-                                let state = if p.running {
-                                    t!("running", "en marche").to_string()
-                                } else if p.starter_on || (p.prop_rate > 5.0 && !p.spec.is_jet() && p.ignition) {
-                                    t!("starting", "démarrage").to_string()
-                                } else {
-                                    t!("off", "arrêté").to_string()
-                                };
-                                let detail = if p.spec.is_jet() {
-                                    if p.ignition { "RUN" } else { "CUTOFF" }.to_string()
-                                } else {
-                                    t!("magnetos {} · mixture {:.0}%", "magnétos {} · mélange {:.0}%", if p.ignition { "ON" } else { "OFF" }, p.mixture * 100.0)
-                                };
-                                row(ui, t!("Engine", "Moteur"), format!("{state}  ·  {detail}"), if p.running { TEXT } else { low });
-                                row(ui, t!("Mass, balance", "Masse, centrage"), format!("{:.0} kg  ·  {:.0}% MAC", p.mass(), p.cg() * 100.0), if p.cg_excess() != 0.0 { Color32::from_rgb(255, 90, 60) } else { TEXT });
-                                let el = &p.sys.elec;
-                                let elec = if !el.master {
-                                    t!("master OFF (Ins)", "master sur OFF (Inser)").to_string()
-                                } else {
-                                    t!("{:.1} V  ·  battery {:.0}%  ·  {:+.0} A", "{:.1} V  ·  batterie {:.0}%  ·  {:+.0} A", el.volts, el.charge * 100.0, el.amps)
-                                };
-                                row(ui, t!("Electrics", "Électricité"), elec, if p.sys.powered() { TEXT } else { low });
-                                if p.sys.fail.any() {
-                                    let list: Vec<&str> = (0..systems::Failures::N).filter(|&i| p.sys.fail.get(i)).map(systems::Failures::label).collect();
-                                    row(ui, t!("Failures", "Pannes"), list.join(", "), Color32::from_rgb(255, 90, 60));
-                                }
-                            });
-                            let on = p.running || p.starter_on;
-                            if ui.button(if on { t!("Shut the engine down  F4", "Couper le moteur  F4") } else { t!("Start the engine  F4", "Démarrer le moteur  F4") }).clicked() {
-                                engine_btn = Some(!on);
+                            pane_section(ui, t!("Flight", "Vol"));
+                            let stall = if p.stalled { bad } else { Color32::WHITE };
+                            tiles(ui, &[
+                                (t!("Airspeed", "Vitesse"), format!("{:.0}", speed * 1.94384), "kt", stall),
+                                (t!("Altitude", "Altitude"), format!("{:.0}", alt * 3.28084), "ft", Color32::WHITE),
+                                (t!("Heading", "Cap"), format!("{hdg:03.0}"), "°", Color32::WHITE),
+                                (t!("Vertical speed", "Vario"), format!("{:+.0}", vs * 196.85), "fpm", Color32::WHITE),
+                            ]);
+                            kv(ui, t!("True airspeed", "Vitesse vraie"), &format!("{:.0} kt", p.airspeed().length() * 1.94384), TEXT);
+                            kv(ui, t!("Ground speed, track", "Vitesse sol, route"), &format!("{:.0} kt  {trk:03.0}°", p.vel.length() * 1.94384), TEXT);
+                            let set = self.radios.setting(self.wx.qnh);
+                            kv(ui, t!("Altimeter", "Altimètre"), &format!("{:.0} ft  {:.0} hPa", alt * 3.28084 + self.radios.alt_error_ft(self.wx.qnh), set), TEXT);
+                            kv(ui, t!("Above ground", "Hauteur sol"), &format!("{:.0} ft", agl.max(0.0) * 3.28084), TEXT);
+                            kv(ui, t!("Angle of attack", "Incidence"), &format!("{:.1}°", p.alpha.to_degrees()), if p.stalled { bad } else { TEXT });
+                            kv(ui, t!("Load", "Facteur de charge"), &format!("{:.1} g", p.g_load), if p.g_load.abs() > 3.8 { warn } else { TEXT });
+
+                            pane_section(ui, p.spec.name);
+                            if let Some((name, lit, n)) = p.engines() {
+                                kv(ui, t!("Stage", "Étage"), p.stage_name().unwrap_or(""), TEXT);
+                                kv(ui, t!("Engines", "Moteurs"), &t!("{}  {} of {} lit", "{}  {} sur {} allumés", name, lit, n), TEXT);
+                                kv(ui, t!("Thrust", "Poussée"), &format!("{:.0}%  {:.1} MN", p.throttle * 100.0, p.thrust_now() / 1.0e6), TEXT);
+                            } else if jet {
+                                kv(ui, t!("Thrust", "Poussée"), &format!("{:.0}%  N1 {:.0}%{}", p.throttle * 100.0, p.n1 * 100.0, if p.reverser > 0.0 { "  REV" } else { "" }), TEXT);
+                            } else {
+                                kv(ui, t!("Throttle", "Gaz"), &format!("{:.0}%  {:.0} rpm", p.throttle * 100.0, rpm), if rpm > 2710.0 { warn } else { TEXT });
+                            }
+                            let state = if p.running {
+                                t!("running", "en marche").to_string()
+                            } else if p.starter_on || (p.prop_rate > 5.0 && !p.spec.is_jet() && p.ignition) {
+                                t!("starting", "démarrage").to_string()
+                            } else {
+                                t!("off", "arrêté").to_string()
+                            };
+                            kv(ui, t!("Engine", "Moteur"), &state, if p.running { TEXT } else { warn });
+                            if !p.spec.is_jet() {
+                                kv(ui, t!("Magnetos, mixture", "Magnétos, mélange"), &format!("{}  {:.0}%", if p.ignition { "ON" } else { "OFF" }, p.mixture * 100.0), TEXT);
+                            } else {
+                                kv(ui, t!("Fuel control", "Commande carburant"), if p.ignition { "RUN" } else { "CUTOFF" }, TEXT);
+                            }
+                            match &p.spec.lever {
+                                Some(l) => kv(ui, l.name[i18n::is_fr() as usize], l.notch(p.flap_set), TEXT),
+                                None => kv(ui, t!("Flaps", "Volets"), &format!("{:.0}°", p.flap_notch_deg()), TEXT),
+                            }
+                            if p.spec.spoiler_cd > 0.0 {
+                                kv(ui, t!("Speedbrake", "Aérofreins"), if p.spoilers > 0.6 { t!("ground spoilers", "spoilers sol") } else if p.speedbrake > 0.0 { t!("flight detent", "cran vol") } else { t!("down", "rentrés") }, TEXT);
+                            }
+                            kv(ui, t!("Gear", "Train"), if p.gear >= 1.0 { t!("down", "sorti") } else if p.gear <= 0.0 { t!("up", "rentré") } else { t!("moving", "en mouvement") }, if p.gear > 0.0 && p.gear < 1.0 { warn } else { TEXT });
+                            kv(ui, t!("Fuel", "Carburant"), &format!("{:.0} kg  {:.0}%", p.fuel, p.fuel_frac() * 100.0), if p.fuel_frac() < 0.1 { warn } else { TEXT });
+                            let flow = match p.endurance() {
+                                Some(e) => format!("{:.0} kg/h  {}h{:02}", p.fuel_flow * 3600.0, (e / 3600.0) as u32, (e / 60.0) as u32 % 60),
+                                None => "—".into(),
+                            };
+                            kv(ui, t!("Fuel flow, endurance", "Débit, autonomie"), &flow, TEXT);
+                            kv(ui, t!("Mass, balance", "Masse, centrage"), &format!("{:.0} kg  {:.0}% MAC", p.mass(), p.cg() * 100.0), if p.cg_excess() != 0.0 { bad } else { TEXT });
+                            let el = &p.sys.elec;
+                            let elec = if !el.master { t!("master off (Ins)", "master coupé (Inser)").to_string() } else { format!("{:.1} V  {:.0}%  {:+.0} A", el.volts, el.charge * 100.0, el.amps) };
+                            kv(ui, t!("Electrics", "Électricité"), &elec, if p.sys.powered() { TEXT } else { warn });
+                            if p.spec.chute.is_some() {
+                                kv(ui, t!("Drag chute", "Parachute-frein"), if p.spoilers > 0.0 { t!("out", "sorti") } else if p.chute_spent { t!("gone", "largué") } else { t!("packed", "plié") }, TEXT);
+                            }
+                            if p.sys.fail.any() {
+                                let list: Vec<&str> = (0..systems::Failures::N).filter(|&i| p.sys.fail.get(i)).map(systems::Failures::label).collect();
+                                kv(ui, t!("Failures", "Pannes"), &list.join(", "), bad);
                             }
                             let report = p.dmg.report();
                             if self.crashed {
-                                ui.label(RichText::new(if padui::active() { t!("Crashed. Close the panel (B), then A to respawn.", "Crash. Fermez le panneau (B), puis A pour réapparaître.") } else { t!("Crashed. R (or A on a gamepad) to respawn.", "Crash. R (ou A à la manette) pour réapparaître.") }).color(Color32::from_rgb(255, 90, 60)));
+                                kv(ui, t!("Damage", "Dégâts"), t!("crashed: R to respawn", "crash : R pour réapparaître"), bad);
                             } else if report.is_empty() {
-                                ui.label(RichText::new(t!("No damage", "Aucun dégât")).font(menu::caption()).color(Color32::from_rgb(140, 220, 140)));
+                                kv(ui, t!("Damage", "Dégâts"), t!("none", "aucun"), menu::OK);
                             } else {
                                 for l in &report {
-                                    ui.label(RichText::new(i18n::caps(l)).font(menu::caption()).color(Color32::from_rgb(255, 180, 50)));
+                                    kv(ui, t!("Damage", "Dégâts"), l, warn);
                                 }
                             }
-                            ui.add_space(6.0);
-                            menu::heading(ui, "CONDITIONS");
-                            egui::Grid::new("info_wx").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
-                                row(ui, "Position", menu::latlon(lat, lon), TEXT);
-                                row(ui, t!("Local time", "Heure locale"), menu::hhmm(local), TEXT);
-                                row(ui, t!("Wind", "Vent"), if wind_kt < 1.0 { t!("calm", "calme").into() } else { format!("{:03.0}° / {:.0} kt", self.wx.wind_from, wind_kt) }, TEXT);
-                                row(ui, t!("Clouds", "Nuages"), if self.wx.clouds < 0.05 { t!("clear", "dégagé").into() } else { format!("{:.0}%, base {:.0} ft", self.wx.clouds * 100.0, self.wx.cloud_base * 3.28084) }, TEXT);
-                                row(ui, "QNH", format!("{:.0} hPa", self.wx.qnh), TEXT);
-                                row(ui, t!("Visibility", "Visibilité"), format!("{:.0} km", self.wx.visibility_km()), TEXT);
-                            });
-                            ui.add_space(6.0);
-                            menu::heading(ui, t!("LIVE TRAFFIC", "TRAFIC RÉEL"));
+                            ui.add_space(8.0);
+                            let on = p.running || p.starter_on;
+                            if flightui::pane_button(ui, if on { t!("Shut the engine down", "Couper le moteur") } else { t!("Start the engine", "Démarrer le moteur") }, ui.available_width()).on_hover_text("F4").clicked() {
+                                engine_btn = Some(!on);
+                            }
+
+                            pane_section(ui, t!("Conditions", "Conditions"));
+                            kv(ui, "Position", &menu::latlon(lat, lon), TEXT);
+                            kv(ui, t!("Local time", "Heure locale"), &menu::hhmm(local), TEXT);
+                            kv(ui, t!("Wind", "Vent"), &if wind_kt < 1.0 { t!("calm", "calme").to_string() } else { format!("{:03.0}°  {:.0} kt", self.wx.wind_from, wind_kt) }, TEXT);
+                            kv(ui, t!("Clouds", "Nuages"), &if self.wx.clouds < 0.05 { t!("clear", "dégagé").to_string() } else { format!("{:.0}%  base {:.0} ft", self.wx.clouds * 100.0, self.wx.cloud_base * 3.28084) }, TEXT);
+                            kv(ui, "QNH", &format!("{:.0} hPa", self.wx.qnh), TEXT);
+                            kv(ui, t!("Visibility", "Visibilité"), &format!("{:.0} km", self.wx.visibility_km()), TEXT);
+
+                            pane_section(ui, t!("Live traffic", "Trafic réel"));
                             if !self.live.enabled() {
-                                ui.label(RichText::new(t!("Off (Esc, Settings, Multiplayer).", "Désactivé (Échap, Réglages, Multijoueur).")).font(menu::caption()).color(DIM));
+                                ui.label(RichText::new(t!("Off (Settings, General).", "Désactivé (Réglages, Général).")).font(menu::caption()).color(flightui::SOFT));
                             } else if self.live.planes.is_empty() {
                                 let e = self.live.error();
                                 let msg = if e.is_empty() { t!("Waiting for aircraft…", "En attente d'avions…").to_string() } else { t!("No data: {}", "Pas de données : {}", e.chars().take(60).collect::<String>()) };
-                                ui.label(RichText::new(msg).font(menu::caption()).color(DIM));
+                                ui.label(RichText::new(msg).font(menu::caption()).color(flightui::SOFT));
                             } else {
                                 let me = self.plane.pos;
                                 let mut near: Vec<&live::Plane> = self.live.planes.iter().collect();
                                 near.sort_by(|a, b| (a.pos - me).length().total_cmp(&(b.pos - me).length()));
-                                ui.label(RichText::new(t!("{} aircraft within 110 km", "{} avions à moins de 110 km", near.len())).font(menu::caption()).color(DIM));
-                                egui::Grid::new("info_live").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
-                                    for p in near.iter().take(6) {
-                                        ui.label(RichText::new(&p.call).font(menu::data()).color(TEXT));
-                                        ui.label(RichText::new(if p.ty.is_empty() { "?" } else { p.ty.as_str() }).font(menu::data()).color(DIM));
-                                        ui.label(RichText::new(format!("{:.1} km · {:.0} ft", (p.pos - me).length() / 1000.0, p.alt_ft)).font(menu::data()).color(DIM));
-                                        ui.end_row();
-                                    }
-                                });
-                            }
-                            ui.add_space(6.0);
-                            menu::heading(ui, t!("MULTIPLAYER", "MULTIJOUEUR"));
-                            match self.mp.as_ref().map(|m| m.status()) {
-                                None if self.mp_on => {
-                                    ui.label(RichText::new(t!("Looking for the fastest server…", "Recherche du serveur le plus rapide…")).size(12.0).color(DIM));
-                                }
-                                None => {
-                                    ui.label(RichText::new(t!("Off (Esc, Settings, Multiplayer).", "Désactivé (Échap, Réglages, Multijoueur).")).size(12.0).color(DIM));
-                                }
-                                Some(mp::Status::Error(e)) => {
-                                    ui.label(RichText::new(t!("No connection: {}", "Pas de connexion : {}", e.chars().take(60).collect::<String>())).size(12.0).color(DIM));
-                                }
-                                Some(mp::Status::Connecting) => {
-                                    let to = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
-                                    ui.label(RichText::new(t!("Connecting to {}…", "Connexion à {}…", to)).size(12.0).color(DIM));
-                                }
-                                Some(mp::Status::Connected) => {
-                                    let me = self.plane.pos;
-                                    let n = self.mp_players.len();
-                                    let on = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
-                                    ui.label(RichText::new(t!("Server: {}", "Serveur : {}", on)).size(12.0).color(TEXT));
-                                    ui.label(RichText::new(i18n::plural(n as u64, "other pilot nearby", "other pilots nearby", "autre pilote à proximité", "autres pilotes à proximité")).size(12.0).color(DIM));
-                                    egui::Grid::new("info_mp").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
-                                        for p in self.mp_players.iter().take(8) {
-                                            ui.label(RichText::new(&p.name).monospace().size(12.5).color(TEXT));
-                                            ui.label(RichText::new(mp_proto::AIRCRAFT.get(p.aircraft as usize).copied().unwrap_or("?")).monospace().size(12.0).color(DIM));
-                                            let alt = geo::pos_to_lla(p.pos).2 * 3.28084;
-                                            ui.label(RichText::new(format!("{:.1} km · {:.0} ft", (p.pos - me).length() / 1000.0, alt)).monospace().size(12.0).color(DIM));
-                                            ui.end_row();
-                                        }
+                                for lp in near.iter().take(6) {
+                                    let ty = if lp.ty.is_empty() { "?" } else { lp.ty.as_str() };
+                                    list_row(ui, &lp.call, ty, "", |ui| {
+                                        ui.label(RichText::new(format!("{:.1} km  {:.0} ft", (lp.pos - me).length() / 1000.0, lp.alt_ft)).font(egui::FontId::monospace(12.5)).color(flightui::SOFT));
                                     });
                                 }
                             }
-                            ui.add_space(4.0);
+                            pane_section(ui, t!("Multiplayer", "Multijoueur"));
+                            let note = |ui: &mut egui::Ui, s: String| {
+                                ui.label(RichText::new(s).font(menu::caption()).color(flightui::SOFT));
+                            };
+                            match self.mp.as_ref().map(|m| m.status()) {
+                                None if self.mp_on => note(ui, t!("Looking for the fastest server…", "Recherche du serveur le plus rapide…").into()),
+                                None => note(ui, t!("Off (Esc, Settings, Multiplayer).", "Désactivé (Échap, Réglages, Multijoueur).").into()),
+                                Some(mp::Status::Error(e)) => note(ui, t!("No connection: {}", "Pas de connexion : {}", e.chars().take(60).collect::<String>())),
+                                Some(mp::Status::Connecting) => {
+                                    let to = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
+                                    note(ui, t!("Connecting to {}…", "Connexion à {}…", to));
+                                }
+                                Some(mp::Status::Connected) => {
+                                    let me = self.plane.pos;
+                                    let on = self.mp.as_ref().map(|m| self.mp_server_name(&m.server)).unwrap_or_default();
+                                    kv(ui, t!("Server", "Serveur"), &on, TEXT);
+                                    kv(ui, t!("Pilots nearby", "Pilotes à proximité"), &self.mp_players.len().to_string(), TEXT);
+                                    for p in self.mp_players.iter().take(8) {
+                                        let ty = mp_proto::AIRCRAFT.get(p.aircraft as usize).copied().unwrap_or("?");
+                                        let alt = geo::pos_to_lla(p.pos).2 * 3.28084;
+                                        list_row(ui, &p.name, ty, "", |ui| {
+                                            ui.label(RichText::new(format!("{:.1} km  {:.0} ft", (p.pos - me).length() / 1000.0, alt)).font(menu::caption()).color(flightui::SOFT));
+                                        });
+                                    }
+                                }
+                            }
                             match engine_btn {
                                 Some(true) => self.plane.start_engine(),
                                 Some(false) => self.plane.stop_engine(),
                                 None => {}
                             }
-                            ui.label(RichText::new(if padui::active() { t!("Menu pauses: settings, the globe, quit.", "Menu met en pause : réglages, globe, quitter.") } else { t!("Esc pauses: settings, the globe, quit.", "Échap met en pause : réglages, globe, quitter.") }).font(menu::caption()).color(ACCENT.gamma_multiply(0.8)));
                         }
                     }
+                    ui.add_space(6.0);
                     padui::follow_focus(ui);
                 });
             });
@@ -6969,252 +7136,6 @@ impl Game {
         Some(out)
     }
 
-    /// The flight instruments drawn on the glass of the screen, in the manner
-    /// of a glass-cockpit primary flight display: a speed tape on the left, an
-    /// artificial horizon with a pitch ladder in the middle, an altitude tape
-    /// on the right, a heading ribbon over it, with the throttle and the
-    /// vertical speed in bars at either side. `ias` is in m/s, `alt` and `agl`
-    /// in metres, `vs` in m/s.
-    fn flight_hud(&self, ctx: &egui::Context, hdg: f64, ias: f64, alt: f64, vs: f64, agl: f64) {
-        use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Shape, Stroke, StrokeKind};
-        let p = &self.plane;
-        let (_, _, u) = geo::enu(p.pos);
-        let (fwd, right, up) = (p.forward(), p.right(), p.up());
-        let pitch = fwd.dot(u).clamp(-1.0, 1.0).asin().to_degrees() as f32;
-        let bank = (-right.dot(u)).atan2(up.dot(u)) as f32;
-        let ias_kt = (ias * 1.94384) as f32;
-        let gs_kt = (p.vel.length() * 1.94384) as f32;
-        let alt_ft = (alt * 3.28084) as f32;
-        let agl_ft = (agl.max(0.0) * 3.28084) as f32;
-        let vs_fpm = (vs * 196.85) as f32;
-        let hdg = hdg as f32;
-        let thr = (p.throttle as f32).clamp(0.0, 1.0);
-
-        let white = Color32::from_rgba_unmultiplied(255, 255, 255, 240);
-        let dim = Color32::from_rgba_unmultiplied(255, 255, 255, 150);
-        let faint = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
-        let green = Color32::from_rgb(110, 235, 140);
-        let amber = Color32::from_rgb(255, 190, 60);
-        let red = Color32::from_rgb(255, 90, 60);
-        let accent = Color32::from_rgb(228, 230, 232);
-        let glass = menu::GLASS;
-        let box_fill = Color32::from_rgba_premultiplied(8, 10, 14, 236);
-        // Keep the traditional blue-over-earth attitude colors distinct from
-        // the neutral liquid-glass chrome around the rest of the interface.
-        let sky = Color32::from_rgb(55, 130, 190);
-        let ground = Color32::from_rgb(150, 91, 58);
-        let mono = |s: f32| FontId::monospace(s);
-
-        const W: f32 = HUD_W;
-        const H: f32 = HUD_H;
-        egui::Area::new(egui::Id::unique("flight_hud")).anchor(Align2::CENTER_BOTTOM, [0.0, -14.0]).interactable(false).show(ctx, |ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(W, H), egui::Sense::hover());
-            let painter = ui.painter().clone();
-            let c = pos2(rect.center().x, rect.top() + 34.0 + 74.0);
-            let ar = Rect::from_center_size(c, vec2(196.0, 148.0));
-            let sr = Rect::from_min_size(pos2(ar.left() - 8.0 - 66.0, ar.top()), vec2(66.0, 148.0));
-            let tr = Rect::from_min_size(pos2(ar.right() + 8.0, ar.top()), vec2(66.0, 148.0));
-            let tb = Rect::from_min_size(pos2(sr.left() - 4.0 - 22.0, ar.top() + 14.0), vec2(22.0, 120.0));
-            let vr = Rect::from_min_size(pos2(tr.right() + 4.0, ar.top() + 14.0), vec2(22.0, 120.0));
-            let hr = Rect::from_min_size(pos2(ar.left(), rect.top()), vec2(196.0, 24.0));
-
-            // ---- the horizon
-            {
-                let ap = painter.with_clip_rect(ar);
-                ap.rect_filled(ar, 0.0, sky);
-                let (sn, cs) = (-bank).sin_cos();
-                let rot = |x: f32, y: f32| pos2(c.x + x * cs - y * sn, c.y + x * sn + y * cs);
-                const K: f32 = 3.6;
-                const L: f32 = 400.0;
-                let hy = pitch * K;
-                ap.add(Shape::convex_polygon(vec![rot(-L, hy), rot(L, hy), rot(L, hy + L), rot(-L, hy + L)], ground, Stroke::NONE));
-                ap.line_segment([rot(-L, hy), rot(L, hy)], Stroke::new(2.0, white));
-                for a in (-30i32..=30).step_by(5) {
-                    if a == 0 {
-                        continue;
-                    }
-                    let y = (pitch - a as f32) * K;
-                    if y.abs() > 130.0 {
-                        continue;
-                    }
-                    let half = if a % 10 == 0 { 28.0 } else { 14.0 };
-                    ap.line_segment([rot(-half, y), rot(half, y)], Stroke::new(1.5, white));
-                    if a % 10 == 0 {
-                        for sgn in [-1.0f32, 1.0] {
-                            ap.text(rot(sgn * (half + 12.0), y), Align2::CENTER_CENTER, format!("{}", a.abs()), mono(11.0), white);
-                        }
-                    }
-                }
-                // the bank scale, fixed, and the pointer that rides the horizon
-                const RR: f32 = 70.0;
-                for ang in [-45.0f32, -30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0, 45.0] {
-                    let (s, k) = ang.to_radians().sin_cos();
-                    let len = if ang % 30.0 == 0.0 { 9.0 } else { 5.0 };
-                    ap.line_segment([pos2(c.x + RR * s, c.y - RR * k), pos2(c.x + (RR - len) * s, c.y - (RR - len) * k)], Stroke::new(1.5, white));
-                }
-                ap.add(Shape::convex_polygon(vec![rot(0.0, -RR + 1.0), rot(-5.0, -RR + 11.0), rot(5.0, -RR + 11.0)], accent, Stroke::NONE));
-                // the aircraft
-                let wing = Stroke::new(3.5, amber);
-                ap.line_segment([pos2(c.x - 54.0, c.y), pos2(c.x - 16.0, c.y)], wing);
-                ap.line_segment([pos2(c.x - 16.0, c.y), pos2(c.x - 16.0, c.y + 7.0)], wing);
-                ap.line_segment([pos2(c.x + 16.0, c.y), pos2(c.x + 54.0, c.y)], wing);
-                ap.line_segment([pos2(c.x + 16.0, c.y), pos2(c.x + 16.0, c.y + 7.0)], wing);
-                ap.circle_filled(c, 3.0, amber);
-            }
-            painter.rect_stroke(ar, 0.0, Stroke::new(1.5, faint), StrokeKind::Outside);
-
-            // ---- speed
-            {
-                painter.rect_filled(sr, menu::R_WIDGET, glass);
-                let tp = painter.with_clip_rect(sr);
-                const PPK: f32 = 3.0;
-                let lo = ((ias_kt - 26.0) / 10.0).floor() as i32 * 10;
-                for v in (lo..=lo + 60).step_by(10) {
-                    if v < 0 {
-                        continue;
-                    }
-                    let y = c.y - (v as f32 - ias_kt) * PPK;
-                    let long = v % 20 == 0;
-                    tp.line_segment([pos2(sr.right(), y), pos2(sr.right() - if long { 12.0 } else { 6.0 }, y)], Stroke::new(1.3, white));
-                    if long {
-                        tp.text(pos2(sr.right() - 16.0, y), Align2::RIGHT_CENTER, format!("{v}"), mono(12.0), dim);
-                    }
-                }
-                let col = if p.stalled { red } else if p.overspeed() > 0.0 || (p.flaps > 0.25 && p.ias() > p.vfe()) { amber } else { white };
-                let b = Rect::from_min_max(pos2(sr.left() + 2.0, c.y - 13.0), pos2(sr.right() + 6.0, c.y + 13.0));
-                painter.rect_filled(b, menu::R_WIDGET, box_fill);
-                painter.rect_stroke(b, menu::R_WIDGET, Stroke::new(1.2, col.gamma_multiply(0.7)), StrokeKind::Inside);
-                painter.text(pos2(b.center().x - 3.0, c.y), Align2::CENTER_CENTER, format!("{:.0}", ias_kt), mono(19.0), col);
-                painter.text(pos2(sr.center().x, sr.top() - 8.0), Align2::CENTER_CENTER, "IAS KT", mono(11.0), dim);
-                painter.text(pos2(sr.center().x, sr.bottom() + 9.0), Align2::CENTER_CENTER, format!("GS {:.0}", gs_kt), mono(11.0), dim);
-            }
-
-            // ---- altitude
-            {
-                painter.rect_filled(tr, menu::R_WIDGET, glass);
-                let tp = painter.with_clip_rect(tr);
-                const PPF: f32 = 0.30;
-                let lo = ((alt_ft - 260.0) / 100.0).floor() as i32 * 100;
-                for v in (lo..=lo + 600).step_by(100) {
-                    let y = c.y - (v as f32 - alt_ft) * PPF;
-                    let long = v % 200 == 0;
-                    tp.line_segment([pos2(tr.left(), y), pos2(tr.left() + if long { 12.0 } else { 6.0 }, y)], Stroke::new(1.3, white));
-                    if long {
-                        tp.text(pos2(tr.left() + 16.0, y), Align2::LEFT_CENTER, format!("{v}"), mono(12.0), dim);
-                    }
-                }
-                let b = Rect::from_min_max(pos2(tr.left() - 6.0, c.y - 13.0), pos2(tr.right() - 2.0, c.y + 13.0));
-                painter.rect_filled(b, menu::R_WIDGET, box_fill);
-                painter.rect_stroke(b, menu::R_WIDGET, Stroke::new(1.2, white.gamma_multiply(0.5)), StrokeKind::Inside);
-                painter.text(pos2(b.center().x + 3.0, c.y), Align2::CENTER_CENTER, format!("{:.0}", (alt_ft / 10.0).round() * 10.0), mono(19.0), white);
-                painter.text(pos2(tr.center().x, tr.top() - 8.0), Align2::CENTER_CENTER, "ALT FT", mono(11.0), dim);
-                let col = if agl_ft < 300.0 && !p.on_ground { amber } else { dim };
-                painter.text(pos2(tr.center().x, tr.bottom() + 9.0), Align2::CENTER_CENTER, format!("AGL {:.0}", agl_ft), mono(11.0), col);
-            }
-
-            // ---- vertical speed
-            {
-                painter.rect_filled(vr, menu::R_WIDGET, glass);
-                let y0 = vr.center().y;
-                let span = vr.height() * 0.5 - 8.0;
-                for k in [-2.0f32, -1.0, 0.0, 1.0, 2.0] {
-                    let y = y0 - k * span * 0.5;
-                    painter.line_segment([pos2(vr.left() + 2.0, y), pos2(vr.left() + if k == 0.0 { 12.0 } else { 7.0 }, y)], Stroke::new(1.2, dim));
-                    if k != 0.0 {
-                        painter.text(pos2(vr.right() - 5.0, y), Align2::CENTER_CENTER, format!("{}", k.abs() as i32), mono(11.0), dim);
-                    }
-                }
-                let y = y0 - (vs_fpm / 2000.0).clamp(-1.0, 1.0) * span;
-                let col = if vs_fpm < -1500.0 && agl_ft < 2500.0 { red } else if vs_fpm.abs() < 100.0 { white } else { green };
-                painter.line_segment([pos2(vr.left() + 2.0, y0), pos2(vr.left() + 2.0, y)], Stroke::new(2.0, col.gamma_multiply(0.45)));
-                painter.rect_filled(Rect::from_min_max(pos2(vr.left() + 2.0, y - 2.5), pos2(vr.right() - 2.0, y + 2.5)), 1.0, col);
-                painter.text(pos2(vr.center().x, vr.top() - 8.0), Align2::CENTER_CENTER, "VS", mono(11.0), dim);
-                painter.text(pos2(vr.center().x, vr.bottom() + 9.0), Align2::CENTER_CENTER, format!("{:+.0}", (vs_fpm / 10.0).round() * 10.0), mono(11.0), col);
-            }
-
-            // ---- throttle
-            {
-                painter.rect_filled(tb, menu::R_WIDGET, glass);
-                let inner = tb.shrink2(vec2(6.0, 5.0));
-                let h = inner.height() * thr;
-                let col = if p.running { accent } else { red };
-                painter.rect_filled(Rect::from_min_max(pos2(inner.left(), inner.bottom() - h), inner.right_bottom()), 1.0, col.gamma_multiply(0.85));
-                painter.rect_stroke(inner, 1.0, Stroke::new(1.0, faint), StrokeKind::Inside);
-                painter.text(pos2(tb.center().x, tb.top() - 8.0), Align2::CENTER_CENTER, "THR", mono(11.0), dim);
-                painter.text(pos2(tb.center().x, tb.bottom() + 9.0), Align2::CENTER_CENTER, format!("{:.0}%", thr * 100.0), mono(11.0), dim);
-            }
-
-            // ---- heading ribbon
-            {
-                painter.rect_filled(hr, menu::R_WIDGET, glass);
-                let hp = painter.with_clip_rect(hr);
-                const PPD: f32 = 3.0;
-                let h0 = ((hdg - 34.0) / 5.0).floor() as i32 * 5;
-                for d in (h0..=h0 + 75).step_by(5) {
-                    let x = hr.center().x + (d as f32 - hdg) * PPD;
-                    let dd = d.rem_euclid(360);
-                    let long = dd % 10 == 0;
-                    hp.line_segment([pos2(x, hr.bottom()), pos2(x, hr.bottom() - if long { 8.0 } else { 4.0 })], Stroke::new(1.2, white));
-                    if long {
-                        let label = match dd {
-                            0 => "N".to_string(),
-                            90 => "E".to_string(),
-                            180 => "S".to_string(),
-                            270 => "W".to_string(),
-                            _ => format!("{:02}", dd / 10),
-                        };
-                        hp.text(pos2(x, hr.top() + 8.0), Align2::CENTER_CENTER, label, mono(11.0), if dd % 90 == 0 { accent } else { dim });
-                    }
-                }
-                let b = Rect::from_center_size(pos2(hr.center().x, hr.center().y), vec2(46.0, 22.0));
-                painter.rect_filled(b, menu::R_WIDGET, box_fill);
-                painter.rect_stroke(b, menu::R_WIDGET, Stroke::new(1.2, white.gamma_multiply(0.5)), StrokeKind::Inside);
-                painter.text(b.center(), Align2::CENTER_CENTER, format!("{:03.0}°", hdg.rem_euclid(360.0).round() % 360.0), mono(14.0), white);
-                // Fixed center index makes the direction of travel immediately
-                // readable while the compass tape slides beneath it.
-                painter.add(Shape::convex_polygon(
-                    vec![pos2(hr.center().x, hr.bottom() + 1.0), pos2(hr.center().x - 5.0, hr.bottom() - 4.0), pos2(hr.center().x + 5.0, hr.bottom() - 4.0)],
-                    amber,
-                    Stroke::NONE,
-                ));
-            }
-
-            // ---- the aircraft's state, in a row of small plates under the instruments
-            {
-                let mut chips: Vec<(String, Color32)> = Vec::new();
-                if p.spec.rocket().is_none() {
-                    let flaps = match &p.spec.lever { Some(l) => l.notches.get(p.flap_set as usize).map_or("", |n| n[0]).to_string(), None => t!("Flaps {:.0}°", "Volets {:.0}°", p.flap_notch_deg()) };
-                    chips.push((flaps, if p.flaps > 0.25 && p.ias() > p.vfe() { amber } else { dim }));
-                    if !p.spec.fixed_gear() {
-                        let (g, col) = if p.gear >= 1.0 { (t!("Gear down", "Train sorti"), green) } else if p.gear <= 0.0 { (t!("Gear up", "Train rentré"), dim) } else { (t!("Gear moving", "Train en transit"), amber) };
-                        chips.push((g.to_string(), col));
-                    }
-                }
-                if p.spoilers > 0.05 {
-                    chips.push(((if p.spec.chute.is_some() { t!("Chute", "Parachute") } else { t!("Speedbrake", "Aérofreins") }).to_string(), amber));
-                }
-                if self.plane.parking_brake {
-                    chips.push((t!("Parking brake", "Frein de parc").to_string(), amber));
-                }
-                if !p.running {
-                    chips.push((t!("Engine off", "Moteur arrêté").to_string(), red));
-                }
-                let font = menu::caption();
-                let gal: Vec<_> = chips.into_iter().map(|(t, col)| (painter.layout_no_wrap(t, font.clone(), col), col)).collect();
-                let total: f32 = gal.iter().map(|(g, _)| g.size().x + 16.0).sum::<f32>() + 6.0 * gal.len().saturating_sub(1) as f32;
-                let mut x = rect.center().x - total * 0.5;
-                let y = rect.bottom() - 11.0;
-                for (g, col) in gal {
-                    let r = Rect::from_min_size(pos2(x, y - 10.0), vec2(g.size().x + 16.0, 20.0));
-                    painter.rect_filled(r, menu::R_WIDGET, glass);
-                    painter.rect_stroke(r, menu::R_WIDGET, Stroke::new(1.0, col.gamma_multiply(0.45)), StrokeKind::Inside);
-                    painter.galley(pos2(r.left() + 8.0, y - g.size().y * 0.5), g, col);
-                    x = r.right() + 6.0;
-                }
-            }
-        });
-    }
-
     fn ui(&mut self, agl: f64) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32) {
         let raw = self.egui_input();
         let (lat, lon, alt) = geo::pos_to_lla(self.plane.pos);
@@ -7244,10 +7165,12 @@ impl Game {
         let out = self.egui_ctx.clone().run_ui(raw, |root| {
             let ctx = &root.ctx().clone();
             self.pad_pass(ctx);
+            // the blurred frame behind the frosted glass.
+            flightui::set_frost(ctx, self.r.frost_id);
             use egui::{Align2, Color32, FontId, RichText};
             let pad = padui::active();
             let white = Color32::from_rgba_unmultiplied(255, 255, 255, 235);
-            // What to press next, as key caps (or the gamepad's buttons).
+            // keys to press next, as key caps.
             let keys_line = |ui: &mut egui::Ui, keys: &[(&str, &str)]| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -7268,26 +7191,27 @@ impl Game {
             if self.info_open {
                 self.info_panel(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local, speed, alt, agl, hdg);
             }
-            // The flight toolbar: slides down from the top edge (see `toolbar`).
+            // the flight menu, over everything but the pause menu.
             if self.mode == Mode::Fly {
-                self.toolbar(ctx, &mut bar);
+                self.radial_menu(ctx, &mut bar);
             }
+            // the hud.
+            let mut nav_lift = 0.0;
             if self.hud_on() {
-                self.flight_hud(ctx, hdg, speed, alt, vs, agl);
-                // Only for the aircraft that have them: a rocket's flight figures, or the weapons.
-                let sys = self.systems_card(ctx, vs, base_up);
-                self.minimap.top = sys.map_or(0.0, |r| r.bottom());
+                self.hud(ctx, &flightui::HudIn { hdg, ias: speed, alt, agl, vs, local });
+                // rocket figures or weapons, for the aircraft that have them.
+                self.systems_card(ctx, vs, base_up);
                 self.notices(ctx, airport_hud.as_deref());
-                self.minimap.bottom = 14.0;
-            }
-            if self.hud_on() && self.radios.show {
-                self.nav_overlay(ctx, hdg);
+                if self.radios.show && self.nav_overlay(ctx, hdg) {
+                    nav_lift = flightui::NAV_H;
+                }
             }
             self.hotspot_overlay(ctx);
-            // Real traffic: a tag beside each aircraft within range.
+            // a ring on each aircraft in range, tags on the nearest that do not overlap.
             if let (true, Some((vp, cam))) = (self.hud_on() && self.live.enabled(), self.live_view) {
                 let screen = ctx.content_rect();
                 let painter = ctx.layer_painter(egui::LayerId::background());
+                let mut seen: Vec<(f64, egui::Pos2, &live::Plane)> = Vec::new();
                 for p in &self.live.planes {
                     if p.downed > 0.0 {
                         continue;
@@ -7302,18 +7226,28 @@ impl Game {
                         continue;
                     }
                     let at = egui::pos2(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height());
-                    if !screen.expand(40.0).contains(at) {
+                    if screen.expand(40.0).contains(at) {
+                        seen.push((d, at, p));
+                    }
+                }
+                seen.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut taken: Vec<egui::Rect> = Vec::new();
+                for (d, at, p) in seen {
+                    // fainter with distance.
+                    let a = (1.0 - d / 40_000.0).clamp(0.45, 1.0) as f32;
+                    painter.circle_stroke(at, 5.0, egui::Stroke::new(1.5, flightui::LIT.gamma_multiply(a)));
+                    let line2 = format!("{}  ·  {:.0} ft  ·  {:.1} km", if p.ty.is_empty() { "?" } else { p.ty.as_str() }, p.alt_ft, d / 1000.0);
+                    let g1 = painter.layout_no_wrap(p.call.clone(), menu::semibold(13.0), Color32::WHITE.gamma_multiply(a));
+                    let g2 = painter.layout_no_wrap(line2, menu::medium(11.5), flightui::SOFT.gamma_multiply(a));
+                    let w = g1.size().x.max(g2.size().x) + 14.0;
+                    let r = egui::Rect::from_min_size(at + egui::vec2(10.0, -16.0), egui::vec2(w, 34.0));
+                    if taken.len() >= 8 || taken.iter().any(|t| t.expand(4.0).intersects(r)) {
                         continue;
                     }
-                    let a = (255.0 * (1.0 - d / 40_000.0).clamp(0.35, 1.0)) as u8;
-                    let col = Color32::from_rgba_unmultiplied(150, 225, 255, a);
-                    painter.circle_stroke(at, 5.0, egui::Stroke::new(1.3, col));
-                    let line2 = format!("{}  {:.0} ft  {:.0} kt  {:.1} km", if p.ty.is_empty() { "?" } else { p.ty.as_str() }, p.alt_ft, p.gs_kt, d / 1000.0);
-                    for (k, (s, size)) in [(p.call.as_str(), 12.5), (line2.as_str(), 11.0)].into_iter().enumerate() {
-                        let pos = at + egui::vec2(9.0, -10.0 + 14.0 * k as f32);
-                        painter.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_TOP, s, FontId::proportional(size), Color32::from_black_alpha(a / 2));
-                        painter.text(pos, Align2::LEFT_TOP, s, FontId::proportional(size), col);
-                    }
+                    taken.push(r);
+                    painter.rect_filled(r, 6, Color32::from_black_alpha((120.0 * a) as u8));
+                    painter.galley(r.min + egui::vec2(7.0, 3.0), g1, Color32::WHITE);
+                    painter.galley(r.min + egui::vec2(7.0, 18.0), g2, Color32::WHITE);
                 }
             }
             // The other players: a tag beside each.
@@ -7435,34 +7369,10 @@ impl Game {
                 }
             }
             let report = if self.crashed { Vec::new() } else { p.dmg.report() };
-            if self.show_hud && (!warn.is_empty() || !report.is_empty()) {
-                // Warnings as annunciators: a lit plate each, red or amber, then any damage.
-                egui::Area::new(egui::Id::unique("damage")).anchor(Align2::RIGHT_TOP, [if self.info_open { -14.0 - 340.0 - 28.0 - 14.0 } else { -14.0 }, 14.0]).interactable(false).show(ctx, |ui| {
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        for (w, col) in &warn {
-                            egui::Frame::new().fill(col.gamma_multiply(0.18)).stroke(egui::Stroke::new(1.0, *col)).corner_radius(menu::R_WIDGET).inner_margin(egui::Margin::symmetric(12, 4)).show(ui, |ui| {
-                                ui.label(RichText::new(*w).font(menu::bold(19.0)).color(*col).extra_letter_spacing(1.0));
-                            });
-                        }
-                        if !report.is_empty() {
-                            ui.add_space(4.0);
-                            flightui::glass().show(ui, |ui| {
-                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                                ui.label(menu::section_text(t!("Damage", "Dégâts")).color(amber));
-                                // (no lower than half the screen: past that, just say how many more)
-                                let floor = ctx.content_rect().height() * 0.5;
-                                for (k, l) in report.iter().enumerate() {
-                                    if ui.cursor().top() + 40.0 > floor && k + 1 < report.len() {
-                                        ui.label(RichText::new(format!("+{}", report.len() - k)).font(menu::label()).color(menu::DIM));
-                                        break;
-                                    }
-                                    ui.label(RichText::new(l.as_str()).font(menu::label()).color(menu::TEXT));
-                                }
-                            });
-                        }
-                    });
-                });
+            // warnings, damage and the approach line.
+            if self.show_hud {
+                let guide = if self.hud_on() { airport_hud.as_ref().and_then(|l| l.get(2)) } else { None };
+                self.alerts(ctx, &warn, &report, guide, nav_lift);
             }
             if !self.flash.is_empty() && !self.crashed {
                 // Each new loss: a small red plate down the left edge (under the systems card,
@@ -7498,7 +7408,7 @@ impl Game {
             self.wreck_seen = self.real;
             if !self.crashed && self.wreck_t > 2.0 && self.mode == Mode::Fly {
                 egui::Area::new(egui::Id::unique("wreck")).anchor(Align2::CENTER_CENTER, [0.0, 80.0]).show(ctx, |ui| {
-                    flightui::glass().inner_margin(egui::Margin::symmetric(24, 16)).show(ui, |ui| {
+                    flightui::frosted(ui, flightui::glass().inner_margin(egui::Margin::symmetric(24, 16)), |ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(RichText::new(t!("AIRCRAFT WRECKED", "AVION DÉTRUIT")).font(menu::bold(34.0)).color(Color32::from_rgb(255, 160, 80)).extra_letter_spacing(1.5));
                             ui.add_space(6.0);
@@ -7516,7 +7426,7 @@ impl Game {
             }
             if self.crashed && self.real - self.crash_real > 3.5 {
                 egui::Area::new(egui::Id::unique("crash")).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ctx, |ui| {
-                    flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)).show(ui, |ui| {
+                    flightui::frosted(ui, flightui::glass().inner_margin(egui::Margin::symmetric(20, 12)), |ui| {
                         if pad {
                             let panel = padmap::spec_of("flight_panel");
                             let mut items = vec![("A", tr("respawn")), (panel.as_str(), tr("go somewhere else")), ("Menu", tr("menu"))];
@@ -7742,6 +7652,12 @@ impl ApplicationHandler for App {
                         }
                     } else {
                         g.keys.remove(&code);
+                        // tab held, pointed and let go picks from the flight menu.
+                        if code == KeyCode::Tab {
+                            if let Some(b) = g.flight_menu_release() {
+                                g.toolbar_act(b);
+                            }
+                        }
                     }
                     }
                 }
@@ -7890,8 +7806,7 @@ fn load_fonts(ctx: &egui::Context) {
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
     ];
-    // The interface's own faces first (bundled, see menu.rs), then the
-    // system's sans and mono behind them for glyphs they don't have.
+    // our bundled faces first, then the system's for missing glyphs.
     let own: [(&str, &'static [u8]); 5] = [("barlow", menu::FONT_REGULAR), ("barlow-medium", menu::FONT_MEDIUM), ("barlow-semibold", menu::FONT_SEMIBOLD), ("barlow-condensed", menu::FONT_DISPLAY), ("plex-mono", menu::FONT_MONO)];
     for (name, data) in own {
         fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(data)));
@@ -8117,7 +8032,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     i18n::set_lang(args.lang.or(settings::Settings::load().lang).unwrap_or_else(i18n::Lang::detect));
-    // Linux: the machine in GameMode's performance state while we fly (if installed).
+    // gamemode while we fly, if installed.
     let _gamemode = gamemode::GameMode::request();
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
