@@ -771,10 +771,18 @@ pub struct RainField {
 const WRAP: f64 = 200.0;
 /// How fast a typical raindrop falls, m/s.
 const FALL: f64 = 7.5;
+/// How fast a snowflake falls, m/s (aggregates of a few millimetres fall at
+/// 0.5-1.5 m/s, Locatelli and Hobbs 1974).
+pub const FLAKE_FALL: f64 = 1.0;
 
 impl RainField {
     /// Advance by `dt` with the camera at `cam` and the wind there `wind` (planet frame).
     pub fn step(&mut self, dt: f64, cam: DVec3, wind: DVec3) {
+        self.step_fall(dt, cam, wind, FALL);
+    }
+
+    /// The same for what falls at `fall` m/s (snowflakes: `FLAKE_FALL`).
+    pub fn step_fall(&mut self, dt: f64, cam: DVec3, wind: DVec3, fall: f64) {
         let v_cam = match self.prev_cam {
             Some(p) if dt > 0.0 => {
                 let v = (cam - p) / dt;
@@ -787,7 +795,7 @@ impl RainField {
             return;
         }
         let (e, n, u) = geo::enu(cam);
-        let rel = wind - u * FALL - v_cam;
+        let rel = wind - u * fall - v_cam;
         // Smoothed a little: the chase camera's spring jitters frame to frame.
         self.rel += (rel - self.rel) * (dt * 20.0).min(1.0);
         let d = self.rel * dt;

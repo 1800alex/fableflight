@@ -400,6 +400,16 @@ impl Game {
         card(ui, t!("Preset", "Préréglage"), |ui| self.gfx.preset_ui(ui));
         card(ui, t!("Quality", "Qualité"), |ui| self.gfx.quality_ui(ui));
         card(ui, t!("Display", "Affichage"), |ui| self.gfx.display_ui(ui, (size.width, size.height), self.fps));
+        card(ui, t!("Scenery", "Paysage"), |ui| {
+            use crate::snow::Mode;
+            row(ui, t!("Snow on the ground", "Neige au sol"), t!("Automatic: from the date, the latitude and the real weather's temperature", "Automatique : selon la date, la latitude et la température de la météo réelle"), |ui| {
+                menu::segments(ui, |ui| {
+                    menu::seg(ui, &mut self.snow, Mode::Auto, t!("Automatic", "Automatique"));
+                    menu::seg(ui, &mut self.snow, Mode::Off, t!("Off", "Désactivée"));
+                    menu::seg(ui, &mut self.snow, Mode::Always, t!("Always", "Toujours"));
+                });
+            });
+        });
         let on = if self.src.google.photoreal() { t!("on", "activées") } else { t!("off", "désactivées") };
         note(ui, &t!("Google's photorealistic 3D cities ({}) have their own switch and detail level under Map and data.", "Les villes 3D photoréalistes de Google ({}) ont leur propre réglage dans Carte et données.", on));
         if self.gfx != before {

@@ -771,6 +771,7 @@ fn city_glow(gq: vec2f, dens: f32, dcx: vec2f, dcy: vec2f, upn: vec3f) -> vec3f 
   var N = in.N;
   if (dot(N, N) < 1e-8) { N = normalize(in.P - G.planet.xyz); }
   N = normalize(N);
+  let Ngeo = N;
   let upn = normalize(in.P - G.planet.xyz);
   var wc = wc0;
   let fw = max(length(dx), length(dy));
@@ -847,6 +848,70 @@ fn city_glow(gq: vec2f, dens: f32, dcx: vec2f, dcy: vec2f, upn: vec3f) -> vec3f 
     c *= (0.55 + 0.45 * cav) / (0.55 + 0.45 * mix(cavm, 1.0, graze * graze * g.grassy));
     albedo = mix(img, c, fade);
     N = normalize(N + nd * fade);
+  }
+  // Snow lying on the ground (snow.rs): from the height above the snow line,
+  // the slope and the way the ground faces, broken by noise into tongues and
+  // bare patches near the line. Water returned above; roads and runways are
+  // drawn over it, cleared.
+  if (snow_on()) {
+    let s1 = snow_noise(wc0, 2300.0, fw);
+    let s2 = snow_noise(wc0 + 517.0, 610.0, fw);
+    let s3 = snow_noise(wc0 - 133.0, 47.0, fw);
+    // The slope through noise too, so the cut-off does not trace the mesh's triangles.
+    let Ns = normalize(Ngeo + upn * ((s2 - 0.5) * 0.35));
+    var ks = snow_at(in.P, Ns, upn, ((s1 - 0.5) * 0.6 + (s2 - 0.5) * 0.4) * SNOW_BAND * 1.2);
+    // Ragged edges where it thins out, solid where it is deep.
+    ks = clamp(ks + (s3 - 0.5) * 2.0 * min(ks, 1.0 - ks), 0.0, 1.0);
+    // The class from the nearest texel: filtered, the packed bits blend into
+    // other classes along every boundary.
+    let mdim = vec2f(textureDimensions(t_mask, 0));
+    let mt = textureLoad(t_mask, vec2i(clamp(floor(in.uv * mdim), vec2f(0.0), mdim - 1.0)), 0);
+    let cls = u32(round(mt.b * 255.0)) & 15u;
+    // Towns and roads in the photo are partly cleared; in woods the snow on
+    // the ground shows between dark trunks and crowns.
+    ks *= select(1.0, 0.85, cls == GC_PAVED);
+    // Bare rock in the photo is mostly steep or windswept: it keeps some showing.
+    ks *= select(1.0, 0.8, cls == GC_ROCK);
+    var sc = SNOW_ALBEDO * (0.93 + 0.14 * s3);
+    if (cls == GC_WOOD) { sc = mix(img, sc, 0.45); }
+    // Dynamic tracks and crash trails carved into the snow (snowtrack.rs):
+    // scrape snow away to reveal the ground underneath, compact what remains,
+    // pile snow into raised berms along the rims, and bend the normal so the
+    // indented ruts and snow banks catch the light.
+    var tr_ao = 1.0;
+    var tr_grad = vec2f(0.0);
+    let ks_orig = ks;
+    if (ks > 0.005) {
+      let tr = snow_track_at(in.P, dist, fw);
+      if (tr.x > 0.002 || tr.y > 0.002) {
+        let tn1 = snow_noise(wc0 + 71.0, 0.65, fw);
+        let tn2 = snow_noise(wc0 - 37.0, 2.3, fw);
+        let rough = tn1 * 0.65 + tn2 * 0.35;
+        let reveal = smoothstep(0.12, 0.68, tr.x + (rough - 0.5) * 0.22 * tr.x);
+        // Clear snow in the trough; pile displaced snow slightly thicker on berms.
+        ks = clamp(ks_orig * (1.0 - reveal) + tr.y * 0.35 * ks_orig * (0.7 + 0.6 * tn1), 0.0, 1.0);
+        // Compacted snow left in the rut is slightly darker and cooler in tone;
+        // fluffed snow in the raised berms gets subtle clumpy variation.
+        let comp = tr.x * (1.0 - reveal * 0.45);
+        sc *= mix(1.0, 0.72 + 0.14 * tn1, comp);
+        sc = mix(sc, sc * vec3f(0.84, 0.91, 1.04), comp * 0.55);
+        sc *= 1.0 + tr.y * 0.09 * (tn1 - 0.30);
+        // Dampen the exposed ground beneath scraped snow, and mix a touch of
+        // churned topsoil on deep crash/belly gouges.
+        albedo *= 1.0 - 0.35 * reveal * ks_orig;
+        let gouge = smoothstep(0.82, 1.0, tr.x) * ks_orig * 0.48 * (0.5 + 0.5 * tn2);
+        albedo = mix(albedo, vec3f(0.13, 0.10, 0.075) * (0.7 + 0.6 * tn1), gouge);
+        tr_ao = 1.0 - 0.22 * tr.x * ks_orig;
+        tr_grad = tr.zw;
+      }
+    }
+    albedo = mix(albedo, sc, ks) * tr_ao;
+    // It smooths over the ground's small relief, while tracks carve new slopes in it.
+    N = normalize(mix(N, Ngeo, ks * 0.75));
+    if (dot(tr_grad, tr_grad) > 1e-8) {
+      let n_fade = (1.0 - smoothstep(180.0, 480.0, dist)) * ks_orig;
+      N = normalize(N - (G.snow_tr_e.xyz * tr_grad.x + G.snow_tr_n.xyz * tr_grad.y) * (1.15 * n_fade));
+    }
   }
   for (var i = 0; i < 8; i++) {
     let s = G.scorch[i];

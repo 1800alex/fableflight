@@ -302,6 +302,8 @@ fn solid_frag(in: VOut, cut: bool) -> Solid {
     // Shaded deep in the gaps between the big clumps.
     let gap = mix(1.0, 0.6 + 0.4 * smoothstep(0.3, 0.7, cm), mid);
     let ao = in.mat.y * (0.55 + 0.45 * smoothstep(0.3, 0.75, clump)) * inside * gap;
+    // Snow caught on the top of the crown (snow.rs).
+    albedo = mix(albedo, SNOW_ALBEDO * inside, snow_top(in.P, N, 0.35, 0.9) * 0.6 * (0.4 + 0.6 * clump));
     let c = foliage(in.P, N, V, albedo, ao, clump, light_at(in.P), shadow_at(in.P, N), 0.0);
     return Solid(vec4f(c, 1.0), vec4f(N, 0.0), a, amb_share(c));
   }
@@ -462,6 +464,7 @@ fn blades(uv: vec2f, seed: f32, grow: f32) -> vec4f {
   // Shade mostly as part of the crown, a little as the leaf's own tilted face.
   let tilt = vec3f(tone, fract(tone * 7.13), fract(tone * 13.7)) - 0.5;
   let N = normalize(normalize(in.N) * 0.7 + Ng * 0.3 + tilt * 0.35);
+  albedo = mix(albedo, SNOW_ALBEDO, snow_top(in.P, N, 0.35, 0.9) * 0.6 * max(tone, 0.0));
   let l = Light(in.sun, in.amb, normalize(in.P - G.planet.xyz), 0.0);
   let c = foliage(in.P, N, V, albedo * (1.0 - 0.2 * tiny), in.aux.w, 0.35, l, shadow_fast(in.P, N), 0.006);
   return COut(vec4f(c, 1.0), vec4f(N, 0.0), amb_share(c), mask);
@@ -797,7 +800,8 @@ struct IOut {
   let ball = smoothstep(200.0, 700.0, length(in.Q)) * leaf;
   N = normalize(N + normalize(P - in.C + in.ey * (0.25 * in.ex.w)) * (0.8 * ball));
   let tn = mix(vec3f(dot(in.tint.rgb, vec3f(1.0 / 3.0))), in.tint.rgb, leaf);
-  let albedo = acc.rgb * inv * tn * 2.0;
+  var albedo = acc.rgb * inv * tn * 2.0;
+  albedo = mix(albedo, SNOW_ALBEDO, snow_top(P, N, 0.35, 0.9) * 0.55 * leaf);
   let l = light_at(P);
   let sh = shadow_at(P, N);
   var c: vec3f;
