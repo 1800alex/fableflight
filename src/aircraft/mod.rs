@@ -7,6 +7,9 @@
 //!
 //! Body frame (as in airframe.rs): +X right, +Y up, -Z forward, the origin at
 //! the centre of gravity.
+// Aircraft geometry tables contain physical dimensions in metres (e.g. 1.57 m,
+// 3.14 m, -6.28 m) that trip clippy::approx_constant.
+#![allow(clippy::approx_constant)]
 pub mod b747;
 pub mod c172;
 pub mod concorde;
@@ -17,6 +20,8 @@ pub mod fa18;
 pub mod g650;
 pub mod sr71;
 pub mod starship;
+#[cfg(test)]
+mod standards;
 
 use crate::airframe::{Model, Sect};
 use glam::{DVec3, Vec3};

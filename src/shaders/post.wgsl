@@ -14,16 +14,6 @@
   // Soft clamp so a single hot pixel cannot flood the screen.
   return vec4f(c / (1.0 + luma(c) * 0.002), 1.0);
 }
-// the frosted glass's first halving, back to linear light.
-@fragment fn fs_frost_in(in: FsIn) -> @location(0) vec4f {
-  let tx = 1.0 / vec2f(textureDimensions(t_src));
-  var c = textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb * 4.0;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(-1.0, -1.0), 0.0).rgb;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(1.0, -1.0), 0.0).rgb;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(-1.0, 1.0), 0.0).rgb;
-  c += textureSampleLevel(t_src, s_clamp, in.uv + tx * vec2f(1.0, 1.0), 0.0).rgb;
-  return vec4f(pow(clamp(c / 8.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)), 1.0);
-}
 @fragment fn fs_up(in: FsIn) -> @location(0) vec4f {
   let tx = 1.0 / vec2f(textureDimensions(t_src));
   var c = textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb * 4.0;
@@ -78,16 +68,16 @@ fn finish(scene: vec3f, in: FsIn) -> vec4f {
   c *= G.time.z;
   // Gentle vignette.
   let q = in.uv - 0.5;
-  if (G.detail.w < 0.5) { c *= 1.0 - dot(q, q) * 0.35; }
+  if (G.detail.w > -0.5) { c *= 1.0 - dot(q, q) * 0.35; }
   c = agx(c * AGX_EXPOSURE);
   c += (ign(in.pos.xy + 17.0) - 0.5) / 255.0;
   return vec4f(c, still_alpha(uv));
 }
-// Aircraft-picker stills (main.rs `--still`, G.detail.w = 1): opaque where
+// Aircraft-picker stills (main.rs `--still`, G.detail.w < 0): opaque where
 // the surface seen lies inside the aircraft's box (in its body frame; it is
 // shot held in the air, so nothing else is near), transparent elsewhere.
 fn still_alpha(uv: vec2f) -> f32 {
-  if (G.detail.w < 0.5) { return 1.0; }
+  if (G.detail.w > -0.5) { return 1.0; }
   let dim = vec2f(textureDimensions(t_depth));
   let d = textureLoad(t_depth, vec2i(clamp(uv * dim, vec2f(0.0), dim - 1.0)), 0);
   if (d <= 0.0) { return 0.0; }
@@ -148,4 +138,11 @@ fn sharpen(c: vec3f, n: vec3f, s: vec3f, w: vec3f, e: vec3f, k: f32) -> vec3f {
 }
 @fragment fn fs_blit_srgb(in: FsIn) -> @location(0) vec4f {
   return vec4f(pow(textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb, vec3f(2.2)), 1.0);
+}
+// The start screen's title (logo.rs), over the finished frame: the source is
+// its coverage, and the blend (src x (1 - dst) + dst x (1 - src)) turns each
+// pixel it covers into the inverse of the colour already there.
+@fragment fn fs_logo(in: FsIn) -> @location(0) vec4f {
+  let m = textureSampleLevel(t_src, s_clamp, in.uv, 0.0).r;
+  return vec4f(m, m, m, 0.0);
 }
