@@ -3,7 +3,7 @@
 use crate::buildings::{self, Footprint, Parked, TreeChunk};
 use crate::cars::{self, Car};
 use crate::geo::{self, TileId};
-use crate::render::{BuildGpu, DetailDraw, Inst, NearDraw, Renderer, TessCells, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
+use crate::render::{BuildGpu, CellView, DetailDraw, Inst, NearDraw, Renderer, TessCells, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
 use crate::roads::RoadNet;
 use crate::trees::{lod_span, tree_jit, NearCell, TreeDim, Under, CARDS, CARD_RANGE, IMP_DIST, LODS, LOD_DIST, LOD_JITTER, TREE_SPECIES, VARIANTS};
 use crate::weapons::{Target, TargetKey};
@@ -60,6 +60,8 @@ struct BTile {
     fine_t: f32,
     /// distance scale of its tallest height class (buildings::HCLASS)
     tall: f32,
+    /// bounding sphere of each cell of its buildings (buildings::BuildingData::spheres)
+    spheres: Vec<[f32; 4]>,
 }
 /// An airfield near enough to be drawn and to be busy.
 pub struct Field {
@@ -238,6 +240,14 @@ pub struct World {
     /// graphics settings: multiplies the distances buildings change level of
     /// detail at (buildings.wgsl `city_k`)
     pub city_k: f32,
+    /// terrain tiles kept loaded before the ones unused for a while go, and
+    /// building tiles kept past the reach (the graphics settings: in a city
+    /// each building tile is 50-170 MB of geometry, which an integrated GPU
+    /// takes out of the system's memory)
+    pub tile_cap: usize,
+    pub spare_builds: usize,
+    /// building tiles made (or waiting to go to the GPU) at once
+    pub max_build_jobs: usize,
     /// graphics settings: how far out trees are drawn (m), and the factor on
     /// the distance they turn into impostors at (trees.wgsl `tree_far`, `tree_imp_k`)
     pub tree_far: f32,
@@ -284,7 +294,7 @@ impl Frustum {
 impl World {
     pub fn new(loader: Loader, max_zoom: u8) -> Self {
         let photo = Some(Box::new(crate::tiles3d::Photo::new(loader.src.google.clone(), Some(loader.src.clone()))));
-        Self { photo, flat: None, loader, tiles: HashMap::default(), builds: HashMap::default(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, reach_k: 1.0, city_k: 1.0, tree_far: 3200.0, tree_imp_k: 1.0, cars: (1.0, 2200.0, 1100.0), buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::default(), ocean: crate::ocean::Ocean::new() }
+        Self { photo, flat: None, loader, tiles: HashMap::default(), builds: HashMap::default(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, reach_k: 1.0, city_k: 1.0, tile_cap: 700, spare_builds: 12, max_build_jobs: 12, tree_far: 3200.0, tree_imp_k: 1.0, cars: (1.0, 2200.0, 1100.0), buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::default(), ocean: crate::ocean::Ocean::new() }
     }
 
     /// Tiles wanted but not yet asked for (at most 28 are on their way at once).
@@ -1111,13 +1121,23 @@ impl World {
         self.wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         // (What is not asked for this time stays in `wanted` until the next
         // update clears it: `queued` counts it.)
-        let mut sent = 0;
+        // Building tiles being made or waiting for the GPU: each is some
+        // 150-250 MB of memory in a city until uploaded, so only a few at once
+        // (`max_build_jobs`); the rest wait their turn in `wanted`.
+        let mut building = self.builds.values().filter(|s| matches!(s, BSlot::Loading)).count();
+        let mut sent = vec![false; self.wanted.len()];
         for k in 0..self.wanted.len() {
             if self.in_flight >= 28 {
                 break;
             }
             let (prio, id) = self.wanted[k];
-            sent += 1;
+            if id.z & 0x80 != 0 {
+                if building >= self.max_build_jobs {
+                    continue;
+                }
+                building += 1;
+            }
+            sent[k] = true;
             self.in_flight += 1;
             let evicted = if id.z & 0x80 != 0 {
                 let id = TileId::new(id.z & 0x7f, id.x, id.y);
@@ -1145,16 +1165,38 @@ impl World {
             }
         }
 
-        self.wanted.drain(..sent);
+        let mut k = 0;
+        self.wanted.retain(|_| {
+            k += 1;
+            !sent[k - 1]
+        });
 
         // Evict what has not been needed for a while.
         if self.frame % 120 == 0 {
             let f = self.frame;
-            if self.tiles.len() > 700 {
+            if self.tiles.len() > self.tile_cap {
                 self.tiles.retain(|id, s| id.z <= 3 || !matches!(s, Slot::Ready(t) if f - t.last_used > 600));
+            }
+            // Still over: the least recently used of those not drawn in the
+            // last couple of seconds go too.
+            if self.tiles.len() > self.tile_cap {
+                let mut old: Vec<(u64, TileId)> = self.tiles.iter().filter_map(|(id, s)| match s { Slot::Ready(t) if id.z > 3 && f - t.last_used > 120 => Some((t.last_used, *id)), _ => None }).collect();
+                old.sort_unstable_by_key(|o| o.0);
+                for (_, id) in old.iter().take(self.tiles.len() - self.tile_cap) {
+                    self.tiles.remove(id);
+                }
             }
             self.tiles.retain(|_, s| !matches!(s, Slot::Failed) || f % 3600 != 0);
             self.builds.retain(|_, s| !matches!(s, BSlot::Ready(b) if f - b.last_used > 900));
+            // Of the building tiles left behind (out of reach this frame),
+            // only the most recent few stay, for turning back.
+            let mut behind: Vec<(u64, TileId)> = self.builds.iter().filter_map(|(id, s)| match s { BSlot::Ready(b) if b.last_used != f => Some((b.last_used, *id)), _ => None }).collect();
+            if behind.len() > self.spare_builds {
+                behind.sort_unstable_by_key(|b| b.0);
+                for (_, id) in &behind[..behind.len() - self.spare_builds] {
+                    self.builds.remove(id);
+                }
+            }
             self.fields.retain(|_, s| match s {
                 FSlot::Ready(fl) => f - fl.last_used < 1200,
                 FSlot::Failed => f % 3600 != 0,
@@ -1216,7 +1258,7 @@ impl World {
             let main = bd.cls[0];
             let tall = (0..buildings::HCLASS.len()).find(|&c| main[c] > if c == 0 { 0 } else { main[c - 1] }).map_or(1.0, |c| buildings::HCLASS[c].1);
             let cars = cars::spawn(&bd.net, id.x.wrapping_mul(2246822519) ^ id.y.wrapping_mul(3266489917));
-            self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall })));
+            self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall, spheres: bd.spheres })));
         }
         bytes
     }
@@ -1669,6 +1711,21 @@ impl World {
             let inside = |r: f32| buildings::HCLASS.iter().take_while(|c| maxd < r * c.1 * ck).count() as u8;
             let settled = [inside(buildings::BFAR[0]), if lod[0] >= 1.0 { inside(buildings::BFAR[0]) } else { 0 }, if lod[1] >= 1.0 { inside(buildings::FINE_FADE) } else { 0 }];
             let reach = [buildings::BFAR[1], LOD_MID, LOD_FINE].map(|r| buildings::HCLASS.iter().take_while(|c| dist < r * c.1 * ck).count() as u8);
+            // Each cell as the camera sees it, for the renderer to leave out
+            // what is out of view or past a level's reach (render::cell_drawn).
+            let cells = if *view {
+                b.spheres
+                    .iter()
+                    .map(|sp| {
+                        let c = o + Vec3::new(sp[0], sp[1], sp[2]);
+                        let d = c.length();
+                        let seen = sp[3] >= 0.0 && self.frustum.as_ref().is_none_or(|f| f.sphere(c.as_dvec3(), sp[3] as f64));
+                        CellView { seen, near: (d - sp[3]).max(0.0), far: d + sp[3] }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             details.push(DetailDraw {
                 gpu: g,
                 u: [o.x, o.y, o.z, 0.0, b.ax[0], b.ax[1], b.ax[2], b.ax[3], b.ay[0], b.ay[1], b.ay[2], b.ay[3], lod[0], lod[1], lod[2], 0.0],
@@ -1678,6 +1735,7 @@ impl World {
                 reach,
                 settled,
                 radius: b.radius as f32,
+                cells,
                 casc: mask,
                 trees: tb.take(),
                 close: near,

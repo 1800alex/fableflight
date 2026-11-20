@@ -1387,6 +1387,8 @@ impl Game {
         }
         let mut r = r;
         r.headless = args.headless;
+        // Scripted pictures show the aircraft from the first frame they take.
+        r.wait_objs = !args.shots.is_empty() || args.record.is_some();
         // Cached scans load offline too; missing ones keep the procedural layer.
         r.load_ground_photos(fetch::Fetcher::new(cache.clone(), args.offline));
         let google_key = args.google_key.clone().or_else(|| std::env::var("FABLE_GOOGLE_KEY").ok().filter(|s| !s.is_empty()));
@@ -7009,6 +7011,9 @@ impl Game {
         self.world.lod_k = g.lod_k();
         self.world.reach_k = g.reach();
         self.world.city_k = g.city_k();
+        self.world.tile_cap = g.tile_cap();
+        self.world.spare_builds = g.spare_builds();
+        self.world.max_build_jobs = g.max_build_jobs();
         self.world.tree_far = g.tree_far();
         self.world.tree_imp_k = g.tree_imp_k();
         self.world.cars = g.car_density();

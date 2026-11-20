@@ -298,6 +298,25 @@ impl Graphics {
         self.scenery.pick(0.6, 0.8, 1.0, 1.3)
     }
 
+    /// Terrain tiles kept loaded at most, before the least recently drawn go
+    /// (High and Ultra as the game always kept). Each is about 1.6 MB of GPU
+    /// memory (imagery, mask, lights, mesh), which an integrated GPU takes
+    /// from the system's.
+    pub fn tile_cap(&self) -> usize {
+        self.terrain.pick(300.0, 450.0, 700.0, 700.0) as usize
+    }
+
+    /// Building tiles made at once (each holds 150-250 MB in a city until it
+    /// is on the GPU: twelve at once took a 16 GB laptop out of memory).
+    pub fn max_build_jobs(&self) -> usize {
+        self.scenery.pick(3.0, 5.0, 10.0, 12.0) as usize
+    }
+
+    /// Building tiles kept loaded once out of reach, for turning back.
+    pub fn spare_builds(&self) -> usize {
+        self.scenery.pick(3.0, 6.0, 12.0, 16.0) as usize
+    }
+
     /// Multiplies the distances buildings change level of detail at (their
     /// dissolve into far stand-ins, the dressing, the window depth close up).
     pub fn city_k(&self) -> f32 {
