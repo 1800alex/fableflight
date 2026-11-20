@@ -1281,16 +1281,6 @@ impl Plane {
             0.0
         }
     }
-    /// the 1 g stall speed (m/s indicated) at this mass with flaps at `flaps`.
-    /// for the hud's speed bands, the model itself stalls by angle of attack.
-    pub fn stall_ias_at(&self, flaps: f64) -> f64 {
-        let s = self.spec;
-        let notch = (0..s.flaps.len() as u8).find(|&k| s.flap_frac(k) >= flaps - 0.01).unwrap_or(0);
-        let slats = if s.slats_at > 0 && notch >= s.slats_at { 1.0 } else { 0.0 };
-        let alpha = s.stall_alpha - s.stall_flap * flaps + s.stall_slat * slats;
-        let cl_max = (s.cl0 + s.flap_cl * flaps + s.cl_a * alpha).max(0.1);
-        (2.0 * self.mass() * 9.81 / (RHO0 * s.wing_area * cl_max)).sqrt()
-    }
     /// Angle of attack (rad) that carries the weight at true airspeed `v`.
     fn alpha_level(&self, v: f64, rho: f64, flap_cl: f64) -> f64 {
         let s = self.spec;
