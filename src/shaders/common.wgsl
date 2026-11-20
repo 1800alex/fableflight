@@ -139,6 +139,9 @@ struct Globals {
   // Precomputed lone-cell turrets (5 per cell: tc.xy, rk, ck) and flanking
   // towers (3 per cell: fo.xy, fr, ft) (storm.rs `turrets`).
   storm_turrets: array<vec4f, 128>,
+  // Graphics settings (graphics.rs): x the water's detail (0 plain, 1 full,
+  // 2 full + screen-space reflections), y 1 while the clouds are drawn.
+  lite: vec4f,
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var t_trans: texture_2d<f32>;

@@ -59,6 +59,7 @@ mod weapons;
 mod mvt;
 mod plane;
 mod render;
+mod single_sample;
 mod roads;
 mod skin;
 mod sources;
@@ -145,10 +146,6 @@ const PSHADOW_DEPTH: f32 = 1600.0;
 /// Moonlight relative to sunlight. Far brighter than the real ratio, so a
 /// moonlit night reads like a film's night scene instead of a black screen.
 const MOON_E: f32 = SUN_E * 0.0035;
-/// Default --render-scale on an integrated GPU (Apple silicon and the like):
-/// it shares memory bandwidth and power with the CPU, and the full-resolution
-/// scene is too much for it. The temporal AA and its sharpening hide most of it.
-const INTEGRATED_SCALE: f32 = 0.75;
 /// What a 3D tiles detail level costs, as measured over San Francisco (see
 /// docs/photorealistic-3d-tiles-plan.md).
 fn detail_hint(d: gmaps::Detail) -> &'static str {
@@ -293,10 +290,10 @@ struct Args {
     find_storms: bool,
     vsync: bool,
     taa: bool,
-    /// graphics preset and render resolution for this run (not saved; the
-    /// resolution defaults to INTEGRATED_SCALE on a GPU without memory of its
-    /// own until the graphics settings are saved)
-    graphics: Option<graphics::Level>,
+    /// graphics preset and render resolution for this run (not saved; on a
+    /// GPU without memory of its own the preset defaults to
+    /// `graphics::integrated_preset` until the graphics settings are saved)
+    graphics: Option<graphics::Preset>,
     storm_quality: Option<graphics::Level>,
     render_scale: Option<f32>,
     /// log the frame rate once a second (average and slowest frame)
@@ -397,7 +394,7 @@ struct Args {
     mcp_port: u16,
 }
 
-const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--birds off|low|medium|high] [--flock gull|crow|starling|buzzard|goose,KM[,BEARING[,AGL_M]]] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit | --tail-view] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--storm-quality low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr|ko] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
+const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--birds off|low|medium|high] [--flock gull|crow|starling|buzzard|goose,KM[,BEARING[,AGL_M]]] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit | --tail-view] [--fov DEG] [--no-vsync] [--no-taa] [--graphics very-low|low|medium|high|ultra] [--storm-quality low|medium|high|ultra] [--render-scale 0.35..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr|ko] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
 
 fn parse_args() -> Args {
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -853,7 +850,7 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
             "--speed" => a.speed = Some(req_num(flag, i)?),
             "--graphics" => {
                 let s = req(flag, i)?;
-                a.graphics = Some(graphics::Level::parse(s).filter(|l| *l != graphics::Level::Off).ok_or_else(|| format!("{flag}: expected low, medium, high or ultra, got '{s}'"))?);
+                a.graphics = Some(graphics::Preset::parse(s).ok_or_else(|| format!("{flag}: expected very-low, low, medium, high or ultra, got '{s}'"))?);
             }
             "--storm-quality" => {
                 let s = req(flag, i)?;
@@ -1364,14 +1361,22 @@ impl Game {
         }
         gfx.vsync &= args.vsync;
         gfx.taa &= args.taa && prefs.taa;
-        let r = pollster::block_on(Renderer::new(window.clone(), gfx.vsync, std::env::var("FABLE_MSAA").ok().and_then(|v| v.parse().ok()).unwrap_or(gfx.samples())))?;
+        // A first start (nothing saved, no preset asked for) leaves the MSAA
+        // and the preset to the GPU found: lighter on integrated graphics.
+        let first = !graphics::Graphics::saved() && args.graphics.is_none();
+        let samples = std::env::var("FABLE_MSAA").ok().and_then(|v| v.parse().ok()).or((!first).then_some(gfx.msaa as u32));
+        let r = pollster::block_on(Renderer::new(window.clone(), gfx.vsync, samples))?;
+        graphics::set_integrated(r.integrated);
+        if r.integrated && first {
+            let p = graphics::integrated_preset(r.vendor);
+            gfx.apply(p);
+            if let Some(l) = args.storm_quality {
+                gfx.storms = l;
+            }
+            log::info!("integrated graphics: {} preset until the graphics settings are saved", p.name());
+        }
         if let Some(sc) = args.render_scale {
             gfx.scale = sc;
-        } else if r.integrated && !graphics::Graphics::saved() {
-            gfx.scale = INTEGRATED_SCALE;
-            if args.graphics.is_none() && args.storm_quality.is_none() {
-                gfx.storms = graphics::Level::Medium;
-            }
         }
         let cache = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame");
         {
@@ -5983,7 +5988,7 @@ impl Game {
             vol_o: [0.0; 4],
             vol_u: [0.0; 4],
             // screen space reflections on water and glass, off on low.
-            misc: [near, self.city_glow, if self.gfx.matches() == Some(graphics::Level::Low) { 0.0 } else { 1.0 }, 2.0 * (fov * 0.5).tan() / rh],
+            misc: [near, self.city_glow, if self.gfx.ssr() { 1.0 } else { 0.0 }, 2.0 * (fov * 0.5).tan() / rh],
             csm: [CASC[0] * 2.0 / sres, CASC[1] * 2.0 / sres, CASC[2] * 2.0 / sres, if shadow_on { 1.0 } else { 0.0 }],
             scorch: [[0.0; 4]; 8],
             crater: [[0.0; 4]; 8],
@@ -6041,6 +6046,7 @@ impl Game {
             snow_tr_n: snow_tr[2],
             storm_bounds: [[0.0; 4]; weather::MAX_STORMS],
             storm_turrets: [[0.0; 4]; 8 * weather::MAX_STORMS],
+            lite: [self.gfx.water_detail(), if self.gfx.clouds_on() { 1.0 } else { 0.0 }, 0.0, 0.0],
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);
@@ -6997,6 +7003,9 @@ impl Game {
         self.r.set_vsync(g.vsync);
         self.r.ao = g.ao;
         self.r.cloud_step = g.cloud_step();
+        self.r.clouds = g.clouds_on();
+        self.r.cloud_shadows = g.clouds_on() && g.cloud_shadows;
+        self.r.set_cloud_shadow_slices(g.cloud_shadow_slices());
         self.world.lod_k = g.lod_k();
         self.world.reach_k = g.reach();
         self.world.city_k = g.city_k();
@@ -7004,7 +7013,7 @@ impl Game {
         self.world.tree_imp_k = g.tree_imp_k();
         self.world.cars = g.car_density();
         if self.gfx_applied.is_some() {
-            log::info!("graphics: {} at {:.0}%, shadows {}, clouds {}, storms {}, terrain {}, scenery {}, city {}, trees {}, traffic {}, AO {}", g.matches().map(graphics::Level::name).unwrap_or("custom"), g.scale * 100.0, g.shadows.name(), g.clouds.name(), g.storms.name(), g.terrain.name(), g.scenery.name(), g.city.name(), g.trees.name(), g.cars.name(), g.ao);
+            log::info!("graphics: {} at {:.0}%, shadows {}, clouds {} (shadows {}), storms {}, terrain {}, scenery {}, city {}, trees {}, traffic {}, AO {}, water {}, MSAA {}x", g.matches().map(graphics::Preset::name).unwrap_or("custom"), g.scale * 100.0, g.shadows.name(), g.clouds.name(), g.cloud_shadows, g.storms.name(), g.terrain.name(), g.scenery.name(), g.city.name(), g.trees.name(), g.cars.name(), g.ao, g.water.name(), g.msaa);
         }
         self.gfx_applied = Some(g);
     }
