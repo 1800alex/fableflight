@@ -124,11 +124,11 @@ pub fn supercell(c: &[[f32; 4]; 2]) -> f64 {
 }
 /// A supercell: its anvil height (m above sea level) and how far its
 /// overshooting top climbs above that (m). (The storm ceiling takes it in.)
-pub const SUPER_TOP: f32 = STORM_TOP + 300.0;
-pub const SUPER_OVERSHOOT: f32 = 2300.0;
+pub const SUPER_TOP: f32 = STORM_TOP + 400.0;
+pub const SUPER_OVERSHOOT: f32 = 2400.0;
 const _: () = assert!(SUPER_TOP + SUPER_OVERSHOOT <= STORM_TOP + 700.0 + STORM_OVERSHOOT + 300.0);
 /// A supercell's tower radius, km.
-pub const SUPER_R: f64 = 9.0;
+pub const SUPER_R: f64 = 14.0;
 /// The cell for the shaders, centre `cen` (cloud space km), radius `rad` km,
 /// `on` 0..1 how far it has grown in (to 0.5 an ordinary storm growing, then a
 /// supercell).
@@ -226,18 +226,18 @@ const DECK_GONE: f64 = 26.0;
 /// How far below its mean base the rain deck's ragged scud hangs, m.
 pub const DECK_RAG: f32 = 320.0;
 /// Spacing of candidate storm sites, km.
-const STORM_GRID: f64 = 40.0;
+const STORM_GRID: f64 = 52.0;
 /// Spacing of candidate squall-line sites, km (on stormy days one now and then
 /// stands in for the scattered cells around it).
 const SQUALL_GRID: f64 = 400.0;
 /// A squall line's tower radius (km): its depth across is about 3x this.
-pub const SQUALL_R: f64 = 6.5;
+pub const SQUALL_R: f64 = 9.5;
 /// Share of candidate storm sites that hold a supercell on the stormiest days,
 /// and how far round one no other cell stands, km.
-const SUPER_P: f64 = 0.006;
-const SUPER_CLEAR: f64 = 50.0;
+const SUPER_P: f64 = 0.010;
+const SUPER_CLEAR: f64 = 68.0;
 /// Storm cells are found out to this distance from the camera, km.
-const STORM_RANGE: f64 = 260.0;
+const STORM_RANGE: f64 = 300.0;
 
 fn shash(x: u32) -> u32 {
     let h = x.wrapping_mul(747796405).wrapping_add(2891336453);
@@ -584,7 +584,7 @@ impl Weather {
         let a = dist_km / 6371.0;
         let p = up * a.cos() + dir * a.sin();
         let cen = (p * 6371.0 + self.cloud_off / 1000.0).normalize() * 6371.0;
-        let size = smoothstep(2.0, 7.0, rad_km);
+        let size = smoothstep(4.0, 12.0, rad_km);
         // Each placed storm gets its own seed (turret layout), so a line of them is not
         // one cloud repeated.
         let seed = (0.37 + dist_km * 0.1373 + bearing * 0.0619 + rad_km * 0.271).fract() as f32;
@@ -630,11 +630,11 @@ impl Weather {
     /// the way, and more around it.
     pub fn storm_field(&mut self, pos: DVec3, heading: f64) {
         self.preset("Storms");
-        self.place_storm(pos, 8.0, heading, 6.5, None);
-        self.place_storm(pos, 24.0, heading + 55.0, 5.0, None);
-        self.place_storm(pos, 30.0, heading - 45.0, 8.0, None);
-        self.place_storm(pos, 42.0, heading + 150.0, 4.5, None);
-        self.place_storm(pos, 55.0, heading - 120.0, 6.0, None);
+        self.place_storm(pos, 26.0, heading, 10.5, None);
+        self.place_storm(pos, 46.0, heading + 48.0, 9.0, None);
+        self.place_storm(pos, 58.0, heading - 40.0, 12.5, None);
+        self.place_storm(pos, 72.0, heading + 140.0, 8.5, None);
+        self.place_storm(pos, 90.0, heading - 115.0, 10.5, None);
     }
 
     /// Storm cells (cumulonimbus) near the camera, nearest first, two vec4s each for
@@ -667,12 +667,12 @@ impl Weather {
             // thunder, all but the strongest (~47 dBZ and up) are.
             let shower = c.age < 0.4 || (self.live && self.showers_only && c.age < 0.8);
             let (age, top) = if shower { let a = age.min(0.35); (a, shower_anvil(self.base() as f64, 4500.0 + 2500.0 * c.seed as f64, a)) } else { (age, c.top) };
-            let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
+            let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(4.5, 13.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
             out.push((dist, [[c.at.x as f32, c.at.y as f32, c.at.z as f32, rad as f32], [age as f32, top, over, c.seed]]));
         }
         // (Showers are many and small: a low setting still has a fair few.)
         let st = self.storms as f64;
-        let prob_amount = (0.15 + 0.35 * st) * (st * 8.0).min(1.0) * smoothstep(0.12, 0.45, self.clouds as f64);
+        let prob_amount = (0.19 + 0.39 * st) * (st * 8.0).min(1.0) * smoothstep(0.12, 0.45, self.clouds as f64);
         // Share of cells that are showers: nearly all on a showery day, a few
         // on a stormy one (and all where live weather says no thunder).
         let p_shower = if self.live && self.showers_only { 1.0 } else { (0.95 - 0.85 * st * st.sqrt()).clamp(0.1, 0.95) };
@@ -699,8 +699,8 @@ impl Weather {
                     return;
                 }
                 let h1 = shash(h0 ^ 0x27d4eb2d);
-                let len = (60.0 + 90.0 * unit(h1)) * (0.6 + 0.4 * on);
-                let rad = (SQUALL_R - 1.0 + 2.0 * unit(h1 >> 16)) * (0.6 + 0.4 * on);
+                let len = (70.0 + 80.0 * unit(h1)) * (0.6 + 0.4 * on);
+                let rad = (SQUALL_R - 1.2 + 2.4 * unit(h1 >> 16)) * (0.6 + 0.4 * on);
                 let h2 = shash(h1);
                 let top = STORM_TOP + 700.0 * (unit(h2) as f32 * 2.0 - 1.0);
                 lines.push((cen, 0.5 * len));
@@ -714,21 +714,21 @@ impl Weather {
         if p_super > 0.0 {
             sites(q, STORM_GRID, STORM_RANGE + SUPER_CLEAR, |cen, dist, h0| {
                 let hs = shash(h0 ^ 0x68e3_1da4);
-                let clear = lines.iter().map(|&(c, l2)| smoothstep(l2 + 30.0, l2 + 90.0, c.distance(cen))).fold(1.0, f64::min);
+                let clear = lines.iter().map(|&(c, l2)| smoothstep(l2 + 30.0, l2 + 65.0, c.distance(cen))).fold(1.0, f64::min);
                 let on = smoothstep(unit(hs) - 0.25 * SUPER_P, unit(hs) + 0.25 * SUPER_P, p_super) * (1.0 - seen_at(cen)) * clear;
                 if on <= 0.0 {
                     return;
                 }
                 supers.push(cen);
                 if dist <= STORM_RANGE {
-                    let rad = (SUPER_R - 1.0 + 2.0 * unit(hs >> 16)) * (0.6 + 0.4 * on);
+                    let rad = (SUPER_R - 1.5 + 3.0 * unit(hs >> 16)) * (0.6 + 0.4 * on);
                     out.push((dist, super_cell(cen, rad, on, unit(shash(hs)) as f32 * 0.999)));
                 }
             });
         }
         sites(q, STORM_GRID, STORM_RANGE, |cen, dist, h0| {
             // (A supercell stands here, or near enough to keep this one off.)
-            let lone = supers.iter().map(|s| smoothstep(0.5 * SUPER_CLEAR, SUPER_CLEAR, s.distance(cen))).fold(1.0, f64::min);
+            let lone = supers.iter().map(|s| smoothstep(0.6 * SUPER_CLEAR, SUPER_CLEAR, s.distance(cen))).fold(1.0, f64::min);
             if lone <= 0.0 {
                 return;
             }
@@ -738,7 +738,7 @@ impl Weather {
             // Fades in rather than pops as the slider or the region changes.
             let r0 = unit(h0);
             // (A squall line takes the place of the cells round it.)
-            let clear = lines.iter().map(|&(c, l2)| smoothstep(l2 + 30.0, l2 + 90.0, c.distance(cen))).fold(1.0, f64::min);
+            let clear = lines.iter().map(|&(c, l2)| smoothstep(l2 + 30.0, l2 + 65.0, c.distance(cen))).fold(1.0, f64::min);
             let on = smoothstep(r0 - 0.04, r0 + 0.04, prob) * (1.0 - seen_at(cen)) * clear * lone;
             if on <= 0.0 {
                 return;
@@ -749,25 +749,25 @@ impl Weather {
             let h3 = shash(h2 ^ 0x9e3779b9);
             let seed = unit(h3 >> 16) as f32;
             if unit(shash(h3 ^ 0x5bd1e995)) < p_shower {
-                // A shower: a tower 2.4-5 km across, no anvil, topping out at
-                // 4-7 km (higher on stormier days).
-                let rad = (1.2 + 1.3 * us) * (0.6 + 0.4 * on);
-                let age = (0.12 + 0.25 * u) * on;
-                let top = 4000.0 + 3000.0 * (unit(h3) * (0.6 + 0.4 * st));
+                // A shower: a towering cumulus 5-10 km across, no anvil, topping
+                // out at 4.2-6.6 km (higher on stormier days).
+                let rad = (2.4 + 2.4 * us) * (0.6 + 0.4 * on);
+                let age = (0.14 + 0.24 * u) * on;
+                let top = 4200.0 + 2400.0 * (unit(h3) * (0.6 + 0.4 * st));
                 out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, shower_anvil(self.base() as f64, top, age), 0.0, seed]]));
                 return;
             }
-            // Thunderstorms. Sizes have a long tail: mostly single towers a
-            // few km across, now and then a giant multicell / supercell 12-18 km wide.
-            let giant = smoothstep(0.82, 1.0, us) * (0.5 + 0.5 * st);
-            let rad = (2.4 + 2.6 * us + 4.0 * giant * giant) * (0.6 + 0.4 * on);
+            // Thunderstorms. Broad convective complexes 10-20 km across, with a
+            // tail of giant multicell storms 20-30 km wide.
+            let giant = smoothstep(0.76, 1.0, us) * (0.5 + 0.5 * st);
+            let rad = (5.2 + 4.6 * us + 5.5 * giant * giant) * (0.6 + 0.4 * on);
             // Mature (with anvils); stormier days have more of the older,
             // bigger ones; giants always are.
             let age = (0.5 + 0.5 * (u + (1.0 - (1.0 - u) * (1.0 - u) - u) * st)).max(giant * 1.6).min(1.0) * on;
             // Anvil height (the tropopause varies a little) and how far the
             // strongest updraft overshoots it: big, mature cells the most.
             let top = STORM_TOP + 700.0 * (unit(h3) as f32 * 2.0 - 1.0);
-            let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(2.5, 8.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
+            let over = STORM_OVERSHOOT * (0.25 + 0.75 * smoothstep(4.5, 13.0, rad) as f32) * smoothstep(0.6, 0.95, age) as f32;
             out.push((dist, [[cen.x as f32, cen.y as f32, cen.z as f32, rad as f32], [age as f32, top, over, seed]]));
         });
         out.sort_by(|a, b| a.0.total_cmp(&b.0));
