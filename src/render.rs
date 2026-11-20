@@ -838,7 +838,6 @@ pub struct Frame<'a> {
     pub egui: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     pub shot: Option<std::path::PathBuf>,
     /// the start screen's title, drawn at this UI scale (None: not shown)
-    pub logo: Option<f32>,
     /// raindrops to draw around the camera (0: no rain)
     pub rain_drops: u32,
     /// lightning channel segments (storm.rs `Lightning::segments`)
@@ -886,9 +885,6 @@ struct Targets {
     bg_taa: [wgpu::BindGroup; 2],
     bloom: Vec<wgpu::TextureView>,
     ldr_tex: wgpu::Texture,
-    /// the start screen's title, one coverage byte per pixel (see logo.rs)
-    logo_tex: wgpu::Texture,
-    bg_logo: wgpu::BindGroup,
     ldr: wgpu::TextureView,
     bg_composite: wgpu::BindGroup,
     bg_cloud: wgpu::BindGroup,
@@ -1023,7 +1019,7 @@ pub struct Renderer {
     obj_ub: wgpu::Buffer,
     bg_obj: wgpu::BindGroup,
     l_obj: wgpu::BindGroupLayout,
-    /// the aircraft shader source and its layout, kept to specialise it per kind off the main thread
+    /// the aircraft shader source, kept to specialise it per kind off the main thread.
     obj_src: std::sync::Arc<String>,
     pl_obj: wgpu::PipelineLayout,
     obj_fast: Option<ObjFast>,
@@ -1085,8 +1081,6 @@ pub struct Renderer {
     p_final: wgpu::RenderPipeline,
     p_final_taa: wgpu::RenderPipeline,
     p_blit: wgpu::RenderPipeline,
-    /// the start screen's title, inverting what is under it
-    p_logo: wgpu::RenderPipeline,
     psim_ub: wgpu::Buffer,
     pbuf: wgpu::Buffer,
     bg_psim: wgpu::BindGroup,
@@ -1106,10 +1100,6 @@ pub struct Renderer {
     taa_hist_ok: bool,
     pub meshes: Vec<MeshGpu>,
     pub egui: egui_wgpu::Renderer,
-    /// the font of the start screen's title, and the screen size and UI
-    /// scale its mask was last drawn for
-    pub logo_font: Option<Vec<u8>>,
-    logo_key: Option<(u32, u32, u32)>,
 }
 
 pub(crate) fn tex_entry(binding: u32, dim: wgpu::TextureViewDimension, depth: bool) -> wgpu::BindGroupLayoutEntry {
@@ -1315,6 +1305,10 @@ fn array_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, w: u32
     }
     t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
+
+/// Size of plane.wgsl's `Paint` uniform: the box and view (`paint_box`),
+/// then the livery (`set_livery`).
+const PAINT_UB: u64 = 112;
 
 /// What plane.wgsl's `hornet_paint` needs to know of a paint (its `PT`): the
 /// rectangle each picture covers, across and fore and aft; how far ahead of
@@ -1902,7 +1896,7 @@ impl Renderer {
             "depth resolve",
             &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: msaa() > 1 }, count: None }],
         );
-        let l_obj = layout("obj", &[ub_entry(0, true, std::mem::size_of::<ObjU>() as u64), tex_entry(1, wgpu::TextureViewDimension::D2Array, false), ub_entry(2, false, 32)]);
+        let l_obj = layout("obj", &[ub_entry(0, true, std::mem::size_of::<ObjU>() as u64), tex_entry(1, wgpu::TextureViewDimension::D2Array, false), ub_entry(2, false, PAINT_UB)]);
         let l_glass = layout("glass", &[tex_entry(1, d2, false), tex_entry(2, d2, true)]);
         let ms_entry = |binding, depth| wgpu::BindGroupLayoutEntry {
             binding,
@@ -2083,7 +2077,7 @@ impl Renderer {
             (p_cshadow_in, p_cshadow_out, p_cshadow_in_plain, p_cshadow_out_plain, p_cshadow_mix, p_composite, p_composite_edge, p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_temporal, p_cloud_apply),
             (p_terrain, p_terrain_tess, p_terrain_cells, p_build, p_build_whole, p_build_shadow, p_photo, p_skin, p_photo_shadow, p_photo_shadow_fast, p_photo_mask, p_water_top, p_shore_cover),
             (p_road, p_field, p_lights, p_lamp_top, p_rain, p_bolt, p_veil, p_tree, imp, p_tree_near, p_tree_shadow, p_tree_shadow_fixed, p_card, p_inst, p_inst_shadow),
-            (p_trans, p_ms, p_sky, p_gtao, p_ao_blur, p_taa, p_down, p_up, p_final, p_final_taa, p_logo, p_blit, p_particles, p_psim, p_vol, p_dres),
+            (p_trans, p_ms, p_sky, p_gtao, p_ao_blur, p_taa, p_down, p_up, p_final, p_final_taa, p_blit, p_particles, p_psim, p_vol, p_dres),
         ) = std::thread::scope(|s| {
             let t_obj = s.spawn(|| {
                 let p_obj = geom("obj", Some(&l_obj), &m_obj, &[vb(64, false, &A_PART)], 0);
@@ -2304,8 +2298,6 @@ impl Renderer {
             let p_up = full("up", &pl(&l_post), &m_post, "fs_up", HDR, Some(wgpu::BlendState { color: add, alpha: add }));
             let p_final = full("final", &pl(&l_post), &m_post, "fs_final", out_format(&config), None);
             let p_final_taa = full("final taa", &pl(&l_post), &m_post, "fs_final_taa", out_format(&config), None);
-            let invert = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::OneMinusDst, dst_factor: wgpu::BlendFactor::OneMinusSrc, operation: wgpu::BlendOperation::Add };
-            let p_logo = full("logo", &pl(&l_post), &m_post, "fs_logo", out_format(&config), Some(wgpu::BlendState { color: invert, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }));
             let p_blit = full("blit", &pl(&l_post), &m_post, if config.format.is_srgb() { "fs_blit_srgb" } else { "fs_blit" }, config.format, None);
             let pm = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
             let p_particles = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2338,7 +2330,7 @@ impl Renderer {
                 t_cloud.join().unwrap(),
                 t_world.join().unwrap(),
                 t_misc.join().unwrap(),
-                (p_trans, p_ms, p_sky, p_gtao, p_ao_blur, p_taa, p_down, p_up, p_final, p_final_taa, p_logo, p_blit, p_particles, p_psim, p_vol, p_dres),
+                (p_trans, p_ms, p_sky, p_gtao, p_ao_blur, p_taa, p_down, p_up, p_final, p_final_taa, p_blit, p_particles, p_psim, p_vol, p_dres),
             )
         });
 
@@ -2378,8 +2370,8 @@ impl Renderer {
         let bolt_buf = dynbuf("lightning", crate::storm::MAX_SEGS as u64 * 32);
         // (No paint until the aircraft is known: `set_paint`.)
         let paint = paint_texture(d, &queue, None);
-        let paint_ub = d.create_buffer(&wgpu::BufferDescriptor { label: Some("paint"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let bg_obj = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_obj, entries: &[buf_res(0, &obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &paint), buf_res(2, &paint_ub, 32)] });
+        let paint_ub = d.create_buffer(&wgpu::BufferDescriptor { label: Some("paint"), size: PAINT_UB, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bg_obj = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &l_obj, entries: &[buf_res(0, &obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &paint), buf_res(2, &paint_ub, PAINT_UB)] });
         let ix = crate::sources::tile_indices();
         let tile_ibuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("tile idx"), contents: bytemuck::cast_slice(&ix), usage: wgpu::BufferUsages::INDEX });
         let patch = |n: u16| {
@@ -2442,8 +2434,8 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_storm, l_cloud_rain, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, gclouds_tex, snow_tex, snow_track_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_composite_edge, p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
-            psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, clouds: true, cloud_shadows: true, vendor: info.vendor, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, instance, window, gpu_error, device_lost, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_glass, p_composite, p_composite_edge, p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit,
+            psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, clouds: true, cloud_shadows: true, vendor: info.vendor, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, instance, window, gpu_error, device_lost, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
 
@@ -2492,8 +2484,6 @@ impl Renderer {
         let bloom: Vec<_> = (0..BLOOM_MIPS).map(|i| bloom_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
         let ldr_tex = make_tex(d, "ldr", ow, oh, 1, 1, out_format(config), rt | wgpu::TextureUsages::COPY_SRC);
         let ldr = view(&ldr_tex);
-        let logo_tex = make_tex(d, "logo", ow, oh, 1, 1, wgpu::TextureFormat::R8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
-        let logo = view(&logo_tex);
         let taa = [view(&make_tex(d, "taa 0", w, h, 1, 1, HDR, rt)), view(&make_tex(d, "taa 1", w, h, 1, 1, HDR, rt))];
         let bg = |l: &wgpu::BindGroupLayout, e: &[wgpu::BindGroupEntry]| d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: l, entries: e });
         let post = |src: &wgpu::TextureView, bl: &wgpu::TextureView| bg(l_post, &[tex_res(0, src), tex_res(1, bl), tex_res(2, &depth)]);
@@ -2524,8 +2514,6 @@ impl Renderer {
             bg_final: [&hdr, &taa[0], &taa[1]].map(|src| post(src, &bloom[0])),
             taa,
             bg_blit: post(&ldr, black),
-            bg_logo: post(&logo, black),
-            logo_tex,
             color, aux, amb, depth, hdr, cloud, cloud_dist, cloud_raw, cloud_dist_raw, cloud_cls_data, cloud_cls_depth, cloud_hist, bloom, ldr_tex, ldr,
         }
     }
@@ -2557,7 +2545,6 @@ impl Renderer {
     fn remake_targets(&mut self) {
         self.cloud_hist_ok = false;
         self.taa_hist_ok = false;
-        self.logo_key = None;
         let (w, h) = self.render_size();
         self.targets = Self::make_targets(&self.device, &self.config, (w, h), &self.l_dres, &self.l_ao, &self.l_composite, &self.l_cloud, &self.l_cloud_storm, &self.l_cloud_rain, &self.l_cloud_apply, &self.l_cloud_temporal, &self.l_post, &self.l_pdraw, &self.l_glass, &self.psim_ub, &self.pbuf, &self.black);
         self.fluid_t = self.fluid.draw_targets(&self.device, &self.targets.depth, w, h);
@@ -2738,7 +2725,13 @@ impl Renderer {
     pub fn set_paint(&mut self, paint: Option<&crate::aircraft::Paint>) {
         let view = paint_texture(&self.device, &self.queue, paint);
         self.queue.write_buffer(&self.paint_ub, 0, bytemuck::cast_slice(&paint_box(paint)));
-        self.bg_obj = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_obj, entries: &[buf_res(0, &self.obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &view), buf_res(2, &self.paint_ub, 32)] });
+        self.bg_obj = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_obj, entries: &[buf_res(0, &self.obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &view), buf_res(2, &self.paint_ub, PAINT_UB)] });
+    }
+
+    /// The paint scheme of a type that takes one (`aircraft::livery_uniform`:
+    /// four colours, the style in the first's w, the title's glyphs).
+    pub fn set_livery(&mut self, scheme: [u32; 20]) {
+        self.queue.write_buffer(&self.paint_ub, 32, bytemuck::cast_slice(&scheme));
     }
 
     pub fn add_mesh(&mut self, verts: &[PartVertex], idx: &[u32]) -> usize {
@@ -2751,7 +2744,7 @@ impl Renderer {
         let white = vec![255u8; (t.size * t.size * 4) as usize];
         let layers: Vec<&[u8]> = if t.layers.is_empty() { vec![&white[..]] } else { t.layers.iter().map(|l| &l[..]).collect() };
         let view = array_texture(&self.device, &self.queue, "aircraft textures", t.size, t.size, &layers);
-        std::sync::Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_obj, entries: &[buf_res(0, &self.obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &view), buf_res(2, &self.paint_ub, 32)] }))
+        std::sync::Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_obj, entries: &[buf_res(0, &self.obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &view), buf_res(2, &self.paint_ub, PAINT_UB)] }))
     }
     /// Draw a mesh with its own textures.
     pub fn set_mesh_bind(&mut self, i: usize, bind: std::sync::Arc<wgpu::BindGroup>) {
@@ -2793,7 +2786,7 @@ impl Renderer {
         }
     }
     fn mesh_gpu(&self, verts: &[PartVertex], idx: &[u32], bind: Option<std::sync::Arc<wgpu::BindGroup>>) -> MeshGpu {
-        // (an empty piece, a hinge other pieces hang from, still gets a buffer: nothing is drawn from it)
+        // an empty piece, a hinge others hang from, still gets a buffer.
         let pad = [PartVertex::zeroed()];
         let verts = if verts.is_empty() { &pad[..] } else { verts };
         let (idx, n_main) = split_instruments(verts, idx);
@@ -3857,21 +3850,13 @@ impl Renderer {
             let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(out, false))], None)).forget_lifetime();
             self.egui.render(&mut rp, jobs, sd);
         }
-        if let Some(scale) = f.logo {
-            let (w, h) = (self.config.width, self.config.height);
-            if self.logo_key != Some((w, h, scale.to_bits())) {
-                let m = self.logo_font.as_deref().map(|font| crate::logo::mask(font, w, h, scale)).unwrap_or_else(|| vec![0; (w * h) as usize]);
-                self.queue.write_texture(t.logo_tex.as_image_copy(), &m, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: Some(h) }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
-                self.logo_key = Some((w, h, scale.to_bits()));
-            }
-            full(&mut enc, out, false, &self.p_logo, &t.bg_logo);
-        }
         mark(&mut enc, "post+ui");
         if let Some(sview) = sview.as_ref().filter(|_| direct.is_none()) {
             full(&mut enc, sview, true, &self.p_blit, &t.bg_blit);
             mark(&mut enc, "blit");
         }
         let bgra = out_format(&self.config) == wgpu::TextureFormat::Bgra8Unorm;
+        let still = f.g.detail[3] < -0.5;
         let shot = f.shot.map(|path| {
             let (w, h) = (self.config.width, self.config.height);
             let row = (w * 4).div_ceil(256) * 256;
@@ -3920,7 +3905,11 @@ impl Renderer {
                     p.0.swap(0, 2);
                 }
             }
-            match image::DynamicImage::ImageRgba8(img).to_rgb8().save(&path) {
+            // (Aircraft-picker stills keep the alpha post.wgsl gives them, in a PNG.)
+            let img = image::DynamicImage::ImageRgba8(img);
+            let png = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("png"));
+            let saved = if still && png { img.save(&path) } else { img.to_rgb8().save(&path) };
+            match saved {
                 Ok(_) => log::info!("saved screenshot {}", path.display()),
                 Err(e) => log::error!("screenshot failed: {e}"),
             }
