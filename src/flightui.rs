@@ -995,7 +995,7 @@ impl Game {
             (Icon::Autopilot, t!("Autopilot", "Pilote auto"), Bar::Page(Page::Autopilot), page(Page::Autopilot)),
             (Icon::Weather, t!("Weather", "Météo"), Bar::Page(Page::Weather), page(Page::Weather)),
             (Icon::Map, t!("Map", "Carte"), Bar::Map, self.minimap.visible),
-            (Icon::Camera, if self.cam_mode == 1 { t!("Cockpit", "Cockpit") } else { t!("Chase", "Extérieur") }, Bar::Camera, false),
+            (Icon::Camera, match self.cam_mode { 1 => "Cockpit", crate::settings::TAIL_VIEW => t!("Fixed rear", "Arrière fixe"), _ => t!("Chase", "Extérieur") }, Bar::Camera, false),
         ]
     }
 

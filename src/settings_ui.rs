@@ -429,10 +429,16 @@ impl Game {
         card(ui, t!("Camera", "Caméra"), |ui| {
             let hint = if in_flight { t!("C switches it in flight", "C la change en vol") } else { t!("the view you start in; C switches it", "la vue au départ ; C la change") };
             row(ui, t!("Camera", "Caméra"), hint, |ui| {
+                let previous = self.cam_mode;
                 menu::segments(ui, |ui| {
                     menu::seg(ui, &mut self.cam_mode, 0, t!("Chase", "Extérieure"));
+                    menu::seg(ui, &mut self.cam_mode, crate::settings::TAIL_VIEW, t!("Fixed rear", "Arrière fixe"));
                     menu::seg(ui, &mut self.cam_mode, 1, "Cockpit");
                 });
+                if self.cam_mode == crate::settings::TAIL_VIEW && previous != self.cam_mode {
+                    self.view_before_tail = previous;
+                    self.cancel_cockpit_input();
+                }
             });
             row(ui, t!("Cockpit field of view", "Champ de vision cockpit"), t!("the mouse wheel zooms for a moment", "la molette zoome un instant"), |ui| {
                 ui.add(egui::Slider::new(&mut self.cockpit_fov, 35.0..=85.0).custom_formatter(|v, _| format!("{v:.0}° vertical")));
@@ -996,7 +1002,12 @@ impl Game {
             for a in ACTIONS.iter().filter(|a| a.keyboard) {
                 grid_label(ui, a.label(), cw);
                 let moved = self.binds.keys.contains_key(a.id);
-                binding_cell(ui, self.binds.key_of(a).map(bind::key_name), moved);
+                let keys = if a.id == "tail_view" && !moved && self.binds.map_key(winit::keyboard::KeyCode::IntlBackslash) == Some(a.key) {
+                    Some(i18n::tr("F6 / ISO key").to_string())
+                } else {
+                    self.binds.key_of(a).map(bind::key_name)
+                };
+                binding_cell(ui, keys, moved);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!busy, egui::Button::new(t!("Change", "Changer"))).clicked() {
                         self.binds.start_capture(Capture::Key(a.id));
