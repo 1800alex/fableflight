@@ -74,8 +74,7 @@ impl crate::Game {
                     }
                 });
             });
-            // The picture: click it for the aircraft screen.
-            // a little shorter than the picture, which keeps its shape (its edges are empty)
+            // a little shorter than the picture, whose edges are empty.
             let ph = w * 0.46;
             let (pic, resp) = ui.allocate_exact_size(egui::vec2(w, ph), egui::Sense::click());
             ui.painter().rect_filled(pic, 0.0, menu::PANEL);
@@ -307,8 +306,7 @@ impl crate::Game {
             mesh.add_triangle(0, 1, 2);
             mesh.add_triangle(0, 2, 3);
             p.add(mesh);
-            // a faint floor line under it
-            // a pool of light where it stands, and a faint floor line under it
+            // a pool of light and a faint floor line under it.
             let floor = stage.bottom() - ph * 0.12;
             let sp = p.with_clip_rect(stage);
             menu::glow(&sp, egui::pos2(stage.center().x, floor), egui::vec2(stage.width() * 0.42, ph * 0.2), Color32::from_white_alpha(22));
@@ -322,7 +320,7 @@ impl crate::Game {
             badge(ui.painter(), stage.left_top() + egui::vec2(14.0, 12.0), if spec.ext.is_some() { "FlightGear" } else { "JSBSim" });
         }
         if chosen {
-            // the one you will fly: a mark in the stage's corner
+            // the aircraft you will fly gets a mark in the corner.
             let g = ui.painter().layout_no_wrap(t!("IN USE", "UTILISÉ").to_string(), menu::bold(13.0), ACCENT);
             let r = egui::Rect::from_min_size(stage.right_top() + egui::vec2(-16.0 - g.size().x - 22.0, 14.0), g.size() + egui::vec2(22.0, 6.0));
             ui.painter().rect_stroke(r, menu::R_WIDGET, Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
@@ -458,7 +456,7 @@ impl crate::Game {
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
                         let lit = menu::ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
                         let p = ui.painter();
-                        // chosen: raised, with the accent mark at its left, as in the aircraft list
+                        // chosen: raised, with the accent mark at its left.
                         p.rect_filled(rect, menu::R_WIDGET, Color32::from_white_alpha(if sel { 16 } else { (4.0 + 8.0 * lit) as u8 }));
                         if sel {
                             p.rect_filled(egui::Rect::from_center_size(egui::pos2(rect.left() + 1.5, rect.center().y), egui::vec2(3.0, rect.height() * 0.5)), 1.0, ACCENT);
