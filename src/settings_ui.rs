@@ -400,6 +400,8 @@ impl Game {
         card(ui, t!("Preset", "Préréglage"), |ui| self.gfx.preset_ui(ui));
         card(ui, t!("Quality", "Qualité"), |ui| self.gfx.quality_ui(ui));
         card(ui, t!("Display", "Affichage"), |ui| self.gfx.display_ui(ui, (size.width, size.height), self.fps));
+        let cx = crate::graphics::UpscaleCx { gpu: &self.r.gpu, window: (size.width, size.height), active: self.r.up.active(), fsr4_blocked: crate::fsr4::blocked(&self.r.gpu, self.r.up.fsr4_error()), fsr4_provider: self.r.up.fsr4_provider().map(str::to_owned) };
+        card(ui, t!("Upscaling", "Mise à l'échelle"), |ui| self.gfx.upscaler_ui(ui, &cx));
         card(ui, t!("Scenery", "Paysage"), |ui| {
             use crate::snow::Mode;
             row(ui, t!("Snow on the ground", "Neige au sol"), t!("Automatic: from the date, the latitude and the real weather's temperature", "Automatique : selon la date, la latitude et la température de la météo réelle"), |ui| {
