@@ -368,7 +368,7 @@ struct Args {
     approach: bool,
     /// which aircraft to fly (`aircraft::by_key`)
     aircraft: Option<String>,
-    /// the Cessna's paint scheme (index into `c172::LIVERIES`)
+    /// the flown type's paint scheme (an index of `aircraft::liveries`)
     livery: Option<usize>,
     /// start with the HUD hidden (H), for screenshots
     no_hud: bool,
@@ -531,7 +531,7 @@ fn parse_args() -> Args {
                 a.menu.get_or_insert(false);
             }
             "--runway" => a.runway = v.get(i + 1).cloned(),
-            "--livery" => a.livery = v.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n < aircraft::c172::LIVERIES.len()),
+            "--livery" => a.livery = v.get(i + 1).and_then(|s| s.parse().ok()),
             "--aircraft" => {
                 a.aircraft = v.get(i + 1).cloned();
                 if let Some(k) = &a.aircraft {
@@ -741,6 +741,12 @@ fn parse_args() -> Args {
                 a.no_hud = true;
                 used = 1;
             }
+            "--still" => {
+                // (read by `still_mode`): --shot pictures cut the aircraft out
+                // on a transparent background, for the aircraft picker
+                a.no_hud = true;
+                used = 1;
+            }
             "--fuel" => a.fuel = num(&v, i).map(|f| f.clamp(0.0, 1.0)),
             "--arcade" => {
                 a.arcade = true;
@@ -816,7 +822,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr] [--fuel 0..1] [--cold] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--livery N] [--still] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -828,6 +834,14 @@ fn parse_args() -> Args {
     }
     a.shots.sort_by(|x, y| x.0.total_cmp(&y.0));
     a
+}
+
+/// `--still`: screenshots for the aircraft picker, the aircraft alone on a
+/// transparent background (post.wgsl `finish` keys it out by depth, so fly it
+/// clear of the ground and anything else within 150 m), saved with alpha.
+fn still_mode() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::args().any(|a| a == "--still"))
 }
 
 fn url_encode(s: &str) -> String {
@@ -1256,14 +1270,22 @@ impl Game {
         if args.ship {
             plane.rocket_return();
         }
+        // (Aircraft-picker stills show it as if parked: gear down, engines
+        // stopped, so its propeller blades are drawn rather than their blur.)
+        if still_mode() {
+            plane.gear_down = true;
+            plane.gear = 1.0;
+            plane.cold_and_dark();
+        }
         if let Some(spec) = &args.damage {
             plane.dmg.apply_spec(spec);
         }
         let mut world = world::World::new(sources::Loader::new(src.clone(), 14), args.max_zoom);
         let mut r = r;
-        r.set_paint(spec.paint.as_ref());
-        let livery = args.livery.unwrap_or(aircraft::c172::DEFAULT_LIVERY);
-        r.set_livery(aircraft::c172::livery_uniform(livery));
+        let livery = args.livery.filter(|&n| n < aircraft::liveries(spec).len()).unwrap_or(aircraft::default_livery(spec));
+        let lv = aircraft::liveries(spec).get(livery);
+        r.set_paint(lv.and_then(|l| l.paint).or(spec.paint.as_ref()));
+        r.set_livery(aircraft::livery_uniform(spec, lv));
         let Loaded { spec: _, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, plane_box, lamps } = Loaded::build(spec, &mut r);
         let tm = trees::build_meshes();
         r.set_tree_meshes(&tm.meshes);
@@ -1280,7 +1302,7 @@ impl Game {
         menu.fuel = args.fuel.unwrap_or(menu.fuel);
         menu.cold = args.cold;
         menu.aircraft = aircraft::index_of(spec);
-        menu.c172_livery = livery;
+        menu.liveries.insert(spec.name, livery);
         if let Some((la, lo, al)) = args.menu_view {
             menu.look_at(la, lo, al);
             menu.alt = al;
@@ -1571,7 +1593,6 @@ impl Game {
             lamps: std::mem::replace(&mut self.lamps, next.lamps),
         };
         self.hangar.push(old);
-        self.r.set_paint(spec.paint.as_ref());
         self.spec = spec;
         self.cancel_cockpit_input();
         self.cockpit_controls = aircraft::cockpit_controls(spec, &self.model.pieces);
@@ -1579,13 +1600,15 @@ impl Game {
         self.weapons.reset(spec, &self.model.pieces);
         self.cam_dist = spec.cam_dist;
         self.menu.aircraft = aircraft::index_of(spec);
-        self.apply_c172_livery();
+        self.apply_livery();
     }
 
-    /// Send the chosen Cessna paint scheme to the shader (only the Cessna's
-    /// livery reads it).
-    pub(crate) fn apply_c172_livery(&mut self) {
-        self.r.set_livery(aircraft::c172::livery_uniform(self.menu.c172_livery));
+    /// Paint the flown type in the scheme picked for it: its paint (a scheme's
+    /// own baked one, else the type's) and the scheme's uniform.
+    pub(crate) fn apply_livery(&mut self) {
+        let lv = aircraft::liveries(self.spec).get(self.menu.livery(self.spec));
+        self.r.set_paint(lv.and_then(|l| l.paint).or(self.spec.paint.as_ref()));
+        self.r.set_livery(aircraft::livery_uniform(self.spec, lv));
     }
 
     /// Menu selection: swap to `spec` without stalling the frame. A model not
@@ -5572,9 +5595,19 @@ impl Game {
             let sz = self.spec.cam_dist / 16.0;
             let at = self.plane.centre();
             let dist = self.cam_dist * if self.plane.stage > 0 { 0.5 } else { 1.0 };
-            cam = at + d * dist + u * (1.5 * sz) + (self.plane.right() * self.rng.range(-1.0, 1.0) as f64 + u * self.rng.range(-1.0, 1.0) as f64) * (vibe * 0.03);
-            dir = if rocket { (at - cam).normalize() } else { (self.plane.pos + u * (1.2 * sz) + self.plane.forward() * (6.0 * sz) - cam).normalize() };
-            upv = if rocket { u } else { (u + self.plane.up() * 0.25).normalize() };
+            if still_mode() {
+                // Aircraft-picker stills: fixed to the airframe, aimed at its
+                // middle (yaw 0 behind it; pitch in radians, positive above it).
+                let (sy, cy) = self.cam_yaw.sin_cos();
+                let (sp, cp) = self.cam_pitch.sin_cos();
+                cam = at + self.plane.rot * DVec3::new(sy * cp, sp, cy * cp) * self.cam_dist * sz;
+                dir = (at - cam).normalize();
+                upv = self.plane.up();
+            } else {
+                cam = at + d * dist + u * (1.5 * sz) + (self.plane.right() * self.rng.range(-1.0, 1.0) as f64 + u * self.rng.range(-1.0, 1.0) as f64) * (vibe * 0.03);
+                dir = if rocket { (at - cam).normalize() } else { (self.plane.pos + u * (1.2 * sz) + self.plane.forward() * (6.0 * sz) - cam).normalize() };
+                upv = if rocket { u } else { (u + self.plane.up() * 0.25).normalize() };
+            }
             self.cam_pos = cam;
             self.cam_look = self.plane.pos;
         }
@@ -5800,7 +5833,8 @@ impl Game {
             flash: [[0.0; 4]; 2 * storm::MAX_FLASHES],
             rain: [[0.0; 4]; 2],
             quality: [0.0; 4],
-            detail: [self.gfx.city_k(), self.gfx.tree_imp_k(), self.gfx.tree_far(), 0.0],
+            // (w: 1 for aircraft-picker stills, `still_mode`)
+            detail: [self.gfx.city_k(), self.gfx.tree_imp_k(), self.gfx.tree_far(), if still_mode() { 1.0 } else { 0.0 }],
             nimbo: if in_menu { [[0.0; 4]; 4] } else { self.wx.deck_globals() },
             glow_c: glow[0],
             glow_e: glow[1],
@@ -6723,6 +6757,8 @@ impl Game {
     /// their imagery or 3D tiles are on screen, then the data credits.
     fn credits(&mut self, ctx: &egui::Context) {
         use egui::{Align2, Color32, RichText};
+        // (Aircraft-picker stills show the aircraft alone.)
+        if still_mode() { return; }
         let logo = self.google_shown().then(|| {
             self.gm_logo
                 .get_or_insert_with(|| {

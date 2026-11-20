@@ -4,13 +4,14 @@
 //! The cockpit lives in `cabin.rs`.
 pub mod cabin;
 
-use crate::aircraft::{Engine, Handling, Hole, Hull, Leg, Part, Piston, Sound, Spec, Tail};
+use crate::aircraft::{Engine, Handling, Hole, Hull, Leg, Livery, Part, Piston, Sound, Spec, Tail};
 use crate::airframe::*;
 use glam::{DVec3, Mat4, Quat, Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-/// Paint schemes offered by the aircraft picker, as (name, main, trim) in
-/// linear RGB. plane.wgsl (`livery`, its Cessna branch) paints them over the
+/// Paint schemes offered by the aircraft picker (`aircraft::liveries`): main
+/// colour (`colours[0]`, its w 1 for painted) and trim (`colours[1]`), linear
+/// RGB. plane.wgsl (`livery`, its Cessna branch) paints them over the
 /// white airframe: the main colour on the cheat line, the top of the fin, the
 /// wing and stabiliser tips, the spinner and the registration; the trim on the
 /// pinstripes. `None` is no paint at all: bare aluminium, registration in black.
@@ -19,36 +20,19 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 /// but no single factory paint recipe is established.
 /// References: https://blueskyaviation.cz/wp-content/uploads/2023/12/Cessna_172RG_C172RG_Cutlass_1981_POH.pdf
 /// and https://www.planesales.com.au/details/Listing/Single-Engine-Propeller/7574/1981-Cessna-172RG-Cutlass-Aircraft
-pub const LIVERIES: &[(&str, Option<([f32; 3], [f32; 3])>)] = &[
-    ("None", None),
-    ("Navy & red", Some(([0.010, 0.024, 0.075], [0.34, 0.018, 0.012]))),
-    ("Royal blue", Some(([0.025, 0.12, 0.48], [0.20, 0.45, 0.80]))),
-    ("Forest green", Some(([0.035, 0.22, 0.12], [0.86, 0.68, 0.12]))),
-    ("Burgundy", Some(([0.30, 0.025, 0.075], [0.88, 0.72, 0.48]))),
+pub const LIVERIES: &[Livery] = &[
+    Livery { name: "None", colours: [[0.0; 4]; 4], title: "", paint: None, swatch: [[0.62, 0.63, 0.65], [0.40, 0.41, 0.43]], still: include_bytes!("../../../assets/aircraft/liveries/c172_none.png") },
+    painted("Navy & red", [0.010, 0.024, 0.075], [0.34, 0.018, 0.012], include_bytes!("../../../assets/aircraft/liveries/c172_navy.png")),
+    painted("Royal blue", [0.025, 0.12, 0.48], [0.20, 0.45, 0.80], include_bytes!("../../../assets/aircraft/liveries/c172_royal.png")),
+    painted("Forest green", [0.035, 0.22, 0.12], [0.86, 0.68, 0.12], include_bytes!("../../../assets/aircraft/liveries/c172_green.png")),
+    painted("Burgundy", [0.30, 0.025, 0.075], [0.88, 0.72, 0.48], include_bytes!("../../../assets/aircraft/liveries/c172_burgundy.png")),
 ];
-/// The aircraft picker's picture in each scheme, in `LIVERIES` order. The
-/// navy & red one is the original still; the others are made from it by
-/// assets/aircraft/c172_liveries.py (rerun it if the colours change).
-pub const LIVERY_STILLS: &[&[u8]] = &[
-    include_bytes!("../../../assets/aircraft/c172_liveries/c172_none.png"),
-    include_bytes!("../../../assets/aircraft/c172.png"),
-    include_bytes!("../../../assets/aircraft/c172_liveries/c172_royal.png"),
-    include_bytes!("../../../assets/aircraft/c172_liveries/c172_green.png"),
-    include_bytes!("../../../assets/aircraft/c172_liveries/c172_burgundy.png"),
-];
-const _: () = assert!(LIVERY_STILLS.len() == LIVERIES.len());
+const fn painted(name: &'static str, m: [f32; 3], t: [f32; 3], still: &'static [u8]) -> Livery {
+    Livery { name, colours: [[m[0], m[1], m[2], 1.0], [t[0], t[1], t[2], 0.0], [0.0; 4], [0.0; 4]], title: "", paint: None, swatch: [m, t], still }
+}
 
 /// The scheme a new session starts with (the long-standing navy and red).
 pub const DEFAULT_LIVERY: usize = 1;
-
-/// The scheme as the shader takes it (`Paint::scheme`, `Paint::trim`): main
-/// colour and 1 (painted) or 0 (bare aluminium), trim colour.
-pub fn livery_uniform(choice: usize) -> [f32; 8] {
-    match LIVERIES[choice.min(LIVERIES.len() - 1)].1 {
-        Some((m, t)) => [m[0], m[1], m[2], 1.0, t[0], t[1], t[2], 0.0],
-        None => [0.0; 8],
-    }
-}
 
 pub fn build() -> Model {
     let mut b = Builder::default();
