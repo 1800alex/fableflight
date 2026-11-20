@@ -16,6 +16,8 @@ mod damage;
 mod destruct;
 mod fetch;
 mod frame_pacer;
+mod fsr3;
+mod fsr4;
 mod fgmodel;
 mod fluid;
 mod gputime;
@@ -63,6 +65,7 @@ mod skin;
 mod sources;
 mod traffic;
 mod trees;
+mod upscale;
 mod ocean;
 mod shore;
 mod skyglow;
@@ -293,6 +296,7 @@ struct Args {
     graphics: Option<graphics::Level>,
     storm_quality: Option<graphics::Level>,
     render_scale: Option<f32>,
+    upscaler: Option<graphics::Upscaler>,
     /// log the frame rate once a second (average and slowest frame)
     fps_log: bool,
     /// draw without showing anything (benchmarks and scripted shots with the screen off)
@@ -395,7 +399,7 @@ struct Args {
     mcp_port: u16,
 }
 
-const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--birds off|low|medium|high] [--flock gull|crow|starling|buzzard|goose,KM[,BEARING[,AGL_M]]] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit | --tail-view] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--storm-quality low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang CODE] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--livery N] [--still] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
+const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--birds off|low|medium|high] [--flock gull|crow|starling|buzzard|goose,KM[,BEARING[,AGL_M]]] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit | --tail-view] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--storm-quality low|medium|high|ultra] [--render-scale 0.5..2] [--upscaler bilinear|fsr1|fsr3|fsr4] [--fsr4-install] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang CODE] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--livery N] [--still] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
 
 fn parse_args() -> Args {
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -442,6 +446,7 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
         graphics: None,
         storm_quality: None,
         render_scale: None,
+        upscaler: None,
         fps_log: false,
         headless: false,
         minimap_plan: None,
@@ -862,6 +867,10 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
                 a.storm_quality = Some(graphics::Level::parse(s).filter(|l| *l != graphics::Level::Off).ok_or_else(|| format!("{flag}: expected low, medium, high or ultra, got '{s}'"))?);
             }
             "--render-scale" => a.render_scale = Some((req_num(flag, i)? as f32).clamp(graphics::SCALE_MIN, graphics::SCALE_MAX)),
+            "--upscaler" => {
+                let s = req(flag, i)?;
+                a.upscaler = Some(graphics::Upscaler::parse(s).ok_or_else(|| format!("{flag}: expected bilinear, fsr1, fsr3 or fsr4, got '{s}'"))?);
+            }
             "--headless" => {
                 a.headless = true;
                 used = 1;
@@ -1390,6 +1399,9 @@ impl Game {
         gfx.vsync &= args.vsync;
         gfx.taa &= args.taa && prefs.taa;
         let r = pollster::block_on(Renderer::new(window.clone(), gfx.vsync, std::env::var("FABLE_MSAA").ok().and_then(|v| v.parse().ok()).unwrap_or(gfx.samples())))?;
+        if let Some(u) = args.upscaler {
+            gfx.upscaler = u;
+        }
         if let Some(sc) = args.render_scale {
             gfx.scale = sc;
         } else if r.integrated && !graphics::Graphics::saved() {
@@ -5922,7 +5934,13 @@ impl Game {
         // Temporal anti-aliasing: each frame is drawn a different fraction of
         // a pixel off centre (a Halton sequence), and the renderer blends the
         // frames back together. Everything else works from the centred `vp`.
-        let jitter = if self.gfx.taa {
+        // (FSR 3.1/4.1 jitter whether or not the AA is on, through as many
+        // phases as AMD asks for the upscale ratio: upscale.rs.)
+        let jitter = if self.r.up.active().temporal() {
+            let [jx, jy] = fsr3::jitter_offset(self.frame, fsr3::jitter_phases(rw as u32, w as u32));
+            // AMD's offsets are in pixels, y down
+            Vec2::new(jx * 2.0 / rw, -jy * 2.0 / rh)
+        } else if self.gfx.taa {
             let halton = |mut i: u64, b: u64| { let (mut f, mut r) = (1.0f32, 0.0f32); while i > 0 { f /= b as f32; r += f * (i % b) as f32; i /= b; } r };
             let k = self.frame % 8 + 1;
             Vec2::new(halton(k, 2) - 0.5, halton(k, 3) - 0.5) * 2.0 / Vec2::new(rw, rh)
@@ -7057,7 +7075,8 @@ impl Game {
         if self.gfx_applied == Some(g) {
             return;
         }
-        self.r.set_scale(g.scale);
+        self.r.set_upscaler(g.upscaler);
+        self.r.set_scale(g.render_scale());
         self.r.set_shadow_res(g.shadow_res());
         self.r.set_vsync(g.vsync);
         self.r.ao = g.ao;
@@ -8473,6 +8492,25 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(i) = argv.iter().position(|a| a == "--fly-check") {
         std::process::exit(fly_check(argv.get(i + 1)));
+    }
+    if argv.iter().any(|a| a == "--fsr4-install") {
+        // AMD's FSR 4 runtime, as the graphics settings' button fetches it (fsr4.rs).
+        let last = std::cell::Cell::new(0u64);
+        let r = fsr4::download(&|done, total| {
+            if done >= last.get() + (4 << 20) || done == total {
+                last.set(done);
+                eprint!("\rFSR {} runtime: {} / {}", fsr4::VERSION, bytes(done), bytes(total));
+            }
+        });
+        eprintln!();
+        match r.and_then(|_| fsr4::verify()) {
+            Ok(dir) => println!("installed and verified in {}", dir.display()),
+            Err(e) => {
+                eprintln!("failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
     }
     if let Some(i) = argv.iter().position(|a| a == "--fg-install") {
         std::process::exit(hangar::install_report(&argv[i + 1..]));
