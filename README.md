@@ -40,7 +40,7 @@ Requires **Rust 1.85+** (edition 2024). Note that the Cargo crate and main simul
   sudo dnf install alsa-lib-devel systemd-devel pkgconf-pkg-config
   ```
 - **macOS:** Xcode Command Line Tools (`xcode-select --install`).
-- **Windows:** [Rust](https://www.rust-lang.org/tools/install) with the MSVC C++ Build Tools.
+- **Windows:** [Rust](https://www.rust-lang.org/tools/install) with the MSVC C++ Build Tools. On Windows x64, use **Visual Studio Installer** to modify your Build Tools installation and add **C++ ATL for x64/x86** under **Individual components**. ATL provides `atls.lib`, which the bundled DirectX shader compiler needs at link time.
 
 ### Build and run
 

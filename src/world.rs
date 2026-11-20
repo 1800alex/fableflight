@@ -295,6 +295,11 @@ impl World {
     /// Height of the ground (or water surface) at a lat/lon: the top of the
     /// photorealistic 3D mesh inside its zone (buildings included), our own
     /// terrain everywhere else.
+    /// Whether a sphere (camera-relative centre, radius) is in this frame's view.
+    pub fn in_view(&self, rel: DVec3, r: f64) -> bool {
+        self.frustum.as_ref().map(|f| f.sphere(rel, r)).unwrap_or(true)
+    }
+
     pub fn ground(&self, lat: f64, lon: f64) -> Option<Ground> {
         let g = self.terrain_ground(lat, lon);
         if let Some(mut h) = self.photo.as_deref().and_then(|p| p.ground(lat, lon, g.as_ref().map(|g| g.h))) {

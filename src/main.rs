@@ -5,6 +5,7 @@ mod airports;
 mod approach;
 mod audio;
 mod autopilot;
+mod birds;
 mod buildings;
 mod aircraft;
 mod cockpit;
@@ -266,6 +267,10 @@ struct Args {
     storms: Option<f32>,
     /// storm cells placed by hand: distance (km), compass bearing (deg), tower radius (km)
     storm_at: Vec<(f64, f64, f64, Option<weather::CellKind>)>,
+    /// --birds off|low|medium|high: birds for this run (birds.rs)
+    birds: Option<graphics::Level>,
+    /// --flock KIND,KM[,BEARING[,AGL]]: a flock that far from the start (repeatable)
+    flocks: Vec<(birds::Kind, f64, f64, Option<f64>)>,
     /// --squall-at: (km, bearing, length km) of squall lines
     squall_at: Vec<(f64, f64, f64)>,
     /// km,bearing: where the rain deck's area is centred, from the spawn
@@ -327,7 +332,7 @@ struct Args {
     /// left button pressed and released at these times (s)
     cursor: Option<(f64, f64)>,
     clicks: Vec<MouseScript>,
-    cockpit: bool,
+    start_view: Option<u8>,
     /// --mp server[,name]: multiplayer on, through this relay
     mp: Option<(String, Option<String>)>,
     /// --mp-list URL: read the server list from there (testing a relay)
@@ -388,7 +393,7 @@ struct Args {
     mcp_port: u16,
 }
 
-const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr|ko] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
+const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--birds off|low|medium|high] [--flock gull|crow|starling|buzzard|goose,KM[,BEARING[,AGL_M]]] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit | --tail-view] [--fov DEG] [--no-vsync] [--no-taa] [--graphics low|medium|high|ultra] [--render-scale 0.5..2] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang en|fr|ko] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
 
 fn parse_args() -> Args {
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -418,6 +423,8 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
         clouds: 0.5,
         storms: None,
         storm_at: Vec::new(),
+        birds: None,
+        flocks: Vec::new(),
         squall_at: Vec::new(),
         rain_at: None,
         time_rate: None,
@@ -459,7 +466,7 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
         photoreal: None,
         photo_detail: None,
         cam: None,
-        cockpit: false,
+        start_view: None,
         fov: None,
         mute: false,
         lang: None,
@@ -572,8 +579,8 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
                 a.menu = Some(false);
                 used = 1;
             }
-            "--cockpit" => {
-                a.cockpit = true;
+            "--cockpit" | "--tail-view" => {
+                a.start_view = Some(if v[i] == "--cockpit" { 1 } else { settings::TAIL_VIEW });
                 used = 1;
             }
             "--fov" => {
@@ -608,6 +615,24 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
             "--time" => a.hour = req_num(flag, i)?,
             "--clouds" => a.clouds = req_num(flag, i)? as f32,
             "--storms" => a.storms = Some(req_num(flag, i)? as f32),
+            "--birds" => {
+                let s = req(flag, i)?;
+                a.birds = Some(graphics::Level::parse(s).ok_or_else(|| format!("{flag}: invalid level '{s}'"))?);
+            }
+            "--flock" => {
+                let s = req(flag, i)?;
+                let (kind, values) = s.split_once(',').ok_or_else(|| format!("{flag}: expected kind,km[,bearing[,agl]], got '{s}'"))?;
+                let kind = birds::Kind::parse(kind).ok_or_else(|| format!("{flag}: unknown bird kind '{kind}'"))?;
+                let values: Vec<f64> = values.split(',').map(|part| {
+                    part.parse::<f64>().ok().filter(|n| n.is_finite())
+                        .ok_or_else(|| format!("{flag}: invalid number '{part}' in '{s}'"))
+                }).collect::<Result<_, _>>()?;
+                if values.len() > 3 {
+                    return Err(format!("{flag}: expected kind,km[,bearing[,agl]], got '{s}'"));
+                }
+                // Without a bearing, place the flock ahead on the aircraft's path.
+                a.flocks.push((kind, values[0], values.get(1).copied().unwrap_or(f64::NAN), values.get(2).copied()));
+            }
             "--storm-at" => {
                 // km,bearing[,radius km[,shower|thunder|severe|supercell]]: a convective cell that far
                 // from the spawn, a mature cumulonimbus unless a kind says otherwise (repeatable)
@@ -1051,6 +1076,7 @@ struct Game {
     cam_pitch: f64,
     cam_dist: f64,
     cam_mode: u8,
+    view_before_tail: u8,
     cam_pos: DVec3,
     cam_dir: DVec3,
     cam_look: DVec3,
@@ -1245,6 +1271,13 @@ struct Game {
     snowmap: snowmap::SnowMap,
     /// dynamic snow tracks and crash trails carved into lying snow (snowtrack.rs)
     snowtrack: snowtrack::SnowTrack,
+    /// birds around the camera (birds.rs), and the setting for this run if given
+    birds: birds::Birds,
+    birds_level: Option<graphics::Level>,
+    /// bird instances drawn last frame (the fps log)
+    bird_insts: usize,
+    /// the flown aircraft's shape for bird strikes, and which type it is of
+    bird_shape: (&'static str, birds::Shape),
     /// an airport start being prepared: (airport, the airfield if it could be put together, runway, on approach, keep the local time)
     airport_rx: Option<std::sync::mpsc::Receiver<(u32, Option<Arc<airports::Geo>>, Option<String>, bool, bool)>>,
     /// an airport start asked for on the command line
@@ -1384,6 +1417,8 @@ impl Game {
         solids.extend(destruct::rebar_meshes());
         debug_assert_eq!(solids.len() as u32, airmodels::BASE);
         solids.extend(airmodels::build());
+        debug_assert_eq!(solids.len() as u32, birds::BASE);
+        solids.extend(birds::models().meshes.iter().cloned());
         r.set_inst_meshes(&solids);
         let mut menu = menu::Menu::new(lat, lon, args.hour);
         menu.fuel = args.fuel.unwrap_or(menu.fuel);
@@ -1500,7 +1535,7 @@ impl Game {
         let mut g = Self {
             gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: std::collections::HashMap::new(), window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, piece_inner, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, lean_drag: None, last_cursor: None,
             minimap: minimap::Minimap::new(&prefs),
-            cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
+            cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: args.start_view.unwrap_or(prefs.cam_mode), view_before_tail: 0, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
             utc: (args.hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], gfx, gfx_applied: None, prev_plane: Mat4::IDENTITY, plane_box, lamps,
             frame: 0, fps: 60.0, fps_log: (args.fps_log, Instant::now(), 0, 0.0), paused: false, show_help: false, show_hud: !args.no_hud && prefs.show_hud, hud_cockpit: prefs.hud_cockpit, arcade: args.arcade || prefs.arcade, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, stage_at: args.stage_at, engines: args.engines, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, pad_y: false, pad_y_combo: false, pad_held: Vec::new(), pad_note: (String::new(), 0.0), pad_aim: false, ap: autopilot::Autopilot::default(), ap_off_t: -100.0, ap_script: args.ap_script.clone(), cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
@@ -1509,7 +1544,7 @@ impl Game {
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
-            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, snow_field: storm::RainField::default(), cam_snow: start_snow, cam_blow: 0.0, fresh: snow::Fresh::default(), fresh_line: 0.0, storm_adapt: 0.0, plane, weapons,
+            start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), birds: birds::Birds::with_flocks(args.flocks.clone()), birds_level: args.birds, bird_insts: 0, bird_shape: ("", birds::Shape::default()), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, snow_field: storm::RainField::default(), cam_snow: start_snow, cam_blow: 0.0, fresh: snow::Fresh::default(), fresh_line: 0.0, storm_adapt: 0.0, plane, weapons,
             airport_rx: None, hold_spot: None,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
@@ -1640,8 +1675,24 @@ impl Game {
             self.head.rear = true;
         } else {
             self.head.rear = false;
-            self.cam_mode = (self.cam_mode + 1) % 2;
+            self.cam_mode = if self.cam_mode == 1 { 0 } else { 1 };
         }
+    }
+
+    fn toggle_tail_view(&mut self) {
+        self.cancel_cockpit_input();
+        if self.cam_mode == settings::TAIL_VIEW {
+            self.cam_mode = self.view_before_tail;
+        } else {
+            self.view_before_tail = self.cam_mode;
+            self.cam_mode = settings::TAIL_VIEW;
+        }
+        self.status = match self.cam_mode {
+            settings::TAIL_VIEW => t!("Fixed rear view", "Vue arrière fixe"),
+            1 => t!("Cockpit view", "Vue cockpit"),
+            _ => t!("Free chase view", "Vue extérieure libre"),
+        }.into();
+        self.status_until = self.real + 2.0;
     }
 
     fn set_aircraft(&mut self, spec: &'static aircraft::Spec) {
@@ -2975,7 +3026,7 @@ impl Game {
         c.throttle = (c.throttle + self.pad.throttle).clamp(-1.0, 1.0);
 
         // (With the flight panel open the right stick scrolls it instead.)
-        if flying && nav != Nav::Panel {
+        if flying && nav != Nav::Panel && self.cam_mode != settings::TAIL_VIEW {
             // Right stick: look around, as fast as a quick head turn at full deflection.
             // Pushed right the view swings right, in the cockpit and outside.
             let rate = 2.2 * self.look_sens * dt;
@@ -3078,6 +3129,9 @@ impl Game {
         use padmap::{Does, View};
         match padmap::does(id, self.spec.rocket().is_some())? {
             Does::View(v) => {
+                if self.cam_mode == settings::TAIL_VIEW {
+                    return None;
+                }
                 // Quick views. Outside, left and right look at that side of the aircraft.
                 let (home_y, home_p) = self.cam_home;
                 let side = if self.cam_mode == 1 { 1.0 } else { -1.0 };
@@ -4000,6 +4054,7 @@ impl Game {
             KeyCode::KeyR if self.arcade || self.crashed => self.respawn_here(),
             KeyCode::KeyR => self.arcade_only(t!("Respawning in flight", "La réapparition en vol")),
             KeyCode::KeyC => self.next_view(),
+            KeyCode::F6 if !self.crashed => self.toggle_tail_view(),
             KeyCode::KeyF if !self.crashed => self.plane.set_flaps(1),
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
             KeyCode::KeyL if !self.crashed => self.plane.toggle_gear(),
@@ -4344,6 +4399,94 @@ impl Game {
     }
 
     /// Particles live in a frame anchored near the action; move it if the action has moved on.
+    /// Advances the birds (birds.rs) around the camera; returns their strikes.
+    fn step_birds(&mut self, dt: f64) -> Vec<birds::Strike> {
+        let level = self.birds_level.unwrap_or(self.gfx.birds);
+        let sun = self.sun_dir();
+        let (utc, doy, rain, conv) = (self.utc, self.doy, self.wx.rain as f64, self.wx.convection());
+        let world = &self.world;
+        let wx = &self.wx;
+        let ground = |p: DVec3| {
+            let (la, lo, _) = geo::pos_to_lla(p);
+            world.ground(la, lo).map(|g| g.h)
+        };
+        let place = |p: DVec3| {
+            let (la, lo, _) = geo::pos_to_lla(p);
+            world.ground(la, lo)?;
+            // The share of water round about: the point and eight more 800 m out.
+            let (e, n, _) = geo::enu(p);
+            let mut wet = 0;
+            let mut seen = 0;
+            for k in 0..9 {
+                let a = k as f64 * std::f64::consts::TAU / 8.0;
+                let q = if k == 8 { p } else { p + (e * a.sin() + n * a.cos()) * 800.0 };
+                let (qa, qo, _) = geo::pos_to_lla(q);
+                if let Some(g) = world.ground(qa, qo) {
+                    seen += 1;
+                    wet += g.water as i32;
+                }
+            }
+            Some(birds::Place {
+                lat: la.to_degrees(),
+                doy,
+                hour: (utc + lo.to_degrees() / 15.0).rem_euclid(24.0),
+                sun: p.normalize().dot(sun),
+                water: if seen > 0 { wet as f64 / seen as f64 } else { 0.0 },
+                convection: conv,
+                rain,
+            })
+        };
+        let t = self.time;
+        let thermal = |p: DVec3, agl: f64| wx.thermal(p, agl, t);
+        let wind = |p: DVec3, agl: f64| wx.steady(p, agl);
+        let env = birds::Env { place: &place, ground: &ground, thermal: &thermal, wind: &wind };
+        // (The aircraft's shape for the strike test, made once per type.)
+        if self.bird_shape.0 != self.spec.keys[0] {
+            self.bird_shape = (self.spec.keys[0], birds::Shape::of(self.spec));
+        }
+        let plane = birds::Aircraft {
+            pos: self.plane.pos,
+            vel: self.plane.vel,
+            rot: self.plane.rot,
+            shape: &self.bird_shape.1,
+            flying: !self.crashed,
+        };
+        // (Last frame's camera: this frame's is placed after the physics.)
+        self.birds.step(dt, self.prev_cam, level, &plane, &env)
+    }
+
+    /// A bird hit the aircraft: a thud, a burst of feathers, a note. No damage.
+    fn bird_strike(&mut self, s: birds::Strike, femit: &mut Vec<(DVec3, render::Particle)>) {
+        // (Where it met the aircraft's box, back in the planet frame.)
+        let at = self.plane.pos + self.plane.rot * s.at.as_dvec3();
+        log::info!("bird strike: a {} at {:.0} m/s, body frame {:.1?}", s.kind.spec().name, s.speed, s.at);
+        self.anchor_fx(at);
+        let sp = s.kind.spec();
+        // Pale or dark feathers, as the bird was.
+        let shade = match s.kind {
+            birds::Kind::Gull => 0.85,
+            birds::Kind::Goose => 0.45,
+            birds::Kind::Buzzard => 0.35,
+            _ => 0.06,
+        };
+        let n = (12.0 + 40.0 * sp.mass.sqrt()) as usize;
+        let v = self.plane.vel.as_vec3();
+        for _ in 0..n {
+            let r = &mut self.rng;
+            femit.push((at, render::Particle { vel: (v * r.range(0.2, 0.7) + r.dir() * r.range(1.0, 5.0)).into(), life: r.range(4.0, 9.0), size0: r.range(0.03, 0.08) * sp.span.sqrt() as f32, size1: r.range(0.04, 0.1) * sp.span.sqrt() as f32, kind: crash::FEATHER, drag: r.range(1.5, 3.0), seed: r.f(), temp: shade * r.range(0.8, 1.1), alpha: 1.0, ..Default::default() }));
+        }
+        // A puff of down, carried off in the slipstream: what the eye catches.
+        for _ in 0..3 {
+            let r = &mut self.rng;
+            let k = sp.span.sqrt() as f32;
+            femit.push((at, render::Particle { vel: (v * r.range(0.3, 0.6) + r.dir() * 2.0).into(), life: r.range(0.5, 0.9), size0: 0.4 * k, size1: r.range(1.5, 2.5) * k, kind: crash::MIST, drag: 2.5, seed: r.f(), alpha: 0.35, ..Default::default() }));
+        }
+        if let Some(a) = &self.audio {
+            a.event(audio::Event::Bump(birds::thud(&s)));
+        }
+        self.flash.push((t!("Bird strike", "Impact d'oiseau").to_string(), self.real));
+    }
+
     fn anchor_fx(&mut self, at: DVec3) {
         let stale = self.crash.as_ref().map(|c| c.time > 90.0).unwrap_or(true);
         if stale && (self.fx_anchor - at).length() > 800.0 {
@@ -5316,6 +5459,12 @@ impl Game {
                     self.sheds.snow_marks.clear();
                 }
             }
+            // Birds (birds.rs): fly, dive out of the way, now and then strike.
+            if !in_menu {
+                for s in self.step_birds(dt) {
+                    self.bird_strike(s, &mut femit);
+                }
+            }
         }
         let booms: Vec<f32> = self.destr.booms.drain(..).collect();
         if !booms.is_empty() {
@@ -5616,6 +5765,15 @@ impl Game {
             dir = r * DVec3::NEG_Z;
             upv = r * DVec3::Y;
             self.cam_pos = cam;
+        } else if self.cam_mode == settings::TAIL_VIEW {
+            let at = self.plane.centre();
+            let dist = self.cam_dist * if self.plane.stage > 0 { 0.5 } else { 1.0 };
+            upv = self.plane.up();
+            cam = at - self.plane.forward() * dist + upv * (0.25 * dist);
+            dir = (at + self.plane.forward() * (0.25 * dist) - cam).normalize();
+            self.cam_pos = cam;
+            self.cam_dir = -self.plane.forward();
+            self.cam_look = at;
         } else {
             let u = self.plane.pos.normalize();
             // (A rocket points at the sky: its chase camera stays level with it, on the side its back is to, and closes in on the ship once that flies alone.)
@@ -6112,6 +6270,10 @@ impl Game {
             self.destr.skin_frame(cam);
             self.destr.upload_skins(&self.r);
             self.world.airport_instances(cam, self.wx.wind_from as f32, (self.wx.wind * 1.94384) as f32, self.time, &mut insts, &mut air_lights);
+            let world = &self.world;
+            let before = insts.len();
+            self.birds.instances(cam, 2.0 * (fov as f64 * 0.5).tan() / h as f64, &|rel, r| world.in_view(rel, r), &mut insts);
+            self.bird_insts = insts.len() - before;
             self.world.photo_beacons(cam, &mut air_lights);
         }
         self.live.step(&self.src, (!in_menu).then_some(self.plane.pos));
@@ -6192,7 +6354,7 @@ impl Game {
         let mut shot = match self.shots.first() {
             Some((t, _, _)) if self.real >= *t => {
                 // Logged with each scripted shot, for comparing builds.
-                log::info!("fps {:.1}  rain {:.2} (glass {:.2}, wet {:.2}, hail {:.2})  sigma {:.2} draft {:.1}", self.fps, self.cam_rain, self.wx.rain, self.glass.wet, self.cam_hail, self.plane.air.sigma_w, self.plane.air.draft);
+                log::info!("fps {:.1}  rain {:.2} (glass {:.2}, wet {:.2}, hail {:.2})  sigma {:.2} draft {:.1}  birds {} in {} flocks ({} drawn, nearest {:.0} m)", self.fps, self.cam_rain, self.wx.rain, self.glass.wet, self.cam_hail, self.plane.air.sigma_w, self.plane.air.draft, self.birds.count(), self.birds.flocks.len(), self.bird_insts, self.birds.nearest(self.prev_cam));
                 Some(self.shots.remove(0).1)
             }
             _ => None,
@@ -7879,7 +8041,7 @@ impl ApplicationHandler for App {
                         let scale = 0.85 / g.window.inner_size().height.max(1) as f64;
                         g.head.lean_by((position.x - x) * scale, (y - position.y) * scale);
                     }
-                } else if g.drag && !g.pause_open {
+                } else if g.drag && !g.pause_open && g.cam_mode != settings::TAIL_VIEW {
                     if let Some((x, y)) = g.last_cursor {
                         // Zoomed in, the view turns slower under the mouse.
                         let k = g.look_sens * if g.cam_mode == 1 { g.head.zoom } else { 1.0 };

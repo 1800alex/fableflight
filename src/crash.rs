@@ -182,6 +182,7 @@ pub const GRIT: f32 = 7.0; // pale masonry dust
 pub const SOOT: f32 = 8.0; // smoke carried on from the fire simulation
 pub const GLASS: f32 = 9.0; // shards of window glass
 pub const DROPS: f32 = 10.0; // thrown water, streaked along its flight
+pub const FEATHER: f32 = 11.0; // a bird's feathers after a strike (temp = how pale)
 
 fn crash_ignition_chance(fuel: f32, energy_per_kg: f32, steep: f32, tank_hit: bool) -> f32 {
     let fuel = fuel.clamp(0.0, 1.0);
