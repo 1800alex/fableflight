@@ -61,6 +61,9 @@ pub struct Graphics {
     pub scale: f32,
     pub shadows: Level,
     pub clouds: Level,
+    /// storm cell rendering detail (separate from ordinary clouds so heavy
+    /// thunderstorm, supercell and squall-line skies can be tuned on their own)
+    pub storms: Level,
     pub terrain: Level,
     /// how far out buildings and trees are loaded
     pub scenery: Level,
@@ -70,6 +73,8 @@ pub struct Graphics {
     pub trees: Level,
     /// moving and parked cars (Off, or Low to High; Ultra is High)
     pub cars: Level,
+    /// birds in the air (birds.rs; Off, or Low to High; Ultra is High)
+    pub birds: Level,
     /// ambient occlusion (GTAO)
     pub ao: bool,
     // Not part of the presets: preferences more than costs.
@@ -92,7 +97,7 @@ pub const SCALE_MAX: f32 = 2.0;
 impl Graphics {
     /// One of the presets (taa and vsync on).
     pub fn preset(l: Level) -> Self {
-        let mut g = Graphics { scale: 1.0, shadows: Level::High, clouds: Level::High, terrain: Level::High, scenery: Level::High, city: Level::High, trees: Level::High, cars: Level::High, ao: true, taa: true, vsync: true, fps_cap: 0 };
+        let mut g = Graphics { scale: 1.0, shadows: Level::High, clouds: Level::High, storms: Level::High, terrain: Level::High, scenery: Level::High, city: Level::High, trees: Level::High, cars: Level::High, birds: Level::High, ao: true, taa: true, vsync: true, fps_cap: 0 };
         g.apply(l);
         g
     }
@@ -108,11 +113,13 @@ impl Graphics {
             h => h,
         };
         self.clouds = l;
+        self.storms = l;
         self.terrain = l;
         self.scenery = l;
         self.city = l;
         self.trees = l;
         self.cars = if l == Level::Ultra { Level::High } else { l };
+        self.birds = if l == Level::Ultra { Level::High } else { l };
         self.ao = matches!(l, Level::High | Level::Ultra);
     }
 
@@ -144,6 +151,27 @@ impl Graphics {
     /// Length of the cloud raymarch's steps relative to High (clouds.wgsl).
     pub fn cloud_step(&self) -> f32 {
         self.clouds.pick(1.8, 1.35, 1.0, 0.7) as f32
+    }
+
+    /// Storm cell quality tier passed in Globals.detail.w (1 Low .. 4 Ultra;
+    /// 0 in WGSL falls back to High).
+    pub fn storm_tier(&self) -> f32 {
+        match self.storms {
+            Level::Off | Level::Low => 1.0,
+            Level::Medium => 2.0,
+            Level::High => 3.0,
+            Level::Ultra => 4.0,
+        }
+    }
+
+    /// Maximum nearby storm cells uploaded for rendering (nearest first; flight
+    /// physics and weather radar still use all cells in `Weather::cells`).
+    pub fn storm_max_cells(&self) -> usize {
+        match self.storms {
+            Level::Off | Level::Low => 8,
+            Level::Medium => 12,
+            Level::High | Level::Ultra => crate::weather::MAX_STORMS,
+        }
     }
 
     /// Terrain tile split threshold (tile width / distance, world.rs `lod_k`):
@@ -213,11 +241,13 @@ impl Graphics {
         }
         g.shadows = j["shadows"].as_str().and_then(Level::parse).unwrap_or(g.shadows);
         g.clouds = lvl("clouds", g.clouds);
+        g.storms = lvl("storms", g.clouds);
         g.terrain = lvl("terrain", g.terrain);
         g.scenery = lvl("scenery", g.scenery);
         g.city = lvl("city", g.city);
         g.trees = lvl("trees", g.trees);
         g.cars = j["cars"].as_str().and_then(Level::parse).map(|l| if l == Level::Ultra { Level::High } else { l }).unwrap_or(g.cars);
+        g.birds = j["birds"].as_str().and_then(Level::parse).map(|l| if l == Level::Ultra { Level::High } else { l }).unwrap_or(g.birds);
         g.ao = j["ao"].as_bool().unwrap_or(g.ao);
         g.taa = j["taa"].as_bool().unwrap_or(g.taa);
         g.vsync = j["vsync"].as_bool().unwrap_or(g.vsync);
@@ -231,11 +261,13 @@ impl Graphics {
             "scale": self.scale,
             "shadows": self.shadows.name(),
             "clouds": self.clouds.name(),
+            "storms": self.storms.name(),
             "terrain": self.terrain.name(),
             "scenery": self.scenery.name(),
             "city": self.city.name(),
             "trees": self.trees.name(),
             "cars": self.cars.name(),
+            "birds": self.birds.name(),
             "ao": self.ao,
             "taa": self.taa,
             "vsync": self.vsync,
@@ -302,6 +334,15 @@ impl Graphics {
             }
         });
         row(ui, t!("graphics.clouds"), "", |ui| levels(ui, &mut self.clouds, false));
+        row(ui, t!("graphics.storm_cells"), t!("graphics.storm_cells_hint"), |ui| {
+            levels(ui, &mut self.storms, false);
+            dim(ui, match self.storms {
+                Level::Off | Level::Low => t!("graphics.storms_low").into(),
+                Level::Medium => t!("graphics.storms_medium").into(),
+                Level::High => t!("graphics.storms_high").into(),
+                Level::Ultra => t!("graphics.storms_ultra").into(),
+            });
+        });
         row(ui, t!("graphics.terrain_detail"), "", |ui| levels(ui, &mut self.terrain, false));
         row(ui, t!("graphics.scenery_distance"), "", |ui| {
             levels(ui, &mut self.scenery, false);
@@ -324,6 +365,15 @@ impl Graphics {
             });
             let (share, far, _) = self.car_density();
             dim(ui, if share > 0.0 { t!("graphics.traffic_share", share * 100.0, far / 1000.0) } else { t!("graphics.no_cars").into() });
+        });
+        row(ui, t!("graphics.birds"), t!("graphics.birds_hint"), |ui| {
+            menu::segments(ui, |ui| {
+                for l in [Level::Off, Level::Low, Level::Medium, Level::High] {
+                    menu::seg(ui, &mut self.birds, l, l.name());
+                }
+            });
+            let (flocks, birds) = crate::birds::caps(self.birds);
+            dim(ui, if flocks > 0 { t!("graphics.birds_caps", flocks, birds) } else { t!("graphics.no_birds").to_string() });
         });
         row(ui, t!("graphics.ambient_occlusion"), t!("graphics.ambient_occlusion_hint"), |ui| {
             menu::switch(ui, &mut self.ao);
@@ -379,6 +429,19 @@ mod tests {
     fn high_is_the_old_look() {
         let g = Graphics::default();
         assert_eq!((g.scale, g.shadow_res(), g.cloud_step(), g.lod_k(), g.reach(), g.ao), (1.0, 4096, 1.0, 0.62, 1.0, true));
+        assert_eq!((g.storms, g.storm_tier(), g.storm_max_cells()), (Level::High, 3.0, crate::weather::MAX_STORMS));
         assert_eq!((g.city_k(), g.tree_far(), g.tree_imp_k(), g.car_density()), (1.0, 3200.0, 1.0, (1.0, 2200.0, 1100.0)));
+    }
+
+    #[test]
+    fn storm_quality_independent_of_clouds() {
+        let mut g = Graphics::preset(Level::High);
+        g.storms = Level::Medium;
+        assert_eq!(g.matches(), None, "changing storm quality independently makes a custom profile");
+        assert_eq!((g.clouds, g.storms, g.storm_tier(), g.storm_max_cells()), (Level::High, Level::Medium, 2.0, 12));
+        g.storms = Level::Low;
+        assert_eq!((g.storm_tier(), g.storm_max_cells()), (1.0, 8));
+        g.storms = Level::Ultra;
+        assert_eq!((g.storm_tier(), g.storm_max_cells()), (4.0, crate::weather::MAX_STORMS));
     }
 }

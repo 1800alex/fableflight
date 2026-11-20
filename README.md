@@ -28,6 +28,8 @@ Download the [latest release](https://github.com/Rolandjg/fableflight/releases/l
 
 ## Compiling
 
+On Windows x64 with MSVC, open **Visual Studio Installer**, choose **Modify** for your Build Tools installation, and select **C++ ATL for x64/x86** under **Individual components**. ATL provides `atls.lib`, which the bundled DirectX shader compiler needs at link time.
+
 Install [Rust](https://www.rust-lang.org/tools/install), then run:
 
 ```sh

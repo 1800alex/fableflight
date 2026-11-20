@@ -146,6 +146,7 @@ pub const ACTIONS: &[Action] = &[
     act("ap_alt_up", KeyCode::Quote),
     act("heading_sync", KeyCode::KeyK),
     act("camera", KeyCode::KeyC),
+    act("tail_view", KeyCode::F6),
     act("hud", KeyCode::KeyH),
     act("minimap", KeyCode::Backquote),
     act("goto", KeyCode::KeyG),
@@ -243,7 +244,14 @@ impl Bindings {
     /// An incoming key as the game should see it: the key it stands for,
     /// itself when it has not been touched, None when it does nothing now.
     pub fn map_key(&self, k: KeyCode) -> Option<KeyCode> {
-        self.remap.get(&k).copied().unwrap_or(Some(k))
+        if let Some(mapped) = self.remap.get(&k) {
+            return *mapped;
+        }
+        // The extra key beside left Shift on ISO keyboards is within reach of ZQSD.
+        if k == KeyCode::IntlBackslash && !self.keys.contains_key("tail_view") {
+            return Some(KeyCode::F6);
+        }
+        Some(k)
     }
 
     /// Moves an action to a key; any other action on that key loses it.
@@ -620,6 +628,7 @@ pub fn key_name(k: KeyCode) -> String {
         KeyCode::Minus => "-",
         KeyCode::Equal => "=",
         KeyCode::Backquote => "`",
+        KeyCode::IntlBackslash => return crate::i18n::tr("key.iso").to_string(),
         KeyCode::ArrowUp => "↑",
         KeyCode::ArrowDown => "↓",
         KeyCode::ArrowLeft => "←",
@@ -649,6 +658,21 @@ mod tests {
         b.set_key("master_arm", KeyCode::Digit8);
         assert_eq!(b.map_key(KeyCode::Digit8), Some(arm.key));
         assert_eq!(b.map_key(KeyCode::Digit7), Some(canopy.key));
+    }
+
+    #[test]
+    fn rear_camera_iso_shortcut_respects_custom_bindings() {
+        use KeyCode::{F6, F9, IntlBackslash, KeyL};
+        let mut b = Bindings::default();
+        assert_eq!(b.map_key(F6), Some(F6));
+        assert_eq!(b.map_key(IntlBackslash), Some(F6));
+        b.set_key("gear", IntlBackslash);
+        assert_eq!(b.map_key(IntlBackslash), Some(KeyL));
+        b.reset_key("gear");
+        b.set_key("tail_view", F9);
+        assert_eq!(b.map_key(IntlBackslash), Some(IntlBackslash));
+        assert_eq!(b.map_key(F6), None);
+        assert_eq!(b.map_key(F9), Some(F6));
     }
 
     #[test]

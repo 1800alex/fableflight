@@ -33,6 +33,14 @@ roxmltree = "0.20"
 rustc-hash = "2"
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
 
+# Windows: shaders compiled with DXC built in. wgpu otherwise falls back to
+# FXC, which can't compile the composite pass (it gives up unrolling its
+# loops: error X3511), so the game crashed on start whenever wgpu picked
+# DirectX 12, as on WARP or machines without a Vulkan driver. wgpu's default
+# compiler choice (Auto) uses the built-in DXC when it is there. x86-64 MSVC only.
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "30", features = ["static-dxc"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # opens Feral GameMode's client library at run time (gamemode.rs)
 libloading = "0.8"
