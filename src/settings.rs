@@ -18,8 +18,10 @@ pub struct Settings {
     pub cockpit_fov: f32,
     pub look_sens: f64,
     pub show_hud: bool,
-    /// the HUD in the cockpit view too (off: hidden there, the cockpit's own instruments in view)
+    /// the hud in the cockpit view too.
     pub hud_cockpit: bool,
+    /// the flight path marker: a ring where the aircraft is going.
+    pub path_marker: bool,
     pub taa: bool,
     pub minimap: bool,
     pub landing_guidance: bool,
@@ -42,25 +44,24 @@ pub struct Settings {
     pub multiplayer: bool,
     pub mp_server: String,
     pub mp_name: String,
-    /// where and how the last flight started (the globe opens on it, and
-    /// the main menu offers to fly it again)
+    /// where the last flight started.
     pub last: Option<LastStart>,
 }
 
-/// The start of the last flight.
+/// the start of the last flight.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LastStart {
     pub lat: f64,
     pub lon: f64,
-    /// what the start point was called on the globe
+    /// the start point's name.
     pub name: String,
-    /// the airport's ident, when it was one
+    /// the airport's ident, if any.
     pub airport: Option<String>,
-    /// "runway", "approach" or "overhead"
+    /// "runway", "approach" or "overhead".
     pub start: String,
-    /// the runway end asked for (None: the one into the wind)
+    /// the runway end, none for into the wind.
     pub runway: Option<String>,
-    /// the aircraft's key (`aircraft::Spec::keys[0]`)
+    /// the aircraft's key.
     pub aircraft: String,
 }
 
@@ -79,7 +80,7 @@ impl LastStart {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, hud_cockpit: false, minimap: true, landing_guidance: true, arcade: false, minimap_plan: false, minimap_heading_up: false, minimap_zoom: 12, minimap_size: 280.0, minimap_height: 280.0, taa: true, live_traffic: true, live_weather: true, real_time: true, snow: crate::snow::Mode::Auto, last: None, multiplayer: false, mp_server: "auto".into(), mp_name: String::new() }
+        Self { lang: None, sound_on: true, volume: 1.0, cam_mode: 0, cockpit_fov: crate::cockpit::FOV, look_sens: 1.0, show_hud: true, hud_cockpit: false, path_marker: false, minimap: true, landing_guidance: true, arcade: false, minimap_plan: false, minimap_heading_up: false, minimap_zoom: 12, minimap_size: 280.0, minimap_height: 280.0, taa: true, live_traffic: true, live_weather: true, real_time: true, snow: crate::snow::Mode::Auto, last: None, multiplayer: false, mp_server: "auto".into(), mp_name: String::new() }
     }
 }
 
@@ -109,6 +110,7 @@ impl Settings {
             look_sens: f("mouse_look_speed", d.look_sens).clamp(0.25, 3.0),
             show_hud: b("hud", d.show_hud),
             hud_cockpit: b("hud_cockpit", d.hud_cockpit),
+            path_marker: b("path_marker", d.path_marker),
             taa: b("taa", d.taa),
             minimap: b("minimap", d.minimap),
             landing_guidance: b("landing_guidance", d.landing_guidance),
@@ -139,6 +141,7 @@ impl Settings {
             "mouse_look_speed": self.look_sens,
             "hud": self.show_hud,
             "hud_cockpit": self.hud_cockpit,
+            "path_marker": self.path_marker,
             "taa": self.taa,
             "minimap": self.minimap,
             "landing_guidance": self.landing_guidance,
@@ -179,7 +182,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let s = Settings { lang: Lang::parse("fr"), sound_on: false, volume: 0.4, cam_mode: 1, cockpit_fov: 50.0, look_sens: 1.5, show_hud: false, hud_cockpit: true, minimap: false, landing_guidance: false, arcade: true, minimap_plan: true, minimap_heading_up: true, minimap_zoom: 15, minimap_size: 420.0, minimap_height: 300.0, taa: false, live_traffic: false, live_weather: false, real_time: false, snow: crate::snow::Mode::Always, last: Some(LastStart { lat: 37.6, lon: -122.4, name: "KSFO".into(), airport: Some("KSFO".into()), start: "approach".into(), runway: Some("28L".into()), aircraft: "c172".into() }), multiplayer: true, mp_server: "example.org:7000".into(), mp_name: "Dany".into() };
+        let s = Settings { lang: Lang::parse("fr"), sound_on: false, volume: 0.4, cam_mode: 1, cockpit_fov: 50.0, look_sens: 1.5, show_hud: false, hud_cockpit: true, path_marker: true, minimap: false, landing_guidance: false, arcade: true, minimap_plan: true, minimap_heading_up: true, minimap_zoom: 15, minimap_size: 420.0, minimap_height: 300.0, taa: false, live_traffic: false, live_weather: false, real_time: false, snow: crate::snow::Mode::Always, last: Some(LastStart { lat: 37.6, lon: -122.4, name: "KSFO".into(), airport: Some("KSFO".into()), start: "approach".into(), runway: Some("28L".into()), aircraft: "c172".into() }), multiplayer: true, mp_server: "example.org:7000".into(), mp_name: "Dany".into() };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         let tail = Settings { cam_mode: TAIL_VIEW, ..Settings::default() };
         assert_eq!(Settings::from_json(&tail.to_json()), tail);

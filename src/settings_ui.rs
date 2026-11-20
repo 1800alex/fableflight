@@ -253,7 +253,7 @@ impl Game {
             menu::screen_heading(&mut s, t!("settings.settings"));
             s.add_space(24.0);
             s.spacing_mut().item_spacing.y = 2.0;
-            // the chosen tab's marker, slid to it from the last one
+            // the chosen tab's marker slides to it.
             let marker = s.painter().add(egui::Shape::Noop);
             let mut on_rect = None;
             for sec in Section::ALL {
@@ -349,6 +349,9 @@ impl Game {
             });
             row(ui, t!("settings.hud_in_the_cockpit"), t!("settings.off_the_cockpits_own_instruments"), |ui| {
                 ui.add_enabled_ui(self.show_hud, |ui| menu::switch(ui, &mut self.hud_cockpit));
+            });
+            row(ui, t!("settings.flight_path_marker"), t!("settings.a_ring_on_the_hud"), |ui| {
+                ui.add_enabled_ui(self.show_hud, |ui| menu::switch(ui, &mut self.path_marker));
             });
             row(ui, t!("settings.minimap"), t!("settings.key_left_of_1_in"), |ui| {
                 menu::switch(ui, &mut self.minimap.visible);
@@ -950,12 +953,12 @@ impl Game {
                     }
                 });
                 ui.horizontal(|ui| {
-                    // (0 until the axis has moved since the game started)
+                    // 0 until the axis moves.
                     if let Some(v) = self.binds.axis(a).or_else(|| self.binds.axes.contains_key(&a).then_some(0.0)) {
                         let f = if a.centred() { (v as f32 + 1.0) * 0.5 } else { v as f32 };
                         ui.add(egui::ProgressBar::new(f).desired_width(64.0).desired_height(6.0));
                     }
-                    // The dead zone: round the centre, or at the idle end of a throttle or brake.
+                    // the dead zone.
                     if let Some(b) = self.binds.axes.get_mut(&a) {
                         ui.spacing_mut().slider_width = 70.0;
                         ui.add(egui::Slider::new(&mut b.dead, 0.0..=0.3).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)))
@@ -1025,14 +1028,12 @@ impl Game {
     }
 }
 
-/// The grid every bindings table shares (action · binding · buttons · extras),
-/// so the three cards line up column for column.
+/// the grid every bindings table shares, so their columns line up.
 fn bind_grid(ui: &mut Ui, id: &str, body: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id).num_columns(4).spacing([16.0, 6.0]).min_row_height(30.0).show(ui, body);
 }
 
-/// What an action is bound to, in a fixed-width column: a key cap, or a
-/// dim dash when nothing is bound. `moved`: changed from the default.
+/// what an action is bound to, as a key cap.
 fn binding_cell(ui: &mut Ui, what: Option<String>, moved: bool) {
     ui.allocate_ui_with_layout(vec2(180.0, 26.0), Layout::left_to_right(Align::Center), |ui| {
         ui.set_min_width(180.0);

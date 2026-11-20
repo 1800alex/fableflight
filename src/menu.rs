@@ -131,6 +131,9 @@ pub struct Menu {
     pub markers: Vec<(u32, f32, f32)>,
     /// which aircraft to fly (index into `aircraft::list()`)
     pub aircraft: usize,
+    /// paint scheme for the Cessna 172RG
+    /// the paint scheme picked for each type (by name; `aircraft::liveries`)
+    pub liveries: std::collections::HashMap<&'static str, usize>,
     /// the aircraft screen's page: the aircraft you have, or more to download
     pub air_tab: crate::hangar_ui::Tab,
     /// the collection entry picked out on its download page, what its search has, and whether it lists the unflyable ones too
@@ -195,7 +198,13 @@ pub enum Start {
 
 impl Menu {
     pub fn new(lat: f64, lon: f64, hour: f64) -> Self {
-        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, screen: Screen::Main, air_back: Screen::Main, set_back: Screen::Main, air_view: 0, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, air_tab: crate::hangar_ui::Tab::Mine, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
+        Self { lat, lon, alt: 1.5e7, target_alt: 1.1e7, pick: None, pick_name: String::new(), search: String::new(), hour, press: None, dragged: 0.0, starting: false, screen: Screen::Main, air_back: Screen::Main, set_back: Screen::Main, air_view: 0, spin: 1.0, airport: None, start: Start::Runway, runway: None, start_agl: 450.0, markers: Vec::new(), aircraft: 0, liveries: std::collections::HashMap::new(), air_tab: crate::hangar_ui::Tab::Mine, hangar_sel: None, hangar_find: String::new(), hangar_all: false, fuel: 0.5, cold: false, payload: None }
+    }
+
+    /// The paint scheme picked for a type (an index of `aircraft::liveries`).
+    pub fn livery(&self, spec: &crate::aircraft::Spec) -> usize {
+        let n = crate::aircraft::liveries(spec).len();
+        self.liveries.get(spec.name).copied().unwrap_or_else(|| crate::aircraft::default_livery(spec)).min(n.saturating_sub(1))
     }
 
     pub fn look_at(&mut self, lat: f64, lon: f64, alt: f64) {
@@ -279,34 +288,14 @@ use crate::i18n::tr_en;
 use crate::padui::{self, Hint};
 use egui::{Color32, RichText, Stroke};
 
-// ---- type
-//
-// The interface's own faces, bundled (assets/fonts, SIL OFL) so every
-// machine sees the same thing: Barlow for reading, Barlow Condensed for the
-// display lines, IBM Plex Mono for numbers, coordinates, keys and readouts.
-// The system's sans stays behind them for any glyph they lack. See
-// `load_fonts` in main.rs.
-//
-// Every screen uses these roles and nothing else, so text of the same job
-// looks the same everywhere:
-//
-//   screen_title  display caps 44   SETTINGS, AIRCRAFT, PAUSED
-//   section_title display caps 15   card and panel headings, tracked
-//   page_title    SemiBold 28       a page's own heading (General, Cessna 172RG)
-//   item_title    SemiBold 17       the name of a thing (a start point, an airport)
-//   label         Medium 15         row labels, buttons, tabs, list names
-//   body          Regular 15        sentences
-//   caption       Regular 13        hints, notes, second lines (DIM)
-//   data          Plex Mono 13      numbers, coordinates, key names
-//
-// Writing: sentence case everywhere ("Camera and view"), except the two
-// display roles, which are set in capitals.
+// the ui's bundled faces: barlow to read, barlow condensed to display, plex mono for data.
+// every screen uses the roles below.
 
-/// The display family's name: Barlow Condensed Bold.
+/// barlow condensed bold.
 pub const BOLD: &str = "bold";
-/// Barlow Medium: labels, buttons, list names.
+/// barlow medium.
 pub const MEDIUM: &str = "medium";
-/// Barlow SemiBold: headings and anything that must read as bold.
+/// barlow semibold.
 pub const SEMIBOLD: &str = "semibold";
 
 pub const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/Barlow-Regular.ttf");
@@ -315,18 +304,17 @@ pub const FONT_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Barlow-SemiBold
 pub const FONT_DISPLAY: &[u8] = include_bytes!("../assets/fonts/BarlowCondensed-Bold.ttf");
 pub const FONT_MONO: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf");
 
-/// The display face (condensed bold) at a size: for the few one-off display
-/// sizes (FLY, the tile captions). Prefer the roles below.
+/// the display face at a size, for one-off sizes.
 pub fn bold(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(BOLD.into()))
 }
 
-/// Medium weight at a size.
+/// medium at a size.
 pub fn medium(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(MEDIUM.into()))
 }
 
-/// SemiBold at a size.
+/// semibold at a size.
 pub fn semibold(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(SEMIBOLD.into()))
 }
@@ -356,12 +344,12 @@ pub fn data() -> egui::FontId {
     egui::FontId::monospace(13.0)
 }
 
-/// A screen's title, in capitals (the sidebars, the pause menu).
+/// a screen's title, in capitals.
 pub fn screen_heading(ui: &mut egui::Ui, s: &str) {
     ui.label(RichText::new(s.to_uppercase()).font(screen_title()).color(Color32::WHITE).extra_letter_spacing(1.5));
 }
 
-/// A page's own heading and the line under it.
+/// a page's heading and the line under it.
 pub fn page_heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     ui.label(RichText::new(title).font(page_title()).color(Color32::WHITE));
     if !blurb.is_empty() {
@@ -369,20 +357,16 @@ pub fn page_heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     }
 }
 
-/// A card's or panel's heading: display capitals, tracked.
+/// a card's heading in display capitals.
 pub fn section_text(s: &str) -> RichText {
     RichText::new(s.to_uppercase()).font(section_title()).color(Color32::WHITE).extra_letter_spacing(1.0)
 }
 
-// ---- colour
-//
-// One cool, night-sky dark, stepped in surfaces; one warm accent that means
-// "this is the thing to press, or the thing you are on". Everything else is
-// neutral so the yellow keeps its meaning.
+// one dark, one accent for what to press, everything else neutral.
 
 /// the UI accent: a warm aviation yellow
 pub const ACCENT: Color32 = Color32::from_rgb(245, 197, 24);
-/// the accent a step brighter, for a hovered primary button
+/// the accent, hovered.
 pub const ACCENT_HI: Color32 = Color32::from_rgb(255, 214, 72);
 /// dark text on the accent colour
 pub const ON_ACCENT: Color32 = Color32::from_rgb(26, 20, 2);
@@ -392,31 +376,29 @@ pub const R_PANEL: u8 = 3;
 pub const R_WIDGET: u8 = 3;
 pub const TEXT: Color32 = Color32::from_rgb(232, 236, 242);
 pub const DIM: Color32 = Color32::from_rgb(146, 156, 171);
-/// quieter than DIM: credits, unchosen captions (still 4.5:1 on BG)
+/// quieter than dim, still readable.
 pub const FAINT: Color32 = Color32::from_rgb(118, 128, 143);
-/// the full-screen backdrop
+/// the backdrop.
 pub const BG: Color32 = Color32::from_rgb(8, 11, 16);
-/// a card or group on the backdrop
+/// a card on the backdrop.
 pub const SURFACE: Color32 = Color32::from_rgb(15, 19, 26);
-/// a control's resting fill (buttons, tracks)
+/// a control at rest.
 pub const RAISED: Color32 = Color32::from_rgb(28, 34, 44);
-/// a control under the pointer
+/// a control under the pointer.
 pub const RAISED_HI: Color32 = Color32::from_rgb(42, 50, 63);
-/// the chosen segment of a segmented control
+/// the chosen segment.
 pub const CHOSEN: Color32 = Color32::from_rgb(66, 78, 98);
-/// hairlines: card edges, dividers
+/// hairlines.
 pub const LINE: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
-/// a firmer edge: control outlines, the rail's divider
+/// a firmer edge.
 pub const LINE_HI: Color32 = Color32::from_rgba_premultiplied(44, 44, 44, 44);
-/// links
+/// links.
 pub const LINK: Color32 = Color32::from_rgb(132, 184, 255);
 pub const OK: Color32 = Color32::from_rgb(112, 214, 138);
 pub const BAD: Color32 = Color32::from_rgb(255, 122, 92);
 pub const PANEL: Color32 = Color32::from_rgba_premultiplied(9, 12, 17, 232);
-/// the see-through glass of the flight panel, over the running game
-pub const GLASS: Color32 = Color32::from_rgba_premultiplied(5, 8, 12, 150);
 
-/// Eases a hover (or any on/off state) in and out instead of snapping: 0..1.
+/// eases an on or off state instead of snapping, 0..1.
 pub fn ease(ctx: &egui::Context, id: egui::Id, on: bool) -> f32 {
     ctx.animate_bool_with_time_and_easing(id.with("ease"), on, 0.14, egui::emath::easing::cubic_out)
 }
@@ -426,13 +408,12 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     a.lerp_to_gamma(b, t.clamp(0.0, 1.0))
 }
 
-/// A soft round glow: `col` at the centre fading smoothly to nothing at
-/// radii `r` (an ellipse when the two differ). No banding: one mesh.
+/// a soft round glow fading to nothing at radii `r`.
 pub fn glow(p: &egui::Painter, c: egui::Pos2, r: egui::Vec2, col: Color32) {
     let n = 48;
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(c, col);
-    // eased fall-off: a few rings, each fainter
+    // a few rings, each fainter.
     let rings = [(0.35, 0.72), (0.65, 0.32), (1.0, 0.0)];
     for (k, a) in rings {
         for i in 0..n {
@@ -452,8 +433,7 @@ pub fn glow(p: &egui::Painter, c: egui::Pos2, r: egui::Vec2, col: Color32) {
     p.add(mesh);
 }
 
-/// A segmented control: a recessed track holding `seg`s side by side, the
-/// chosen one raised, its highlight sliding across when the choice changes.
+/// a segmented control whose highlight slides to the chosen segment.
 pub fn segments<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
         .fill(Color32::from_rgba_premultiplied(0, 0, 0, 70))
@@ -462,13 +442,13 @@ pub fn segments<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R
         .inner_margin(3)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            // A slot under the labels for the highlight, filled once the chosen segment is known.
+            // a slot for the highlight, filled once the chosen segment is known.
             let id = ui.next_auto_id().with("seg_slide");
             let slot = ui.painter().add(egui::Shape::Noop);
             ui.ctx().data_mut(|d| d.insert_temp::<Option<egui::Rect>>(seg_key(), None));
             let r = ui.horizontal(|ui| add(ui)).inner;
             if let Some(target) = ui.ctx().data(|d| d.get_temp::<Option<egui::Rect>>(seg_key())).flatten() {
-                // eased from where it was: it slides when the choice changes
+                // eased from where it was.
                 let ctx = ui.ctx().clone();
                 let x0 = ctx.animate_value_with_time(id.with("x0"), target.left(), 0.18);
                 let x1 = ctx.animate_value_with_time(id.with("x1"), target.right(), 0.18);
@@ -481,12 +461,12 @@ pub fn segments<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R
         .inner
 }
 
-/// Where a `seg` tells its `segments` track that it is the chosen one.
+/// where a segment marks itself chosen.
 fn seg_key() -> egui::Id {
     egui::Id::unique("menu::segments chosen")
 }
 
-/// One choice of a `segments` control, like `selectable_value`.
+/// one choice of a segmented control.
 pub fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: &str) -> egui::Response {
     let on = *current == value;
     let g = ui.painter().layout_no_wrap(text.to_string(), label(), TEXT);
@@ -510,13 +490,13 @@ pub fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: &st
     resp
 }
 
-/// An on/off switch reading only "On" or "Off": the row it sits in says what it is.
+/// an on or off switch.
 pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let t = if *on { crate::t!("menu.on") } else { crate::t!("menu.off") };
     toggle(ui, on, t)
 }
 
-/// An on/off switch with its label after it, in place of a checkbox.
+/// an on or off switch with its label after it.
 pub fn toggle(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     let text: egui::WidgetText = text.into();
     let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::FontId(body()));
@@ -633,7 +613,6 @@ pub const CONTROLS: &[(&str, &[(&str, &str)])] = &[
         ("I", "magnetos on / off (jets: fuel controls)"),
         ("O", "starter (hold; jets: engage)"),
         ("Page Up / Down", "mixture richer / leaner"),
-        ("J", "navigation instruments (VOR, ILS, ADF)"),
         ("[ / ]", "OBS course left / right"),
         ("X", "altimeter to the QNH"),
         (".", "parking brake"),
@@ -725,10 +704,10 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.text_edit_bg_color = Some(Color32::from_rgb(11, 14, 20));
         v.faint_bg_color = Color32::from_white_alpha(6);
         v.slider_trailing_fill = true;
-        // (selected chips, the slider's trail and selected text)
+        // selected chips, slider trails and selected text.
         v.selection.bg_fill = ACCENT;
         v.selection.stroke = Stroke::new(1.5, ON_ACCENT);
-        // links in a calm blue: yellow is for the thing to press
+        // links in blue, yellow is for what to press.
         v.hyperlink_color = LINK;
         v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
         v.interact_cursor = Some(egui::CursorIcon::PointingHand);
@@ -748,7 +727,7 @@ pub fn apply_theme(ctx: &egui::Context) {
             st.corner_radius = R_WIDGET.into();
             st.expansion = 0.0;
         }
-        // a hairline edge so controls (text fields, boxes, buttons) read on any card
+        // a hairline edge so controls read on any card.
         w.inactive.bg_stroke = Stroke::new(1.0, LINE_HI);
         w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_white_alpha(70));
         w.active.bg_stroke = Stroke::new(1.0, ACCENT);
@@ -761,11 +740,11 @@ pub fn panel() -> egui::Frame {
     egui::Frame::new().fill(PANEL).corner_radius(R_PANEL).inner_margin(20.0).stroke(Stroke::new(1.0, LINE_HI)).shadow(egui::Shadow { offset: [0, 10], blur: 32, spread: 0, color: Color32::from_black_alpha(120) })
 }
 
-/// A key or the gamepad's buttons, right-aligned at `right` on a row.
+/// a key or the pad's buttons, right aligned.
 fn paint_hint(p: &egui::Painter, hint: Hint, right: f32, y: f32, pad_h: f32, col: Color32) {
     match hint {
         Hint::Text(h) => {
-            // a key's name in the instrument face; a few words in the reading one
+            // keys in mono, words in barlow.
             let font = if h.contains(' ') { egui::FontId::proportional(13.0) } else { egui::FontId::monospace(11.0) };
             p.text(egui::pos2(right, y), egui::Align2::RIGHT_CENTER, h, font, col);
         }
@@ -777,10 +756,7 @@ fn paint_hint(p: &egui::Painter, hint: Hint, right: f32, y: f32, pad_h: f32, col
     }
 }
 
-/// A full-width menu button; the primary one is filled with the accent
-/// colour, its label in the display face. Its hint (a key, or the gamepad's
-/// buttons) sits at its right end. A disabled primary keeps its shape as an
-/// outline, so it reads as "not yet" rather than as broken.
+/// a full width button, the primary one filled with the accent.
 pub fn wide_button(ui: &mut egui::Ui, text: &str, hint: Hint, primary: bool, enabled: bool) -> egui::Response {
     let h = if primary { 46.0 } else { 36.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), if enabled { egui::Sense::click() } else { egui::Sense::hover() });
@@ -811,7 +787,7 @@ pub fn wide_button(ui: &mut egui::Ui, text: &str, hint: Hint, primary: bool, ena
     resp
 }
 
-/// The flight toolbar's icons, drawn in one line weight.
+/// the hud's icons, in one line weight.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Icon {
     Flight,
@@ -821,24 +797,23 @@ pub enum Icon {
     Weather,
     Map,
     Camera,
-    Pause,
 }
 
-/// Draws an icon `s` points across, centred on `c`.
+/// draws an icon `s` across, centred on `c`.
 pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32) {
     use egui::{pos2, vec2};
     let st = Stroke::new(1.7, col);
     let u = s * 0.5;
     let arc = |c: egui::Pos2, r: f32, a0: f32, a1: f32| -> Vec<egui::Pos2> { (0..=16).map(|i| { let a = a0 + (a1 - a0) * i as f32 / 16.0; c + vec2(a.cos(), a.sin()) * r }).collect() };
     match which {
-        // an aeroplane seen from above
+        // an aircraft from above.
         Icon::Flight => {
             let pts = [(0.0, -1.0), (0.12, -0.75), (0.12, -0.2), (0.95, 0.2), (0.95, 0.35), (0.12, 0.15), (0.1, 0.65), (0.4, 0.85), (0.4, 0.95), (0.0, 0.85)];
             let mut v: Vec<egui::Pos2> = pts.iter().map(|&(x, y)| c + vec2(x, y) * u).collect();
             v.extend(pts.iter().rev().skip(1).take(pts.len() - 2).map(|&(x, y)| c + vec2(-x, y) * u));
             p.add(egui::Shape::closed_line(v, st));
         }
-        // a map pin
+        // a map pin.
         Icon::GoTo => {
             let top = c - vec2(0.0, u * 0.25);
             let mut v = arc(top, u * 0.6, std::f32::consts::PI * 0.8, std::f32::consts::PI * 2.2);
@@ -847,13 +822,13 @@ pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32)
             p.add(egui::Shape::line(v, st));
             p.circle_stroke(top, u * 0.22, st);
         }
-        // a mast and its waves
+        // a mast and its waves.
         Icon::Radio => {
             p.line_segment([c - vec2(0.0, u * 0.1), c + vec2(0.0, u)], st);
             p.circle_filled(c - vec2(0.0, u * 0.15), u * 0.14, col);
             let pi = std::f32::consts::PI;
             for r in [0.45, 0.85] {
-                // to the right, and to the left
+                // right and left.
                 p.add(egui::Shape::line(arc(c - vec2(0.0, u * 0.15), u * r, -0.75, 0.75), st));
                 p.add(egui::Shape::line(arc(c - vec2(0.0, u * 0.15), u * r, pi - 0.75, pi + 0.75), st));
             }
@@ -871,7 +846,7 @@ pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32)
                 p.add(egui::Shape::line(arc(c, u * r, pi - 0.65, pi + 0.65), st));
             }
         }
-        // a cloud
+        // a cloud.
         Icon::Weather => {
             let b = c + vec2(0.0, u * 0.35);
             let mut v = vec![pos2(b.x - u * 0.9, b.y)];
@@ -883,7 +858,7 @@ pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32)
             v.push(pos2(b.x - u * 0.9, b.y));
             p.add(egui::Shape::line(v, st));
         }
-        // a folded map
+        // a folded map.
         Icon::Map => {
             let xs = [-0.9, -0.3, 0.3, 0.9];
             let ys = [(-0.7, 0.8), (-0.85, 0.65), (-0.7, 0.8), (-0.85, 0.65)];
@@ -896,18 +871,12 @@ pub fn icon(p: &egui::Painter, which: Icon, c: egui::Pos2, s: f32, col: Color32)
                 p.line_segment([top[k], bot[k]], st);
             }
         }
-        // a camera
+        // a camera.
         Icon::Camera => {
             let r = egui::Rect::from_center_size(c + vec2(0.0, u * 0.1), vec2(s, s * 0.66));
             p.rect_stroke(r, 2.0, st, egui::StrokeKind::Middle);
             p.line_segment([pos2(c.x - u * 0.35, r.top() - u * 0.2), pos2(c.x + u * 0.35, r.top() - u * 0.2)], st);
             p.circle_stroke(r.center(), u * 0.36, st);
-        }
-        // two bars
-        Icon::Pause => {
-            for x in [-0.3, 0.3] {
-                p.rect_filled(egui::Rect::from_center_size(c + vec2(x * u, 0.0), vec2(u * 0.28, u * 1.5)), 1.0, col);
-            }
         }
     }
 }
@@ -930,7 +899,7 @@ pub fn section(ui: &mut egui::Ui, id: &str, title: &str, summary: &str, open: bo
     let k = state.openness(ui.ctx());
     let lit = ease(ui.ctx(), resp.id, resp.hovered() || resp.has_focus());
     let p = ui.painter();
-    // shut: a resting row; open: it becomes the head of its group
+    // the title row, lit when open.
     p.rect_filled(rect, R_WIDGET, Color32::from_white_alpha((7.0 + 9.0 * lit) as u8));
     let title_col = mix(TEXT, Color32::WHITE, lit.max(k));
     p.text(rect.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, title, label(), title_col);
@@ -966,7 +935,7 @@ pub fn heading(ui: &mut egui::Ui, s: &str) {
     ui.label(section_text(s).color(DIM));
 }
 
-/// A key cap: the key's name on a raised plate with a darker lip below.
+/// a key cap.
 pub fn key_cap(ui: &mut egui::Ui, keys: &str) -> egui::Response {
     let g = ui.painter().layout_no_wrap(keys.to_string(), egui::FontId::monospace(11.5), Color32::WHITE);
     let (r, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 12.0, 20.0), egui::Sense::hover());
@@ -1128,7 +1097,7 @@ pub fn big_button(ui: &mut egui::Ui, text: &str, hint: Hint, primary: bool, chos
     };
     p.rect_filled(rect, R_WIDGET, fill);
     if !primary {
-        // the page it opens is showing: a short accent mark grows at the left
+        // a short accent mark for the page showing.
         if pick > 0.0 {
             let h = rect.height() * 0.5 * pick;
             p.rect_filled(egui::Rect::from_center_size(egui::pos2(rect.left() + 1.5, rect.center().y), egui::vec2(3.0, h)), 1.0, ACCENT);

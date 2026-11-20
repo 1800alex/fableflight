@@ -131,7 +131,6 @@ pub const ACTIONS: &[Action] = &[
     act("starter", KeyCode::KeyO),
     act("mixture_rich", KeyCode::PageUp),
     act("mixture_lean", KeyCode::PageDown),
-    act("nav_display", KeyCode::KeyJ),
     act("obs_left", KeyCode::BracketLeft),
     act("obs_right", KeyCode::BracketRight),
     act("baro_qnh", KeyCode::KeyX),
