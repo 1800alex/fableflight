@@ -7519,17 +7519,20 @@ impl Game {
                     let a = (1.0 - d / 40_000.0).clamp(0.45, 1.0) as f32;
                     painter.circle_stroke(at, 5.0, egui::Stroke::new(1.5, flightui::LIT.gamma_multiply(a)));
                     let line2 = format!("{}  ·  {:.0} ft  ·  {:.1} km", if p.ty.is_empty() { "?" } else { p.ty.as_str() }, p.alt_ft, d / 1000.0);
-                    let g1 = painter.layout_no_wrap(p.call.clone(), menu::semibold(13.0), Color32::WHITE.gamma_multiply(a));
-                    let g2 = painter.layout_no_wrap(line2, menu::medium(11.5), flightui::SOFT.gamma_multiply(a));
-                    let w = g1.size().x.max(g2.size().x) + 14.0;
-                    let r = egui::Rect::from_min_size(at + egui::vec2(10.0, -16.0), egui::vec2(w, 34.0));
+                    // bare text, a dark shadow under it to read against cloud and sky.
+                    let lines = [(p.call.as_str(), menu::semibold(11.5), Color32::WHITE.gamma_multiply(a)), (line2.as_str(), menu::medium(10.0), flightui::SOFT.gamma_multiply(a))];
+                    let w = lines.iter().map(|(s, f, _)| painter.layout_no_wrap(s.to_string(), f.clone(), Color32::WHITE).size().x).fold(0.0, f32::max);
+                    let r = egui::Rect::from_min_size(at + egui::vec2(9.0, -12.0), egui::vec2(w, 26.0));
                     if taken.len() >= 8 || taken.iter().any(|t| t.expand(4.0).intersects(r)) {
                         continue;
                     }
                     taken.push(r);
-                    painter.rect_filled(r, 6, Color32::from_black_alpha((120.0 * a) as u8));
-                    painter.galley(r.min + egui::vec2(7.0, 3.0), g1, Color32::WHITE);
-                    painter.galley(r.min + egui::vec2(7.0, 18.0), g2, Color32::WHITE);
+                    let shade = Color32::from_black_alpha((200.0 * a) as u8);
+                    for (k, (s, f, col)) in lines.into_iter().enumerate() {
+                        let pos = r.min + egui::vec2(0.0, 13.0 * k as f32);
+                        painter.text(pos + egui::vec2(1.0, 1.0), Align2::LEFT_TOP, s, f.clone(), shade);
+                        painter.text(pos, Align2::LEFT_TOP, s, f, col);
+                    }
                 }
             }
             // The other players: a tag beside each.
