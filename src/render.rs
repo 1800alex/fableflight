@@ -2597,7 +2597,10 @@ impl Renderer {
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (d, src, pl) = (self.device.clone(), self.obj_src.clone(), self.pl_obj.clone());
-        let spawned = std::thread::Builder::new().name("obj shader".into()).spawn(move || {
+        // A roomy stack: the aircraft shader is the biggest, and on DirectX 12
+        // naga's HLSL writer and DXC compile it on this thread (2 MB, Rust's
+        // default for a spawned thread, isn't enough there).
+        let spawned = std::thread::Builder::new().name("obj shader".into()).stack_size(16 << 20).spawn(move || {
             let t = std::time::Instant::now();
             let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("plane fast"), source: wgpu::ShaderSource::Wgsl(specialise(&src, kind).into()) });
             let f = ObjFast { kind, cut: obj_pipeline(&d, &pl, &m, true), solid: obj_pipeline(&d, &pl, &m, false) };

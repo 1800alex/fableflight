@@ -17,6 +17,8 @@ pub mod fa18;
 pub mod g650;
 pub mod sr71;
 pub mod starship;
+#[cfg(test)]
+mod standards;
 
 use crate::airframe::{Model, Sect};
 use glam::{DVec3, Vec3};
