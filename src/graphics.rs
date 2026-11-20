@@ -67,6 +67,8 @@ pub struct Graphics {
     pub trees: Level,
     /// moving and parked cars (Off, or Low to High; Ultra is High)
     pub cars: Level,
+    /// birds in the air (birds.rs; Off, or Low to High; Ultra is High)
+    pub birds: Level,
     /// ambient occlusion (GTAO)
     pub ao: bool,
     // Not part of the presets: preferences more than costs.
@@ -89,7 +91,7 @@ pub const SCALE_MAX: f32 = 2.0;
 impl Graphics {
     /// One of the presets (taa and vsync on).
     pub fn preset(l: Level) -> Self {
-        let mut g = Graphics { scale: 1.0, shadows: Level::High, clouds: Level::High, storms: Level::High, terrain: Level::High, scenery: Level::High, city: Level::High, trees: Level::High, cars: Level::High, ao: true, taa: true, vsync: true, fps_cap: 0 };
+        let mut g = Graphics { scale: 1.0, shadows: Level::High, clouds: Level::High, storms: Level::High, terrain: Level::High, scenery: Level::High, city: Level::High, trees: Level::High, cars: Level::High, birds: Level::High, ao: true, taa: true, vsync: true, fps_cap: 0 };
         g.apply(l);
         g
     }
@@ -111,6 +113,7 @@ impl Graphics {
         self.city = l;
         self.trees = l;
         self.cars = if l == Level::Ultra { Level::High } else { l };
+        self.birds = if l == Level::Ultra { Level::High } else { l };
         self.ao = matches!(l, Level::High | Level::Ultra);
     }
 
@@ -238,6 +241,7 @@ impl Graphics {
         g.city = lvl("city", g.city);
         g.trees = lvl("trees", g.trees);
         g.cars = j["cars"].as_str().and_then(Level::parse).map(|l| if l == Level::Ultra { Level::High } else { l }).unwrap_or(g.cars);
+        g.birds = j["birds"].as_str().and_then(Level::parse).map(|l| if l == Level::Ultra { Level::High } else { l }).unwrap_or(g.birds);
         g.ao = j["ao"].as_bool().unwrap_or(g.ao);
         g.taa = j["taa"].as_bool().unwrap_or(g.taa);
         g.vsync = j["vsync"].as_bool().unwrap_or(g.vsync);
@@ -257,6 +261,7 @@ impl Graphics {
             "city": self.city.name(),
             "trees": self.trees.name(),
             "cars": self.cars.name(),
+            "birds": self.birds.name(),
             "ao": self.ao,
             "taa": self.taa,
             "vsync": self.vsync,
@@ -354,6 +359,15 @@ impl Graphics {
             });
             let (share, far, _) = self.car_density();
             dim(ui, if share > 0.0 { format!("{:.0}% of the cars, out to {:.1} km", share * 100.0, far / 1000.0) } else { "no cars on the roads".into() });
+        });
+        row(ui, crate::i18n::t!("Birds", "Oiseaux"), crate::i18n::t!("gulls, crows, starlings, buzzards and geese, by place, season and hour", "goélands, corneilles, étourneaux, buses et oies, selon le lieu, la saison et l'heure"), |ui| {
+            menu::segments(ui, |ui| {
+                for l in [Level::Off, Level::Low, Level::Medium, Level::High] {
+                    menu::seg(ui, &mut self.birds, l, l.name());
+                }
+            });
+            let (flocks, birds) = crate::birds::caps(self.birds);
+            dim(ui, if flocks > 0 { crate::i18n::t!("up to {} flocks, {} birds", "jusqu'à {} volées, {} oiseaux", flocks, birds) } else { crate::i18n::t!("no birds", "aucun oiseau").to_string() });
         });
         row(ui, "Ambient occlusion", "contact shadows (GTAO)", |ui| {
             menu::switch(ui, &mut self.ao);
