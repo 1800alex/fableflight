@@ -292,16 +292,21 @@ struct Scatter { L: vec3f, T: vec3f };
 // Single scattering plus the multi-scatter LUT along a ray segment. oc is the
 // ray origin relative to the planet centre.
 fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32) -> Scatter {
+  let rg = G.planet.w;
   let sun = G.sun_dir.xyz;
   let c = dot(rd, sun);
   let pr = phase_r(c);
   let pm = phase_m(c, 0.8);
+  let oc_sun = dot(oc, sun);
   let moon = G.moon.xyz;
   let cm = dot(rd, moon);
   let prm = phase_r(cm);
   let pmm = phase_m(cm, 0.8);
+  let oc_moon = dot(oc, moon);
   let mk = MOON_TINT * (G.moon.w / G.sun_dir.w);
   let moon_on = G.moon.w > 0.0;
+  let cs_on = G.cs[4].w >= 0.5 && G.start.x <= 0.0;
+  let cs_top = G.cs[3].y;
   var T = vec3f(1.0);
   var L = vec3f(0.0);
   let len = max(tmax - tmin, 0.0);
@@ -312,20 +317,24 @@ fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32) -
     let f = f32(i + 1) / f32(steps);
     let tn = tmin + len * f * f;
     let dt = tn - tp;
-    let p = oc + rd * mix(tp, tn, jit);
+    let tm = mix(tp, tn, jit);
+    let p = oc + rd * tm;
     let r = length(p);
-    let h = r - G.planet.w;
-    let mu = dot(p / r, sun);
+    let h = r - rg;
+    let mu = (oc_sun + c * tm) / r;
     let d = atm_density(h);
     let ext = atm_ext(d);
     let sr = RAYLEIGH * d.x;
     let sm = MIE_S * d.y;
     // Air in the shadow of a cloud gets no sunlight (light shafts through the gaps);
     // under a closed deck the light that remains is the deck's dull grey.
-    let cl = cloud_sun(p, false);
     var msl = ms_lut(h, mu);
-    msl = mix(msl, vec3f(luma(msl)), cl.closed * 0.75) * (1.0 - 0.45 * cl.closed);
-    var vis = cl.vis;
+    var vis = 1.0;
+    if (cs_on && h < cs_top) {
+      let cl = cloud_sun_at(p, r, h, false);
+      msl = mix(msl, vec3f(luma(msl)), cl.closed * 0.75) * (1.0 - 0.45 * cl.closed);
+      vis = cl.vis;
+    }
     if (sdark > 0.0) {
       let k = 1.0 - 0.8 * sdark * exp(-mix(tp, tn, 0.5) / 15000.0);
       msl *= k;
@@ -333,7 +342,7 @@ fn atm_march(oc: vec3f, rd: vec3f, tmin: f32, tmax: f32, steps: i32, jit: f32) -
     }
     var S = sun_trans(h, mu) * vis * (sr * pr + vec3f(sm * pm)) + msl * (sr + vec3f(sm));
     if (moon_on) {
-      let mum = dot(p / r, moon);
+      let mum = (oc_moon + cm * tm) / r;
       S += (sun_trans(h, mum) * (sr * prm + vec3f(sm * pmm)) + ms_lut(h, mum) * (sr + vec3f(sm))) * mk;
     }
     let st = exp(-ext * dt);
@@ -1850,17 +1859,15 @@ fn cs_fetch(uv: vec2f, layer: i32, hq: bool) -> vec4f {
   return g0.y * (g0.x * textureSampleLevel(t_cshadow, s_clamp, c0, layer, 0.0) + g1.x * textureSampleLevel(t_cshadow, s_clamp, vec2f(c1.x, c0.y), layer, 0.0))
        + g1.y * (g0.x * textureSampleLevel(t_cshadow, s_clamp, vec2f(c0.x, c1.y), layer, 0.0) + g1.x * textureSampleLevel(t_cshadow, s_clamp, c1, layer, 0.0));
 }
-fn cloud_sun(pc: vec3f, hq: bool) -> CloudSun {
+fn cloud_sun_at(pc: vec3f, r: f32, h: f32, hq: bool) -> CloudSun {
   var o = CloudSun(1.0, 0.0);
   let base = G.cs[3].x;
   let top = G.cs[3].y;
-  let r = length(pc);
-  let h = r - G.planet.w;
   if (G.cs[4].w < 0.5 || G.start.x > 0.0 || h >= top) { return o; }
   // The sun the maps were drawn for (it differs from this frame's by a fraction
   // of a degree while the clock runs fast).
   let sun = G.cs[4].xyz;
-  let mu = dot(pc / r, sun);
+  let mu = dot(pc, sun) / r;
   let R = G.planet.w + base;
   // Exactly along the sun (a low sun's rays cross the base tens of km away): forward
   // to the base from below it, back down to it from inside the layer.
@@ -1894,6 +1901,10 @@ fn cloud_sun(pc: vec3f, hq: bool) -> CloudSun {
   o.vis = mix(t + (1.0 - t) * 0.22 / (1.0 + 0.12 * od + 0.01 * od * od), 1.0, fade);
   o.closed = v.w * (1.0 - fade) * (1.0 - smoothstep(base, base + 600.0, h));
   return o;
+}
+fn cloud_sun(pc: vec3f, hq: bool) -> CloudSun {
+  let r = length(pc);
+  return cloud_sun_at(pc, r, r - G.planet.w, hq);
 }
 // High cirrus: a thin streaky sheet at CIRRUS_H. Returns optical thickness.
 fn cirrus(pp: vec3f) -> f32 {

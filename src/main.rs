@@ -5287,6 +5287,7 @@ impl Game {
             return;
         }
         let now = Instant::now();
+        crate::gputime::cpu_begin();
         let raw_dt = (now - self.last).as_secs_f64();
         let mut dt_real = raw_dt.min(0.25);
         if self.fps_log.0 {
@@ -5453,6 +5454,7 @@ impl Game {
             self.glass.step(dt, glass_rain, self.plane.ias() * 1.94384);
         }
 
+        crate::gputime::cpu("sim.weather+controls");
         // Physics at a fixed step.
         let c = self.controls(dt_real);
         let mut emit = Vec::new();
@@ -5659,6 +5661,7 @@ impl Game {
                 }
             }
         }
+        crate::gputime::cpu("sim.flight_physics+weapons");
         if dt > 0.0 && !self.kills.is_empty() {
             self.step_kills(dt, &mut femit);
         }
@@ -5687,6 +5690,7 @@ impl Game {
                 }
             }
         }
+        crate::gputime::cpu("sim.destruction+birds");
         let booms: Vec<f32> = self.destr.booms.drain(..).collect();
         if !booms.is_empty() {
             let near = self.crash.as_ref().map(|cr| 1.0 / (1.0 + ((self.cam_pos - cr.site).length() as f32 / 400.0).powi(2))).unwrap_or(0.5);
@@ -6025,6 +6029,7 @@ impl Game {
             self.cam_pos = cam;
             self.cam_look = self.plane.pos;
         }
+        crate::gputime::cpu("audio+camera+misc");
         // Never let the camera sink into the ground.
         let (clat, clon, calt) = geo::pos_to_lla(cam);
         let ground = self.world.ground(clat, clon).map(|g| g.h);
@@ -6100,7 +6105,9 @@ impl Game {
         };
         let vp_jit = Mat4::from_translation(jitter.extend(0.0)) * vp;
         let frustum = world::Frustum::new(DMat4::from_cols_array(&vp.to_cols_array().map(|v| v as f64)));
+        crate::gputime::cpu("weather.lightning+rain");
         self.world.update(&self.r, cam, &frustum);
+        crate::gputime::cpu("world.stream_terrain+buildings");
         let focus_abs = if in_menu { cam } else if self.crashed { self.crash.as_ref().unwrap().site } else { self.plane.pos };
         {
             // Photorealistic 3D tiles in flight, day and night (after dusk the
@@ -6109,6 +6116,7 @@ impl Game {
             let px = h as f64 / (2.0 * (fov as f64 * 0.5).tan());
             self.world.update_photo(&self.r, cam, focus_abs, &frustum, px, day, dt_real);
         }
+        crate::gputime::cpu("world.photo3d_stream");
         if dt > 0.0 {
             self.world.update_traffic(dt as f32, focus_abs);
             let local = (self.utc + geo::pos_to_lla(focus_abs).1.to_degrees() / 15.0).rem_euclid(24.0);
@@ -6116,6 +6124,7 @@ impl Game {
             self.world.update_airports(dt as f32, self.wx.wind_from as f32, (self.wx.wind * 1.94384) as f32, (cars::activity(local as f32) * 1.2).clamp(0.25, 1.0), player, focus_abs);
         }
 
+        crate::gputime::cpu("world.traffic+airports_sim");
         // ---- frame constants
         let (east, north, up) = geo::enu(cam);
         let delta = cam - self.prev_cam;
@@ -6505,6 +6514,7 @@ impl Game {
                 }
             }
         }
+        crate::gputime::cpu("frame_constants+aircraft_objects");
         let mut insts = Vec::new();
         let mut fall = Vec::new();
         let mut air_lights = own_lights;
@@ -6523,6 +6533,7 @@ impl Game {
             self.bird_insts = insts.len() - before;
             self.world.photo_beacons(cam, &mut air_lights);
         }
+        crate::gputime::cpu("instances(cars,airport,birds)");
         self.live.step(&self.src, (!in_menu).then_some(self.plane.pos));
         if !in_menu {
             // A downed aircraft that has reached the ground is gone (see
@@ -6561,7 +6572,9 @@ impl Game {
 
         // The globe's labels are placed in the window's pixels, not the (maybe smaller) 3D scene's.
         let (ww, wh) = (self.r.config.width as f32, self.r.config.height as f32);
+        crate::gputime::cpu("live_traffic+weather_fetch");
         let ui = if in_menu { self.menu_ui(vp, cam, ww, wh) } else { self.ui(agl) };
+        crate::gputime::cpu("ui.build(egui)");
         // The smoke volume: a grid around the effects anchor, on its local east/north/up axes.
         {
             let site = cam + DVec3::new(psim.anchor[0] as f64, psim.anchor[1] as f64, psim.anchor[2] as f64);
@@ -6587,7 +6600,9 @@ impl Game {
         g.cut = pf.cut;
         g.cut_v = pf.cut_v;
         casc_vp[render::MASK_SLOT] = g.photo_vp;
+        crate::gputime::cpu("photo3d.draw_lists");
         let (tiles, tess, details, near) = self.world.draw_lists(cam, focus_abs, CASC);
+        crate::gputime::cpu("world.draw_lists(culling)");
         let cover = self.world.light_cover(cam);
         // The shore distance field: a step of its rebuild this frame.
         let sf = self.shore.frame(cam);
@@ -6636,6 +6651,7 @@ impl Game {
             self.lightning.segments(cam, dt, &mut bolts);
         }
         let rain_drops = if in_menu || (self.cam_rain < 0.002 && self.cam_blow < 0.01) { 0 } else { render::RAIN_DROPS };
+        crate::gputime::cpu("shore+fields+misc");
         self.r.render(Frame { rain_drops, bolts, g, tiles, tess, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.water_in_view().then(|| self.world.ocean.uniform()), egui: Some(ui), shot, cover, glow: glow_px, snow: snow_px, snow_tracks: snow_tr_uploads });
         self.finish_mcp_shots();
         if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
