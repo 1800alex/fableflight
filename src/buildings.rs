@@ -17,7 +17,10 @@ use std::sync::Arc;
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct BVertex {
     pub pos: [f32; 3],
-    pub nrm: [f32; 3],
+    /// the face's normal, signed 8-bit (w unused): a city tile holds millions
+    /// of these vertices, and 32 bytes a vertex rather than 40 keeps a fifth
+    /// of its geometry out of GPU memory
+    pub nrm: [i8; 4],
     /// walls: (metres along, metres above ground). roofs: material coordinates.
     pub uv: [f32; 2],
     /// rgb colour; a = surface kind (see K_*)
@@ -96,6 +99,14 @@ pub struct BuildingData {
     /// base level, the middle level, the finest level and the far stand-ins
     /// (absolute indices; buildings are laid down tallest first in each).
     pub cls: [[u32; 4]; 4],
+    /// The buildings' index runs cut by the cell of the tile they stand in
+    /// (`CELLS`), in index order, and each cell's bounding sphere (centre
+    /// relative to `center`, radius; a negative radius when empty): the
+    /// renderer leaves out the cells out of view or past the reach of the
+    /// level they belong to, rather than send the whole tile and have the
+    /// vertex shader drop them one vertex at a time.
+    pub segs: Vec<Seg>,
+    pub spheres: Vec<[f32; 4]>,
     pub atlas: Vec<Vec<u8>>,
     pub atlas_size: u32,
     pub ax: [f32; 4],
@@ -246,7 +257,7 @@ pub const FAR: Lvl = Lvl(3);
 pub const BFAR: [f32; 2] = [1000.0, 1300.0];
 /// Distance the finest level of detail starts to dissolve out at (60% of
 /// `LOD2_FAR` in buildings.wgsl; must match it).
-pub const FINE_FADE: f32 = 680.0 * 0.6;
+pub const FINE_FADE: f32 = LOD2_FAR * 0.6;
 /// Height classes, tallest first: (least height in metres, distance scale). A
 /// tower stands out against the skyline from much farther off than a house, so
 /// its full geometry, and the middle and finest levels that dress it, are kept
@@ -257,6 +268,25 @@ pub const HCLASS: [(f32, f32); 4] = [(150.0, 3.0), (100.0, 2.0), (65.0, 1.5), (0
 pub fn hclass(h: f32) -> usize {
     HCLASS.iter().position(|c| h >= c.0).unwrap_or(HCLASS.len() - 1)
 }
+/// A unit vector as `Snorm8x4`.
+fn snorm8(n: Vec3) -> [i8; 4] {
+    let q = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
+    [q(n.x), q(n.y), q(n.z), 0]
+}
+
+/// Side of the grid of cells a tile's buildings are sorted into (`BuildingData::segs`):
+/// some 250 m at zoom 14, near the 450 m the finest level reaches on the Low city detail.
+pub const CELLS: usize = 8;
+/// A stretch of a tile's index buffer made of the buildings of one cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seg {
+    pub start: u32,
+    pub end: u32,
+    pub cell: u8,
+}
+/// Distance the finest level of detail is drawn to, before the city detail
+/// and height class scale it (LOD2_FAR in buildings.wgsl; must match it).
+pub const LOD2_FAR: f32 = 680.0;
 /// Most vertices a tile may spend on its finest level of detail.
 const FINE_BUDGET: usize = 450_000;
 
@@ -294,7 +324,7 @@ impl Mesh {
         let v0 = self.v.len() as u32;
         for (p, uv) in pts {
             self.radius = self.radius.max(p.length());
-            self.v.push(BVertex { pos: (*p).into(), nrm: n.into(), uv: *uv, col, sty });
+            self.v.push(BVertex { pos: (*p).into(), nrm: snorm8(n), uv: *uv, col, sty });
         }
         if lvl == FINE {
             self.fine_verts += pts.len();
@@ -1974,9 +2004,25 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
     let mut m = Mesh::default();
     let mut footprints = Vec::new();
     // Tallest first, so the far shadow cascade can draw just the start of the index run.
+    // Within a height class, the ones tall enough for the far cascade first
+    // (`n_far_tall`), then by cell, so each cell's buildings follow on in
+    // every run (`segs`).
     let rels = relate(cx.unit_m, &vt.buildings);
+    let cell_of = |b: &crate::sources::BuildingPoly| {
+        let r = &b.rings[0];
+        let c = r.iter().fold([0.0f32; 2], |a, p| [a[0] + p[0], a[1] + p[1]]).map(|v| v / r.len().max(1) as f32);
+        let k = |v: f32| ((v / ext as f32 * CELLS as f32) as i64).clamp(0, CELLS as i64 - 1) as usize;
+        (k(c[1]) * CELLS + k(c[0])) as u8
+    };
+    let cells: Vec<u8> = vt.buildings.iter().map(cell_of).collect();
     let mut order: Vec<usize> = (0..vt.buildings.len()).collect();
-    order.sort_by(|a, b| rels[*b].hi.total_cmp(&rels[*a].hi));
+    order.sort_by(|a, b| {
+        let key = |i: usize| (hclass(rels[i].hi), rels[i].hi < 12.0, cells[i]);
+        key(*a).cmp(&key(*b)).then(rels[*b].hi.total_cmp(&rels[*a].hi))
+    });
+    // Cell stretches of each run (relative to its start), and each cell's bounds.
+    let mut segs_rel: [Vec<Seg>; 4] = Default::default();
+    let mut bounds = vec![(Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)); CELLS * CELLS];
     let mut n_far_tall = 0;
     // Ends of each height class in the four runs (relative to each run's start).
     let mut cls: [Option<[u32; 4]>; 4] = [None; 4];
@@ -1990,9 +2036,25 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
         let b = &vt.buildings[bi];
         let on_street = rels[bi].lo < 3.0 && on_road(&street, &b.rings[0], ext);
         if !on_street {
+            let (v0, before) = (m.v.len(), [m.main.len(), m.det.len(), m.fine.len(), m.far.len()]);
             if let Some(f) = building(&cx, &mut m, &vt.buildings, &rels, bi, &hoods, &landuse) {
                 footprints.push(f);
                 raster(&mut built, RASTER, ext, &b.rings[..1], 1);
+            }
+            let after = [m.main.len(), m.det.len(), m.fine.len(), m.far.len()];
+            let cell = cells[bi];
+            for r in 0..4 {
+                let (start, end) = (before[r] as u32, after[r] as u32);
+                match segs_rel[r].last_mut() {
+                    _ if end == start => {}
+                    Some(s) if s.cell == cell && s.end == start => s.end = end,
+                    _ => segs_rel[r].push(Seg { start, end, cell }),
+                }
+            }
+            let bd = &mut bounds[cell as usize];
+            for v in &m.v[v0..] {
+                bd.0 = bd.0.min(Vec3::from(v.pos));
+                bd.1 = bd.1.max(Vec3::from(v.pos));
             }
         }
         if rels[bi].hi >= 12.0 {
@@ -2030,6 +2092,8 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
             cls_abs[r][c] = starts[r] + e[r];
         }
     }
+    let segs: Vec<Seg> = segs_rel.iter().enumerate().flat_map(|(r, v)| v.iter().map(move |s| Seg { start: starts[r] + s.start, end: starts[r] + s.end, cell: s.cell })).collect();
+    let spheres = bounds.iter().map(|(lo, hi)| if lo.x > hi.x { [0.0, 0.0, 0.0, -1.0] } else { let c = (*lo + *hi) * 0.5; [c.x, c.y, c.z, (*hi - *lo).length() * 0.5] }).collect();
     let mut indices = m.main;
     indices.extend(m.det);
     indices.extend(m.fine);
@@ -2045,6 +2109,8 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
         n_far,
         n_far_tall: n_far + n_far_tall,
         cls: cls_abs,
+        segs,
+        spheres,
         atlas: mip_chain(cx.atlas, ATLAS, 4),
         atlas_size: ATLAS as u32,
         ax: [ax.x, ax.y, ax.z, 0.5 - ax.dot(p0)],
