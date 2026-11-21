@@ -21,7 +21,7 @@ struct VOut {
 };
 struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f32 };
 
-@vertex fn vs(@location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) uv: vec2f, @location(3) col: vec4f, @location(4) sty: vec4u, @builtin(instance_index) lod: u32) -> VOut {
+@vertex fn vs(@location(0) pos: vec3f, @location(1) nrm8: vec4f, @location(2) uv: vec2f, @location(3) col: vec4f, @location(4) sty: vec4u, @builtin(instance_index) lod: u32) -> VOut {
   let P = pos + T.offset.xyz;
   // The roof atlas is the satellite image of this map tile, so its texture
   // coordinate is (very nearly) a linear function of position.
@@ -33,7 +33,7 @@ struct GOut { @location(0) c: vec4f, @location(1) n: vec4f, @location(2) amb: f3
   let d = lod_dist(P, lod);
   let l = lod & 7u;
   if ((l == 1u || l == 3u) && d > FAR1 + 250.0) || (l == 2u && d > LOD2_FAR) || (l == 4u && d < FAR0 - 250.0) { clip = vec4f(2.0, 2.0, 2.0, 1.0); }
-  return VOut(clip, P, nrm, uv, col, sty, auv, lod);
+  return VOut(clip, P, nrm8.xyz, uv, col, sty, auv, lod);
 }
 // Distance the levels of detail go by: towers keep theirs out to a multiple of
 // the usual distances (buildings::HCLASS; the draw's instance index carries 4x

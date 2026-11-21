@@ -17,7 +17,10 @@ use std::sync::Arc;
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct BVertex {
     pub pos: [f32; 3],
-    pub nrm: [f32; 3],
+    /// the face's normal, signed 8-bit (w unused): a city tile holds millions
+    /// of these vertices, and 32 bytes a vertex rather than 40 keeps a fifth
+    /// of its geometry out of GPU memory
+    pub nrm: [i8; 4],
     /// walls: (metres along, metres above ground). roofs: material coordinates.
     pub uv: [f32; 2],
     /// rgb colour; a = surface kind (see K_*)
@@ -259,6 +262,12 @@ pub const HCLASS: [(f32, f32); 4] = [(150.0, 3.0), (100.0, 2.0), (65.0, 1.5), (0
 pub fn hclass(h: f32) -> usize {
     HCLASS.iter().position(|c| h >= c.0).unwrap_or(HCLASS.len() - 1)
 }
+/// A unit vector as `Snorm8x4`.
+fn snorm8(n: Vec3) -> [i8; 4] {
+    let q = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
+    [q(n.x), q(n.y), q(n.z), 0]
+}
+
 /// Most vertices a tile may spend on its finest level of detail.
 const FINE_BUDGET: usize = 450_000;
 /// The tile is cut into CELLS x CELLS cells (about 230-300 m across), and the
@@ -329,7 +338,7 @@ impl Mesh {
         let v0 = self.v.len() as u32;
         for (p, uv) in pts {
             self.radius = self.radius.max(p.length());
-            self.v.push(BVertex { pos: (*p).into(), nrm: n.into(), uv: *uv, col, sty });
+            self.v.push(BVertex { pos: (*p).into(), nrm: snorm8(n), uv: *uv, col, sty });
         }
         if lvl == FINE {
             self.fine_verts += pts.len();
@@ -2217,7 +2226,7 @@ mod tests {
                     let v0 = m.v.len() as u32;
                     for k in 0..3 {
                         let p = [c[0] + k as f32 + t as f32, 5.0 * k as f32, c[1]];
-                        m.v.push(BVertex { pos: p, nrm: [0.0; 3], uv: [0.0; 2], col: [0; 4], sty: [0; 4] });
+                        m.v.push(BVertex { pos: p, nrm: [0; 4], uv: [0.0; 2], col: [0; 4], sty: [0; 4] });
                         owner.push(b);
                     }
                     run.extend([v0, v0 + 1, v0 + 2]);
@@ -2238,7 +2247,7 @@ mod tests {
         for x in [990.0f32, 5.0, 995.0] {
             let v0 = m.v.len() as u32;
             for k in 0..3 {
-                m.v.push(BVertex { pos: [x + k as f32, 0.0, 500.0], nrm: [0.0; 3], uv: [0.0; 2], col: [0; 4], sty: [0; 4] });
+                m.v.push(BVertex { pos: [x + k as f32, 0.0, 500.0], nrm: [0; 4], uv: [0.0; 2], col: [0; 4], sty: [0; 4] });
                 owner.push(usize::MAX);
             }
             m.det.extend([v0, v0 + 1, v0 + 2]);
