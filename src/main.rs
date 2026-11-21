@@ -41,6 +41,8 @@ mod gamemode;
 mod gauges;
 mod gmaps;
 mod graphics;
+mod graphics_core;
+mod progress;
 mod tiles3d;
 mod impostor;
 mod materials;
@@ -218,6 +220,7 @@ impl Loaded {
             None => (spec.build)(),
         };
         log::info!("{}: {} pieces, {} vertices, built in {:.0} ms", spec.name, model.pieces.len(), model.pieces.iter().map(|p| p.mesh.v.len()).sum::<usize>(), t0.elapsed().as_secs_f64() * 1000.0);
+        crate::progress::step("aircraft");
         model
     }
 
@@ -310,6 +313,8 @@ struct Args {
     upscaler: Option<graphics::Upscaler>,
     /// log the frame rate once a second (average and slowest frame)
     fps_log: bool,
+    /// --bench SECONDS: the launcher's graphics test (see `Bench`)
+    bench: Option<f64>,
     /// draw without showing anything (benchmarks and scripted shots with the screen off)
     headless: bool,
     minimap_plan: Option<bool>,
@@ -410,7 +415,7 @@ struct Args {
     mcp_port: u16,
 }
 
-const CLI_USAGE: &str = "fablegame [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--birds off|low|medium|high] [--flock gull|crow|starling|buzzard|goose,KM[,BEARING[,AGL_M]]] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit | --tail-view] [--fov DEG] [--no-vsync] [--no-taa] [--graphics very-low|low|medium|high|ultra] [--storm-quality low|medium|high|ultra] [--render-scale 0.35..2] [--upscaler bilinear|fsr1|fsr3|fsr4] [--fsr4-install] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--mute] [--lang CODE] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--livery N] [--still] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
+const CLI_USAGE: &str = "fablegame [--version] [--menu | --no-menu] [--menu-screen main|fly|aircraft|settings] [--menu-view LAT,LON,ALT_M] [--hangar mine|download[:FOLDER]] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--speed KT] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--rain 0..1] [--rain-at KM,BEARING] [--wet 0..1] [--birds off|low|medium|high] [--flock gull|crow|starling|buzzard|goose,KM[,BEARING[,AGL_M]]] [--snow auto|off|always] [--weather [clear|fair|hazy|overcast|windy|storm]] [--storm-at KM,BEARING[,RADIUS_KM][,shower|thunder|severe|supercell]] [--squall-at KM,BEARING[,LENGTH_KM]] [--strike cg|ic,KM,BEARING@SECONDS] [--flight-menu SECONDS] [--pause-menu flight|places|radio|weather|game|settings[:SECTION]|controls|failures[@SECONDS]] [--settings general|graphics|sound|camera|controls|map] [--airport CODE [--runway 28L] [--approach]] [--aircraft KEY] [--max-zoom 8..19] [--cockpit | --tail-view] [--fov DEG] [--no-vsync] [--no-taa] [--graphics very-low|low|medium|high|ultra] [--storm-quality low|medium|high|ultra] [--render-scale 0.35..2] [--upscaler bilinear|fsr1|fsr3|fsr4] [--fsr4-install] [--headless] [--minimap plan|satellite] [--minimap-up north|heading] [--fps-log] [--bench SECONDS] [--mute] [--lang CODE] [--fuel 0..1] [--cold] [--arcade] [--mcp | --no-mcp] [--mcp-port PORT] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--livery N] [--still] [--boost-at SECONDS] [--stage-at SECONDS] [--engines GROUP] [--ship] [--damage ...]";
 
 fn parse_args() -> Args {
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -459,6 +464,7 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
         render_scale: None,
         upscaler: None,
         fps_log: false,
+        bench: None,
         headless: false,
         minimap_plan: None,
         minimap_heading_up: None,
@@ -894,6 +900,7 @@ fn parse_args_from(v: &[String]) -> Result<Args, String> {
                 a.find_storms = true;
                 used = 1;
             }
+            "--bench" => a.bench = Some(req_num(flag, i)?.clamp(3.0, 120.0)),
             "--fps-log" => {
                 a.fps_log = true;
                 used = 1;
@@ -1440,6 +1447,72 @@ struct Game {
     mcp_throttle: Option<f64>,
     /// the bound throttle axis's last reading, to notice the pilot moving it
     throttle_axis: Option<f64>,
+    /// --bench: the frame times being gathered for the launcher's graphics test
+    bench: Option<Bench>,
+}
+
+/// The launcher's graphics test (`--bench SECONDS`): after a settling time
+/// for the scenery to stream in, every frame's time is kept for SECONDS of
+/// real time; then the figures go to stdout as one line
+/// `@fable-bench {json}` and the game quits.
+struct Bench {
+    secs: f64,
+    /// when the frames counted start (real seconds since the first frame)
+    from: f64,
+    clock: Instant,
+    times: Vec<f64>,
+}
+
+impl Bench {
+    /// Seconds given to the shaders, the terrain and the city to load first
+    /// (the aircraft's own pipelines compile about 15 s in, see render.rs).
+    const SETTLE: f64 = 16.0;
+
+    fn new(secs: f64) -> Self {
+        Bench { secs, from: Self::SETTLE, clock: Instant::now(), times: Vec::new() }
+    }
+
+    /// Counts a frame; true once the test is over.
+    fn frame(&mut self, dt: f64, gpu: &str, size: (u32, u32), gfx: &graphics::Graphics) -> bool {
+        let t = self.clock.elapsed().as_secs_f64();
+        if t < self.from {
+            return false;
+        }
+        self.times.push(dt);
+        if t < self.from + self.secs {
+            return false;
+        }
+        let mut v = self.times.clone();
+        v.sort_by(|a, b| b.total_cmp(a));
+        let n = v.len().max(1) as f64;
+        let total: f64 = v.iter().sum();
+        // the frame rate the slowest 1% and 0.1% of frames stay above (the
+        // 99th and 99.9th percentile frame times): steady running, where a
+        // mean of the slowest frames would be all the odd loading hitch
+        let low = |share: f64| {
+            let k = ((n * share) as usize).min(v.len().saturating_sub(1));
+            v.get(k).map_or(0.0, |t| if *t > 0.0 { 1.0 / t } else { 0.0 })
+        };
+        let j = serde_json::json!({
+            "fps": if total > 0.0 { n / total } else { 0.0 },
+            "low1": low(0.01),
+            "low01": low(0.001),
+            "worst_ms": v.first().copied().unwrap_or(0.0) * 1000.0,
+            // frames over 100 ms: the stutters a pilot notices
+            "hitches": v.iter().filter(|t| **t > 0.1).count(),
+            "frames": v.len(),
+            "secs": total,
+            "gpu": gpu,
+            "width": size.0,
+            "height": size.1,
+            "preset": gfx.matches().map(graphics::Preset::name).unwrap_or("Custom"),
+            "scale": gfx.render_scale(),
+        });
+        println!("@fable-bench {j}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        true
+    }
 }
 
 impl Game {
@@ -1454,6 +1527,10 @@ impl Game {
             gfx.storms = l;
         }
         gfx.vsync &= args.vsync;
+        if args.bench.is_some() {
+            // the graphics test measures the GPU, not a frame limit
+            gfx.fps_cap = 0;
+        }
         gfx.taa &= args.taa && prefs.taa;
         // A first start (nothing saved, no preset asked for) leaves the MSAA
         // and the preset to the GPU found: lighter on integrated graphics.
@@ -1671,7 +1748,7 @@ impl Game {
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), airport_note: (String::new(), -100.0), weapon_flash: None, kills: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
             start_rx: None, loading: None, name_rx: None, last_click: -10.0, n_cars: 0, skyglow: Default::default(), snowmap: Default::default(), snowtrack: Default::default(), birds: birds::Birds::with_flocks(args.flocks.clone()), birds_level: args.birds, bird_insts: 0, bird_shape: ("", birds::Shape::default()), gauges: gauges::Gauges::new(&plane, secs.to_bits()), glass, lightning, rain_field: storm::RainField::default(), cam_rain: 0.0, cam_hail: 0.0, snow_field: storm::RainField::default(), cam_snow: start_snow, cam_blow: 0.0, fresh: snow::Fresh::default(), fresh_line: 0.0, storm_adapt: 0.0, city_adapt: 0.0, city_probe: None, plane, weapons,
-            airport_rx: None, hold_spot: None,
+            airport_rx: None, hold_spot: None, bench: args.bench.map(Bench::new),
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
             live: live::Live::new(prefs.live_traffic),
@@ -1744,6 +1821,7 @@ impl Game {
         if g.menu.pick.is_none() && !args.pos_set && args.menu_view.is_none() && args.aircraft.is_none() {
             g.restore_last_start();
         }
+        progress::step("world");
         Ok(g)
     }
 
@@ -5172,7 +5250,7 @@ impl Game {
     /// Saves the settings when they have changed (looked at once a second,
     /// so dragging a slider does not write the file every frame).
     fn keep_settings(&mut self, now: bool) {
-        if std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record") { return; }
+        if std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record" || a == "--bench") { return; }
         if !now && self.real - self.prefs_t < 1.0 {
             return;
         }
@@ -5246,6 +5324,12 @@ impl Game {
         self.last = now;
         self.real += dt_real;
         self.frame += 1;
+        if self.frame > 1 && let Some(b) = &mut self.bench {
+            let size = (self.r.config.width, self.r.config.height);
+            if b.frame(raw_dt, &self.r.gpu.name, size, &self.gfx) {
+                self.quit = true;
+            }
+        }
         self.pump_mcp();
         if self.record.is_none() {
             self.fps += (1.0 / raw_dt.max(1e-4) - self.fps) * 0.05;
@@ -8074,7 +8158,9 @@ impl ApplicationHandler for App {
         if self.game.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("Fable Flight").with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
+        progress::step("window");
+        let title = if self.args.bench.is_some() { "Fable Flight: graphics test" } else { "Fable Flight" };
+        let attrs = Window::default_attributes().with_title(title).with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
         let window = Arc::new(el.create_window(attrs).expect("window"));
         match Game::new(window, &self.args) {
             Ok(g) => self.game = Some(g),
@@ -8110,7 +8196,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 g.keep_settings(true);
-                if !std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record") { g.src.google.save(); }
+                if !std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record" || a == "--bench") { g.src.google.save(); }
                 // Dropped here, while the event loop (and with it the Wayland
                 // connection) is still alive: egui's clipboard thread tears
                 // down its Wayland objects on drop, and if the game outlived
@@ -8127,9 +8213,12 @@ impl ApplicationHandler for App {
                 }
                 self.frame_pacer.frame_started(now);
                 g.frame();
+                if g.frame == 1 {
+                    progress::step("ready");
+                }
                 if g.quit {
                     g.keep_settings(true);
-                    if !std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record") { g.src.google.save(); }
+                    if !std::env::args().any(|a| a == "--headless" || a == "--shot" || a == "--record" || a == "--bench") { g.src.google.save(); }
                     // Worker threads may be mid-download, so the process just
                     // exits; but the GPU device is torn down first: exiting
                     // under the driver's shader compiler threads can crash it.
@@ -8142,7 +8231,7 @@ impl ApplicationHandler for App {
                 g.cancel_cockpit_input();
                 g.keys.clear();
                 (g.pad_y, g.pad_y_combo) = (false, false);
-                if g.mode == Mode::Fly && !g.crashed && !g.r.headless && g.record.is_none() && g.shots.is_empty() {
+                if g.mode == Mode::Fly && !g.crashed && !g.r.headless && g.record.is_none() && g.shots.is_empty() && g.bench.is_none() {
                     g.set_pause_menu(true);
                 }
             }
@@ -8584,6 +8673,11 @@ fn fly_check(key: Option<&String>) -> i32 {
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("fablegame {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    progress::step("boot");
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,fablegame=info")).init();
     // A JSBSim aircraft compared with one of ours (see jsbsim.rs), and out.
     let argv: Vec<String> = std::env::args().collect();
