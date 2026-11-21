@@ -867,12 +867,6 @@ fn geom_pipeline(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_casc: &wgpu::Bi
     })
 }
 
-/// The aircraft pipelines with the shader that draws every kind and the
-/// instruments. Built on a thread of their own, after the first frame: Intel's
-/// shader compiler takes minutes over this shader when its cache is cold
-/// (2.5 min on an Alder Lake iGPU with Mesa 25.3), during which the window
-/// would stand frozen. Until they are ready the kind flown is drawn with its
-/// specialised shader (`ObjFast`), and what needs these waits.
 /// Held while the aircraft shader is compiled for a pipeline set (`ObjFast`,
 /// `ObjGeneric`): with a cold driver cache each compile of it takes 1.5-2 GB
 /// on Intel's compiler, so two at once beside the world loading took a 16 GB
@@ -880,20 +874,65 @@ fn geom_pipeline(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_casc: &wgpu::Bi
 static BIG_COMPILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 0 no specialised set asked for yet, 1 one is being built, 2 built.
 static FAST_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Of the two pipelines that draw the aircraft, how many the specialised set
+/// being built and the generic set have (for `Renderer::aircraft_prep`).
+static FAST_STEPS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static GEN_STEPS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// The aircraft not drawn yet, its shaders still being compiled: of the
+/// `total` pipelines it needs, `done`, and since when it has waited.
+#[derive(Clone, Copy, Debug)]
+pub struct AircraftPrep {
+    pub done: u32,
+    pub total: u32,
+    pub secs: f64,
+}
+
+/// The aircraft pipelines with the shader that draws every kind and the
+/// instruments. Built on a thread of their own, after the first frame: Intel's
+/// shader compiler takes minutes over this shader when its cache is cold
+/// (about a minute per pipeline on an Alder Lake iGPU with Mesa 25.3), during
+/// which the window would stand frozen. Until they are ready the kind flown is
+/// drawn with its specialised shader (`ObjFast`), and what needs these waits.
+/// The two that draw the aircraft come first (`ObjGenMsg::Draw`), so it shows
+/// a minute or two in rather than after all five; shadows and glass follow.
 pub struct ObjGeneric {
     obj: wgpu::RenderPipeline,
-    shadow: wgpu::RenderPipeline,
     solid: wgpu::RenderPipeline,
+    /// the aircraft's shadows and windows, once built
+    rest: Option<ObjRest>,
+}
+
+pub struct ObjRest {
+    shadow: wgpu::RenderPipeline,
     shadow_solid: wgpu::RenderPipeline,
     glass: wgpu::RenderPipeline,
 }
 
-fn obj_generic(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_obj: &wgpu::BindGroupLayout, l_casc: &wgpu::BindGroupLayout, l_glass: &wgpu::BindGroupLayout, m: &wgpu::ShaderModule) -> ObjGeneric {
-    const A_PART: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x4];
+/// What the generic aircraft pipeline thread sends, in this order.
+pub enum ObjGenMsg {
+    Draw(wgpu::RenderPipeline, wgpu::RenderPipeline),
+    Rest(ObjRest),
+}
+
+const A_PART: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x4];
+
+/// The generic `obj` (cut) and `solid` pipelines: what draws the aircraft.
+fn obj_generic_draw(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_obj: &wgpu::BindGroupLayout, l_casc: &wgpu::BindGroupLayout, m: &wgpu::ShaderModule) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
     let vb = [Some(wgpu::VertexBufferLayout { array_stride: 64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A_PART })];
     let geom = |label: &str, mode: u8| geom_pipeline(d, l0, l_casc, label, Some(l_obj), m, &vb, mode);
-    let (obj, shadow, solid, shadow_solid) = (geom("obj", 0), geom("obj shadow", 4), geom("obj solid", 5), geom("obj shadow solid", 1));
+    use std::sync::atomic::Ordering::Relaxed;
+    let obj = geom("obj", 0);
+    GEN_STEPS.store(1, Relaxed);
+    let solid = geom("obj solid", 5);
+    GEN_STEPS.store(2, Relaxed);
+    (obj, solid)
+}
+
+fn obj_generic_rest(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_obj: &wgpu::BindGroupLayout, l_casc: &wgpu::BindGroupLayout, l_glass: &wgpu::BindGroupLayout, m: &wgpu::ShaderModule) -> ObjRest {
+    let vb = [Some(wgpu::VertexBufferLayout { array_stride: 64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A_PART })];
+    let geom = |label: &str, mode: u8| geom_pipeline(d, l0, l_casc, label, Some(l_obj), m, &vb, mode);
+    let (shadow, shadow_solid) = (geom("obj shadow", 4), geom("obj shadow solid", 1));
     let p_glass = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("glass"),
         layout: Some(&d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(l0), Some(l_obj), Some(l_glass)], immediate_size: 0 })),
@@ -917,7 +956,7 @@ fn obj_generic(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_obj: &wgpu::BindG
         multiview_mask: None,
         cache: None,
     });
-    ObjGeneric { obj, shadow, solid, shadow_solid, glass: p_glass }
+    ObjRest { shadow, shadow_solid, glass: p_glass }
 }
 
 /// the g-buffer pipeline for aircraft parts, mode 0 or 5 of `geom`.
@@ -1226,9 +1265,11 @@ pub struct Renderer {
     p_build_shadow: wgpu::RenderPipeline,
     /// the generic aircraft pipelines, once built (`ObjGeneric`)
     obj_gen: Option<ObjGeneric>,
-    obj_gen_rx: Option<crossbeam_channel::Receiver<ObjGeneric>>,
+    obj_gen_rx: Option<crossbeam_channel::Receiver<ObjGenMsg>>,
     /// wait for them rather than draw without them (screenshots, recordings)
     pub wait_objs: bool,
+    /// since when the aircraft has waited for its pipelines (`aircraft_prep`)
+    obj_wait: Option<(std::time::Instant, AircraftPrep)>,
     p_composite: wgpu::RenderPipeline,
     /// the composite again, sample by sample, where water shares a pixel
     /// only with MSAA: at one sample there are no water edges to shade sample by sample
@@ -2461,7 +2502,7 @@ impl Renderer {
             )
         });
         let obj_gen_rx = {
-            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (tx, rx) = crossbeam_channel::bounded(2);
             let (d, l0, l_obj, l_casc, l_glass, m) = (d.clone(), l0.clone(), l_obj.clone(), l_casc.clone(), l_glass.clone(), m_obj.clone());
             // (a roomy stack, as for `want_obj_kind`)
             let spawned = std::thread::Builder::new().name("obj pipelines".into()).stack_size(16 << 20).spawn(move || {
@@ -2472,11 +2513,26 @@ impl Renderer {
                 while FAST_STATE.load(Relaxed) == 1 || (FAST_STATE.load(Relaxed) == 0 && t.elapsed().as_secs() < 15) {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                let _big = BIG_COMPILE.lock().unwrap_or_else(|e| e.into_inner());
                 let t = std::time::Instant::now();
-                let g = obj_generic(&d, &l0, &l_obj, &l_casc, &l_glass, &m);
+                let draw = {
+                    let _big = BIG_COMPILE.lock().unwrap_or_else(|e| e.into_inner());
+                    obj_generic_draw(&d, &l0, &l_obj, &l_casc, &m)
+                };
+                log::info!("aircraft draw pipelines ready in {:.1} s", t.elapsed().as_secs_f64());
+                if tx.send(ObjGenMsg::Draw(draw.0, draw.1)).is_err() {
+                    return;
+                }
+                // (the lock let go between the two, so a specialised set asked
+                // for meanwhile is not kept waiting behind the shadows)
+                while FAST_STATE.load(Relaxed) == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let rest = {
+                    let _big = BIG_COMPILE.lock().unwrap_or_else(|e| e.into_inner());
+                    obj_generic_rest(&d, &l0, &l_obj, &l_casc, &l_glass, &m)
+                };
                 log::info!("aircraft pipelines ready in {:.1} s", t.elapsed().as_secs_f64());
-                let _ = tx.send(g);
+                let _ = tx.send(ObjGenMsg::Rest(rest));
             });
             if let Err(e) = spawned {
                 log::error!("aircraft pipeline thread: {e}");
@@ -2586,7 +2642,7 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_composite, l_cloud, l_cloud_storm, l_cloud_rain, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, gclouds_tex, snow_tex, snow_track_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, obj_gen: None, obj_gen_rx: Some(obj_gen_rx), wait_objs: false, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_composite, p_composite_edge, p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit,
+            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, obj_gen: None, obj_gen_rx: Some(obj_gen_rx), wait_objs: false, obj_wait: None, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_composite, p_composite_edge, p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, clouds: true, cloud_shadows: true, vendor: info.vendor, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, up, gpu: info.clone(), meshes: Vec::new(), egui, instance, window, gpu_error, device_lost, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
@@ -2957,12 +3013,17 @@ impl Renderer {
         // default for a spawned thread, isn't enough there).
         use std::sync::atomic::Ordering::Relaxed;
         let _ = FAST_STATE.compare_exchange(0, 1, Relaxed, Relaxed);
+        FAST_STEPS.store(0, Relaxed);
         let spawned = std::thread::Builder::new().name("obj shader".into()).stack_size(16 << 20).spawn(move || {
             let t = std::time::Instant::now();
             let f = {
                 let _big = BIG_COMPILE.lock().unwrap_or_else(|e| e.into_inner());
                 let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("plane fast"), source: wgpu::ShaderSource::Wgsl(specialise(&src, kind).into()) });
-                ObjFast { kind, cut: obj_pipeline(&d, &pl, &m, true), solid: obj_pipeline(&d, &pl, &m, false) }
+                let cut = obj_pipeline(&d, &pl, &m, true);
+                FAST_STEPS.store(1, Relaxed);
+                let solid = obj_pipeline(&d, &pl, &m, false);
+                FAST_STEPS.store(2, Relaxed);
+                ObjFast { kind, cut, solid }
             };
             FAST_STATE.store(2, Relaxed);
             log::info!("aircraft shader for kind {kind} ready in {:.1} s", t.elapsed().as_secs_f64());
@@ -2973,6 +3034,26 @@ impl Renderer {
         } else {
             FAST_STATE.store(2, Relaxed);
         }
+    }
+    /// Whether the aircraft `kind` (of the first object drawn, if any) can be
+    /// drawn yet, and if not how far its pipelines are (`aircraft_prep`).
+    fn update_obj_wait(&mut self, kind: Option<u32>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let drawn = kind.is_none_or(|k| self.obj_gen.is_some() || self.obj_fast.as_ref().is_some_and(|f| f.kind == k));
+        if drawn {
+            self.obj_wait = None;
+            return;
+        }
+        // whichever of the two sets is nearer: the first done draws it
+        let fast = if self.obj_fast_rx.is_some() { FAST_STEPS.load(Relaxed) } else { 0 };
+        let done = fast.max(GEN_STEPS.load(Relaxed)).min(1) as u32;
+        let t0 = self.obj_wait.map_or_else(std::time::Instant::now, |w| w.0);
+        self.obj_wait = Some((t0, AircraftPrep { done, total: 2, secs: t0.elapsed().as_secs_f64() }));
+    }
+    /// The aircraft is not drawn yet: its shaders are being compiled (minutes
+    /// on some drivers with a cold cache). None once it is drawn.
+    pub fn aircraft_prep(&self) -> Option<AircraftPrep> {
+        self.obj_wait.map(|w| w.1)
     }
     fn mesh_gpu(&self, verts: &[PartVertex], idx: &[u32], bind: Option<std::sync::Arc<wgpu::BindGroup>>) -> MeshGpu {
         // an empty piece, a hinge others hang from, still gets a buffer.
@@ -3073,23 +3154,30 @@ impl Renderer {
         }
         let t_enc = std::time::Instant::now();
         self.stats[1] += (t_enc - t_acq).as_secs_f64();
-        if let Some(rx) = &self.obj_gen_rx {
+        // (asked for first: a screenshot waiting below for the generic set
+        // would otherwise hold it back until the 15 s are up)
+        let kind = f.objs.iter().find(|o| !o.glass).map(|o| o.glow[1].round().max(0.0) as u32);
+        if let Some(k) = kind {
+            self.want_obj_kind(k);
+        }
+        while let Some(rx) = &self.obj_gen_rx {
             let got = if self.wait_objs { rx.recv().map_err(|_| crossbeam_channel::TryRecvError::Disconnected) } else { rx.try_recv() };
             match got {
-                Ok(g) => {
-                    self.obj_gen = Some(g);
+                Ok(ObjGenMsg::Draw(obj, solid)) => self.obj_gen = Some(ObjGeneric { obj, solid, rest: None }),
+                Ok(ObjGenMsg::Rest(r)) => {
+                    if let Some(g) = &mut self.obj_gen {
+                        g.rest = Some(r);
+                    }
                     self.obj_gen_rx = None;
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     log::error!("the aircraft pipelines could not be built");
                     self.obj_gen_rx = None;
                 }
             }
         }
-        if let Some(o) = f.objs.iter().find(|o| !o.glass) {
-            self.want_obj_kind(o.glow[1].round().max(0.0) as u32);
-        }
+        self.update_obj_wait(kind);
         let sview = frame.as_ref().map(|f| f.texture.create_view(&Default::default()));
         let q = &self.queue;
         self.cloud_flip ^= 1;
@@ -3568,20 +3656,22 @@ impl Renderer {
             let fast = self.obj_fast.as_ref().filter(|_| !shadow);
             // (until the generic pipelines are built, only what the fast ones draw)
             let generic = self.obj_gen.as_ref();
+            let rest = generic.and_then(|g| g.rest.as_ref());
             for (i, o) in f.objs.iter().take(if part & 1 == 0 { 0 } else { n_objs }).enumerate() {
                 if o.glass || if shadow { o.cast & bit == 0 } else { false } {
                     continue;
                 }
                 let is_fast = fast.is_some_and(|fp| fp.kind == o.glow[1].round() as u32);
-                if generic.is_none() && !is_fast {
+                let ready = if shadow { rest.is_some() } else { generic.is_some() || is_fast };
+                if !ready {
                     continue;
                 }
                 let m = &self.meshes[o.mesh];
                 let mut set = |rp: &mut wgpu::RenderPass, want: u8| {
                     if cur != Some(want) {
                         rp.set_pipeline(match (shadow, want) {
-                            (true, 1) => &generic.expect("generic").shadow,
-                            (true, _) => &generic.expect("generic").shadow_solid,
+                            (true, 1) => &rest.expect("generic").shadow,
+                            (true, _) => &rest.expect("generic").shadow_solid,
                             (false, 1) => &generic.expect("generic").obj,
                             (false, 0) => &generic.expect("generic").solid,
                             (false, 3) => &fast.expect("fast").cut,
@@ -3744,7 +3834,7 @@ impl Renderer {
         {
             // The aircraft's own fine shadow map.
             let mut rp = enc.begin_render_pass(&pass_desc(&[], Some(depth_att(&self.shadow[PLANE_LAYER], 1.0))));
-            if let (true, Some(generic)) = (f.g.pshadow[3] > 0.0, self.obj_gen.as_ref()) {
+            if let (true, Some(generic)) = (f.g.pshadow[3] > 0.0, self.obj_gen.as_ref().and_then(|g| g.rest.as_ref())) {
                 let r = self.plane_shadow_res() as f32;
                 rp.set_viewport(0.0, 0.0, r, r, 0.0, 1.0);
                 rp.set_bind_group(0, &self.bg0_pre, &[]);
@@ -4012,7 +4102,7 @@ impl Renderer {
             }
         }
         mark(&mut enc, "fire");
-        if let (true, Some(generic)) = (f.objs.iter().take(n_objs).any(|o| o.glass), self.obj_gen.as_ref()) {
+        if let (true, Some(generic)) = (f.objs.iter().take(n_objs).any(|o| o.glass), self.obj_gen.as_ref().and_then(|g| g.rest.as_ref())) {
             // The windows bend what is seen through them, so they read the
             // scene from a copy. The depth stays read-only: it is sampled too.
             let (w, h) = (t.hdr_tex.width(), t.hdr_tex.height());

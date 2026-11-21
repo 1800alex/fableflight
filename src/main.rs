@@ -1035,6 +1035,50 @@ impl Loading {
     }
 }
 
+/// The bar for the aircraft's shaders: the pipelines done filled in, and a
+/// glint running over the one being compiled (it gives no progress of its own).
+fn prep_bar(p: &egui::Painter, bar: egui::Rect, prep: render::AircraftPrep, now: f64, a: f32) {
+    let fade = |c: egui::Color32| c.gamma_multiply(a);
+    p.rect_filled(bar, menu::R_WIDGET, fade(egui::Color32::from_gray(45)));
+    let step = bar.width() / prep.total.max(1) as f32;
+    let mut done = bar;
+    done.set_width(step * prep.done as f32);
+    p.rect_filled(done, menu::R_WIDGET, fade(menu::ACCENT));
+    let x0 = bar.left() + done.width();
+    let glint = (step * 0.3).min(80.0);
+    let x = x0 + ((now * 0.6).fract() as f32) * (step + glint) - glint;
+    let g = egui::Rect::from_x_y_ranges(x.max(x0)..=(x + glint).min(x0 + step), bar.y_range());
+    if g.width() > 0.0 {
+        p.rect_filled(g, menu::R_WIDGET, fade(menu::ACCENT.gamma_multiply(0.55)));
+    }
+}
+
+/// The aircraft's shaders: the bar `w` wide with its top centred on `top`,
+/// what they are at and why it takes so long under it (wrapped to `w`), on a
+/// dark panel if `panel`.
+fn draw_prep(p: &egui::Painter, top: egui::Pos2, w: f32, prep: render::AircraftPrep, now: f64, a: f32, panel: bool) {
+    let fade = |c: egui::Color32| c.gamma_multiply(a);
+    let s = prep.secs as u64;
+    // (centred line by line: a galley laid out about x = 0)
+    let centred = |text: String, col: egui::Color32| {
+        let mut job = egui::text::LayoutJob::simple(text, menu::caption(), fade(col), w);
+        job.halign = egui::Align::Center;
+        p.layout_job(job)
+    };
+    let head = centred(t!("game.aircraft_shaders", prep.done + 1, prep.total, s / 60, s % 60), menu::ACCENT);
+    let note = centred(t!("game.aircraft_shaders_note").to_string(), egui::Color32::from_gray(150));
+    let bar = egui::Rect::from_center_size(egui::pos2(top.x, top.y + 3.0), egui::vec2(w, 6.0));
+    let y_head = bar.bottom() + 10.0;
+    let y_note = y_head + head.size().y + 4.0;
+    if panel {
+        let r = egui::Rect::from_min_max(egui::pos2(top.x - w / 2.0 - 18.0, top.y - 16.0), egui::pos2(top.x + w / 2.0 + 18.0, y_note + note.size().y + 14.0));
+        p.rect_filled(r, 8.0, egui::Color32::from_black_alpha((190.0 * a) as u8));
+    }
+    prep_bar(p, bar, prep, now, a);
+    p.galley(egui::pos2(top.x, y_head), head, egui::Color32::WHITE);
+    p.galley(egui::pos2(top.x, y_note), note, egui::Color32::WHITE);
+}
+
 /// Shown on the loading screen, one at a time (translated in i18n.rs).
 const LOADING_TIPS: &[&str] = &[
     "C switches between the chase view and the cockpit; drag the mouse to look around.",
@@ -2140,6 +2184,7 @@ impl Game {
     fn loading_overlay(&mut self, ctx: &egui::Context) {
         use egui::{Align2, Color32, FontId};
         let Some(l) = self.loading.clone() else { return };
+        let prep = self.r.aircraft_prep();
         let a = match l.done {
             Some(d) => (1.0 - (self.real - d) / Loading::FADE).clamp(0.0, 1.0) as f32,
             None => 1.0,
@@ -2176,6 +2221,10 @@ impl Game {
             y = bar.bottom() + 12.0;
             let what = if l.done.is_some() { t!("game.ready").to_string() } else { t!("game.loading_the_scenery").to_string() };
             p.text(egui::pos2(c.x, y), Align2::CENTER_TOP, what, menu::caption(), fade(Color32::from_gray(150)));
+            // The aircraft's shaders, if they are still being compiled.
+            if let Some(prep) = prep {
+                draw_prep(p, egui::pos2(c.x, y + 40.0), w.min(460.0), prep, self.real, a, false);
+            }
             // A tip, and how to skip.
             let tip = tr_en(LOADING_TIPS[l.tip % LOADING_TIPS.len()]);
             p.text(egui::pos2(c.x, screen.bottom() - 70.0), Align2::CENTER_TOP, tip, menu::body(), fade(Color32::from_gray(200)));
@@ -2185,6 +2234,17 @@ impl Game {
         if l.done.is_none() && ctx.input(|i| i.pointer.any_click()) {
             self.finish_loading();
         }
+    }
+
+    /// A panel at the top while the aircraft's shaders are still compiling
+    /// (it is not drawn until they are): how far, and that it takes a while.
+    fn aircraft_prep_overlay(&self, ctx: &egui::Context) {
+        let Some(prep) = self.r.aircraft_prep() else { return };
+        let screen = ctx.content_rect();
+        let w = (screen.width() - 80.0).clamp(160.0, 460.0);
+        egui::Area::new(egui::Id::unique("aircraft prep")).order(egui::Order::Foreground).fixed_pos(screen.min).interactable(false).show(ctx, |ui| {
+            draw_prep(ui.painter(), egui::pos2(screen.center().x, screen.top() + 40.0), w, prep, self.real, 1.0, true);
+        });
     }
 
     fn start_airport(&mut self, idx: u32, runway: Option<String>, approach: bool, keep_local: bool) {
@@ -7742,6 +7802,10 @@ impl Game {
             }
             // The loading screen, over everything else.
             self.loading_overlay(ctx);
+            // After it, the aircraft still waiting for its shaders.
+            if self.loading.is_none() {
+                self.aircraft_prep_overlay(ctx);
+            }
             // Google's imagery has to carry its credit, HUD or not.
             if self.hud_on() || self.google_shown() {
                 self.credits(ctx);
