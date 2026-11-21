@@ -3,7 +3,7 @@
 use crate::buildings::{self, Footprint, Parked, TreeChunk};
 use crate::cars::{self, Car};
 use crate::geo::{self, TileId};
-use crate::render::{BuildGpu, CellView, DetailDraw, Inst, NearDraw, Renderer, TessCells, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
+use crate::render::{BuildGpu, DetailDraw, Inst, NearDraw, Renderer, TessCells, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
 use crate::roads::RoadNet;
 use crate::trees::{lod_span, tree_jit, NearCell, TreeDim, Under, CARDS, CARD_RANGE, IMP_DIST, LODS, LOD_DIST, LOD_JITTER, TREE_SPECIES, VARIANTS};
 use crate::weapons::{Target, TargetKey};
@@ -60,8 +60,6 @@ struct BTile {
     fine_t: f32,
     /// distance scale of its tallest height class (buildings::HCLASS)
     tall: f32,
-    /// bounding sphere of each cell of its buildings (buildings::BuildingData::spheres)
-    spheres: Vec<[f32; 4]>,
 }
 /// An airfield near enough to be drawn and to be busy.
 pub struct Field {
@@ -1258,7 +1256,7 @@ impl World {
             let main = bd.cls[0];
             let tall = (0..buildings::HCLASS.len()).find(|&c| main[c] > if c == 0 { 0 } else { main[c - 1] }).map_or(1.0, |c| buildings::HCLASS[c].1);
             let cars = cars::spawn(&bd.net, id.x.wrapping_mul(2246822519) ^ id.y.wrapping_mul(3266489917));
-            self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall, spheres: bd.spheres })));
+            self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall })));
         }
         bytes
     }
@@ -1711,21 +1709,6 @@ impl World {
             let inside = |r: f32| buildings::HCLASS.iter().take_while(|c| maxd < r * c.1 * ck).count() as u8;
             let settled = [inside(buildings::BFAR[0]), if lod[0] >= 1.0 { inside(buildings::BFAR[0]) } else { 0 }, if lod[1] >= 1.0 { inside(buildings::FINE_FADE) } else { 0 }];
             let reach = [buildings::BFAR[1], LOD_MID, LOD_FINE].map(|r| buildings::HCLASS.iter().take_while(|c| dist < r * c.1 * ck).count() as u8);
-            // Each cell as the camera sees it, for the renderer to leave out
-            // what is out of view or past a level's reach (render::cell_drawn).
-            let cells = if *view {
-                b.spheres
-                    .iter()
-                    .map(|sp| {
-                        let c = o + Vec3::new(sp[0], sp[1], sp[2]);
-                        let d = c.length();
-                        let seen = sp[3] >= 0.0 && self.frustum.as_ref().is_none_or(|f| f.sphere(c.as_dvec3(), sp[3] as f64));
-                        CellView { seen, near: (d - sp[3]).max(0.0), far: d + sp[3] }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
             details.push(DetailDraw {
                 gpu: g,
                 u: [o.x, o.y, o.z, 0.0, b.ax[0], b.ax[1], b.ax[2], b.ax[3], b.ay[0], b.ay[1], b.ay[2], b.ay[3], lod[0], lod[1], lod[2], 0.0],
@@ -1735,7 +1718,6 @@ impl World {
                 reach,
                 settled,
                 radius: b.radius as f32,
-                cells,
                 casc: mask,
                 trees: tb.take(),
                 close: near,

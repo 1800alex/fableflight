@@ -631,20 +631,81 @@ pub struct SkinGpu {
 pub struct BuildGpu {
     vbuf: wgpu::Buffer,
     pub ibuf: wgpu::Buffer,
-    n_idx: u32,
+    /// where the middle, finest and far levels start in the index runs
     n_main: u32,
     n_det: u32,
-    n_bld: u32,
     n_far: u32,
-    n_far_tall: u32,
-    cls: [[u32; 4]; 4],
-    /// the buildings' index runs by cell (buildings::BuildingData::segs)
-    segs: Vec<crate::buildings::Seg>,
+    /// where each cell's part of each sort group ends in each run, and each
+    /// cell's bounding sphere (buildings::BuildingData::cell_end, cell_bound)
+    cell_end: Box<crate::buildings::CellEnds>,
+    cell_bound: Vec<[f32; 4]>,
     bind: wgpu::BindGroup,
     road: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     pub trees: Option<wgpu::Buffer>,
 }
 impl BuildGpu {
+    /// The cells (bit per cell) with geometry inside a shadow cascade's box,
+    /// `vp` its camera-relative view-projection; `o` the tile's offset from the camera.
+    fn cells_in(&self, vp: &glam::Mat4, o: glam::Vec3) -> u64 {
+        let (sx, sy) = (vp.row(0).truncate().length(), vp.row(1).truncate().length());
+        let mut mask = 0u64;
+        for (k, b) in self.cell_bound.iter().enumerate() {
+            if b[3] < 0.0 {
+                continue;
+            }
+            let q = *vp * (o + glam::Vec3::new(b[0], b[1], b[2])).extend(1.0);
+            if q.x.abs() <= 1.0 + b[3] * sx && q.y.abs() <= 1.0 + b[3] * sy {
+                mask |= 1 << k;
+            }
+        }
+        mask
+    }
+    /// The cells (bit per cell) with geometry in the view frustum (`planes`,
+    /// its side planes), and how near and how far from the camera each cell's
+    /// geometry may lie; `o` the tile's offset from the camera.
+    fn cells_seen(&self, planes: &[glam::Vec4; 4], o: glam::Vec3) -> (u64, [f32; crate::buildings::NCELL], [f32; crate::buildings::NCELL]) {
+        let (mut mask, mut near, mut far) = (0u64, [0.0; crate::buildings::NCELL], [0.0; crate::buildings::NCELL]);
+        for (k, b) in self.cell_bound.iter().enumerate() {
+            if b[3] < 0.0 {
+                continue;
+            }
+            let p = o + glam::Vec3::new(b[0], b[1], b[2]);
+            if planes.iter().all(|pl| pl.truncate().dot(p) + pl.w >= -b[3] * pl.truncate().length()) {
+                mask |= 1 << k;
+                near[k] = (p.length() - b[3]).max(0.0);
+                far[k] = p.length() + b[3];
+            }
+        }
+        (mask, near, far)
+    }
+    /// Index ranges of sort groups `groups` of run `r` (0 base, 1 middle,
+    /// 2 finest, 3 far stand-ins) in the cells of `mask`, neighbouring cells
+    /// joined into one range.
+    fn cell_ranges(&self, r: usize, groups: std::ops::Range<usize>, mask: u64, mut out: impl FnMut(u32, u32)) {
+        use crate::buildings::NCELL;
+        let start = [0, self.n_main, self.n_det, self.n_far][r];
+        let e = &self.cell_end[r];
+        let mut at = if groups.start == 0 { start } else { e[groups.start - 1][NCELL - 1] };
+        let mut cur: Option<(u32, u32)> = None;
+        for g in groups {
+            for (c, &end) in e[g].iter().enumerate() {
+                if end > at && mask & (1 << c) != 0 {
+                    cur = match cur {
+                        Some((s, ce)) if ce == at => Some((s, end)),
+                        Some((s, ce)) => {
+                            out(s, ce);
+                            Some((at, end))
+                        }
+                        None => Some((at, end)),
+                    };
+                }
+                at = end;
+            }
+        }
+        if let Some((s, e)) = cur {
+            out(s, e);
+        }
+    }
     /// The geometry buffers, in the order of `building_payload`.
     pub fn targets(&self) -> [Option<&wgpu::Buffer>; 5] {
         [Some(&self.vbuf), Some(&self.ibuf), self.road.as_ref().map(|r| &r.0), self.road.as_ref().map(|r| &r.1), self.trees.as_ref()]
@@ -701,81 +762,10 @@ pub struct DetailDraw<'a> {
     pub settled: [u8; 3],
     /// the tile's bounding sphere
     pub radius: f32,
-    /// each cell of its buildings (buildings::CELLS), as the camera sees it;
-    /// empty when the tile is drawn whole
-    pub cells: Vec<CellView>,
     pub casc: u8,
     pub trees: Vec<TreeDraw>,
     pub close: Vec<NearDraw>,
 }
-/// A cell of a building tile from the camera: whether any of it is in view,
-/// and the nearest and farthest its buildings can be (m).
-#[derive(Clone, Copy, Debug)]
-pub struct CellView {
-    pub seen: bool,
-    pub near: f32,
-    pub far: f32,
-}
-
-/// Whether the vertex shader of buildings.wgsl (`vs`) keeps any of a cell
-/// drawn with instance index `inst` (level in the low 3 bits, 4x the height
-/// class's distance scale above). It drops level 1 and 3 past FAR1 + 250 m,
-/// level 2 past LOD2_FAR and level 4 short of FAR0 - 250 m, each over the
-/// scale and the city detail `ck`; a cell wholly on the dropped side, or out
-/// of view, can be left out of the draw.
-fn cell_drawn(c: &CellView, inst: u32, ck: f32) -> bool {
-    use crate::buildings::{BFAR, LOD2_FAR};
-    if !c.seen {
-        return false;
-    }
-    let k = ((inst >> 3) as f32 * 0.25).max(1.0) * ck;
-    let (near, far) = (c.near / k, c.far / k);
-    match inst & 7 {
-        1 | 3 => near <= BFAR[1] + 250.0,
-        2 => near <= LOD2_FAR,
-        4 => far >= BFAR[0] - 250.0,
-        _ => true,
-    }
-}
-
-/// Cuts the index range `start..end` into the stretches to draw: the cells
-/// `cell_drawn` keeps, and whatever between them belongs to no cell (roads,
-/// bridge decks, street furniture), joined where they follow on.
-fn cell_ranges(segs: &[crate::buildings::Seg], cells: &[CellView], start: u32, end: u32, inst: u32, ck: f32, mut out: impl FnMut(u32, u32)) {
-    if cells.is_empty() {
-        out(start, end);
-        return;
-    }
-    let mut open: Option<(u32, u32)> = None;
-    let mut add = |a: u32, b: u32, out: &mut dyn FnMut(u32, u32)| {
-        if b <= a {
-            return;
-        }
-        match &mut open {
-            Some(o) if o.1 == a => o.1 = b,
-            _ => {
-                if let Some(o) = open.replace((a, b)) {
-                    out(o.0, o.1);
-                }
-            }
-        }
-    };
-    let mut at = start;
-    let first = segs.partition_point(|s| s.end <= start);
-    for s in segs[first..].iter().take_while(|s| s.start < end) {
-        add(at, s.start.max(at), &mut out);
-        let (a, b) = (s.start.max(start), s.end.min(end));
-        if cells.get(s.cell as usize).is_none_or(|c| cell_drawn(c, inst, ck)) {
-            add(a, b, &mut out);
-        }
-        at = b;
-    }
-    add(at, end, &mut out);
-    if let Some(o) = open {
-        out(o.0, o.1);
-    }
-}
-
 struct MeshLib {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
@@ -2907,7 +2897,7 @@ impl Renderer {
         let bind = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_build, entries: &[buf_res(0, &self.build_ub, 64), tex_res(1, &atlas)] });
         let road = (!b.road_idx.is_empty()).then(|| (buf(bytemuck::cast_slice(&b.road_verts), wgpu::BufferUsages::VERTEX), buf(bytemuck::cast_slice(&b.road_idx), wgpu::BufferUsages::INDEX), b.road_idx.len() as u32));
         let trees = (!b.trees.is_empty()).then(|| buf(bytemuck::cast_slice(&b.trees), wgpu::BufferUsages::VERTEX));
-        BuildGpu { vbuf, ibuf, n_idx: b.indices.len() as u32, n_main: b.n_main, n_det: b.n_det, n_bld: b.n_bld, n_far: b.n_far, n_far_tall: b.n_far_tall, cls: b.cls, segs: b.segs.clone(), bind, road, trees }
+        BuildGpu { vbuf, ibuf, n_main: b.n_main, n_det: b.n_det, n_far: b.n_far, cell_end: b.cell_end.clone(), cell_bound: b.cell_bound.clone(), bind, road, trees }
     }
 
     pub fn upload_field(&self, m: &crate::airfield::FieldMesh) -> FieldGpu {
@@ -3424,6 +3414,16 @@ impl Renderer {
         }
         // Draws shared by the shadow cascades (c = Some) and the main view (c = None).
         // part: 1 the aircraft and objects, 2 the rest, 3 both.
+        let casc_m: [glam::Mat4; CASCADES] = std::array::from_fn(|c| glam::Mat4::from_cols_array_2d(&f.casc_vp[c]));
+        // The view frustum's side planes (camera-relative), and the graphics
+        // settings' city detail (common.wgsl `city_k`).
+        let frustum = {
+            let m = glam::Mat4::from_cols_array_2d(&f.g.view_proj);
+            let (r0, r1, r3) = (m.row(0), m.row(1), m.row(3));
+            [r3 + r0, r3 - r0, r3 + r1, r3 - r1]
+        };
+        let city_k = if f.g.detail[0] <= 0.0 { 1.0 } else { f.g.detail[0] };
+        use crate::buildings::NCELL;
         let solids = |rp: &mut wgpu::RenderPass, c: Option<usize>, part: u8| {
             let shadow = c.is_some();
             let bit = c.map(|c| 1u8 << c).unwrap_or(0);
@@ -3436,14 +3436,13 @@ impl Renderer {
             // In view, the runs nothing can cut away or dissolve go first with
             // the pipeline that has no discard (early depth testing hides the
             // facades behind them before they are shaded); the rest follow.
-            // (the city detail, as buildings.wgsl's `city_k` reads it)
-            let ck = if f.g.detail[0] <= 0.0 { 1.0 } else { f.g.detail[0] };
             for pass in if part & 2 == 0 { 0..0 } else if shadow { 1..2 } else { 0..2 } {
                 rp.set_pipeline(match (shadow, pass) {
                     (true, _) => &self.p_build_shadow,
                     (false, 0) => &self.p_build_whole,
                     _ => &self.p_build,
                 });
+                let mut runs: Vec<(u32, u32, u32, bool)> = Vec::with_capacity(32);
                 for (i, dd) in f.details.iter().take(n_builds).enumerate() {
                     let g = dd.gpu;
                     let (mid, fine) = (dd.u[12] > 0.0, dd.u[13] > 0.0);
@@ -3453,81 +3452,103 @@ impl Renderer {
                     // 4 far stand-ins dissolving in; above them, 4x the distance scale
                     // of the run's height class (buildings::HCLASS). Whole runs have
                     // nothing cut away this frame (DetailDraw::settled).
-                    let mut runs = [(0u32, 0u32, 0u32, false); 24];
-                    let mut nr = 0;
+                    runs.clear();
                     let mut push = |r: (u32, u32, u32, bool)| {
                         if r.1 > r.0 {
-                            runs[nr] = r;
-                            nr += 1;
+                            runs.push(r);
                         }
                     };
-                    // Level `r` (0 base, 1 middle, 2 finest, 3 far stand-ins): its start,
-                    // and the end of height class `c` in it.
-                    let start = [0, g.n_main, g.n_det, g.n_far];
-                    let end = |r: usize, k: usize| if k == 0 { start[r] } else { g.cls[r][k - 1] };
+                    use crate::buildings::{class_groups, sort_groups_to, GROUPS, HCLASS};
+                    let o = glam::Vec3::new(dd.u[0], dd.u[1], dd.u[2]);
                     let in_zone = zone.is_some_and(|(r, zc, up)| {
-                        let q = glam::Vec3::new(dd.u[0], dd.u[1], dd.u[2]) - zc;
+                        let q = o - zc;
                         (q - up * q.dot(up)).length() < r + dd.radius + 50.0
                     });
                     // Nothing of the tile is fading in, nor inside the 3D tiles zone.
                     let base = dd.u[14] >= 1.0 && !in_zone;
-                    // Height classes `from..to` of level `r`, one draw each; the first
+                    let (k_full, k_mid, k_fine) = (dd.reach[0] as usize, if mid { dd.reach[1] as usize } else { 0 }, if fine { dd.reach[2] as usize } else { 0 });
+                    let [s_full, s_mid, s_fine] = dd.settled;
+                    // Only the cells (buildings::CELLS) a draw can show: in a shadow
+                    // cascade those inside its box; in view those in the frustum and,
+                    // for the levels that end at a distance, short of it (the vertex
+                    // shader would cut every triangle of the rest away).
+                    let (cells, near, far) = match c {
+                        Some(ci) if dd.casc & bit != 0 => (g.cells_in(&casc_m[ci], o), [0.0; NCELL], [0.0; NCELL]),
+                        Some(_) => (0, [0.0; NCELL], [0.0; NCELL]),
+                        None if dd.view => g.cells_seen(&frustum, o),
+                        None => (0, [0.0; NCELL], [0.0; NCELL]),
+                    };
+                    if cells == 0 {
+                        continue;
+                    }
+                    // Cells in view with some of them nearer than `d` metres, or
+                    // some of them further, for height class `c` (buildings.wgsl `lod_dist`).
+                    let short = |c: usize, d: f32| (0..NCELL).filter(|&k| near[k] <= d * HCLASS[c].1 * city_k).fold(0u64, |m, k| m | 1 << k) & cells;
+                    let past = |c: usize, d: f32| (0..NCELL).filter(|&k| far[k] >= d * HCLASS[c].1 * city_k).fold(0u64, |m, k| m | 1 << k) & cells;
+                    let draw = |push: &mut dyn FnMut((u32, u32, u32, bool)), r: usize, groups: std::ops::Range<usize>, lvl: u32, whole: bool, mask: u64| {
+                        g.cell_ranges(r, groups, mask, |s, e| push((s, e, lvl, whole)));
+                    };
+                    // Height classes `from..to` of level `r`, each with the
+                    // level of detail `lvl` in the instance index; the first
                     // `whole` of them are whole.
                     let classes = |push: &mut dyn FnMut((u32, u32, u32, bool)), r: usize, from: usize, to: usize, lvl: u32, whole: u8| {
                         for c in from..to {
-                            push((end(r, c), end(r, c + 1), lvl | ((crate::buildings::HCLASS[c].1 * 4.0) as u32) << 3, base && c < whole as usize));
+                            let mask = match lvl {
+                                1 | 3 => short(c, crate::buildings::BFAR[1] + 250.0),
+                                2 => short(c, crate::buildings::LOD2_FAR),
+                                _ => past(c, crate::buildings::BFAR[0] - 250.0),
+                            };
+                            draw(push, r, class_groups(r, c), lvl | ((HCLASS[c].1 * 4.0) as u32) << 3, base && c < whole as usize, mask);
                         }
                     };
-                    let (k_full, k_mid, k_fine) = (dd.reach[0] as usize, if mid { dd.reach[1] as usize } else { 0 }, if fine { dd.reach[2] as usize } else { 0 });
-                    let [s_full, s_mid, s_fine] = dd.settled;
                     match c {
-                        Some(_) if dd.casc & bit == 0 => {}
-                        Some(2) => push((g.n_far, g.n_far_tall, 0, false)),
+                        // The far cascade: the stand-ins of all but the lowest buildings.
+                        Some(2) => draw(&mut push, 3, 0..4, 0, false, cells),
                         // The second cascade swaps to the stand-ins at their usual distance.
-                        Some(1) if k_full < crate::buildings::HCLASS.len() => {
-                            push((g.n_bld, g.n_main, 0, false));
-                            push((g.n_far, g.n_idx, 0, false));
+                        Some(1) if k_full < HCLASS.len() => {
+                            draw(&mut push, 0, GROUPS - 1..GROUPS, 0, false, cells);
+                            draw(&mut push, 3, 0..GROUPS, 0, false, cells);
                         }
-                        Some(1) => push((0, g.n_main, 0, false)),
+                        Some(1) => draw(&mut push, 0, 0..GROUPS, 0, false, cells),
                         Some(_) => {
-                            push((0, g.n_main, 0, false));
-                            push((g.n_main, end(1, k_mid), 1, false));
-                            push((g.n_det, if dd.u[13] > 0.5 { end(2, k_fine) } else { g.n_det }, 2, false));
+                            draw(&mut push, 0, 0..GROUPS, 0, false, cells);
+                            draw(&mut push, 1, 0..sort_groups_to(k_mid), 1, false, cells);
+                            if dd.u[13] > 0.5 {
+                                draw(&mut push, 2, 0..sort_groups_to(k_fine), 2, false, cells);
+                            }
                         }
-                        None if !dd.view => {}
                         None => match dd.far {
                             0 => {
-                                push((0, g.n_main, 0, base));
+                                draw(&mut push, 0, 0..GROUPS, 0, base, cells);
                                 classes(&mut push, 1, 0, k_mid, 1, s_mid);
                                 classes(&mut push, 2, 0, k_fine, 2, s_fine);
                             }
                             1 => {
                                 classes(&mut push, 0, 0, k_full, 3, s_full);
-                                push((g.n_bld, g.n_main, 0, base));
+                                draw(&mut push, 0, GROUPS - 1..GROUPS, 0, base, cells);
                                 classes(&mut push, 1, 0, k_mid, 1, s_mid);
                                 classes(&mut push, 2, 0, k_fine, 2, s_fine);
                                 // Stand-ins of the classes wholly short of their dissolve
                                 // would only be discarded pixel by pixel: left out.
                                 classes(&mut push, 3, (s_full as usize).min(k_full), k_full, 4, 0);
                                 // Classes past their full geometry's reach: stand-ins only.
-                                push((end(3, k_full), g.n_idx, 0, base));
+                                draw(&mut push, 3, sort_groups_to(k_full)..GROUPS, 0, base, cells);
                             }
                             _ => {
-                                push((g.n_bld, g.n_main, 0, base));
-                                push((g.n_far, g.n_idx, 0, base));
+                                draw(&mut push, 0, GROUPS - 1..GROUPS, 0, base, cells);
+                                draw(&mut push, 3, 0..GROUPS, 0, base, cells);
                             }
                         },
                     }
-                    let mut runs = runs[..nr].iter().filter(|r| shadow || r.3 == (pass == 0)).peekable();
+                    let mut runs = runs.iter().filter(|r| shadow || r.3 == (pass == 0)).peekable();
                     if runs.peek().is_none() {
                         continue;
                     }
                     rp.set_bind_group(1, &g.bind, &[i as u32 * 256]);
                     rp.set_vertex_buffer(0, g.vbuf.slice(..));
                     rp.set_index_buffer(g.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    let cells: &[CellView] = if shadow { &[] } else { &dd.cells };
                     for r in runs {
-                        cell_ranges(&g.segs, cells, r.0, r.1, r.2, ck, |a, b| rp.draw_indexed(a..b, 0, r.2..r.2 + 1));
+                        rp.draw_indexed(r.0..r.1, 0, r.2..r.2 + 1);
                     }
                 }
             }
@@ -4301,57 +4322,5 @@ fn pass_desc<'a>(colors: &'a [Option<wgpu::RenderPassColorAttachment<'a>>], dept
 impl Drop for Renderer {
     fn drop(&mut self) {
         self.fluid.shutdown(&self.device);
-    }
-}
-
-#[cfg(test)]
-mod cell_tests {
-    use super::{cell_drawn, cell_ranges, CellView};
-    use crate::buildings::Seg;
-
-    fn ranges(segs: &[Seg], cells: &[CellView], start: u32, end: u32, inst: u32) -> Vec<(u32, u32)> {
-        let mut v = Vec::new();
-        cell_ranges(segs, cells, start, end, inst, 1.0, |a, b| v.push((a, b)));
-        v
-    }
-    const IN: CellView = CellView { seen: true, near: 10.0, far: 200.0 };
-    const OUT: CellView = CellView { seen: false, near: 10.0, far: 200.0 };
-
-    #[test]
-    fn whole_range_without_cells() {
-        assert_eq!(ranges(&[Seg { start: 0, end: 30, cell: 0 }], &[], 0, 90, 0), vec![(0, 90)]);
-    }
-
-    #[test]
-    fn hidden_cells_are_cut_and_the_rest_joined() {
-        // cell 0 seen, cell 1 hidden, then cell 0 again, then indices of no cell (roads)
-        let segs = [Seg { start: 0, end: 30, cell: 0 }, Seg { start: 30, end: 60, cell: 1 }, Seg { start: 60, end: 90, cell: 0 }];
-        let cells = [IN, OUT];
-        assert_eq!(ranges(&segs, &cells, 0, 120, 0), vec![(0, 30), (60, 120)]);
-        // a range starting and ending inside segments
-        assert_eq!(ranges(&segs, &cells, 15, 75, 0), vec![(15, 30), (60, 75)]);
-        // all hidden
-        assert_eq!(ranges(&segs, &cells, 30, 60, 0), vec![]);
-        // a gap before the first segment is kept
-        let segs = [Seg { start: 12, end: 30, cell: 1 }];
-        assert_eq!(ranges(&segs, &cells, 0, 40, 0), vec![(0, 12), (30, 40)]);
-    }
-
-    #[test]
-    fn levels_follow_the_vertex_shader_reach() {
-        let far = CellView { seen: true, near: 2000.0, far: 2300.0 };
-        let near = CellView { seen: true, near: 0.0, far: 300.0 };
-        // full geometry dissolving out (3) and middle level (1): gone past FAR1 + 250
-        assert!(!cell_drawn(&far, 3, 1.0) && !cell_drawn(&far, 1, 1.0));
-        assert!(cell_drawn(&near, 3, 1.0));
-        // a tower class (4x scale 3 = 12 above the level) keeps it three times as far
-        assert!(cell_drawn(&far, 3 | (12 << 3), 1.0));
-        // stand-ins (4): not drawn close up
-        assert!(!cell_drawn(&near, 4, 1.0) && cell_drawn(&far, 4, 1.0));
-        // finest (2): to LOD2_FAR, scaled by the city detail
-        let mid = CellView { seen: true, near: 500.0, far: 700.0 };
-        assert!(cell_drawn(&mid, 2, 1.0) && !cell_drawn(&mid, 2, 0.45));
-        // base level (0): only the view matters
-        assert!(cell_drawn(&far, 0, 0.45) && !cell_drawn(&OUT, 0, 1.0));
     }
 }

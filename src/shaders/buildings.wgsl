@@ -305,12 +305,14 @@ fn shade_building(in: VOut) -> GOut {
   var extra = vec3f(0.0);
   var Nout = N;
   var mirror = 0.0;  // how much of this pixel is a mirror, for screen-space reflections
+  var sh = -1.0;     // shadow_at(in.P, N), once a branch has needed it
   if (kind == 0u) {
     // Facade frame: x along the wall (the way uv.x runs).
     var Tw = cross(l.upn, N);
     Tw = select(G.east.xyz, Tw / max(length(Tw), 1e-4), length(Tw) > 1e-3);
     if (dot(dPx, Tw) * dUx.x + dot(dPy, Tw) * dUy.x < 0.0) { Tw = -Tw; }
-    let fs = facade_shade(in.P, V, N, Tw, in.uv, fw, base, in.sty.y & 15u, seed, wealth, f32(in.sty.w), false);
+    sh = shadow_at(in.P, N);
+    let fs = facade_shade(in.P, V, N, Tw, in.uv, fw, base, in.sty.y & 15u, seed, wealth, f32(in.sty.w), false, l, sh);
     albedo = fs.albedo;
     extra = fs.extra;
     Nout = fs.N;
@@ -345,12 +347,12 @@ fn shade_building(in: VOut) -> GOut {
     if (dot(dPx, Tr) * dUx.x + dot(dPy, Tr) * dUy.x < 0.0) { Tr = -Tr; }
     N = normalize(N - Tr * ro.bend);
     let fspec = mix(vec3f(ro.f0), ro.albedo, ro.metal);
-    let sh = shadow_at(in.P, N);
+    sh = shadow_at(in.P, N);
     extra = l.sun * roof_glint(N, V, fspec, ro.rough) * sh;
     // Smooth sheet mirrors the sky; rough coverings only scatter it, which the ambient term already has.
     let gloss = (1.0 - ro.rough) * (1.0 - ro.rough);
     let Fe = fspec + (1.0 - fspec) * pow(1.0 - max(dot(N, -V), 0.0), 5.0);
-    extra += env_reflect(in.P, reflect(V, N), l.upn, false) * Fe * gloss;
+    if (gloss > 0.0) { extra += env_reflect(in.P, reflect(V, N), l.upn, false) * Fe * gloss; }
     albedo = ro.albedo * (1.0 - 0.75 * ro.metal);
     // Snow on the roof (snow.rs), sliding off the steep ones; it hides the
     // covering's glint and reflections.
@@ -434,6 +436,7 @@ fn shade_building(in: VOut) -> GOut {
       albedo = base * (0.8 + 0.2 * n);
     }
   }
-  let c = shade(in.P, N, albedo) + extra;
+  if (sh < 0.0) { sh = shadow_at(in.P, N); }
+  let c = shade_lit(in.P, N, albedo, l, sh) + extra;
   return GOut(vec4f(c, 1.0), vec4f(Nout, -mirror), amb_share(c));
 }
