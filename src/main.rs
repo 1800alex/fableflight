@@ -6603,7 +6603,7 @@ impl Game {
         g.cut_v = pf.cut_v;
         casc_vp[render::MASK_SLOT] = g.photo_vp;
         crate::gputime::cpu("photo3d.draw_lists");
-        let (tiles, tess, details, near) = self.world.draw_lists(cam, focus_abs, CASC);
+        let (tiles, tess, details, near) = self.world.draw_lists(cam, focus_abs, CASC, &shadow_vp);
         crate::gputime::cpu("world.draw_lists(culling)");
         let cover = self.world.light_cover(cam);
         // The shore distance field: a step of its rebuild this frame.

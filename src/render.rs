@@ -726,6 +726,8 @@ pub fn building_payload(b: &crate::buildings::BuildingData) -> [&[u8]; 5] {
 pub fn tile_bytes(t: &crate::sources::TileData) -> usize {
     std::mem::size_of_val(&t.verts[..]) + t.imagery.iter().chain(&t.mask).chain(&t.lights).map(|m| m.len()).sum::<usize>()
 }
+/// Distance rings used to sort tree impostor chunks front-to-back for Early-Z occlusion.
+pub const IMP_RINGS: u8 = 6;
 /// One model drawn for a run of the frame's near instances.
 pub struct NearDraw {
     pub mesh: u32,
@@ -733,6 +735,8 @@ pub struct NearDraw {
     pub count: u32,
     /// leaf cards rather than a solid model
     pub cards: bool,
+    /// standing tree (already casts into cascade 0 via `dd.trees`), vs undergrowth
+    pub tree: bool,
 }
 pub struct TreeDraw {
     pub mesh: u32,
@@ -747,6 +751,8 @@ pub struct TreeDraw {
     pub imp: bool,
     /// every tree in the batch drawn with `mesh`, whatever its distance (shadows)
     pub fixed: bool,
+    /// distance ring (0 = nearest .. IMP_RINGS - 1 = farthest) for front-to-back impostors
+    pub ring: u8,
 }
 /// Everything drawn for one detail tile this frame.
 pub struct DetailDraw<'a> {
@@ -816,7 +822,7 @@ pub fn specialise(src: &str, kind: u32) -> String {
 /// A geometry pipeline (see the modes in `Renderer::new`).
 #[allow(clippy::too_many_arguments)]
 fn geom_pipeline(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_casc: &wgpu::BindGroupLayout, label: &str, l1: Option<&wgpu::BindGroupLayout>, m: &wgpu::ShaderModule, buffers: &[Option<wgpu::VertexBufferLayout>], mode: u8) -> wgpu::RenderPipeline {
-    let shadow = mode == 1 || mode == 4 || mode == 10 || mode == 12 || mode == 13;
+    let shadow = mode == 1 || mode == 4 || mode == 10 || mode == 12 || mode == 13 || mode == 21 || mode == 22;
     let groups = [Some(l0), l1, Some(l_casc)];
     let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: if shadow { &groups[..] } else { &groups[..2] }, immediate_size: 0 });
     let alpha = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
@@ -830,7 +836,7 @@ fn geom_pipeline(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_casc: &wgpu::Bi
         label: Some(label),
         layout: Some(&layout),
         vertex: wgpu::VertexState { module: m, entry_point: Some(match mode {
-            10 => "vs_shadow_fixed",
+            10 | 22 => "vs_shadow_fixed",
             _ if shadow => "vs_shadow",
             3 => "vs_card",
             7 => "vs_near",
@@ -841,7 +847,9 @@ fn geom_pipeline(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_casc: &wgpu::Bi
         }), compilation_options: Default::default(), buffers },
         primitive: wgpu::PrimitiveState {
             cull_mode: match mode {
-                12..=14 => Some(wgpu::Face::Front),
+                // Tree world basis (e, upn, n) has det = -1, so outward model triangles are CW;
+                // culling Front keeps all sun-facing faces and culls back-facing shadow triangles.
+                12..=14 | 21 | 22 => Some(wgpu::Face::Front),
                 8 | 9 | 15..=20 => Some(wgpu::Face::Back),
                 _ => None,
             },
@@ -2675,8 +2683,8 @@ impl Renderer {
                 let p_tree = geom("tree", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 0);
                 let imp = crate::impostor::Impostors::new(d, &l0, &l_tileu, &m_tree, if integrated { crate::impostor::CELL_INTEGRATED } else { crate::impostor::CELL });
                 let p_tree_near = geom("trees near", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 7);
-                let p_tree_shadow = geom("tree shadow", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 1);
-                let p_tree_shadow_fixed = geom("tree shadow fixed", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 10);
+                let p_tree_shadow = geom("tree shadow", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 21);
+                let p_tree_shadow_fixed = geom("tree shadow fixed", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 22);
                 let p_card = geom("leaf cards", Some(&l_tileu), &m_tree, &[vb(72, false, &A_TREEV), vb(36, true, &A_TREE)], 3);
                 let p_inst = geom("inst", None, &m_inst, &[vb(40, false, &A_MESH), vb(80, true, &A_INST)], 0);
                 let p_inst_shadow = geom("inst shadow", None, &m_inst, &[vb(40, false, &A_MESH), vb(80, true, &A_INST)], 1);
@@ -3881,19 +3889,15 @@ impl Renderer {
             if let Some(lib) = self.tree_lib.as_ref().filter(|_| part & 2 != 0) {
                 rp.set_vertex_buffer(0, lib.vbuf.slice(..));
                 rp.set_index_buffer(lib.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                // In view only the trees short of IMP_DIST are models (impostors follow below).
-                // The second cascade draws whole batches with one model each.
-                rp.set_pipeline(match c {
-                    Some(1) => &self.p_tree_shadow_fixed,
-                    Some(_) => &self.p_tree_shadow,
-                    None => &self.p_tree_near,
-                });
-                {
+                // Shadow cascades draw standing trees from the per-tile buffers (both
+                // cascade 0 and cascade 1 pick one LOD per chunk, drawn with fixed mode).
+                if shadow {
+                    rp.set_pipeline(&self.p_tree_shadow_fixed);
                     for (i, dd) in f.details.iter().take(n_builds).enumerate() {
                         let Some(tb) = &dd.gpu.trees else { continue };
                         let mut bound = false;
                         for t in &dd.trees {
-                            if t.imp || if shadow { t.casc & bit == 0 } else { !t.view || !t.close } {
+                            if t.imp || t.casc & bit == 0 {
                                 continue;
                             }
                             if !bound {
@@ -3905,8 +3909,8 @@ impl Renderer {
                             rp.draw_indexed(first..first + count, base, t.first..t.first + t.count);
                         }
                     }
-                }
-                if !shadow {
+                    rp.set_pipeline(&self.p_tree_shadow);
+                } else {
                     rp.set_pipeline(&self.p_tree);
                 }
                 let loose = c != Some(2) && fall_ranges.iter().any(|r| r.1 > r.0);
@@ -3920,12 +3924,13 @@ impl Renderer {
                         }
                     }
                 }
-                // What stands close to the camera: undergrowth (which only casts
-                // into the nearest cascade), then everyone's leaf cards.
-                let near = |rp: &mut wgpu::RenderPass, cards: bool| {
+                // What stands close to the camera: in view, both standing trees short of
+                // IMP_DIST and undergrowth (ring-sorted front-to-back); in cascade 0,
+                // only undergrowth (standing trees already cast via `dd.trees` above).
+                let near = |rp: &mut wgpu::RenderPass, cards: bool, only_under: bool| {
                     for (i, dd) in f.details.iter().take(n_builds).enumerate() {
                         let mut bound = false;
-                        for nd in dd.close.iter().filter(|nd| nd.cards == cards) {
+                        for nd in dd.close.iter().filter(|nd| nd.cards == cards && (!only_under || !nd.tree)) {
                             let (first, count, base) = lib.ranges[nd.mesh as usize];
                             if count == 0 || nd.first + nd.count > n_near as u32 {
                                 continue;
@@ -3943,33 +3948,12 @@ impl Renderer {
                     if !shadow {
                         rp.set_pipeline(&self.p_tree_near);
                     }
-                    near(rp, false);
+                    near(rp, false, shadow);
                 }
                 rmark(rp, lab[1]);
                 if c.is_none() {
                     rp.set_pipeline(&self.p_card);
-                    near(rp, true);
-                    // Everything further off: one picture each.
-                    if self.imp.ready {
-                        rp.set_pipeline(&self.imp.p_draw);
-                        rp.set_bind_group(2, &self.imp.bg, &[]);
-                        rp.set_index_buffer(self.imp.quad.slice(..), wgpu::IndexFormat::Uint32);
-                        for (i, dd) in f.details.iter().take(n_builds).enumerate() {
-                            let Some(tb) = &dd.gpu.trees else { continue };
-                            let mut bound = false;
-                            for t in dd.trees.iter().filter(|t| t.imp) {
-                                if !bound {
-                                    rp.set_bind_group(1, &self.bg_tileu, &[i as u32 * 256]);
-                                    rp.set_vertex_buffer(0, tb.slice(..));
-                                    bound = true;
-                                }
-                                rp.draw_indexed(0..6, t.mesh as i32 * 4, t.first..t.first + t.count);
-                            }
-                        }
-                        rp.set_pipeline(&self.p_card);
-                        rp.set_vertex_buffer(0, lib.vbuf.slice(..));
-                        rp.set_index_buffer(lib.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    }
+                    near(rp, true, false);
                     if loose {
                         rp.set_bind_group(1, &self.bg_tileu, &[loose_slot]);
                         rp.set_vertex_buffer(1, self.fall_buf.slice(..));
@@ -3980,7 +3964,41 @@ impl Renderer {
                             }
                         }
                     }
-                    rmark(rp, lab[2]);
+                    rmark(rp, "view.tree_cards");
+                    // Everything further off: one picture each, drawn ring by ring from
+                    // nearest to farthest across tiles so Early-Z / Hi-Z kills occluded crowns.
+                    // Specialized pipelines drop photo3d mask/cut code outside the 3D tiles zone
+                    // and use a loop-free single-view shader for distant rings (>= 600 m).
+                    if self.imp.ready {
+                        rp.set_bind_group(2, &self.imp.bg, &[]);
+                        rp.set_index_buffer(self.imp.quad.slice(..), wgpu::IndexFormat::Uint32);
+                        let has_photo = zone.is_some();
+                        if has_photo {
+                            rp.set_pipeline(&self.imp.p_draw_photo);
+                        }
+                        for ring in 0..IMP_RINGS {
+                            if !has_photo {
+                                if ring == 0 {
+                                    rp.set_pipeline(&self.imp.p_draw);
+                                } else if ring == 2 {
+                                    rp.set_pipeline(&self.imp.p_draw_far);
+                                }
+                            }
+                            for (i, dd) in f.details.iter().take(n_builds).enumerate() {
+                                let Some(tb) = &dd.gpu.trees else { continue };
+                                let mut bound = false;
+                                for t in dd.trees.iter().filter(|t| t.imp && t.ring == ring) {
+                                    if !bound {
+                                        rp.set_bind_group(1, &self.bg_tileu, &[i as u32 * 256]);
+                                        rp.set_vertex_buffer(0, tb.slice(..));
+                                        bound = true;
+                                    }
+                                    rp.draw_indexed(0..6, t.mesh as i32 * 4, t.first..t.first + t.count);
+                                }
+                            }
+                        }
+                    }
+                    rmark(rp, "view.impostors");
                 }
             }
             if c == Some(2) {
