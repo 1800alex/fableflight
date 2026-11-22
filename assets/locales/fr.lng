@@ -513,6 +513,7 @@ settings.back_to_the_flight_simulator = "Revenir à la disposition de Flight Sim
 settings.binding_then_its_live_value = "Assignation · puis sa valeur en direct et sa zone morte (course sans effet)"
 settings.assign = "Assigner"
 settings.dead_zone_how_much_travel = "Zone morte : la course qui ne fait rien"
+settings.no_gamepad = "Pas de manette"
 settings.not_bound = "Non assigné"
 settings.requests.one = "{n} requête"
 settings.requests.other = "{n} requêtes"

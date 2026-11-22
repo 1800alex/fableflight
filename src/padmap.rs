@@ -417,6 +417,35 @@ pub fn one_ended(v: f64, d: f32) -> f64 {
     if v <= d { 0.0 } else { ((v - d) / (1.0 - d)).min(1.0) }
 }
 
+/// The pad's sticks and triggers as read now, before any dead zone: for
+/// Settings › Controls › Gamepad to show where a drifting pad rests.
+#[derive(Copy, Clone, Default, PartialEq, Debug)]
+pub struct Live {
+    /// left stick x, y (-1..1, up and right +)
+    pub ls: [f32; 2],
+    pub rs: [f32; 2],
+    /// the triggers, 0..1
+    pub lt: f32,
+    pub rt: f32,
+}
+
+impl Live {
+    /// A thumbstick as x, y; the triggers as LT, RT.
+    pub fn at(&self, t: Thumb) -> [f32; 2] {
+        match t {
+            Thumb::Left => self.ls,
+            Thumb::Right => self.rs,
+            Thumb::Triggers => [self.lt, self.rt],
+        }
+    }
+
+    /// Whether each of `at`'s two gets through the dead zone `d`.
+    pub fn through(&self, t: Thumb, d: f32) -> [bool; 2] {
+        let f = |v: f32| if t == Thumb::Triggers { one_ended(v as f64, d) } else { centred(v as f64, d) } != 0.0;
+        self.at(t).map(f)
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct AxisSrc {
     pub stick: Stick,
@@ -905,6 +934,20 @@ mod tests {
         m.set_dead(Thumb::Left, 0.12);
         m.set_dead(Thumb::Triggers, 0.0);
         assert!(m.is_default(), "{m:?}");
+    }
+
+    #[test]
+    fn live_readout() {
+        let l = Live { ls: [0.03, -0.08], rs: [0.5, 0.0], lt: 0.02, rt: 0.9 };
+        // A thumbstick as x, y; the triggers as LT, RT.
+        assert_eq!(l.at(Thumb::Left), [0.03, -0.08]);
+        assert_eq!(l.at(Thumb::Right), [0.5, 0.0]);
+        assert_eq!(l.at(Thumb::Triggers), [0.02, 0.9]);
+        // Whether each way gets through a dead zone, as the flying reads it.
+        assert_eq!(l.through(Thumb::Left, 0.05), [false, true]);
+        assert_eq!(l.through(Thumb::Left, 0.12), [false, false]);
+        assert_eq!(l.through(Thumb::Right, 0.12), [true, false]);
+        assert_eq!(l.through(Thumb::Triggers, 0.05), [false, true]);
     }
 
     #[test]
