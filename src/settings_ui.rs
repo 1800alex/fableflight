@@ -868,7 +868,7 @@ impl Game {
     /// then every action, each bound from the pad itself.
     fn binds_pad(&mut self, ui: &mut Ui) {
         use bind::Capture;
-        use padmap::{AxisSrc, PadAxis};
+        use padmap::{AxisSrc, PadAxis, Thumb};
         let busy = self.binds.capture.is_some();
         note(ui, t!("settings.in_the_menus_the_pad"));
         if self.pad_note.1 > self.real {
@@ -898,6 +898,26 @@ impl Game {
                         if menu::toggle(ui, &mut inv, t!("settings.invert")).changed() {
                             self.binds.pad.set_axis(a, Some(AxisSrc { sign: -s.sign, ..s }));
                         }
+                    }
+                });
+                ui.end_row();
+            }
+            // Each thumbstick's dead zone, for a pad that drifts at rest.
+            for t in Thumb::ALL {
+                let mut d = self.binds.pad.dead(t);
+                grid_label(ui, t.label(), cw);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().slider_width = 70.0;
+                    if ui.add(egui::Slider::new(&mut d, 0.0..=padmap::DEAD_MAX).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)))
+                        .on_hover_text(t!("settings.dead_zone_how_much_travel"))
+                        .changed()
+                    {
+                        self.binds.pad.set_dead(t, d);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if d != t.default_dead() && ui.add_enabled(!busy, egui::Button::new(t!("settings.default"))).clicked() {
+                        self.binds.pad.set_dead(t, t.default_dead());
                     }
                 });
                 ui.end_row();

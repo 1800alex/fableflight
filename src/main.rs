@@ -3169,12 +3169,13 @@ impl Game {
         } else {
             Nav::Off
         };
-        // A small dead zone, the rest of the travel rescaled so there is no step out of it.
-        let dz = |v: f32| {
-            let v = v as f64;
-            let d = 0.12;
-            if v.abs() < d { 0.0 } else { v.signum() * (v.abs() - d) / (1.0 - d) }
-        };
+        // Each thumbstick's dead zone (Settings › Controls › Gamepad), the rest
+        // of the travel rescaled so there is no step out of it.
+        let pm = &self.binds.pad;
+        let (dl, dr, dtrig) = (pm.dead(padmap::Thumb::Left), pm.dead(padmap::Thumb::Right), pm.dead(padmap::Thumb::Triggers));
+        let dzl = |v: f32| padmap::centred(v as f64, dl);
+        let dzr = |v: f32| padmap::centred(v as f64, dr);
+        let dz = |s: padmap::Stick, v: f32| if s.thumb() == padmap::Thumb::Left { dzl(v) } else { dzr(v) };
         // The analogue triggers; on a pad left without a layout they come through as
         // bare Z axes, -1 at rest to +1 squeezed.
         let trig = |b: Button, z: Axis| match (pad.button_data(b), pad.axis_data(z)) {
@@ -3182,6 +3183,7 @@ impl Game {
             (None, Some(a)) => ((a.value() as f64 + 1.0) * 0.5).clamp(0.0, 1.0),
             _ => 0.0,
         };
+        let trig_dz = |b: Button, z: Axis| padmap::one_ended(trig(b, z), dtrig);
         let modifier = pad.is_pressed(Button::North);
         let flying = self.mode == Mode::Fly && !self.pause_open;
         // The globe itself is only on the start screen's Fly page; the main
@@ -3190,18 +3192,18 @@ impl Game {
         // The flying axes, wherever Settings › Controls › Gamepad has put them.
         let map = &self.binds.pad;
         let stick = |s: padmap::Stick| match s {
-            padmap::Stick::LX => dz(pad.value(Axis::LeftStickX)),
-            padmap::Stick::LY => dz(pad.value(Axis::LeftStickY)),
-            padmap::Stick::RX => dz(pad.value(Axis::RightStickX)),
-            padmap::Stick::RY => dz(pad.value(Axis::RightStickY)),
-            padmap::Stick::Trig => (trig(Button::RightTrigger2, Axis::RightZ) - trig(Button::LeftTrigger2, Axis::LeftZ)).clamp(-1.0, 1.0),
+            padmap::Stick::LX => dz(s, pad.value(Axis::LeftStickX)),
+            padmap::Stick::LY => dz(s, pad.value(Axis::LeftStickY)),
+            padmap::Stick::RX => dz(s, pad.value(Axis::RightStickX)),
+            padmap::Stick::RY => dz(s, pad.value(Axis::RightStickY)),
+            padmap::Stick::Trig => (trig_dz(Button::RightTrigger2, Axis::RightZ) - trig_dz(Button::LeftTrigger2, Axis::LeftZ)).clamp(-1.0, 1.0),
         };
         let axis = |a: padmap::PadAxis| map.axis(a).map(|s| stick(s.stick) * s.sign as f64).unwrap_or(0.0);
         self.pad = Controls { pitch: axis(padmap::PadAxis::Pitch), roll: axis(padmap::PadAxis::Roll), yaw: axis(padmap::PadAxis::Rudder), throttle: axis(padmap::PadAxis::Throttle), ..Controls::default() };
         let (look_x, look_y) = (axis(padmap::PadAxis::LookX), axis(padmap::PadAxis::LookY));
         // The buttons held now, for the flying actions held with them.
         let down: Vec<padmap::PadBtn> = padmap::PadBtn::ALL.into_iter().filter(|b| pad.is_pressed(b.gilrs())).collect();
-        let ry = dz(pad.value(Axis::RightStickY));
+        let ry = dzr(pad.value(Axis::RightStickY));
         let right = (pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
 
         // Moving about the menus: the d-pad (and the left stick too, except
@@ -3268,7 +3270,7 @@ impl Game {
             // Left stick turns the globe (squared, for a fine touch), the triggers zoom.
             let h = self.window.inner_size().height.max(1) as f64;
             let sq = |v: f64| v * v.abs();
-            let (sx, sy) = (sq(dz(lx)), sq(dz(ly)));
+            let (sx, sy) = (sq(dzl(lx)), sq(dzl(ly)));
             if sx != 0.0 || sy != 0.0 {
                 let k = 0.8 * h * dt;
                 self.menu.drag(-sx * k, sy * k, h, 60f64.to_radians());

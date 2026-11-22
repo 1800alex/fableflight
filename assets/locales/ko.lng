@@ -602,6 +602,9 @@ weather.real_2 = "실제 · {}"
 
 # ---- gamepad
 gamepad.y_let_go = "Y (놓기)"
+gamepad.dead_zone_left_stick = "왼쪽 스틱 데드존"
+gamepad.dead_zone_right_stick = "오른쪽 스틱 데드존"
+gamepad.dead_zone_triggers = "트리거 데드존"
 
 # ---- bindings page
 bind.throttle = "스로틀"
