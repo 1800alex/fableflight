@@ -6284,6 +6284,8 @@ impl Game {
             storm_bounds: [[0.0; 4]; weather::MAX_STORMS],
             storm_turrets: [[0.0; 4]; 8 * weather::MAX_STORMS],
             lite: [self.gfx.water_detail(), if self.gfx.clouds_on() { 1.0 } else { 0.0 }, 0.0, 0.0],
+            det_mean: [[1.0 / 0.35, 1.0 / 0.35, 1.0 / 0.35, 1.0]; 16],
+            det_hmean: [[0.5; 4]; 4],
         };
         if !in_menu {
             let cells = self.wx.storm_cells(cam);

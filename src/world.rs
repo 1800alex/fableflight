@@ -178,7 +178,7 @@ const TESS_N: u32 = 16;
 /// any is in doubt the larger patch is taken, which costs time but changes
 /// nothing on screen. `p`: the grid vertices, `o`: the tile's offset from the
 /// camera and `cell` its grid spacing, as in the tile's uniform.
-fn tess_cells(p: &[[f32; 3]], o: Vec3, cell: f32, b: [f32; 4], out: &mut [Vec<u32>; 5]) {
+fn tess_cells(p: &[[f32; 3]], o: Vec3, cell: f32, b: [f32; 4], fr: Option<&Frustum>, out: &mut [Vec<u32>; 5]) {
     let w = cell as f64;
     // terrain.wgsl `tess_level` at distance d.
     let level = |d: f64| {
@@ -191,6 +191,14 @@ fn tess_cells(p: &[[f32; 3]], o: Vec3, cell: f32, b: [f32; 4], out: &mut [Vec<u3
         for ci in x0..(x0 + b[2] as usize).min(GRID) {
             let i00 = cj * GV + ci;
             let (c00, c10, c01, c11) = (at(i00), at(i00 + 1), at(i00 + GV), at(i00 + GV + 1));
+            // Skip cells completely outside the view frustum (pad radius for relief, waves and craters).
+            if let Some(fr) = fr {
+                let mid = (c00 + c10 + c01 + c11) * 0.25;
+                let r2 = (c00 - mid).length_squared().max((c10 - mid).length_squared()).max((c01 - mid).length_squared()).max((c11 - mid).length_squared());
+                if !fr.sphere(mid.as_dvec3(), r2.sqrt() as f64 + 20.0) {
+                    continue;
+                }
+            }
             // The edges' midpoints, then the inside's (the shader's order of operations).
             let mids = [(c00 + c10) * 0.5, (c01 + c11) * 0.5, (c00 + c01) * 0.5, (c10 + c11) * 0.5, (c00 + c11) * 0.5];
             let (mut lo, mut hi) = (TESS_N, 1);
@@ -1569,8 +1577,9 @@ impl World {
         for (i, (t, u)) in drawn.iter().enumerate() {
             // (render.rs draws a block tessellated only if it has cells both ways)
             if u[10] >= 1.0 && u[11] >= 1.0 {
-                tess_cells(&t.grid, Vec3::new(u[0], u[1], u[2]), u[3], [u[8], u[9], u[10], u[11]], &mut by_n);
-                for (k, cells) in by_n.iter_mut().enumerate() {
+                tess_cells(&t.grid, Vec3::new(u[0], u[1], u[2]), u[3], [u[8], u[9], u[10], u[11]], self.frustum.as_ref(), &mut by_n);
+                // Highest subdivision (nearest cells) first so early-Z hides farther cells behind ridges.
+                for (k, cells) in by_n.iter_mut().enumerate().rev() {
                     if !cells.is_empty() {
                         tess.groups.push((i as u32, k as u32, tess.cells.len() as u32, cells.len() as u32));
                         tess.cells.append(cells);

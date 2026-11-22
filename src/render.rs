@@ -234,6 +234,10 @@ pub struct Globals {
     /// (0 plain, 1 full, 2 full + screen-space reflections), y 1 while the
     /// clouds are drawn; zw unused
     pub lite: [f32; 4],
+    /// precomputed top-mip means for the ground detail arrays (GroundMats):
+    /// rgb = 1 / max(albedo mean, 0.02), w = cavity mean; det_hmean = height mean (4 per vec4)
+    pub det_mean: [[f32; 4]; 16],
+    pub det_hmean: [[f32; 4]; 4],
 }
 
 /// Raindrops drawn around the camera in rain (as many as the rain is heavy show).
@@ -587,6 +591,9 @@ pub struct FieldGpu {
 pub struct TileGpu {
     vbuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
+    radius: f32,
+    wet: bool,
+    all_water: bool,
 }
 /// The cells of the terrain tiles' tessellated blocks (world.rs `tess_cells`),
 /// each `cell | k << 16` for a 2^k x 2^k patch (terrain.wgsl `vs_tess`), in
@@ -828,11 +835,18 @@ fn geom_pipeline(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_casc: &wgpu::Bi
             3 => "vs_card",
             7 => "vs_near",
             11 => "vs_skin",
-            8 => "vs_tess",
-            9 => "vs_cells",
+            8 | 17 => "vs_tess",
+            9 | 18 => "vs_cells",
             _ => "vs",
         }), compilation_options: Default::default(), buffers },
-        primitive: wgpu::PrimitiveState { cull_mode: if mode >= 12 { Some(wgpu::Face::Front) } else { None }, ..Default::default() },
+        primitive: wgpu::PrimitiveState {
+            cull_mode: match mode {
+                12..=14 => Some(wgpu::Face::Front),
+                8 | 9 | 15..=20 => Some(wgpu::Face::Back),
+                _ => None,
+            },
+            ..Default::default()
+        },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH,
             depth_write_enabled: Some(mode != 2),
@@ -850,7 +864,7 @@ fn geom_pipeline(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, l_casc: &wgpu::Bi
         } else if shadow {
             None
         } else {
-            Some(wgpu::FragmentState { module: m, entry_point: Some(match mode { 3 => "fs_card", 5 => "fs_solid", 7 => "fs_cut", 11 => "fs_skin", 14 => "fs_whole", _ => "fs" }), compilation_options: Default::default(), targets: &targets })
+            Some(wgpu::FragmentState { module: m, entry_point: Some(match mode { 3 => "fs_card", 5 => "fs_solid", 7 => "fs_cut", 11 => "fs_skin", 14 => "fs_whole", 16..=18 => "fs_photo", 19 => "fs_far", 20 => "fs_water", _ => "fs" }), compilation_options: Default::default(), targets: &targets })
         },
         multiview_mask: None,
         cache: None,
@@ -1258,8 +1272,13 @@ pub struct Renderer {
     tile_nidx: u32,
     p_sky: wgpu::RenderPipeline,
     p_terrain: wgpu::RenderPipeline,
+    p_terrain_far: wgpu::RenderPipeline,
+    p_terrain_water: wgpu::RenderPipeline,
     p_terrain_tess: wgpu::RenderPipeline,
     p_terrain_cells: wgpu::RenderPipeline,
+    p_terrain_photo: wgpu::RenderPipeline,
+    p_terrain_tess_photo: wgpu::RenderPipeline,
+    p_terrain_cells_photo: wgpu::RenderPipeline,
     /// index buffers of the tessellated cell patches (1, 2, 4 .. TESS_N sub-cells
     /// across, where each starts and ends), and of a single cell quad
     tess_ibuf: wgpu::Buffer,
@@ -1661,6 +1680,11 @@ struct GroundMats {
     nrm: wgpu::Texture,
     p_down: wgpu::ComputePipeline,
     params: [[f32; 4]; 16],
+    means: [[f32; 4]; 16],
+    hmeans: [[f32; 4]; 4],
+    rb: wgpu::Buffer,
+    rb_state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    rb_dirty: bool,
     photos: Option<crossbeam_channel::Receiver<crate::materials::Layer>>,
 }
 
@@ -1687,7 +1711,7 @@ impl GroundMats {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
         };
@@ -1699,10 +1723,52 @@ impl GroundMats {
         let (a0, n0) = (det_level(&alb, 0), det_level(&nrm, 0));
         det_run(d, &mut enc, &p_gen, &[tex_res(0, &a0)], DET_N);
         det_run(d, &mut enc, &p_nrm, &[tex_res(1, &a0), tex_res(2, &n0)], DET_N);
-        let g = Self { alb, nrm, p_down, params: DET_PROC, photos: None };
+        let stride = 256u64;
+        let half = stride * DET_LAYERS as u64;
+        let rb = d.create_buffer(&wgpu::BufferDescriptor { label: Some("det top"), size: half * 2, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut g = Self { alb, nrm, p_down, params: DET_PROC, means: [[1.0 / 0.35, 1.0 / 0.35, 1.0 / 0.35, 1.0]; 16], hmeans: [[0.5; 4]; 4], rb, rb_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), rb_dirty: false, photos: None };
         g.mips(d, &mut enc);
+        // Read back the 1x1 top mip of both arrays once at startup so shaders
+        // never need per-pixel textureLoad calls for layer_mean / cav_mean.
+        g.copy_top(&mut enc);
         queue.submit([enc.finish()]);
+        g.rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = d.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        g.read_rb();
         g
+    }
+
+    fn copy_top(&self, enc: &mut wgpu::CommandEncoder) {
+        let stride = 256u64;
+        let half = stride * DET_LAYERS as u64;
+        let top = self.alb.mip_level_count() - 1;
+        for (k, t) in [&self.alb, &self.nrm].into_iter().enumerate() {
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: t, mip_level: top, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &self.rb, layout: wgpu::TexelCopyBufferLayout { offset: k as u64 * half, bytes_per_row: Some(stride as u32), rows_per_image: Some(1) } },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: DET_LAYERS },
+            );
+        }
+    }
+
+    fn read_rb(&mut self) {
+        let stride = 256usize;
+        let half = stride * DET_LAYERS as usize;
+        {
+            let data = self.rb.slice(..).get_mapped_range().expect("det top mapped");
+            for l in 0..DET_LAYERS as usize {
+                let ao = l * stride;
+                let no = half + l * stride;
+                self.means[l] = [
+                    1.0 / (data[ao] as f32 / 255.0).max(0.02),
+                    1.0 / (data[ao + 1] as f32 / 255.0).max(0.02),
+                    1.0 / (data[ao + 2] as f32 / 255.0).max(0.02),
+                    data[no + 2] as f32 / 255.0,
+                ];
+                self.hmeans[l / 4][l % 4] = data[ao + 3] as f32 / 255.0;
+            }
+        }
+        self.rb.unmap();
     }
 
     /// Rebuild every mip level from level 0 (both arrays, all layers).
@@ -1717,24 +1783,49 @@ impl GroundMats {
 
     /// Swap in any photo layers that have finished loading.
     fn poll(&mut self, d: &wgpu::Device, queue: &wgpu::Queue) {
-        let Some(rx) = &self.photos else { return };
+        use std::sync::atomic::Ordering;
+        if self.rb_state.load(Ordering::Acquire) == 2 {
+            self.read_rb();
+            self.rb_state.store(0, Ordering::Release);
+        }
         let mut any = false;
-        while let Ok(l) = rx.try_recv() {
-            for (t, data) in [(&self.alb, &l.alb), (&self.nrm, &l.nrm)] {
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: l.layer }, aspect: wgpu::TextureAspect::All },
-                    data,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(DET_N * 4), rows_per_image: Some(DET_N) },
-                    wgpu::Extent3d { width: DET_N, height: DET_N, depth_or_array_layers: 1 },
-                );
+        if let Some(rx) = &self.photos {
+            while let Ok(l) = rx.try_recv() {
+                for (t, data) in [(&self.alb, &l.alb), (&self.nrm, &l.nrm)] {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: l.layer }, aspect: wgpu::TextureAspect::All },
+                        data,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(DET_N * 4), rows_per_image: Some(DET_N) },
+                        wgpu::Extent3d { width: DET_N, height: DET_N, depth_or_array_layers: 1 },
+                    );
+                }
+                self.params[l.layer as usize] = l.params;
+                self.means[l.layer as usize] = l.mean;
+                self.hmeans[l.layer as usize / 4][l.layer as usize % 4] = l.hmean;
+                any = true;
             }
-            self.params[l.layer as usize] = l.params;
-            any = true;
         }
         if any {
+            self.rb_dirty = true;
+        }
+        let do_rb = self.rb_dirty && self.rb_state.load(Ordering::Acquire) == 0;
+        if any || do_rb {
             let mut enc = d.create_command_encoder(&Default::default());
-            self.mips(d, &mut enc);
+            if any {
+                self.mips(d, &mut enc);
+            }
+            if do_rb {
+                self.copy_top(&mut enc);
+                self.rb_dirty = false;
+                self.rb_state.store(1, Ordering::Release);
+            }
             queue.submit([enc.finish()]);
+            if do_rb {
+                let st = self.rb_state.clone();
+                self.rb.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    st.store(if r.is_ok() { 2 } else { 0 }, Ordering::Release);
+                });
+            }
         }
     }
 
@@ -2361,7 +2452,7 @@ impl Renderer {
         crate::progress::step("shaders");
         let (
             (p_cshadow_in, p_cshadow_out, p_cshadow_in_plain, p_cshadow_out_plain, p_cshadow_mix, (p_ap_build, p_sky_build, p_cloud_refl, p_cloud_refl_plain), (p_comp_cls, p_comp_sky, p_comp_opaque, p_comp_glass, p_comp_water, p_comp_edge, p_composite, p_composite_edge), p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_temporal, p_cloud_apply),
-            (p_terrain, p_terrain_tess, p_terrain_cells, p_build, p_build_whole, p_build_shadow, p_photo, p_skin, p_photo_shadow, p_photo_shadow_fast, p_photo_mask, p_water_top, p_shore_cover),
+            (p_terrain, p_terrain_far, p_terrain_water, p_terrain_tess, p_terrain_cells, p_terrain_photo, p_terrain_tess_photo, p_terrain_cells_photo, p_build, p_build_whole, p_build_shadow, p_photo, p_skin, p_photo_shadow, p_photo_shadow_fast, p_photo_mask, p_water_top, p_shore_cover),
             (p_road, p_field, p_lights, p_lamp_top, p_rain, p_bolt, p_veil, p_tree, imp, p_tree_near, p_tree_shadow, p_tree_shadow_fixed, p_card, p_inst, p_inst_shadow),
             (p_trans, p_ms, p_sky, p_gtao, p_ao_blur, p_taa, p_down, p_up, p_final, p_final_taa, p_blit, p_particles, p_psim, p_vol, p_dres),
         ) = std::thread::scope(|s| {
@@ -2463,10 +2554,15 @@ impl Renderer {
             });
 
             let t_world = s.spawn(|| {
-                let p_terrain = geom("terrain", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 0);
+                let p_terrain = geom("terrain", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 15);
+                let p_terrain_far = geom("terrain far", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 19);
+                let p_terrain_water = geom("terrain water", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 20);
                 let tess_layout = wgpu::VertexBufferLayout { array_stride: 4, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Uint32] };
-                let p_terrain_tess = geom("terrain tess", Some(&l_tile), &m_terrain, &[Some(tess_layout)], 8);
+                let p_terrain_tess = geom("terrain tess", Some(&l_tile), &m_terrain, &[Some(tess_layout.clone())], 8);
                 let p_terrain_cells = geom("terrain cells", Some(&l_tile), &m_terrain, &[], 9);
+                let p_terrain_photo = geom("terrain photo", Some(&l_tile), &m_terrain, &[vb(40, false, &A_TERRAIN)], 16);
+                let p_terrain_tess_photo = geom("terrain tess photo", Some(&l_tile), &m_terrain, &[Some(tess_layout)], 17);
+                let p_terrain_cells_photo = geom("terrain cells photo", Some(&l_tile), &m_terrain, &[], 18);
                 let p_build = geom("build", Some(&l_build), &m_build, &[vb(std::mem::size_of::<crate::buildings::BVertex>() as u64, false, &A_BUILD)], 0);
                 let p_build_whole = geom("build whole", Some(&l_build), &m_build, &[vb(std::mem::size_of::<crate::buildings::BVertex>() as u64, false, &A_BUILD)], 14);
                 let p_build_shadow = geom("build shadow", Some(&l_build), &m_build, &[vb(std::mem::size_of::<crate::buildings::BVertex>() as u64, false, &A_BUILD)], 1);
@@ -2508,7 +2604,7 @@ impl Renderer {
                     cache: None,
                 });
                 crate::progress::step("shaders-part");
-                (p_terrain, p_terrain_tess, p_terrain_cells, p_build, p_build_whole, p_build_shadow, p_photo, p_skin, p_photo_shadow, p_photo_shadow_fast, p_photo_mask, p_water_top, p_shore_cover)
+                (p_terrain, p_terrain_far, p_terrain_water, p_terrain_tess, p_terrain_cells, p_terrain_photo, p_terrain_tess_photo, p_terrain_cells_photo, p_build, p_build_whole, p_build_shadow, p_photo, p_skin, p_photo_shadow, p_photo_shadow_fast, p_photo_mask, p_water_top, p_shore_cover)
             });
 
             let t_misc = s.spawn(|| {
@@ -2776,7 +2872,7 @@ impl Renderer {
             gpu_timer: crate::gputime::GpuTimer::new(&device, &queue),
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, shadow_res: SHADOW_RES, bg0_src, scale: 1.0, ao: true, cloud_step: 1.0, l_tile, l_build, l_comp_cls, l_comp_main, l_comp_edge, l_comp_globe, l_hiz, ap_l, ap_t, cloud_refl, bg_atmlut, bg_comp_sky, p_hiz_build, p_ap_build, p_sky_build, p_cloud_refl, p_cloud_refl_plain, l_cloud, l_cloud_storm, l_cloud_rain, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
             tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, light_cover, light_cover_view, glow_tex, gclouds_tex, snow_tex, snow_track_tex, build_ub, obj_ub, bg_obj, l_obj, paint_ub, tile_ibuf, tile_nidx: ix.len() as u32,
-            p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, obj_gen: None, obj_gen_rx: Some(obj_gen_rx), wait_objs: false, obj_wait: None, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_comp_cls, p_comp_sky, p_comp_opaque, p_comp_glass, p_comp_water, p_comp_edge, p_composite, p_composite_edge, p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit,
+            p_sky, p_terrain, p_terrain_far, p_terrain_water, p_terrain_tess, p_terrain_cells, p_terrain_photo, p_terrain_tess_photo, p_terrain_cells_photo, tess_ibuf, tess_idx, tess_buf, tess_cap, cell_ibuf, p_build, p_build_whole, p_build_shadow, obj_gen: None, obj_gen_rx: Some(obj_gen_rx), wait_objs: false, obj_wait: None, obj_src, pl_obj, obj_fast: None, obj_fast_rx: None, p_comp_cls, p_comp_sky, p_comp_opaque, p_comp_glass, p_comp_water, p_comp_edge, p_composite, p_composite_edge, p_cloud, p_cloud_plain, p_cloud_classify, p_cloud_plain_cls, p_cloud_storm_cls, p_cloud_rain, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, parts_until: 0.0, now: 0.0, black, targets, cloud_flip: 0, cloud_hist_ok: false, clouds: true, cloud_shadows: true, vendor: info.vendor, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, up, gpu: info.clone(), meshes: Vec::new(), egui, instance, window, gpu_error, device_lost, surface, config, queue, device, stats: [0.0; 4], headless: false, integrated,
         })
     }
@@ -3003,7 +3099,13 @@ impl Renderer {
         let mask = upload_mips(d, &self.queue, "mask", crate::sources::MASK as u32, wgpu::TextureFormat::Rgba8Unorm, 4, &t.mask);
         let lights = upload_mips(d, &self.queue, "lights", crate::sources::MASK as u32, wgpu::TextureFormat::R8Unorm, 1, &t.lights);
         let bind = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_tile, entries: &[buf_res(0, &self.tile_ub, 48), tex_res(1, &img), tex_res(2, &mask), buf_res(3, &vbuf, 0), tex_res(4, &lights), tex_res(5, &self.light_cover_view)] });
-        TileGpu { vbuf, bind }
+        let mut wet = false;
+        let mut all_water = true;
+        for p in t.mask[0].chunks_exact(4) {
+            if p[0] > 0 { wet = true; }
+            if p[0] <= 127 { all_water = false; }
+        }
+        TileGpu { vbuf, bind, radius: t.radius as f32, wet, all_water }
     }
 
     /// Create a building tile's GPU objects. The geometry buffers start out
@@ -3357,6 +3459,8 @@ impl Renderer {
         f.g.vol_u[3] = if smoke { 1.0 } else { 0.0 };
         self.ground_mats.poll(&self.device, q);
         f.g.det = self.ground_mats.params;
+        f.g.det_mean = self.ground_mats.means;
+        f.g.det_hmean = self.ground_mats.hmeans;
         f.g.quality = [self.cloud_step, self.scale, 1.0 / self.config.width.max(1) as f32, 1.0 / self.config.height.max(1) as f32];
         // Cloud shadows off (or no clouds): lookups find none (common.wgsl
         // `cloud_sun`), and the map is redrawn whole once they are back on.
@@ -3371,15 +3475,51 @@ impl Renderer {
         q.write_buffer(&self.cshadow.mix_ub, 0, &self.cshadow.mix_bytes());
         let horizon = (2.0 * crate::geo::R * (f.g.up[3].max(500.0) as f64)).sqrt() as f32;
         f.g.lite[2] = (horizon * 1.4).clamp(100_000.0, 500_000.0);
-        q.write_buffer(&self.globals_ub, 0, bytemuck::bytes_of(&f.g));
-        q.write_buffer(&self.psim_ub, 0, bytemuck::bytes_of(&f.psim));
         let n_tiles = f.tiles.len().min(MAX_TILES as usize);
         let n_shore_tiles = f.shore_tiles.len().min(MAX_TILES as usize - n_tiles);
         let n_builds = f.details.len().min(MAX_BUILDS as usize);
         let n_objs = f.objs.len().min(MAX_OBJS as usize);
+        // Active shadow cascade bitmask (bits 0..3): lets shadow_world skip empty cascades.
+        let mut casc_mask = 0u32;
+        if f.g.csm[3] > 0.0 {
+            for dd in f.details.iter().take(n_builds) {
+                casc_mask |= dd.casc as u32 & 7;
+            }
+            for o in f.objs.iter().take(n_objs) {
+                if !o.glass { casc_mask |= o.cast as u32 & 7; }
+            }
+            if !f.insts.is_empty() || !f.fall.is_empty() {
+                casc_mask |= 3;
+            }
+            if !f.photo.is_empty() && f.g.photo[2] > 0.0 && f.g.photo_sun[3] >= 0.0 {
+                casc_mask |= 7;
+            }
+        }
+        f.g.lite[3] = casc_mask as f32;
+        q.write_buffer(&self.globals_ub, 0, bytemuck::bytes_of(&f.g));
+        q.write_buffer(&self.psim_ub, 0, bytemuck::bytes_of(&f.psim));
+        // Outer shadow cascade and aircraft shadow matrices for per-tile shadow skipping in fs_far.
+        let sm2 = glam::Mat4::from_cols_array_2d(&f.g.shadow_vp[2]);
+        let (s2x, s2y) = (sm2.row(0).truncate().length(), sm2.row(1).truncate().length());
+        let psm = glam::Mat4::from_cols_array_2d(&f.g.pshadow_vp);
+        let (psx, psy) = (psm.row(0).truncate().length(), psm.row(1).truncate().length());
+        let psh_on = f.g.pshadow[3] > 0.0;
         let mut blob = vec![0u8; (n_tiles + n_shore_tiles) * UB_ALIGN as usize];
-        for (i, (_, u)) in f.tiles.iter().take(n_tiles).chain(f.shore_tiles.iter().take(n_shore_tiles)).enumerate() {
-            blob[i * 256..i * 256 + 48].copy_from_slice(bytemuck::bytes_of(u));
+        for (i, (tile, u)) in f.tiles.iter().take(n_tiles).chain(f.shore_tiles.iter().take(n_shore_tiles)).enumerate() {
+            let mut u2 = *u;
+            if !tile.wet {
+                u2[4] = -u2[4];
+            }
+            if u2[10] < 1.0 || u2[11] < 1.0 {
+                let o = glam::Vec3::new(u2[0], u2[1], u2[2]);
+                let q2 = sm2 * o.extend(1.0);
+                let in_csm = casc_mask != 0 && q2.x.abs() <= 1.0 + tile.radius * s2x && q2.y.abs() <= 1.0 + tile.radius * s2y;
+                let qp = psm * o.extend(1.0);
+                let in_psh = psh_on && qp.x.abs() <= 1.0 + tile.radius * psx && qp.y.abs() <= 1.0 + tile.radius * psy;
+                // Bitmask for fs_far: bit 0 = shadow_world, bit 1 = plane_shadow.
+                u2[8] = ((in_csm as u32) | ((in_psh as u32) << 1)) as f32;
+            }
+            blob[i * 256..i * 256 + 48].copy_from_slice(bytemuck::bytes_of(&u2));
         }
         q.write_buffer(&self.tile_ub, 0, &blob);
         if f.tess.cells.len() > self.tess_cap {
@@ -3933,6 +4073,7 @@ impl Renderer {
                 rp.set_pipeline(&self.p_water_top);
                 rp.set_index_buffer(self.tile_ibuf.slice(..), wgpu::IndexFormat::Uint16);
                 for (i, (tile, _)) in f.tiles.iter().take(n_tiles).enumerate() {
+                    if !tile.wet { continue; }
                     rp.set_bind_group(1, &tile.bind, &[i as u32 * 256]);
                     rp.set_vertex_buffer(0, tile.vbuf.slice(..));
                     rp.draw_indexed(0..self.tile_nidx, 0, 0..1);
@@ -3969,10 +4110,10 @@ impl Renderer {
                     let reach = half as f32 * 1.45;
                     let near = |u: &[f32; 12]| (glam::Vec3::new(u[0], u[1], u[2]) - c).length() - u[3] * crate::sources::GRID as f32 * 0.75 < reach;
                     let all = f.tiles.iter().take(n_tiles).chain(f.shore_tiles.iter().take(n_shore_tiles)).enumerate();
-                    for p in [&self.p_shore_cover, &self.p_water_top] {
+                    for (is_water, p) in [(false, &self.p_shore_cover), (true, &self.p_water_top)] {
                         rp.set_pipeline(p);
                         for (i, (tile, u)) in all.clone() {
-                            if near(u) {
+                            if near(u) && (!is_water || tile.wet) {
                                 rp.set_bind_group(1, &tile.bind, &[i as u32 * 256]);
                                 rp.set_vertex_buffer(0, tile.vbuf.slice(..));
                                 rp.draw_indexed(0..self.tile_nidx, 0, 0..1);
@@ -4107,36 +4248,82 @@ impl Renderer {
             // scenery before the ground, so terrain under buildings and trees is never shaded.
             solids(&mut rp, None, 2);
             rp.set_bind_group(0, &self.bg0, &[]);
-            rp.set_pipeline(&self.p_terrain);
-            rp.set_index_buffer(self.tile_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+            let photo_zone = (f.g.photo[0] > 0.0 && f.g.photo[2] > 0.0).then(|| {
+                let c = glam::Vec3::from_slice(&f.g.photo_c[..3]);
+                (f.g.photo[0], c, (c - glam::Vec3::from_slice(&f.g.planet[..3])).normalize_or_zero())
+            });
+            let in_photo = |u: &[f32; 12]| {
+                photo_zone.is_some_and(|(r, zc, up)| {
+                    let q = glam::Vec3::new(u[0], u[1], u[2]) - zc;
+                    let tile_r = u[3] * crate::sources::GRID as f32 * 0.8 + 50.0;
+                    (q - up * q.dot(up)).length() < r + tile_r
+                })
+            };
             let tess = |u: &[f32; 12]| u[10] >= 1.0 && u[11] >= 1.0;
-            for (i, (tile, u)) in f.tiles.iter().take(n_tiles).enumerate() {
-                rp.set_bind_group(1, &tile.bind, &[i as u32 * 256]);
-                rp.set_vertex_buffer(0, tile.vbuf.slice(..));
-                // A tessellated tile only takes its skirts from here.
-                let first = if tess(u) { (crate::sources::GRID * crate::sources::GRID * 6) as u32 } else { 0 };
-                rp.draw_indexed(first..self.tile_nidx, 0, 0..1);
-            }
-            rmark(&mut rp, "view.terrain");
+            let grid = crate::sources::GRID as u32;
+            // Draw nearest (tessellated) terrain first so it populates depth/Hi-Z before farther tiles.
             let mut groups = f.tess.groups.iter().peekable();
             for (i, (tile, u)) in f.tiles.iter().take(n_tiles).enumerate() {
                 if !tess(u) {
                     continue;
                 }
+                let ph = in_photo(u);
                 rp.set_bind_group(1, &tile.bind, &[i as u32 * 256]);
-                rp.set_pipeline(&self.p_terrain_cells);
-                rp.set_index_buffer(self.cell_ibuf.slice(..), wgpu::IndexFormat::Uint16);
-                rp.draw_indexed(0..6, 0, 0..(crate::sources::GRID * crate::sources::GRID) as u32);
-                // Each cell of the block as the smallest patch that makes the same triangles.
-                rp.set_pipeline(&self.p_terrain_tess);
+                // Each cell of the block as the smallest patch that makes the same triangles (nearest first).
+                rp.set_pipeline(if ph { &self.p_terrain_tess_photo } else { &self.p_terrain_tess });
                 rp.set_index_buffer(self.tess_ibuf.slice(..), wgpu::IndexFormat::Uint16);
                 while groups.next_if(|g| (g.0 as usize) < i).is_some() {}
                 while let Some(&(_, k, first, n)) = groups.next_if(|g| g.0 as usize == i) {
                     rp.set_vertex_buffer(0, self.tess_buf.slice(first as u64 * 4..(first + n) as u64 * 4));
                     rp.draw_indexed(self.tess_idx[k as usize].clone(), 0, 0..n);
                 }
+                // Middle rows spanning the tessellated block use vs_cells; rows above/below + skirts share vertices via tile_ibuf.
+                let y0 = (u[9] as u32).min(grid);
+                let y1 = ((u[9] + u[11]) as u32).min(grid);
+                if y1 > y0 {
+                    rp.set_pipeline(if ph { &self.p_terrain_cells_photo } else { &self.p_terrain_cells });
+                    rp.set_index_buffer(self.cell_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                    rp.draw_indexed(0..6, 0, (y0 * grid)..(y1 * grid));
+                }
+                rp.set_pipeline(if tile.all_water { &self.p_terrain_water } else if ph { &self.p_terrain_photo } else { &self.p_terrain });
+                rp.set_vertex_buffer(0, tile.vbuf.slice(..));
+                rp.set_index_buffer(self.tile_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                if y0 > 0 {
+                    rp.draw_indexed(0..(y0 * grid * 6), 0, 0..1);
+                }
+                rp.draw_indexed((y1 * grid * 6)..self.tile_nidx, 0, 0..1);
             }
             rmark(&mut rp, "view.terrain_tess");
+            let det_far = if f.g.quality[0] > 1.5 { 500.0f32 } else { 1000.0f32 };
+            rp.set_index_buffer(self.tile_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+            let mut cur_pipe: u8 = 255;
+            for (i, (tile, u)) in f.tiles.iter().take(n_tiles).enumerate() {
+                if tess(u) {
+                    continue;
+                }
+                let kind = if tile.all_water {
+                    0u8
+                } else if in_photo(u) {
+                    1
+                } else if glam::Vec3::new(u[0], u[1], u[2]).length() - tile.radius > det_far + 10.0 {
+                    2
+                } else {
+                    3
+                };
+                if cur_pipe != kind {
+                    rp.set_pipeline(match kind {
+                        0 => &self.p_terrain_water,
+                        1 => &self.p_terrain_photo,
+                        2 => &self.p_terrain_far,
+                        _ => &self.p_terrain,
+                    });
+                    cur_pipe = kind;
+                }
+                rp.set_bind_group(1, &tile.bind, &[i as u32 * 256]);
+                rp.set_vertex_buffer(0, tile.vbuf.slice(..));
+                rp.draw_indexed(0..self.tile_nidx, 0, 0..1);
+            }
+            rmark(&mut rp, "view.terrain");
             // Airfield pavement, then roads, straight onto the terrain.
             rp.set_pipeline(&self.p_field);
             for (i, (fg, _)) in f.fields.iter().take(n_fields).enumerate() {
