@@ -3202,6 +3202,7 @@ impl Game {
         // The buttons held now, for the flying actions held with them.
         let down: Vec<padmap::PadBtn> = padmap::PadBtn::ALL.into_iter().filter(|b| pad.is_pressed(b.gilrs())).collect();
         let ry = dz(pad.value(Axis::RightStickY));
+        let right = (pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
 
         // Moving about the menus: the d-pad (and the left stick too, except
         // where it turns the globe or flies), repeating while held.
@@ -3236,7 +3237,29 @@ impl Game {
             }
         }
         for k in nav_keys {
-            self.pad_key(k);
+            if self.radial.open {
+                // The flight menu is a ring: the d-pad goes round it.
+                let n = flightui::RADIAL_N;
+                let back = matches!(k, egui::Key::ArrowLeft | egui::Key::ArrowUp);
+                self.radial.pad = Some(match self.radial.pad {
+                    None => 0,
+                    Some(i) if back => (i + n - 1) % n,
+                    Some(i) => (i + 1) % n,
+                });
+            } else {
+                self.pad_key(k);
+            }
+        }
+        // The right stick points straight at a flight menu item.
+        if self.radial.open {
+            let (rx, ry) = right;
+            if rx.hypot(ry) > 0.5 {
+                let n = flightui::RADIAL_N;
+                let step = std::f32::consts::TAU / n as f32;
+                // Clockwise from the top, as the ring is laid out.
+                let a = rx.atan2(ry).rem_euclid(std::f32::consts::TAU);
+                self.radial.pad = Some((a / step).round() as usize % n);
+            }
         }
         // The right stick scrolls the menus and the flight panel: squared,
         // for slow reading near the centre, fast at full tilt.
@@ -4173,6 +4196,7 @@ impl Game {
             (Nav::Pause, _) => {}
             // The flight panel, open beside the flying: the same, and B closes it.
             // (Its other buttons, and Y with any, still fly: pad_fly_buttons.)
+            (Nav::Panel, Button::South) if !modifier && self.radial.open => self.radial.pick = true,
             (Nav::Panel, Button::South) if !modifier => self.pad_key(egui::Key::Enter),
             (Nav::Panel, Button::East) if !modifier && self.radial.open => self.radial.open = false,
             (Nav::Panel, Button::East) if !modifier => self.info_open = false,
